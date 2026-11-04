@@ -10,7 +10,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import timedelta
 
-from .model import UAC, Account, Finding, Severity, Snapshot
+from . import sd
+from .model import UAC, Account, CertTemplate, Finding, Severity, Snapshot
 
 CheckFn = Callable[[Snapshot], Finding | None]
 
@@ -347,4 +348,186 @@ def laps_missing(snap: Snapshot) -> Finding | None:
         "shared local admin passwords allow lateral movement.",
         "Deploy Windows LAPS and confirm the policy applies to these computers.",
         _names(hits),
+    )
+
+
+# --- AD CS ---------------------------------------------------------------------------
+
+EKU_CLIENT_AUTH = {
+    "1.3.6.1.5.5.7.3.2",  # Client Authentication
+    "1.3.6.1.4.1.311.20.2.2",  # Smart Card Logon
+    "1.3.6.1.5.2.3.4",  # PKINIT Client Authentication
+}
+EKU_ANY = "2.5.29.37.0"
+EKU_REQUEST_AGENT = "1.3.6.1.4.1.311.20.2.1"
+
+
+def _broad_enroll(snap: Snapshot, t: CertTemplate) -> list[str]:
+    broad = snap.broad_sids()
+    return sorted(
+        {
+            snap.name_of(a.sid)
+            for a in t.aces
+            if a.sid in broad
+            and (a.extended_right(sd.CERT_ENROLL) or a.extended_right(sd.CERT_AUTOENROLL))
+        }
+    )
+
+
+def _issuable(t: CertTemplate) -> bool:
+    """Published and issued without a human or an enrollment agent in the loop."""
+    return t.published and not t.manager_approval and t.authorized_signatures == 0
+
+
+def _template_finding(
+    snap: Snapshot,
+    check_id: str,
+    detail: str,
+    remediation: str,
+    match: Callable[[CertTemplate], bool],
+) -> Finding | None:
+    hits = []
+    for t in snap.templates:
+        who = _broad_enroll(snap, t)
+        if who and _issuable(t) and match(t):
+            hits.append(f"{t.name} (enroll: {', '.join(who)})")
+    if not hits:
+        return None
+    return _finding(check_id, Severity.HIGH, detail, remediation, sorted(hits))
+
+
+@check("AD-ADCS-001", "ESC1: enrollee-supplied subject on an authentication template")
+def esc1(snap: Snapshot) -> Finding | None:
+    return _template_finding(
+        snap,
+        "AD-ADCS-001",
+        "Any member of the enrolling group can request a certificate for any user, "
+        "including a domain admin, and authenticate as them.",
+        "Clear 'Supply in the request', require manager approval, or restrict enrollment.",
+        lambda t: (
+            t.enrollee_supplies_subject
+            and (not t.ekus or EKU_ANY in t.ekus or bool(EKU_CLIENT_AUTH & set(t.ekus)))
+        ),
+    )
+
+
+@check("AD-ADCS-002", "ESC2: any-purpose or no-EKU template")
+def esc2(snap: Snapshot) -> Finding | None:
+    return _template_finding(
+        snap,
+        "AD-ADCS-002",
+        "Certificates from these templates are valid for any purpose, including "
+        "acting as an enrollment agent or a subordinate CA.",
+        "Set explicit EKUs, require manager approval, or restrict enrollment.",
+        lambda t: not t.ekus or EKU_ANY in t.ekus,
+    )
+
+
+@check("AD-ADCS-003", "ESC3: enrollment agent template open to broad groups")
+def esc3(snap: Snapshot) -> Finding | None:
+    return _template_finding(
+        snap,
+        "AD-ADCS-003",
+        "An enrollment agent certificate lets its holder request certificates on behalf "
+        "of other users.",
+        "Restrict enrollment to the agents that need it and configure enrollment agent "
+        "restrictions on the CA.",
+        lambda t: EKU_REQUEST_AGENT in t.ekus,
+    )
+
+
+@check("AD-ADCS-004", "ESC4: broad groups can modify a certificate template")
+def esc4(snap: Snapshot) -> Finding | None:
+    broad = snap.broad_sids()
+    hits = []
+    for t in snap.templates:
+        who = sorted({snap.name_of(a.sid) for a in t.aces if a.sid in broad and a.takeover})
+        if who:
+            hits.append(f"{t.name} ({', '.join(who)})")
+    if not hits:
+        return None
+    return _finding(
+        "AD-ADCS-004",
+        Severity.HIGH,
+        "Write access to a template lets an attacker reconfigure it into an ESC1 template.",
+        "Remove write, WriteDacl and WriteOwner rights from these groups on the template.",
+        sorted(hits),
+    )
+
+
+# --- ACLs ----------------------------------------------------------------------------
+
+
+@check("AD-ACL-001", "Non-default principals with DCSync rights")
+def dcsync(snap: Snapshot) -> Finding | None:
+    aces = snap.acls.get("domain", [])
+    tier0 = snap.tier0_sids()
+    get = {a.sid for a in aces if a.extended_right(sd.DS_REPL_GET_CHANGES)}
+    get_all = {a.sid for a in aces if a.extended_right(sd.DS_REPL_GET_CHANGES_ALL)}
+    hits = sorted(snap.name_of(s) for s in (get & get_all) - tier0)
+    if not hits:
+        return None
+    return _finding(
+        "AD-ACL-001",
+        Severity.HIGH,
+        "These principals can replicate password hashes from a DC, including krbtgt's.",
+        "Remove the 'Replicating Directory Changes (All)' rights unless the account is a "
+        "sanctioned sync service (e.g. Entra Connect), and then protect it as tier 0.",
+        hits,
+    )
+
+
+def _takeover_finding(snap: Snapshot, key: str, check_id: str, detail: str) -> Finding | None:
+    tier0 = snap.tier0_sids()
+    hits = sorted(
+        {snap.name_of(a.sid) for a in snap.acls.get(key, []) if a.takeover and a.sid not in tier0},
+        key=str.lower,
+    )
+    if not hits:
+        return None
+    return _finding(
+        check_id,
+        Severity.HIGH,
+        detail,
+        "Remove GenericAll, GenericWrite, WriteDacl and WriteOwner grants for these principals.",
+        hits,
+    )
+
+
+@check("AD-ACL-002", "Non-default control over AdminSDHolder")
+def adminsdholder(snap: Snapshot) -> Finding | None:
+    return _takeover_finding(
+        snap,
+        "AdminSDHolder",
+        "AD-ACL-002",
+        "SDProp copies the AdminSDHolder ACL onto every protected admin account and group "
+        "every hour, so these principals end up controlling all of them.",
+    )
+
+
+@check("AD-ACL-003", "Non-default control over the domain object")
+def domain_object_acl(snap: Snapshot) -> Finding | None:
+    return _takeover_finding(
+        snap,
+        "domain",
+        "AD-ACL-003",
+        "Write access to the domain head lets these principals grant themselves DCSync "
+        "or change domain-wide settings.",
+    )
+
+
+# --- SYSVOL --------------------------------------------------------------------------
+
+
+@check("AD-GPP-001", "Passwords in Group Policy Preferences")
+def gpp_passwords(snap: Snapshot) -> Finding | None:
+    if not snap.gpp_passwords:
+        return None
+    return _finding(
+        "AD-GPP-001",
+        Severity.HIGH,
+        "cpassword values in SYSVOL are encrypted with a key Microsoft published (MS14-025); "
+        "every domain user can read and decrypt them.",
+        "Delete the preference items, remove the XML files and change the passwords.",
+        sorted(f"{g.path} ({g.user})" for g in snap.gpp_passwords),
     )

@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 import ldap3
-from ldap3.core.exceptions import LDAPException
+from ldap3.core.exceptions import LDAPException, LDAPNoSuchObjectResult
+from ldap3.protocol.microsoft import security_descriptor_control
 
-from .model import Account, DomainPolicy, Snapshot, filetime_to_datetime
+from . import sd, sysvol
+from .model import Account, CertTemplate, DomainPolicy, Snapshot, filetime_to_datetime
 
 IN_CHAIN = "1.2.840.113556.1.4.1941"
 PAGE_SIZE = 500
@@ -25,6 +26,11 @@ PRIVILEGED_BUILTIN = {
     "Backup Operators": "S-1-5-32-551",
 }
 PROTECTED_USERS_RID = 525
+DACL_ONLY = security_descriptor_control(sdflags=0x04)  # readable without admin rights
+
+# msPKI-Certificate-Name-Flag / msPKI-Enrollment-Flag bits
+CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT = 0x1
+CT_FLAG_PEND_ALL_REQUESTS = 0x2
 
 ACCOUNT_ATTRS = [
     "distinguishedName",
@@ -53,13 +59,12 @@ class Target:
     user: str | None = None
     password: str | None = None
     use_ssl: bool = False
+    sysvol: bool = True
+    smb_port: int = 445
 
 
 def sid_to_str(raw: bytes) -> str:
-    revision, count = raw[0], raw[1]
-    authority = int.from_bytes(raw[2:8], "big")
-    subs = struct.unpack(f"<{count}I", raw[8 : 8 + 4 * count])
-    return f"S-{revision}-{authority}" + "".join(f"-{s}" for s in subs)
+    return sd.sid_from_bytes(raw)[0]
 
 
 def _str(values: list[Any]) -> list[str]:
@@ -72,15 +77,27 @@ def _int(entry: dict[str, list[Any]], attr: str, default: int = 0) -> int:
 
 
 class Collector:
-    def __init__(self, conn: ldap3.Connection) -> None:
+    def __init__(self, conn: ldap3.Connection, target: Target | None = None) -> None:
         self.conn = conn
+        self.target = target
 
     def search(
-        self, base: str, flt: str, attrs: list[str], scope: str = ldap3.SUBTREE
+        self,
+        base: str,
+        flt: str,
+        attrs: list[str],
+        scope: str = ldap3.SUBTREE,
+        controls: list[Any] | None = None,
     ) -> list[dict[str, list[Any]]]:
         """Paged search returning raw attribute values with lower-cased names."""
         entries = self.conn.extend.standard.paged_search(
-            base, flt, search_scope=scope, attributes=attrs, paged_size=PAGE_SIZE, generator=True
+            base,
+            flt,
+            search_scope=scope,
+            attributes=attrs,
+            controls=controls,
+            paged_size=PAGE_SIZE,
+            generator=True,
         )
         out = []
         for e in entries:
@@ -96,6 +113,7 @@ class Collector:
         if root is None or not root.other.get("defaultNamingContext"):
             raise CollectError("rootDSE did not return defaultNamingContext")
         domain_dn = root.other["defaultNamingContext"][0]
+        config_dn = root.other["configurationNamingContext"][0]
         domain = ".".join(p.split("=", 1)[1] for p in domain_dn.split(","))
 
         head = self.search(
@@ -142,6 +160,31 @@ class Collector:
             privileged[name] = self._members(domain_dn, sid)
         protected = self._members(domain_dn, f"{domain_sid}-{PROTECTED_USERS_RID}")
 
+        notes: list[str] = []
+        acls = {
+            "domain": self._dacl(domain_dn),
+            "AdminSDHolder": self._dacl(f"CN=AdminSDHolder,CN=System,{domain_dn}"),
+        }
+        templates = self._templates(config_dn, notes)
+        trustees = {a.sid for aces in acls.values() for a in aces}
+        trustees |= {a.sid for t in templates for a in t.aces}
+        principals = self._resolve(domain_dn, trustees)
+
+        gpp = []
+        if self.target and self.target.sysvol and self.target.user:
+            try:
+                gpp = sysvol.find_gpp_passwords(
+                    self.target.host,
+                    domain,
+                    self.target.user,
+                    self.target.password or "",
+                    self.target.smb_port,
+                )
+            except sysvol.SysvolError as exc:
+                notes.append(f"SYSVOL not checked: {exc}")
+        elif self.target and self.target.sysvol:
+            notes.append("SYSVOL not checked: needs credentials")
+
         return Snapshot(
             domain=domain,
             domain_dn=domain_dn,
@@ -151,7 +194,78 @@ class Collector:
             accounts=accounts,
             privileged={k: v for k, v in privileged.items() if v is not None},
             protected_users=protected or [],
+            templates=templates,
+            acls=acls,
+            principals=principals,
+            gpp_passwords=gpp,
+            notes=notes,
         )
+
+    def _dacl(self, dn: str) -> list[sd.Ace]:
+        entry = self.search(dn, "(objectClass=*)", ["nTSecurityDescriptor"], ldap3.BASE, DACL_ONLY)
+        raw = entry[0].get("ntsecuritydescriptor") if entry else None
+        return sd.parse_dacl(raw[0]) if raw else []
+
+    def _templates(self, config_dn: str, notes: list[str]) -> list[CertTemplate]:
+        pks = f"CN=Public Key Services,CN=Services,{config_dn}"
+        try:
+            services = self.search(
+                f"CN=Enrollment Services,{pks}",
+                "(objectClass=pKIEnrollmentService)",
+                ["certificateTemplates"],
+            )
+            entries = self.search(
+                f"CN=Certificate Templates,{pks}",
+                "(objectClass=pKICertificateTemplate)",
+                [
+                    "name",
+                    "msPKI-Certificate-Name-Flag",
+                    "msPKI-Enrollment-Flag",
+                    "msPKI-RA-Signature",
+                    "pKIExtendedKeyUsage",
+                    "msPKI-Certificate-Application-Policy",
+                    "nTSecurityDescriptor",
+                ],
+                controls=DACL_ONLY,
+            )
+        except LDAPNoSuchObjectResult:
+            notes.append("AD CS not installed")
+            return []
+        if not services:
+            notes.append("no enterprise CA found, so no template is published")
+        published = {n for svc in services for n in _str(svc.get("certificatetemplates", []))}
+        templates = []
+        for e in entries:
+            name = _str(e["name"])[0]
+            # schema v2+ templates carry the authoritative list in the application policy
+            ekus = _str(e.get("mspki-certificate-application-policy", []))
+            ekus = ekus or _str(e.get("pkiextendedkeyusage", []))
+            raw_sd = e.get("ntsecuritydescriptor")
+            name_flag = _int(e, "msPKI-Certificate-Name-Flag")
+            templates.append(
+                CertTemplate(
+                    name=name,
+                    published=name in published,
+                    enrollee_supplies_subject=bool(name_flag & CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT),
+                    manager_approval=bool(
+                        _int(e, "msPKI-Enrollment-Flag") & CT_FLAG_PEND_ALL_REQUESTS
+                    ),
+                    authorized_signatures=_int(e, "msPKI-RA-Signature"),
+                    ekus=ekus,
+                    aces=sd.parse_dacl(raw_sd[0]) if raw_sd else [],
+                )
+            )
+        return sorted(templates, key=lambda t: t.name)
+
+    def _resolve(self, domain_dn: str, sids: set[str]) -> dict[str, str]:
+        names = {}
+        for sid in sorted(sids):
+            if not sid.startswith("S-1-5-21-"):
+                continue  # well-known SIDs are named in model.py
+            hit = self.search(domain_dn, f"(objectSid={sid})", ["sAMAccountName"])
+            if hit:
+                names[sid] = _str(hit[0]["samaccountname"])[0]
+        return names
 
     def _members(self, domain_dn: str, sid: str) -> list[str] | None:
         group = self.search(domain_dn, f"(objectSid={sid})", ["distinguishedName"])
@@ -212,6 +326,6 @@ def connect(target: Target) -> ldap3.Connection:
 def collect(target: Target) -> Snapshot:
     conn = connect(target)
     try:
-        return Collector(conn).snapshot()
+        return Collector(conn, target).snapshot()
     finally:
         conn.unbind()

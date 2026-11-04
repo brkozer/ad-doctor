@@ -6,13 +6,13 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
 # pycryptodome: ldap3 falls back to it for NTLM's MD4, which OpenSSL 3 no longer provides
-dependencies = ["ldap3>=2.9.1", "pycryptodome>=3.21"]
+dependencies = ["ldap3>=2.9.1", "pycryptodome>=3.21", "smbprotocol>=1.15"]
 
 [project.scripts]
 ad-doctor = "ad_doctor.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8.3", "ruff>=0.8", "mypy>=1.13"]
+dev = ["pytest>=8.3", "ruff>=0.8", "mypy>=1.13", "rich>=13.9"]
 
 [build-system]
 requires = ["hatchling"]
@@ -31,7 +31,7 @@ packages = ["ad_doctor"]
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["ldap3", "ldap3.*"]
+module = ["ldap3", "ldap3.*", "smbclient", "smbclient.*", "smbprotocol", "smbprotocol.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

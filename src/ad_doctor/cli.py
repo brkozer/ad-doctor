@@ -7,6 +7,7 @@ import getpass
 import json
 import os
 import sys
+import textwrap
 from pathlib import Path
 
 from . import __version__
@@ -20,27 +21,65 @@ def _target(args: argparse.Namespace) -> Target:
     if args.user and password is None:
         password = getpass.getpass(f"Password for {args.user}: ")
     port = args.port or (636 if args.ldaps else 389)
-    return Target(args.host, port, args.user, password, args.ldaps)
+    return Target(
+        args.host, port, args.user, password, args.ldaps, not args.no_sysvol, args.smb_port
+    )
 
 
-def render_text(snap: Snapshot, findings: list[Finding]) -> str:
+SEVERITY_COLOR = {
+    Severity.HIGH: "\033[1;31m",
+    Severity.MEDIUM: "\033[33m",
+    Severity.LOW: "\033[36m",
+    Severity.INFO: "\033[2m",
+}
+BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
+
+
+INDENT = " " * 9
+WIDTH = 100
+
+
+def _wrap(text: str, prefix: str = "", prefix_len: int = 0) -> str:
+    lines = textwrap.wrap(text, WIDTH - len(INDENT) - prefix_len, break_on_hyphens=False)
+    first = f"{INDENT}{prefix}{lines[0]}" if lines else INDENT + prefix
+    rest = [INDENT + " " * prefix_len + line for line in lines[1:]]
+    return "\n".join([first, *rest])
+
+
+def _use_color() -> bool:
+    if "NO_COLOR" in os.environ:
+        return False
+    return "FORCE_COLOR" in os.environ or sys.stdout.isatty()
+
+
+def render_text(snap: Snapshot, findings: list[Finding], color: bool = False) -> str:
+    def c(code: str, text: str) -> str:
+        return f"{code}{text}{RESET}" if color else text
+
     lines = [
-        f"ad-doctor {__version__}  domain {snap.domain}  "
-        f"{len(snap.accounts)} accounts  {snap.collected_at:%Y-%m-%d %H:%M} UTC",
+        c(BOLD, f"ad-doctor {__version__}")
+        + f"  domain {snap.domain}  {len(snap.accounts)} accounts  "
+        f"{len(snap.templates)} cert templates  {snap.collected_at:%Y-%m-%d %H:%M} UTC",
         "",
     ]
     if not findings:
-        lines.append("No findings.")
+        lines += ["No findings.", ""]
     for f in findings:
-        lines.append(f"[{str(f.severity).upper():6}] {f.check_id}  {f.title}")
-        lines.append(f"         {f.detail}")
+        tag = c(SEVERITY_COLOR[f.severity], f"[{str(f.severity).upper():6}]")
+        lines.append(f"{tag} {c(BOLD, f.check_id)}  {f.title}")
+        lines.append(_wrap(f.detail))
         shown = f.objects[:10]
         more = f" (+{len(f.objects) - len(shown)} more)" if len(f.objects) > len(shown) else ""
-        lines.append(f"         objects: {', '.join(shown)}{more}")
-        lines.append(f"         fix: {f.remediation}")
+        lines.append(_wrap(", ".join(shown) + more, c(DIM, "objects:") + " ", len("objects: ")))
+        lines.append(_wrap(f.remediation, c(DIM, "fix:") + " ", len("fix: ")))
         lines.append("")
+    for note in snap.notes:
+        lines.append(c(DIM, f"note: {note}"))
     counts = {s: sum(f.severity == s for f in findings) for s in Severity}
-    lines.append("summary: " + "  ".join(f"{s!s} {counts[s]}" for s in reversed(Severity)))
+    lines.append(
+        "summary: "
+        + "  ".join(c(SEVERITY_COLOR[s], f"{s!s} {counts[s]}") for s in reversed(Severity))
+    )
     return "\n".join(lines)
 
 
@@ -62,6 +101,7 @@ def render_json(snap: Snapshot, findings: list[Finding]) -> str:
                 }
                 for f in findings
             ],
+            "notes": snap.notes,
         },
         indent=2,
     )
@@ -84,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
             help="DOMAIN\\user (NTLM) or a DN/UPN (simple bind); "
             "password from AD_DOCTOR_PASSWORD or prompt",
         )
+        p.add_argument("--no-sysvol", action="store_true", help="skip the SYSVOL (SMB) checks")
+        p.add_argument("--smb-port", type=int, default=445)
 
     def out_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("-f", "--format", choices=["text", "json"], default="text")
@@ -128,7 +170,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     findings = run_all(snap, args.only)
-    print(render_json(snap, findings) if args.format == "json" else render_text(snap, findings))
+    if args.format == "json":
+        print(render_json(snap, findings))
+    else:
+        print(render_text(snap, findings, _use_color()))
     if args.fail_on and any(f.severity >= Severity[args.fail_on.upper()] for f in findings):
         return 2
     return 0

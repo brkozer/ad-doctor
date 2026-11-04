@@ -30,6 +30,17 @@ EXPECTED = {
     "AD-POL-001": {"adlab.test"},
     "AD-POL-002": {"adlab.test"},
     "AD-SEC-001": {"APP01$", "FS01$", "WS01$"},
+    "AD-ADCS-001": {"LabESC1 (enroll: Domain Users)"},
+    "AD-ADCS-002": {"LabESC2 (enroll: Domain Users)"},
+    "AD-ADCS-003": {"LabESC3 (enroll: Domain Users)"},
+    "AD-ADCS-004": {"LabESC4 (Authenticated Users)"},
+    "AD-ACL-001": {"svc_sync"},
+    "AD-ACL-002": {"helpdesk"},
+    "AD-ACL-003": {"helpdesk"},
+    "AD-GPP-001": {
+        r"Policies\{4B1D7A55-0C1E-4A3B-9D2F-7E6A5C3B2A10}\Machine\Preferences\Groups\Groups.xml"
+        " (localadmin)"
+    },
 }
 
 
@@ -44,9 +55,11 @@ def findings() -> dict[str, set[str]]:
         user=os.environ["AD_DOCTOR_LAB_USER"],
         password=os.environ["AD_DOCTOR_PASSWORD"],
         use_ssl=os.environ.get("AD_DOCTOR_LAB_SSL", "1") == "1",
+        smb_port=int(os.environ.get("AD_DOCTOR_LAB_SMB_PORT", "445")),
     )
     snap = collect(target)
     assert snap.domain == "adlab.test"
+    assert snap.notes == []
     return {f.check_id: set(f.objects) for f in run_all(snap)}
 
 
@@ -56,6 +69,9 @@ def test_seeded_misconfiguration_found(findings: dict[str, set[str]], check_id: 
     assert EXPECTED[check_id] <= findings[check_id]
 
 
-def test_clean_account_not_flagged(findings: dict[str, set[str]]) -> None:
-    for objects in findings.values():
+def test_clean_and_default_objects_not_flagged(findings: dict[str, set[str]]) -> None:
+    for check_id, objects in findings.items():
         assert "alice" not in objects
+        if check_id.startswith("AD-ADCS"):
+            # only the seeded templates; none of the built-in ones are exploitable by default
+            assert all(o.startswith("Lab") for o in objects)

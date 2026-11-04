@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 from typing import Any
 
+from .sd import Ace
+
 
 class UAC(IntEnum):
     """userAccountControl bits the checks care about."""
@@ -70,6 +72,24 @@ class DomainPolicy:
 
 
 @dataclass
+class CertTemplate:
+    name: str
+    published: bool
+    enrollee_supplies_subject: bool
+    manager_approval: bool
+    authorized_signatures: int
+    # application policies (EKUs); empty means "any purpose"
+    ekus: list[str]
+    aces: list[Ace]
+
+
+@dataclass
+class GppPassword:
+    path: str
+    user: str
+
+
+@dataclass
 class Snapshot:
     domain: str
     domain_dn: str
@@ -80,12 +100,34 @@ class Snapshot:
     # privileged group name -> DNs of transitive members
     privileged: dict[str, list[str]]
     protected_users: list[str]
+    templates: list[CertTemplate] = field(default_factory=list)
+    # DACLs of security-critical objects ("domain", "AdminSDHolder")
+    acls: dict[str, list[Ace]] = field(default_factory=dict)
+    # SID -> account or group name, for the trustees that appear in acls/templates
+    principals: dict[str, str] = field(default_factory=dict)
+    gpp_passwords: list[GppPassword] = field(default_factory=list)
+    # parts of the collection that could not run (no AD CS, SYSVOL unreachable, ...)
+    notes: list[str] = field(default_factory=list)
 
     def by_dn(self) -> dict[str, Account]:
         return {a.dn.lower(): a for a in self.accounts}
 
     def privileged_dns(self) -> set[str]:
         return {dn.lower() for members in self.privileged.values() for dn in members}
+
+    def name_of(self, sid: str) -> str:
+        if sid in self.principals:
+            return self.principals[sid]
+        rid = sid.removeprefix(self.domain_sid + "-")
+        return WELL_KNOWN_RIDS.get(rid, WELL_KNOWN_SIDS.get(sid, sid))
+
+    def broad_sids(self) -> set[str]:
+        """Groups every (or nearly every) account belongs to."""
+        return BROAD_SIDS | {f"{self.domain_sid}-{rid}" for rid in BROAD_RIDS}
+
+    def tier0_sids(self) -> set[str]:
+        """Principals that are expected to hold control over the domain."""
+        return TIER0_SIDS | {f"{self.domain_sid}-{rid}" for rid in TIER0_RIDS}
 
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)
@@ -114,7 +156,48 @@ class Snapshot:
             accounts=accounts,
             privileged=data["privileged"],
             protected_users=data["protected_users"],
+            templates=[
+                CertTemplate(**{**t, "aces": [Ace(**a) for a in t["aces"]]})
+                for t in data.get("templates", [])
+            ],
+            acls={k: [Ace(**a) for a in v] for k, v in data.get("acls", {}).items()},
+            principals=data.get("principals", {}),
+            gpp_passwords=[GppPassword(**g) for g in data.get("gpp_passwords", [])],
+            notes=data.get("notes", []),
         )
+
+
+WELL_KNOWN_SIDS = {
+    "S-1-1-0": "Everyone",
+    "S-1-5-7": "Anonymous Logon",
+    "S-1-5-9": "Enterprise Domain Controllers",
+    "S-1-5-10": "Principal Self",
+    "S-1-5-11": "Authenticated Users",
+    "S-1-5-18": "SYSTEM",
+    "S-1-5-32-544": "Administrators",
+    "S-1-5-32-545": "Users",
+    "S-1-5-32-548": "Account Operators",
+    "S-1-5-32-554": "Pre-Windows 2000 Compatible Access",
+}
+WELL_KNOWN_RIDS = {
+    "498": "Enterprise Read-only Domain Controllers",
+    "500": "Administrator",
+    "512": "Domain Admins",
+    "513": "Domain Users",
+    "514": "Domain Guests",
+    "515": "Domain Computers",
+    "516": "Domain Controllers",
+    "517": "Cert Publishers",
+    "518": "Schema Admins",
+    "519": "Enterprise Admins",
+    "521": "Read-only Domain Controllers",
+    "526": "Key Admins",
+    "527": "Enterprise Key Admins",
+}
+BROAD_SIDS = {"S-1-1-0", "S-1-5-7", "S-1-5-11", "S-1-5-32-545"}
+BROAD_RIDS = {"513", "514", "515"}
+TIER0_SIDS = {"S-1-5-9", "S-1-5-18", "S-1-5-32-544"}
+TIER0_RIDS = {"498", "500", "512", "516", "518", "519", "521"}
 
 
 def _encode(value: Any) -> Any:
