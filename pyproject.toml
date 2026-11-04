@@ -1,0 +1,40 @@
+[project]
+name = "ad-doctor"
+version = "0.1.0"
+description = "Read-only Active Directory health and misconfiguration audit over LDAP"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = ["ldap3>=2.9.1"]
+
+[project.scripts]
+ad-doctor = "ad_doctor.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.8", "mypy>=1.13"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+packages = ["ad_doctor"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["ldap3", "ldap3.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["lab: needs a live domain controller (AD_DOCTOR_LAB_* env vars)"]
+addopts = "-m 'not lab'"
+filterwarnings = ["ignore::DeprecationWarning:ldap3.*"]

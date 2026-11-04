@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+snapshot*.json
+AGENTS.md
+CLAUDE.md
