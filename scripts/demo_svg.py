@@ -21,7 +21,7 @@ SCAN = [
 
 
 def main(out: str) -> None:
-    console = Console(record=True, width=104, force_terminal=True)
+    console = Console(record=True, width=110, force_terminal=True)
     shown = " ".join(f"'{a}'" if "\\" in a else a for a in SCAN)
     console.print(Text("$ ", style="bold green") + Text(shown, style="bold"))
     console.print()
