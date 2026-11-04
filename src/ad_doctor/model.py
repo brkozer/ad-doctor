@@ -48,6 +48,8 @@ class Account:
     rbcd: bool = False
     allowed_to_delegate_to: list[str] = field(default_factory=list)
     laps: bool = False
+    os: str | None = None
+    sid_history: list[str] = field(default_factory=list)
 
     def has(self, flag: UAC) -> bool:
         return bool(self.uac & flag)
@@ -81,12 +83,32 @@ class CertTemplate:
     # application policies (EKUs); empty means "any purpose"
     ekus: list[str]
     aces: list[Ace]
+    schema_version: int = 2
+    no_security_extension: bool = False
+    issuance_policies: list[str] = field(default_factory=list)
 
 
 @dataclass
 class GppPassword:
     path: str
     user: str
+
+
+@dataclass
+class Trust:
+    name: str
+    direction: int  # 1 inbound, 2 outbound, 3 both
+    trust_type: int  # 1 downlevel, 2 uplevel (AD), 3 MIT
+    attributes: int
+
+
+@dataclass
+class Gpo:
+    name: str
+    guid: str
+    # where the GPO is linked among the places that reach domain controllers
+    linked_to: list[str]
+    aces: list[Ace]
 
 
 @dataclass
@@ -101,11 +123,24 @@ class Snapshot:
     privileged: dict[str, list[str]]
     protected_users: list[str]
     templates: list[CertTemplate] = field(default_factory=list)
-    # DACLs of security-critical objects ("domain", "AdminSDHolder")
+    # DACLs of security-critical objects ("domain", "AdminSDHolder", PKI objects)
     acls: dict[str, list[Ace]] = field(default_factory=dict)
     # SID -> account or group name, for the trustees that appear in acls/templates
     principals: dict[str, str] = field(default_factory=dict)
     gpp_passwords: list[GppPassword] = field(default_factory=list)
+    trusts: list[Trust] = field(default_factory=list)
+    gpos: list[Gpo] = field(default_factory=list)
+    # issuance policy OID -> group DN (msDS-OIDToGroupLink)
+    oid_group_links: dict[str, str] = field(default_factory=dict)
+    # computer accounts (sAMAccountName) of the enterprise CA servers
+    ca_hosts: list[str] = field(default_factory=list)
+    dns_admins: list[str] = field(default_factory=list)
+    # direct members of Pre-Windows 2000 Compatible Access
+    pre2k_members: list[str] = field(default_factory=list)
+    ds_heuristics: str = ""
+    recycle_bin: bool | None = None
+    # None when the probe did not run
+    ldap_signing_required: bool | None = None
     # parts of the collection that could not run (no AD CS, SYSVOL unreachable, ...)
     notes: list[str] = field(default_factory=list)
 
@@ -130,21 +165,10 @@ class Snapshot:
         return TIER0_SIDS | {f"{self.domain_sid}-{rid}" for rid in TIER0_RIDS}
 
     def to_json(self) -> dict[str, Any]:
-        data = asdict(self)
-        return _encode(data)  # type: ignore[no-any-return]
+        return _encode(asdict(self))  # type: ignore[no-any-return]
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> Snapshot:
-        accounts = [
-            Account(
-                **{
-                    **a,
-                    "pwd_last_set": _dt(a["pwd_last_set"]),
-                    "last_logon": _dt(a["last_logon"]),
-                }
-            )
-            for a in data["accounts"]
-        ]
         collected = _dt(data["collected_at"])
         assert collected is not None
         return cls(
@@ -153,16 +177,33 @@ class Snapshot:
             domain_sid=data["domain_sid"],
             collected_at=collected,
             policy=DomainPolicy(**data["policy"]),
-            accounts=accounts,
+            accounts=[
+                Account(
+                    **{
+                        **a,
+                        "pwd_last_set": _dt(a["pwd_last_set"]),
+                        "last_logon": _dt(a["last_logon"]),
+                    }
+                )
+                for a in data["accounts"]
+            ],
             privileged=data["privileged"],
             protected_users=data["protected_users"],
             templates=[
-                CertTemplate(**{**t, "aces": [Ace(**a) for a in t["aces"]]})
-                for t in data.get("templates", [])
+                CertTemplate(**{**t, "aces": _aces(t["aces"])}) for t in data.get("templates", [])
             ],
-            acls={k: [Ace(**a) for a in v] for k, v in data.get("acls", {}).items()},
+            acls={k: _aces(v) for k, v in data.get("acls", {}).items()},
             principals=data.get("principals", {}),
             gpp_passwords=[GppPassword(**g) for g in data.get("gpp_passwords", [])],
+            trusts=[Trust(**t) for t in data.get("trusts", [])],
+            gpos=[Gpo(**{**g, "aces": _aces(g["aces"])}) for g in data.get("gpos", [])],
+            oid_group_links=data.get("oid_group_links", {}),
+            ca_hosts=data.get("ca_hosts", []),
+            dns_admins=data.get("dns_admins", []),
+            pre2k_members=data.get("pre2k_members", []),
+            ds_heuristics=data.get("ds_heuristics", ""),
+            recycle_bin=data.get("recycle_bin"),
+            ldap_signing_required=data.get("ldap_signing_required"),
             notes=data.get("notes", []),
         )
 
@@ -200,6 +241,10 @@ TIER0_SIDS = {"S-1-5-9", "S-1-5-18", "S-1-5-32-544"}
 TIER0_RIDS = {"498", "500", "512", "516", "518", "519", "521"}
 
 
+def _aces(items: list[dict[str, Any]]) -> list[Ace]:
+    return [Ace(**a) for a in items]
+
+
 def _encode(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -232,3 +277,23 @@ class Finding:
     detail: str
     remediation: str
     objects: list[str] = field(default_factory=list)
+    mitre: list[str] = field(default_factory=list)
+
+    @property
+    def category(self) -> str:
+        return CATEGORIES[self.check_id.split("-")[1]]
+
+
+CATEGORIES = {
+    "ACC": "Accounts",
+    "KRB": "Kerberos",
+    "DEL": "Delegation",
+    "PRIV": "Privileged access",
+    "POL": "Policy",
+    "SEC": "Hardening",
+    "INF": "Infrastructure",
+    "ADCS": "Certificate services",
+    "ACL": "Permissions",
+    "GPP": "Group Policy",
+    "GPO": "Group Policy",
+}

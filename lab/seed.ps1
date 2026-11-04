@@ -98,7 +98,7 @@ $copy = 'flags', 'pKIDefaultKeySpec', 'pKIKeyUsage', 'pKIMaxIssuingDepth', 'pKIC
     'pKIExpirationPeriod', 'pKIOverlapPeriod', 'pKIExtendedKeyUsage', 'pKIDefaultCSPs',
     'msPKI-RA-Signature', 'msPKI-Enrollment-Flag', 'msPKI-Private-Key-Flag',
     'msPKI-Certificate-Name-Flag', 'msPKI-Minimal-Key-Size'
-function New-LabTemplate([string]$Name, [hashtable]$Set = @{}, [string[]]$Clear = @()) {
+function New-LabTemplate([string]$Name, [hashtable]$Set = @{}, [string[]]$Clear = @(), [int]$SchemaVersion = 2) {
     if (Get-ADObject -SearchBase $tplBase -Filter "cn -eq '$Name'") { return }
     $src = Get-ADObject "CN=User,$tplBase" -Properties $copy
     $attrs = @{}
@@ -112,7 +112,7 @@ function New-LabTemplate([string]$Name, [hashtable]$Set = @{}, [string[]]$Clear 
     }
     $attrs['displayName'] = $Name
     $attrs['revision'] = 100
-    $attrs['msPKI-Template-Schema-Version'] = 2
+    $attrs['msPKI-Template-Schema-Version'] = $SchemaVersion
     $attrs['msPKI-Template-Minor-Revision'] = 1
     $attrs['msPKI-Cert-Template-OID'] = '1.3.6.1.4.1.311.21.8.{0}.{1}' -f (Get-Random 9999999), (Get-Random 9999)
     foreach ($k in $Set.Keys) { $attrs[$k] = $Set[$k] }
@@ -126,13 +126,68 @@ New-LabTemplate LabESC1 @{ 'msPKI-Certificate-Name-Flag' = 1; 'msPKI-Enrollment-
 New-LabTemplate LabESC2 -Clear 'pKIExtendedKeyUsage'                                         # AD-ADCS-002
 New-LabTemplate LabESC3 @{ 'pKIExtendedKeyUsage' = [string[]]'1.3.6.1.4.1.311.20.2.1' }      # AD-ADCS-003
 New-LabTemplate LabESC4                                                                       # AD-ADCS-004
-foreach ($t in 'LabESC1', 'LabESC2', 'LabESC3') { Grant-Ad "CN=$t,$tplBase" $domainUsers ExtendedRight $enroll }
-Grant-Ad "CN=LabESC4,$tplBase" $authUsers GenericWrite
+New-LabTemplate LabESC9 @{ 'msPKI-Enrollment-Flag' = 0x29 -bor 0x80000 }                    # AD-ADCS-006
 
-$ca = Get-ADObject -SearchBase "CN=Enrollment Services,CN=Public Key Services,CN=Services,$cfg" `
+# ESC13: an issuance policy linked to an (empty, universal) group
+$pks = "CN=Public Key Services,CN=Services,$cfg"
+if (-not (Get-ADGroup -Filter "Name -eq 'LabLinked'")) {
+    New-ADGroup LabLinked -GroupScope Universal -GroupCategory Security -Path $ou
+}
+$policy = Get-ADObject -SearchBase "CN=OID,$pks" -Filter "displayName -eq 'LabIssuance'" `
+    -Properties 'msPKI-Cert-Template-OID'
+if (-not $policy) {
+    $forestOid = (Get-ADObject "CN=OID,$pks" -Properties 'msPKI-Cert-Template-OID').'msPKI-Cert-Template-OID'
+    $oid = '{0}.1337.{1}' -f $forestOid, (Get-Random 99999)
+    New-ADObject -Name "1337.LabIssuance" -Type msPKI-Enterprise-Oid -Path "CN=OID,$pks" `
+        -OtherAttributes @{ displayName = 'LabIssuance'; flags = 2; 'msPKI-Cert-Template-OID' = $oid }
+    $policy = Get-ADObject -SearchBase "CN=OID,$pks" -Filter "displayName -eq 'LabIssuance'" `
+        -Properties 'msPKI-Cert-Template-OID'
+}
+Set-ADObject $policy -Replace @{ 'msDS-OIDToGroupLink' = (Get-ADGroup LabLinked).DistinguishedName }
+New-LabTemplate LabESC13 @{ 'msPKI-Certificate-Policy' = [string[]]$policy.'msPKI-Cert-Template-OID' }  # AD-ADCS-007
+
+# ESC15: a schema v1 server template that lets the enrollee supply the subject
+New-LabTemplate LabESC15 @{ 'msPKI-Certificate-Name-Flag' = 1; 'pKIExtendedKeyUsage' = [string[]]'1.3.6.1.5.5.7.3.1' } `
+    -SchemaVersion 1                                                                         # AD-ADCS-008
+
+$published = 'LabESC1', 'LabESC2', 'LabESC3', 'LabESC9', 'LabESC13', 'LabESC15'
+foreach ($t in $published) { Grant-Ad "CN=$t,$tplBase" $domainUsers ExtendedRight $enroll }
+Grant-Ad "CN=LabESC4,$tplBase" $authUsers GenericWrite
+Grant-Ad "CN=NTAuthCertificates,$pks" $helpdesk GenericAll                                    # AD-ADCS-005
+
+$ca = Get-ADObject -SearchBase "CN=Enrollment Services,$pks" `
     -Filter "objectClass -eq 'pKIEnrollmentService'" -Properties certificateTemplates
-$missing = 'LabESC1', 'LabESC2', 'LabESC3' | Where-Object { $ca.certificateTemplates -notcontains $_ }
+$missing = $published | Where-Object { $ca.certificateTemplates -notcontains $_ }
 if ($missing) { Set-ADObject $ca -Add @{ certificateTemplates = [string[]]$missing } }
+
+# --- Accounts, groups and directory settings ---
+Ensure-User ex_admin
+Set-ADUser ex_admin -Replace @{ adminCount = 1 }                                             # AD-ACC-006
+Ensure-Computer OLD2008
+Set-ADComputer OLD2008 -OperatingSystem 'Windows Server 2008 R2 Standard'                     # AD-INF-001
+Add-ADGroupMember DnsAdmins helpdesk                                                          # AD-PRIV-004
+$pre2k = Get-ADGroup -Identity 'S-1-5-32-554' -Properties member
+if (-not ($pre2k.member -match '^CN=S-1-5-7,')) {
+    # binding by SID creates the ForeignSecurityPrincipal for Anonymous Logon
+    ([ADSI]"LDAP://$($pre2k.DistinguishedName)").Add('LDAP://<SID=S-1-5-7>')                # AD-PRIV-005
+}
+Set-ADObject "CN=Directory Service,CN=Windows NT,CN=Services,$cfg" -Replace @{ dSHeuristics = '0000002' }  # AD-INF-004
+# The Recycle Bin is off by default (AD-INF-002); Administrator stays in Schema/Enterprise Admins (AD-PRIV-003).
+
+# LDAP signing: Server 2025 enforces it separately from the classic setting; relax both (AD-INF-005)
+$ntds = 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters'
+$enforced = (Get-ItemProperty $ntds).LDAPServerEnforceIntegrity
+Set-ItemProperty $ntds LDAPServerIntegrity 1
+Set-ItemProperty $ntds LdapEnforceChannelBinding 0
+Set-ItemProperty $ntds LDAPServerEnforceIntegrity 0 -Type DWord
+if ($enforced -ne 0) { Restart-Service NTDS -Force }
+
+# --- A GPO linked to the Domain Controllers OU that a non-admin can edit (AD-GPO-001) ---
+Import-Module GroupPolicy
+if (-not (Get-GPO -Name LabDCPolicy -ErrorAction SilentlyContinue)) {
+    New-GPO -Name LabDCPolicy | New-GPLink -Target "OU=Domain Controllers,$dn" | Out-Null
+}
+Set-GPPermission -Name LabDCPolicy -TargetName helpdesk -TargetType User -PermissionLevel GpoEditDeleteModifySecurity | Out-Null
 
 # --- SYSVOL: a Group Policy Preferences password (MS14-025) ---
 # The value is the example from Microsoft's GPP documentation, not a real secret.

@@ -6,9 +6,10 @@ stays one line per problem rather than one line per account.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date, timedelta
 
 from . import sd
 from .model import UAC, Account, CertTemplate, Finding, Severity, Snapshot
@@ -62,7 +63,54 @@ def _finding(
     objects: list[str],
 ) -> Finding:
     title = next(c.title for c in REGISTRY if c.id == check_id)
-    return Finding(check_id, title, severity, detail, remediation, objects)
+    return Finding(
+        check_id, title, severity, detail, remediation, objects, list(MITRE.get(check_id, ()))
+    )
+
+
+# MITRE ATT&CK techniques each finding enables
+MITRE: dict[str, tuple[str, ...]] = {
+    "AD-KRB-001": ("T1558.001",),
+    "AD-KRB-002": ("T1558.004",),
+    "AD-KRB-003": ("T1558.003",),
+    "AD-KRB-004": ("T1558",),
+    "AD-DEL-001": ("T1558", "T1187"),
+    "AD-DEL-002": ("T1558", "T1134"),
+    "AD-DEL-003": ("T1558", "T1134"),
+    "AD-ACC-001": ("T1078.002",),
+    "AD-ACC-002": ("T1003",),
+    "AD-ACC-003": ("T1078.002",),
+    "AD-ACC-004": ("T1078.001",),
+    "AD-ACC-005": ("T1078.002",),
+    "AD-ACC-006": ("T1078.002",),
+    "AD-ACC-007": ("T1134.005",),
+    "AD-PRIV-001": ("T1078.002",),
+    "AD-PRIV-002": ("T1558",),
+    "AD-PRIV-003": ("T1078.002",),
+    "AD-PRIV-004": ("T1574.002",),
+    "AD-PRIV-005": ("T1087.002",),
+    "AD-POL-001": ("T1110",),
+    "AD-POL-002": ("T1136.002",),
+    "AD-SEC-001": ("T1550.002",),
+    "AD-INF-001": ("T1210",),
+    "AD-INF-002": ("T1485",),
+    "AD-INF-004": ("T1087.002", "T1098"),
+    "AD-INF-005": ("T1557",),
+    "AD-INF-006": ("T1134.005", "T1482"),
+    "AD-ADCS-001": ("T1649",),
+    "AD-ADCS-002": ("T1649",),
+    "AD-ADCS-003": ("T1649",),
+    "AD-ADCS-004": ("T1649",),
+    "AD-ADCS-005": ("T1649",),
+    "AD-ADCS-006": ("T1649",),
+    "AD-ADCS-007": ("T1649",),
+    "AD-ADCS-008": ("T1649",),
+    "AD-ACL-001": ("T1003.006",),
+    "AD-ACL-002": ("T1098",),
+    "AD-ACL-003": ("T1098", "T1222"),
+    "AD-GPO-001": ("T1484.001",),
+    "AD-GPP-001": ("T1552.006",),
+}
 
 
 KRBTGT_MAX_AGE = timedelta(days=180)
@@ -530,4 +578,368 @@ def gpp_passwords(snap: Snapshot) -> Finding | None:
         "every domain user can read and decrypt them.",
         "Delete the preference items, remove the XML files and change the passwords.",
         sorted(f"{g.path} ({g.user})" for g in snap.gpp_passwords),
+    )
+
+
+@check("AD-ADCS-005", "ESC5: non-tier-0 control over PKI objects")
+def esc5(snap: Snapshot) -> Finding | None:
+    # Cert Publishers (the CA servers' group) is expected to manage some PKI objects
+    expected = snap.tier0_sids() | {f"{snap.domain_sid}-517"}
+    hits = []
+    for key, aces in sorted(snap.acls.items()):
+        if not key.startswith("PKI:"):
+            continue
+        who = {snap.name_of(a.sid) for a in aces if a.takeover and a.sid not in expected}
+        if key.startswith("PKI:CA "):
+            who = {w for w in who if w.upper() not in snap.ca_hosts}
+        if who:
+            hits.append(f"{key.removeprefix('PKI:')} ({', '.join(sorted(who))})")
+    if not hits:
+        return None
+    return _finding(
+        "AD-ADCS-005",
+        Severity.HIGH,
+        "Control over the CA objects, the template container or NTAuthCertificates lets "
+        "these principals add rogue CAs or vulnerable templates.",
+        "Remove write, WriteDacl and WriteOwner rights for these principals.",
+        hits,
+    )
+
+
+@check("AD-ADCS-006", "ESC9: authentication template without the security extension")
+def esc9(snap: Snapshot) -> Finding | None:
+    return _template_finding(
+        snap,
+        "AD-ADCS-006",
+        "Certificates from these templates carry no SID, so with weak certificate mapping "
+        "anyone who can change a victim's UPN can authenticate as that victim.",
+        "Clear CT_FLAG_NO_SECURITY_EXTENSION and set StrongCertificateBindingEnforcement=2 "
+        "on the domain controllers.",
+        lambda t: t.no_security_extension and _authenticates(t),
+    )
+
+
+@check("AD-ADCS-007", "ESC13: issuance policy linked to a group")
+def esc13(snap: Snapshot) -> Finding | None:
+    return _template_finding(
+        snap,
+        "AD-ADCS-007",
+        "Logging on with a certificate from these templates adds the linked group to the "
+        "token, so every enrollee gets that group's rights.",
+        "Remove the msDS-OIDToGroupLink or restrict enrollment to the group's members.",
+        lambda t: _authenticates(t) and any(p in snap.oid_group_links for p in t.issuance_policies),
+    )
+
+
+@check("AD-ADCS-008", "ESC15: schema v1 template with enrollee-supplied subject")
+def esc15(snap: Snapshot) -> Finding | None:
+    return _template_finding(
+        snap,
+        "AD-ADCS-008",
+        "Unpatched CAs let the requester add any application policy to a v1 template "
+        "(CVE-2024-49019), turning it into a client authentication template.",
+        "Install the November 2024 updates on the CA, then duplicate the template as v2+ "
+        "or clear 'Supply in the request'.",
+        lambda t: t.schema_version == 1 and t.enrollee_supplies_subject,
+    )
+
+
+def _authenticates(t: CertTemplate) -> bool:
+    return not t.ekus or EKU_ANY in t.ekus or bool(EKU_CLIENT_AUTH & set(t.ekus))
+
+
+# --- Group Policy --------------------------------------------------------------------
+
+
+@check("AD-GPO-001", "GPOs reaching domain controllers editable outside tier 0")
+def gpo_edit(snap: Snapshot) -> Finding | None:
+    tier0 = snap.tier0_sids()
+    hits = []
+    for g in snap.gpos:
+        who = sorted({snap.name_of(a.sid) for a in g.aces if a.takeover and a.sid not in tier0})
+        if who and g.linked_to:
+            hits.append(f"{g.name} -> {', '.join(g.linked_to)} ({', '.join(who)})")
+    if not hits:
+        return None
+    return _finding(
+        "AD-GPO-001",
+        Severity.HIGH,
+        "These GPOs apply to domain controllers; whoever can edit them can run code there.",
+        "Restrict edit rights on GPOs linked to the domain or the Domain Controllers OU to "
+        "tier-0 administrators.",
+        sorted(hits),
+    )
+
+
+# --- Accounts and groups (continued) -------------------------------------------------
+
+
+@check("AD-ACC-006", "adminCount set on accounts that are no longer privileged")
+def admincount_orphans(snap: Snapshot) -> Finding | None:
+    privileged = snap.privileged_dns()
+    hits = [
+        a
+        for a in _enabled_users(snap)
+        if a.admin_count and a.dn.lower() not in privileged and a.sam.lower() != "krbtgt"
+    ]
+    if not hits:
+        return None
+    return _finding(
+        "AD-ACC-006",
+        Severity.LOW,
+        "These accounts were once protected admins: inheritance is still disabled on them, "
+        "and they are often forgotten former admins.",
+        "Review each account, clear adminCount and re-enable inheritance.",
+        _names(hits),
+    )
+
+
+PRIVILEGED_RID_SUFFIXES = ("-500", "-512", "-518", "-519")
+
+
+@check("AD-ACC-007", "Accounts with SID history")
+def sid_history(snap: Snapshot) -> Finding | None:
+    hits = [a for a in snap.accounts if a.enabled and a.sid_history]
+    if not hits:
+        return None
+    risky = [
+        a
+        for a in hits
+        if any(
+            s.endswith(PRIVILEGED_RID_SUFFIXES)
+            or s == "S-1-5-32-544"
+            or s.startswith(snap.domain_sid + "-")
+            for s in a.sid_history
+        )
+    ]
+    detail = "SID history grants the rights of the old SIDs at every logon."
+    if risky:
+        detail += (
+            " Privileged or same-domain SIDs (a persistence technique): "
+            f"{', '.join(_names(risky))}."
+        )
+    return _finding(
+        "AD-ACC-007",
+        Severity.HIGH if risky else Severity.MEDIUM,
+        detail,
+        "Clear sIDHistory once migrations are finished.",
+        _names(hits),
+    )
+
+
+@check("AD-PRIV-003", "Schema Admins or Enterprise Admins not empty")
+def standing_forest_admins(snap: Snapshot) -> Finding | None:
+    groups = {g: snap.privileged.get(g, []) for g in ("Schema Admins", "Enterprise Admins")}
+    by_dn = snap.by_dn()
+    hits = sorted(
+        f"{g}: {by_dn[dn.lower()].sam if dn.lower() in by_dn else dn}"
+        for g, members in groups.items()
+        for dn in members
+    )
+    if not hits:
+        return None
+    return _finding(
+        "AD-PRIV-003",
+        Severity.LOW,
+        "Forest-wide admin groups should be empty except while a change is being made.",
+        "Remove permanent members and add them only for the duration of a change.",
+        hits,
+    )
+
+
+@check("AD-PRIV-004", "Members of DnsAdmins")
+def dns_admins(snap: Snapshot) -> Finding | None:
+    if not snap.dns_admins:
+        return None
+    by_dn = snap.by_dn()
+    return _finding(
+        "AD-PRIV-004",
+        Severity.MEDIUM,
+        "DnsAdmins can make the DNS service on a DC load an arbitrary DLL as SYSTEM.",
+        "Treat DnsAdmins as tier 0 or empty it and delegate DNS record management instead.",
+        sorted(by_dn[d.lower()].sam if d.lower() in by_dn else d for d in snap.dns_admins),
+    )
+
+
+@check("AD-PRIV-005", "Anonymous or Everyone in Pre-Windows 2000 Compatible Access")
+def pre2k(snap: Snapshot) -> Finding | None:
+    hits = sorted(
+        name
+        for sid, name in (("S-1-5-7", "Anonymous Logon"), ("S-1-1-0", "Everyone"))
+        if any(m.upper().startswith(f"CN={sid},") for m in snap.pre2k_members)
+    )
+    if not hits:
+        return None
+    return _finding(
+        "AD-PRIV-005",
+        Severity.MEDIUM,
+        "Unauthenticated users can enumerate users, groups and policy over legacy interfaces.",
+        "Remove Anonymous Logon and Everyone from Pre-Windows 2000 Compatible Access.",
+        hits,
+    )
+
+
+# --- Infrastructure ------------------------------------------------------------------
+
+# (name pattern, end of extended support); the first match wins
+OS_END_OF_SUPPORT = [
+    (r"Windows 2000", date(2010, 7, 13)),
+    (r"Windows XP", date(2014, 4, 8)),
+    (r"Windows Vista", date(2017, 4, 11)),
+    (r"Windows 7\b", date(2020, 1, 14)),
+    (r"Windows 8\.1", date(2023, 1, 10)),
+    (r"Windows 8\b", date(2016, 1, 12)),
+    (r"Windows 10\b", date(2025, 10, 14)),
+    (r"Windows Server 2003", date(2015, 7, 14)),
+    (r"Windows Server 2008", date(2020, 1, 14)),
+    (r"Windows Server 2012", date(2023, 10, 10)),
+    (r"Windows Server 2016", date(2027, 1, 12)),
+    (r"Windows Server 2019", date(2029, 1, 9)),
+]
+
+
+def end_of_support(os_name: str) -> date | None:
+    for pattern, eol in OS_END_OF_SUPPORT:
+        if re.search(pattern, os_name):
+            return eol
+    return None
+
+
+@check("AD-INF-001", "Computers running unsupported Windows versions")
+def obsolete_os(snap: Snapshot) -> Finding | None:
+    today = snap.collected_at.date()
+    hits = []
+    for a in snap.accounts:
+        if not (a.is_computer and a.enabled and a.os):
+            continue
+        eol = end_of_support(a.os)
+        if eol and eol <= today:
+            hits.append(a)
+    if not hits:
+        return None
+    dcs = [a for a in hits if a.is_dc]
+    detail = (
+        f"{len(hits)} enabled computers run Windows versions past end of support "
+        "(Windows 10 only if not enrolled in Extended Security Updates)."
+    )
+    if dcs:
+        detail += f" Domain controllers: {', '.join(_names(dcs))}."
+    return _finding(
+        "AD-INF-001",
+        Severity.HIGH if dcs else Severity.MEDIUM,
+        detail,
+        "Upgrade or retire them; isolate the ones that cannot be upgraded.",
+        sorted(f"{a.sam} ({a.os})" for a in hits),
+    )
+
+
+@check("AD-INF-002", "AD Recycle Bin disabled")
+def recycle_bin(snap: Snapshot) -> Finding | None:
+    if snap.recycle_bin is not False:
+        return None
+    return _finding(
+        "AD-INF-002",
+        Severity.LOW,
+        "Deleted objects cannot be restored with their attributes and group memberships, "
+        "which turns a mass deletion by an attacker or an admin into an outage.",
+        "Enable-ADOptionalFeature 'Recycle Bin Feature' -Scope ForestOrConfigurationSet.",
+        [snap.domain],
+    )
+
+
+FUNCTIONAL_LEVELS = {
+    0: "2000",
+    1: "2003 interim",
+    2: "2003",
+    3: "2008",
+    4: "2008 R2",
+    5: "2012",
+    6: "2012 R2",
+    7: "2016",
+    10: "2025",
+}
+
+
+@check("AD-INF-003", "Domain functional level below Windows Server 2016")
+def functional_level(snap: Snapshot) -> Finding | None:
+    level = snap.policy.functional_level
+    if level >= 7:
+        return None
+    return _finding(
+        "AD-INF-003",
+        Severity.LOW,
+        f"The domain runs at the {FUNCTIONAL_LEVELS.get(level, str(level))} functional "
+        "level, which leaves out protections such as the DC-side Protected Users "
+        "restrictions and rolling of NTLM secrets for smart-card accounts.",
+        "Retire old domain controllers and raise the domain and forest functional level.",
+        [snap.domain],
+    )
+
+
+@check("AD-INF-004", "Unsafe dsHeuristics settings")
+def ds_heuristics(snap: Snapshot) -> Finding | None:
+    h = snap.ds_heuristics
+    issues, severity = [], Severity.MEDIUM
+    if len(h) >= 7 and h[6] == "2":
+        issues.append("anonymous LDAP operations allowed (7th character = 2)")
+        severity = Severity.HIGH
+    if len(h) >= 16 and h[15] != "0":
+        issues.append("operator groups excluded from AdminSDHolder (16th character)")
+    if not issues:
+        return None
+    return _finding(
+        "AD-INF-004",
+        severity,
+        "dsHeuristics: " + "; ".join(issues) + ".",
+        "Reset the affected characters of dsHeuristics to 0.",
+        [h],
+    )
+
+
+@check("AD-INF-005", "LDAP signing not required")
+def ldap_signing(snap: Snapshot) -> Finding | None:
+    if snap.ldap_signing_required is not False:
+        return None
+    return _finding(
+        "AD-INF-005",
+        Severity.MEDIUM,
+        "The DC accepted an unsigned NTLM bind on plain LDAP, so relayed authentication "
+        "(for example from coerced machine accounts) can be used to modify the directory.",
+        "Set 'Domain controller: LDAP server signing requirements' to Require signing and "
+        "enable LDAP channel binding.",
+        [snap.domain],
+    )
+
+
+TRUST_QUARANTINED = 0x4
+TRUST_FOREST = 0x8
+TRUST_WITHIN_FOREST = 0x20
+TRUST_TREAT_AS_EXTERNAL = 0x40
+TRUST_ENABLE_TGT_DELEGATION = 0x800
+TRUST_OUTBOUND = 0x2
+
+
+@check("AD-INF-006", "Trusts that let SIDs or TGTs through")
+def trusts(snap: Snapshot) -> Finding | None:
+    hits = []
+    for t in snap.trusts:
+        if t.attributes & TRUST_WITHIN_FOREST or not t.direction & TRUST_OUTBOUND:
+            continue
+        forest = bool(t.attributes & TRUST_FOREST)
+        if not forest and not t.attributes & TRUST_QUARANTINED:
+            hits.append(f"{t.name} (external, SID filtering disabled)")
+        if forest and t.attributes & TRUST_TREAT_AS_EXTERNAL:
+            hits.append(f"{t.name} (forest, SID history enabled)")
+        if forest and t.attributes & TRUST_ENABLE_TGT_DELEGATION:
+            hits.append(f"{t.name} (forest, TGT delegation enabled)")
+    if not hits:
+        return None
+    return _finding(
+        "AD-INF-006",
+        Severity.HIGH,
+        "A compromise of the trusted domain can be escalated into this one with forged "
+        "SID history or captured TGTs.",
+        "Enable SID filtering (netdom trust /quarantine:yes or /enablesidhistory:no) and "
+        "disable TGT delegation across the trust.",
+        sorted(hits),
     )

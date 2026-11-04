@@ -1,0 +1,100 @@
+"""Generate a PowerShell remediation script for review.
+
+Every command that changes something runs with -WhatIf (or is commented out when the tool
+has no dry-run mode), so the script is safe to execute as-is and does nothing until an
+administrator has read it and removed the guards.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+from .model import Finding, Snapshot
+
+Fix = Callable[[Finding, Snapshot], list[str]]
+
+
+def _name(obj: str) -> str:
+    return obj.split(" ", 1)[0]
+
+
+def _q(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _per_object(template: str) -> Fix:
+    def fix(f: Finding, snap: Snapshot) -> list[str]:
+        return [template.format(o=_q(_name(o)), c=_q(_name(o).rstrip("$"))) for o in f.objects]
+
+    return fix
+
+
+def _netbios(snap: Snapshot) -> str:
+    return snap.domain.split(".")[0].upper()
+
+
+def _dsacls(target: str) -> Fix:
+    def fix(f: Finding, snap: Snapshot) -> list[str]:
+        dn = target.format(domain=snap.domain_dn)
+        return [f'# dsacls "{dn}" /R "{_netbios(snap)}\\{_name(o)}"' for o in f.objects]
+
+    return fix
+
+
+def _manual(f: Finding, snap: Snapshot) -> list[str]:
+    return [f"# manual: {f.remediation}"]
+
+
+FIXES: dict[str, Fix] = {
+    "AD-KRB-002": _per_object("Set-ADAccountControl {o} -DoesNotRequirePreAuth $false -WhatIf"),
+    "AD-KRB-004": _per_object("Set-ADAccountControl {o} -UseDESKeyOnly $false -WhatIf"),
+    "AD-DEL-001": _per_object("Set-ADAccountControl {o} -TrustedForDelegation $false -WhatIf"),
+    "AD-DEL-002": _per_object(
+        "Set-ADAccountControl {o} -TrustedToAuthForDelegation $false -WhatIf"
+    ),
+    "AD-DEL-003": _per_object(
+        "Set-ADComputer {c} -PrincipalsAllowedToDelegateToAccount $null -WhatIf"
+    ),
+    "AD-ACC-001": _per_object("Set-ADAccountControl {o} -PasswordNotRequired $false -WhatIf"),
+    "AD-ACC-002": _per_object(
+        "Set-ADAccountControl {o} -AllowReversiblePasswordEncryption $false -WhatIf"
+    ),
+    "AD-ACC-003": _per_object("Set-ADUser {o} -PasswordNeverExpires $false -WhatIf"),
+    "AD-ACC-004": _per_object("Disable-ADAccount {o} -WhatIf"),
+    "AD-ACC-005": _per_object("Disable-ADAccount {o} -WhatIf"),
+    "AD-ACC-006": _per_object("Set-ADUser {o} -Clear adminCount -WhatIf"),
+    "AD-ACC-007": _per_object("Set-ADUser {o} -Clear sIDHistory -WhatIf"),
+    "AD-PRIV-002": _per_object("Set-ADAccountControl {o} -AccountNotDelegated $true -WhatIf"),
+    "AD-PRIV-004": _per_object("Remove-ADGroupMember DnsAdmins -Members {o} -WhatIf"),
+    "AD-POL-001": lambda f, snap: [
+        f"Set-ADDefaultDomainPasswordPolicy -Identity {_q(snap.domain)} -MinPasswordLength 14 "
+        "-ComplexityEnabled $true -LockoutThreshold 10 -WhatIf"
+    ],
+    "AD-POL-002": lambda f, snap: [
+        f"Set-ADDomain -Identity {_q(snap.domain)} "
+        "-Replace @{'ms-DS-MachineAccountQuota'=0} -WhatIf"
+    ],
+    "AD-INF-002": lambda f, snap: [
+        "Enable-ADOptionalFeature 'Recycle Bin Feature' -Scope ForestOrConfigurationSet "
+        f"-Target {_q(snap.domain)} -WhatIf"
+    ],
+    "AD-ACL-001": _dsacls("{domain}"),
+    "AD-ACL-002": _dsacls("CN=AdminSDHolder,CN=System,{domain}"),
+    "AD-ACL-003": _dsacls("{domain}"),
+}
+
+
+def render_fixes(findings: list[Finding], snap: Snapshot) -> str:
+    out = [
+        f"# ad-doctor remediation script for {snap.domain}",
+        f"# generated {snap.collected_at:%Y-%m-%d %H:%M} UTC from {len(findings)} findings",
+        "# Review every line. Commands run with -WhatIf; commented lines have no dry-run mode.",
+        "# Remove the guards only for the changes you have approved.",
+        "#Requires -Modules ActiveDirectory",
+        "",
+    ]
+    for f in findings:
+        out.append(f"# --- {f.check_id} [{f.severity}] {f.title}")
+        out += FIXES.get(f.check_id, _manual)(f, snap)
+        out.append("")
+    return "\n".join(out)

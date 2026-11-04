@@ -1,0 +1,14 @@
+# Accepted risks for `ad-doctor ... --accept examples/accept.toml`.
+# Each entry needs a check ID, a reason and an expiry date; after the date the finding
+# comes back. Leave out `objects` to accept the whole check.
+
+[[accept]]
+check = "AD-KRB-003"
+objects = ["svc_backup"]
+reason = "Backup appliance cannot use a gMSA; 32-character password, rotation ticket OPS-1182"
+expires = 2027-03-31
+
+[[accept]]
+check = "AD-INF-003"
+reason = "Last 2012 R2 DC is retired in the Q1 migration; raise the level afterwards"
+expires = 2027-01-15

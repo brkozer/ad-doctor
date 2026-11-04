@@ -14,7 +14,9 @@ from ad_doctor.collect import Target, collect
 
 pytestmark = pytest.mark.lab
 
-# Every misconfiguration seed.ps1 plants. AD-KRB-001 and AD-ACC-005 need time to pass.
+# Every misconfiguration seed.ps1 plants. AD-KRB-001 and AD-ACC-005 need time to pass;
+# AD-ACC-007 (SID history) and AD-INF-006 (trusts) need a second domain, so they are
+# covered by the unit tests only.
 EXPECTED = {
     "AD-KRB-002": {"legacy_app"},
     "AD-KRB-003": {"svc_sql", "svc_web"},
@@ -37,6 +39,19 @@ EXPECTED = {
     "AD-ACL-001": {"svc_sync"},
     "AD-ACL-002": {"helpdesk"},
     "AD-ACL-003": {"helpdesk"},
+    "AD-ADCS-005": {"NTAuthCertificates (helpdesk)"},
+    "AD-ADCS-006": {"LabESC9 (enroll: Domain Users)"},
+    "AD-ADCS-007": {"LabESC13 (enroll: Domain Users)"},
+    "AD-ADCS-008": {"LabESC15 (enroll: Domain Users)"},
+    "AD-GPO-001": {"LabDCPolicy -> Domain Controllers OU (helpdesk)"},
+    "AD-ACC-006": {"ex_admin"},
+    "AD-PRIV-003": {"Schema Admins: Administrator", "Enterprise Admins: Administrator"},
+    "AD-PRIV-004": {"helpdesk"},
+    "AD-PRIV-005": {"Anonymous Logon"},
+    "AD-INF-001": {"OLD2008$ (Windows Server 2008 R2 Standard)"},
+    "AD-INF-002": {"adlab.test"},
+    "AD-INF-004": {"0000002"},
+    "AD-INF-005": {"adlab.test"},
     "AD-GPP-001": {
         r"Policies\{4B1D7A55-0C1E-4A3B-9D2F-7E6A5C3B2A10}\Machine\Preferences\Groups\Groups.xml"
         " (localadmin)"
@@ -56,6 +71,7 @@ def findings() -> dict[str, set[str]]:
         password=os.environ["AD_DOCTOR_PASSWORD"],
         use_ssl=os.environ.get("AD_DOCTOR_LAB_SSL", "1") == "1",
         smb_port=int(os.environ.get("AD_DOCTOR_LAB_SMB_PORT", "445")),
+        plain_port=int(os.environ.get("AD_DOCTOR_LAB_PLAIN_PORT", "389")),
     )
     snap = collect(target)
     assert snap.domain == "adlab.test"
@@ -73,5 +89,9 @@ def test_clean_and_default_objects_not_flagged(findings: dict[str, set[str]]) ->
     for check_id, objects in findings.items():
         assert "alice" not in objects
         if check_id.startswith("AD-ADCS"):
-            # only the seeded templates; none of the built-in ones are exploitable by default
-            assert all(o.startswith("Lab") for o in objects)
+            # only the seeded objects: the built-in templates, the CA object and its host
+            # account are not exploitable by default
+            assert objects == EXPECTED[check_id]
+    # nothing seeded in the GPO, delegation or ACL areas beyond what EXPECTED lists
+    for check_id in ("AD-GPO-001", "AD-ACL-001", "AD-ACL-002", "AD-ACL-003", "AD-DEL-001"):
+        assert findings[check_id] == EXPECTED[check_id]

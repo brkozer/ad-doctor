@@ -15,8 +15,8 @@ from rich.text import Text
 # The lab DC's LDAPS and SMB ports are forwarded to localhost (see lab/build.sh).
 SCAN = [
     "ad-doctor", "scan", "127.0.0.1", "--ldaps", "--port", "10636", "--smb-port", "10445",
-    "-u", "ADLAB\\adreader",
-    "--only", "AD-ADCS-001", "AD-ACL-001", "AD-GPP-001", "AD-KRB-003", "AD-POL-002",
+    "--signing-probe-port", "10389", "-u", "ADLAB\\adreader",
+    "--only", "AD-ACL-001", "AD-ADCS-001", "AD-GPO-001", "AD-GPP-001", "AD-INF-005",
 ]  # fmt: skip
 
 

@@ -7,3 +7,4 @@ __pycache__/
 snapshot*.json
 AGENTS.md
 CLAUDE.md
+dist/

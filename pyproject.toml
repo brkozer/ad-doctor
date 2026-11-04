@@ -1,12 +1,31 @@
 [project]
 name = "ad-doctor"
 version = "0.1.0"
-description = "Read-only Active Directory health and misconfiguration audit over LDAP"
+description = "Read-only Active Directory misconfiguration audit: AD CS ESC, ACLs, Kerberos, delegation, GPO; SARIF and HTML reports"
 readme = "README.md"
 license = "MIT"
+authors = [{ name = "Burak Özer" }]
 requires-python = ">=3.12"
+keywords = ["active-directory", "ldap", "security", "audit", "adcs", "kerberos", "sarif"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: System :: Systems Administration :: Authentication/Directory :: LDAP",
+    "Typing :: Typed",
+]
 # pycryptodome: ldap3 falls back to it for NTLM's MD4, which OpenSSL 3 no longer provides
 dependencies = ["ldap3>=2.9.1", "pycryptodome>=3.21", "smbprotocol>=1.15"]
+
+[project.urls]
+Homepage = "https://github.com/brkozer/ad-doctor"
+Issues = "https://github.com/brkozer/ad-doctor/issues"
 
 [project.scripts]
 ad-doctor = "ad_doctor.cli:main"

@@ -1,0 +1,23 @@
+name: release
+
+# Publishes to PyPI with trusted publishing when a GitHub release is published.
+# Off until the repository variable PYPI_PUBLISH is set to "true".
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  pypi:
+    if: vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run pytest
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1

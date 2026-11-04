@@ -1,4 +1,4 @@
-"""Command line: collect a snapshot, analyze it, or both."""
+"""Command line: collect a snapshot, analyze it, compare two runs."""
 
 from __future__ import annotations
 
@@ -7,13 +7,30 @@ import getpass
 import json
 import os
 import sys
-import textwrap
 from pathlib import Path
+from typing import Any
 
-from . import __version__
-from .checks import REGISTRY, run_all
+from . import __version__, accept
+from .checks import MITRE, REGISTRY, run_all
 from .collect import CollectError, Target, collect
+from .fixes import render_fixes
 from .model import Finding, Severity, Snapshot
+from .report import (
+    Report,
+    finding_keys,
+    render_html,
+    render_json,
+    render_markdown,
+    render_sarif,
+    render_text,
+)
+
+RENDERERS = {
+    "json": render_json,
+    "markdown": render_markdown,
+    "html": render_html,
+    "sarif": render_sarif,
+}
 
 
 def _target(args: argparse.Namespace) -> Target:
@@ -22,89 +39,81 @@ def _target(args: argparse.Namespace) -> Target:
         password = getpass.getpass(f"Password for {args.user}: ")
     port = args.port or (636 if args.ldaps else 389)
     return Target(
-        args.host, port, args.user, password, args.ldaps, not args.no_sysvol, args.smb_port
+        host=args.host,
+        port=port,
+        user=args.user,
+        password=password,
+        use_ssl=args.ldaps,
+        sysvol=not args.no_sysvol,
+        smb_port=args.smb_port,
+        plain_port=args.signing_probe_port,
     )
 
 
-SEVERITY_COLOR = {
-    Severity.HIGH: "\033[1;31m",
-    Severity.MEDIUM: "\033[33m",
-    Severity.LOW: "\033[36m",
-    Severity.INFO: "\033[2m",
-}
-BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
-
-
-INDENT = " " * 9
-WIDTH = 100
-
-
-def _wrap(text: str, prefix: str = "", prefix_len: int = 0) -> str:
-    lines = textwrap.wrap(text, WIDTH - len(INDENT) - prefix_len, break_on_hyphens=False)
-    first = f"{INDENT}{prefix}{lines[0]}" if lines else INDENT + prefix
-    rest = [INDENT + " " * prefix_len + line for line in lines[1:]]
-    return "\n".join([first, *rest])
-
-
-def _use_color() -> bool:
+def _use_color(stream: Any) -> bool:
     if "NO_COLOR" in os.environ:
         return False
-    return "FORCE_COLOR" in os.environ or sys.stdout.isatty()
+    return "FORCE_COLOR" in os.environ or bool(stream.isatty())
 
 
-def render_text(snap: Snapshot, findings: list[Finding], color: bool = False) -> str:
-    def c(code: str, text: str) -> str:
-        return f"{code}{text}{RESET}" if color else text
-
-    lines = [
-        c(BOLD, f"ad-doctor {__version__}")
-        + f"  domain {snap.domain}  {len(snap.accounts)} accounts  "
-        f"{len(snap.templates)} cert templates  {snap.collected_at:%Y-%m-%d %H:%M} UTC",
-        "",
-    ]
-    if not findings:
-        lines += ["No findings.", ""]
-    for f in findings:
-        tag = c(SEVERITY_COLOR[f.severity], f"[{str(f.severity).upper():6}]")
-        lines.append(f"{tag} {c(BOLD, f.check_id)}  {f.title}")
-        lines.append(_wrap(f.detail))
-        shown = f.objects[:10]
-        more = f" (+{len(f.objects) - len(shown)} more)" if len(f.objects) > len(shown) else ""
-        lines.append(_wrap(", ".join(shown) + more, c(DIM, "objects:") + " ", len("objects: ")))
-        lines.append(_wrap(f.remediation, c(DIM, "fix:") + " ", len("fix: ")))
-        lines.append("")
-    for note in snap.notes:
-        lines.append(c(DIM, f"note: {note}"))
-    counts = {s: sum(f.severity == s for f in findings) for s in Severity}
-    lines.append(
-        "summary: "
-        + "  ".join(c(SEVERITY_COLOR[s], f"{s!s} {counts[s]}") for s in reversed(Severity))
-    )
-    return "\n".join(lines)
+def _load_json(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: not a snapshot or report")
+    return data
 
 
-def render_json(snap: Snapshot, findings: list[Finding]) -> str:
-    return json.dumps(
-        {
-            "tool": "ad-doctor",
-            "version": __version__,
-            "domain": snap.domain,
-            "collected_at": snap.collected_at.isoformat(),
-            "findings": [
+def _findings_from(path: Path) -> tuple[str, list[Finding]]:
+    """Findings from either a saved snapshot or a JSON report."""
+    data = _load_json(path)
+    if data.get("tool") == "ad-doctor":
+        return data["domain"], [
+            Finding(
+                f["id"],
+                f["title"],
+                Severity[f["severity"].upper()],
+                f["detail"],
+                f["remediation"],
+                f["objects"],
+                f.get("mitre", []),
+            )
+            for f in data["findings"]
+        ]
+    snap = Snapshot.from_json(data)
+    return snap.domain, run_all(snap)
+
+
+def _fails(findings: list[Finding], level: str | None) -> bool:
+    return bool(level) and any(f.severity >= Severity[str(level).upper()] for f in findings)
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    domain, old = _findings_from(args.old)
+    _, new = _findings_from(args.new)
+    before, after = finding_keys(old), finding_keys(new)
+    added = sorted(after - before)
+    removed = sorted(before - after)
+    sev = {f.check_id: f.severity for f in [*old, *new]}
+    title = {f.check_id: f.title for f in [*old, *new]}
+    if args.format == "json":
+        print(
+            json.dumps(
                 {
-                    "id": f.check_id,
-                    "title": f.title,
-                    "severity": str(f.severity),
-                    "detail": f.detail,
-                    "remediation": f.remediation,
-                    "objects": f.objects,
-                }
-                for f in findings
-            ],
-            "notes": snap.notes,
-        },
-        indent=2,
-    )
+                    "domain": domain,
+                    "new": [{"id": c, "object": o, "severity": str(sev[c])} for c, o in added],
+                    "resolved": [{"id": c, "object": o} for c, o in removed],
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"{domain}: {len(added)} new, {len(removed)} resolved")
+        for c, o in added:
+            print(f"+ [{str(sev[c]).upper():6}] {c}  {o}  ({title[c]})")
+        for c, o in removed:
+            print(f"- [{str(sev[c]).upper():6}] {c}  {o}  ({title[c]})")
+    new_findings = [f for f in new for o in f.objects if (f.check_id, o) in set(added)]
+    return 2 if _fails(new_findings, args.fail_on) else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -126,12 +135,31 @@ def main(argv: list[str] | None = None) -> int:
         )
         p.add_argument("--no-sysvol", action="store_true", help="skip the SYSVOL (SMB) checks")
         p.add_argument("--smb-port", type=int, default=445)
+        p.add_argument(
+            "--signing-probe-port",
+            type=int,
+            default=389,
+            metavar="PORT",
+            help="plain LDAP port for the LDAP signing probe (0 to skip; needs DOMAIN\\user)",
+        )
 
     def out_args(p: argparse.ArgumentParser) -> None:
-        p.add_argument("-f", "--format", choices=["text", "json"], default="text")
+        p.add_argument(
+            "-f", "--format", choices=["text", *RENDERERS], default="text", help="report format"
+        )
+        p.add_argument("-o", "--output", type=Path, help="write the report to a file")
         p.add_argument("--only", nargs="+", metavar="ID", help="run only these check IDs")
         p.add_argument(
-            "--fail-on", choices=[str(s) for s in Severity], help="exit 2 at this severity or above"
+            "--fail-on",
+            choices=[str(s) for s in Severity],
+            help="exit 2 at this severity or above (only new findings with --baseline)",
+        )
+        p.add_argument("--accept", type=Path, metavar="TOML", help="accepted-risk file")
+        p.add_argument(
+            "--baseline", type=Path, metavar="JSON", help="earlier report or snapshot to diff"
+        )
+        p.add_argument(
+            "--fixes", type=Path, metavar="PS1", help="write a reviewable remediation script"
         )
 
     p_scan = sub.add_parser("scan", help="collect and analyze in one go")
@@ -146,34 +174,66 @@ def main(argv: list[str] | None = None) -> int:
     p_analyze.add_argument("snapshot", type=Path)
     out_args(p_analyze)
 
-    sub.add_parser("checks", help="list available checks")
+    p_diff = sub.add_parser("diff", help="compare two snapshots or JSON reports")
+    p_diff.add_argument("old", type=Path)
+    p_diff.add_argument("new", type=Path)
+    p_diff.add_argument("-f", "--format", choices=["text", "json"], default="text")
+    p_diff.add_argument("--fail-on", choices=[str(s) for s in Severity])
+
+    p_checks = sub.add_parser("checks", help="list available checks")
+    p_checks.add_argument("-f", "--format", choices=["text", "json"], default="text")
 
     args = parser.parse_args(argv)
 
     if args.cmd == "checks":
-        for c in REGISTRY:
-            print(f"{c.id}  {c.title}")
+        rows = [
+            {"id": c.id, "title": c.title, "mitre": list(MITRE.get(c.id, ()))} for c in REGISTRY
+        ]
+        if args.format == "json":
+            print(json.dumps(rows, indent=2))
+        else:
+            for row in rows:
+                print(f"{row['id']:12} {row['title']}")
         return 0
 
     try:
+        if args.cmd == "diff":
+            return cmd_diff(args)
         if args.cmd == "analyze":
-            snap = Snapshot.from_json(json.loads(args.snapshot.read_text()))
+            snap = Snapshot.from_json(_load_json(args.snapshot))
         else:
             snap = collect(_target(args))
-    except CollectError as exc:
+        if args.cmd == "collect":
+            args.output.write_text(json.dumps(snap.to_json(), indent=2), encoding="utf-8")
+            print(f"wrote {args.output} ({len(snap.accounts)} accounts)")
+            return 0
+
+        findings = run_all(snap, args.only)
+        report = Report(snap, findings)
+        if args.accept:
+            entries = accept.load(args.accept)
+            today = snap.collected_at.date()
+            report.findings, report.accepted, notes = accept.apply(findings, entries, today)
+            snap.notes.extend(notes)
+        if args.baseline:
+            _, old = _findings_from(args.baseline)
+            report.new = finding_keys(report.findings) - finding_keys(old)
+    except (CollectError, accept.AcceptError, OSError, ValueError, KeyError) as exc:
         print(f"ad-doctor: {exc}", file=sys.stderr)
         return 1
 
-    if args.cmd == "collect":
-        args.output.write_text(json.dumps(snap.to_json(), indent=2))
-        print(f"wrote {args.output} ({len(snap.accounts)} accounts)")
-        return 0
-
-    findings = run_all(snap, args.only)
-    if args.format == "json":
-        print(render_json(snap, findings))
+    if args.fixes:
+        args.fixes.write_text(render_fixes(report.findings, snap), encoding="utf-8")
+    if args.format == "text":
+        text = render_text(report, color=not args.output and _use_color(sys.stdout))
     else:
-        print(render_text(snap, findings, _use_color()))
-    if args.fail_on and any(f.severity >= Severity[args.fail_on.upper()] for f in findings):
-        return 2
-    return 0
+        text = RENDERERS[args.format](report)
+    if args.output:
+        args.output.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+    else:
+        print(text)
+
+    gate = report.findings
+    if report.new is not None:
+        gate = [f for f in gate if report.is_new(f)]
+    return 2 if _fails(gate, args.fail_on) else 0
