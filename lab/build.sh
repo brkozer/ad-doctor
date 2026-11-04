@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the adlab DC VM (Windows Server 2025 eval) on this host.
-# Only localhost ports are forwarded to the guest; it has no address on any host network.
+# The guest is on QEMU user networking: only localhost ports are forwarded to it and it
+# cannot reach any network itself.
 set -euo pipefail
 cd ~/adlab
 
@@ -33,19 +34,20 @@ virt-install --connect qemu:///system --name adlab-dc01 \
   --disk /var/lib/libvirt/images/adlab/cfg.iso,device=cdrom,bus=sata \
   --network none --graphics vnc,listen=127.0.0.1 --noautoconsole --print-xml > dc01.xml
 
-# passt user networking with localhost-only forwards (ports < 1024 need root on the host side)
+# QEMU user networking (slirp) with localhost-only forwards and restrict=on, so the guest
+# cannot open connections anywhere. libvirt's passt backend would be the native way, but
+# Ubuntu 24.04's AppArmor profile blocks QEMU from reaching the passt socket.
 python3 - <<'EOF'
-import re
 p = "dc01.xml"; s = open(p).read()
 fw = [("tcp", 12222, 22), ("tcp", 10389, 389), ("udp", 10389, 389), ("tcp", 10636, 636),
       ("tcp", 13268, 3268), ("tcp", 13269, 3269), ("tcp", 10088, 88), ("udp", 10088, 88),
       ("tcp", 10445, 445), ("tcp", 10053, 53), ("udp", 10053, 53), ("tcp", 15985, 5985)]
-by = {}
-for proto, host, guest in fw:
-    by.setdefault(proto, []).append(f'<range start="{host}" to="{guest}"/>')
-pf = "".join(f'<portForward proto="{k}" address="127.0.0.1">{"".join(v)}</portForward>' for k, v in by.items())
-nic = f'<interface type="user"><backend type="passt"/><model type="e1000e"/>{pf}</interface>'
-s = s.replace("</devices>", nic + "</devices>", 1)
+net = "user,id=adlab0,restrict=on," + ",".join(f"hostfwd={p}:127.0.0.1:{h}-:{g}" for p, h, g in fw)
+args = ["-netdev", net, "-device", "e1000e,netdev=adlab0,bus=pcie.0,addr=0x10"]
+cl = "".join(f'<qemu:arg value="{a}"/>' for a in args)
+s = s.replace("<domain type=\"kvm\">",
+              '<domain type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">', 1)
+s = s.replace("</domain>", f"<qemu:commandline>{cl}</qemu:commandline></domain>", 1)
 open(p, "w").write(s)
 EOF
 virsh -c qemu:///system define dc01.xml

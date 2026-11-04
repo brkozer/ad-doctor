@@ -13,7 +13,8 @@ Copy-Item "$cfg\authorized_keys" C:\ProgramData\ssh\administrators_authorized_ke
 icacls C:\ProgramData\ssh\administrators_authorized_keys /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F'
 New-ItemProperty -Path HKLM:\SOFTWARE\OpenSSH -Name DefaultShell -Value 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -PropertyType String -Force
 Restart-Service sshd
-Get-NetFirewallRule -Name *OpenSSH* -ErrorAction SilentlyContinue | Enable-NetFirewallRule
+# the built-in rule only covers the Private profile; the lab NIC comes up as Public
+Set-NetFirewallRule -Name OpenSSH-Server-In-TCP -Enabled True -Profile Any
 
 Install-WindowsFeature AD-Domain-Services -IncludeManagementTools
 $dsrm = ConvertTo-SecureString (Get-Content "$cfg\dsrm.txt" -Raw).Trim() -AsPlainText -Force

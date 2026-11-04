@@ -6,6 +6,37 @@ ad-doctor binds as an ordinary domain user, takes one snapshot of the domain and
 checks for the misconfigurations attackers look for first: roastable accounts, risky
 delegation, weak policy, unprotected admins. It writes nothing to the directory.
 
+Against the seeded lab domain (`lab/`):
+
+```text
+$ ad-doctor scan 127.0.0.1 --ldaps --port 10636 -u 'ADLAB\adreader'
+ad-doctor 0.1.0  domain adlab.test  17 accounts  2026-11-04 22:41 UTC
+
+[HIGH  ] AD-ACC-002  Reversible password encryption
+         Passwords for these accounts are stored in a form equivalent to plain text.
+         objects: old_vpn
+         fix: Clear 'Store password using reversible encryption' and reset the passwords.
+
+[HIGH  ] AD-ACC-004  Guest account enabled
+         The built-in Guest account allows unauthenticated-style access to the domain.
+         objects: Guest
+         fix: Disable the Guest account.
+
+[HIGH  ] AD-DEL-001  Unconstrained delegation outside domain controllers
+         These hosts keep the TGT of every user who authenticates to them; coercing a DC to connect yields domain compromise.
+         objects: APP01$
+         fix: Switch to constrained or resource-based delegation, or remove delegation.
+
+[HIGH  ] AD-KRB-002  Accounts without Kerberos pre-authentication (AS-REP roasting)
+         Anyone can request an AS-REP for these accounts and crack the password offline.
+         objects: legacy_app
+         fix: Clear 'Do not require Kerberos preauthentication' on each account.
+
+...
+
+summary: high 5  medium 8  low 1  info 0
+```
+
 ## Checks
 
 | ID | Finding | Severity |
