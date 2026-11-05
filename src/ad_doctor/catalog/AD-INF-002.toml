@@ -1,0 +1,78 @@
+id = "AD-INF-002"
+aliases = ["recycle-bin"]
+summary = "The AD Recycle Bin is not enabled, so deleted objects cannot be restored with their attributes and group memberships."
+severities = ["low"]
+severity_logic = """
+Always **low**: it does not open an attack path, but it decides how long an outage
+lasts after a mass deletion.
+"""
+mitre = ["T1485"]
+data_sources = ["ldap"]
+attributes = ["msDS-EnabledFeature"]
+related = ["AD-INF-011", "AD-INF-003"]
+since = "0.1.0"
+
+risk = """
+Without the Recycle Bin, a deleted object becomes a tombstone: most of its attributes,
+including group memberships, are stripped at once. Restoring it means an authoritative
+restore from a backup with the DC offline, or rebuilding the object by hand and
+re-adding it to every group.
+
+An attacker who wants to cause damage, or a script run against the wrong OU, can delete
+thousands of users, groups or computers in seconds. With the Recycle Bin enabled the
+same objects come back with `Restore-ADObject`, memberships included, for as long as
+the deleted-object lifetime (180 days by default).
+"""
+
+detection = """
+ad-doctor reads `msDS-EnabledFeature` on `CN=Partitions` in the configuration partition
+and reports the domain when no value starts with `CN=Recycle Bin Feature,`. If that
+object cannot be read the result is unknown and nothing is reported.
+
+The finding has one object, the domain name, for example `adlab.test`.
+"""
+
+false_positives = """
+None expected. The feature is forest-wide and needs the Windows Server 2008 R2 forest
+functional level or later; once enabled it cannot be turned off.
+"""
+
+remediation = """
+1. **Confirm the current state.**
+
+    ```powershell
+    Get-ADOptionalFeature -Filter "Name -eq 'Recycle Bin Feature'" |
+        Select-Object Name, EnabledScopes
+    ```
+
+2. **Enable it for the forest** (as an Enterprise Admin). The change is permanent, so
+   run it with `-WhatIf` first:
+
+    ```powershell
+    Enable-ADOptionalFeature 'Recycle Bin Feature' -Scope ForestOrConfigurationSet `
+        -Target 'corp.example' -WhatIf
+    ```
+
+3. **Practise a restore** of a test object so the procedure is known before it is
+   needed:
+
+    ```powershell
+    Get-ADObject -Filter 'Name -like "test*"' -IncludeDeletedObjects |
+        Restore-ADObject -WhatIf
+    ```
+
+4. Keep taking system-state backups ([AD-INF-011](AD-INF-011.md)): the Recycle Bin does
+   not help after a forest compromise or once the deleted-object lifetime has passed.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-002"
+
+[[references]]
+title = "Enable Active Directory Recycle Bin in Windows Server"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/get-started/adac/active-directory-recycle-bin"
+kind = "vendor"
+
+[[references]]
+title = "Active Directory Forest Recovery Guide"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/forest-recovery-guide/ad-forest-recovery-guide"
+kind = "vendor"

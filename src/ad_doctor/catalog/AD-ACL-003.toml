@@ -1,0 +1,100 @@
+id = "AD-ACL-003"
+aliases = []
+summary = "A principal outside tier 0 holds write, WriteDacl or WriteOwner on the domain object, so it can grant itself DCSync or change domain-wide settings."
+severities = ["high"]
+severity_logic = """
+Always **high**: WriteDacl (or ownership, which implies it) on the domain head is one ACE
+away from [AD-ACL-001](AD-ACL-001.md), and therefore from every password hash.
+"""
+mitre = ["T1098", "T1222"]
+data_sources = ["ldap"]
+attributes = ["nTSecurityDescriptor of the domain head (effective ACEs)"]
+related = ["AD-ACL-001", "AD-ACL-007", "AD-GPO-002", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+The domain object (`DC=corp,DC=example`) carries the replication rights, the domain-wide
+settings (machine account quota, password policy attributes, `gPLink` of the domain) and
+the inheritable ACEs that flow to every object below it.
+
+1. An attacker with WriteDacl on it adds *Replicating Directory Changes (All)* for an
+   account they own, then runs DCSync. WriteOwner gets there in two steps (take ownership,
+   then rewrite the DACL); GenericAll gets there directly.
+2. With GenericWrite or write access to all properties they can instead link a GPO to the
+   domain (see [AD-GPO-002](AD-GPO-002.md)) or raise `ms-DS-MachineAccountQuota`.
+3. An inheritable ACE added here lands on every user, group and computer in the domain
+   that does not block inheritance.
+
+This is the classic shape of the PrivExchange problem ([AD-ACL-007](AD-ACL-007.md)) and of
+many leftover delegations from migrations and old management tools.
+"""
+
+detection = """
+ad-doctor reads the DACL of the domain head with the SD flags control (the effective ACEs,
+not inherit-only ones) and reports every principal outside the default tier-0 set that
+holds a **takeover** right: GenericAll or full control, GenericWrite, WriteDacl,
+WriteOwner, or WriteProperty on all attributes (an ACE with no object type).
+
+Default tier 0 is Administrators, Domain Admins, Enterprise Admins, Schema Admins, Domain
+Controllers, Enterprise Domain Controllers, the read-only DC groups, the built-in
+Administrator and SYSTEM. Each object is the principal's name, for example `helpdesk` or
+`Exchange Windows Permissions`. Rights limited to one attribute or property set (for
+example `gPLink` alone) are not takeover rights and are covered by
+[AD-GPO-002](AD-GPO-002.md).
+"""
+
+false_positives = """
+- **Exchange on the shared permissions model** before the 2019 fix: correct finding, fixed
+  as described in [AD-ACL-007](AD-ACL-007.md).
+- **A tier-0 group created by the organisation** (for example a dedicated AD admin group
+  that is not nested in Domain Admins). ad-doctor does not know it is tier 0; if it really
+  is managed as tier 0, accept the finding with an owner (../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **Review the domain DACL** (read-only):
+
+    ```powershell
+    $domain = (Get-ADDomain).DistinguishedName
+    (Get-Acl "AD:$domain").Access |
+        Where-Object { $_.AccessControlType -eq 'Allow' -and
+                       $_.ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner|WriteProperty' } |
+        Format-Table IdentityReference, ActiveDirectoryRights, ObjectType, InheritanceType -AutoSize
+    ```
+
+2. **Remove the grants for the reported principals.** `dsacls /R` removes every ACE for
+   the trustee on the domain object, including legitimate narrower ones, so check step 1:
+
+    ```powershell
+    # dsacls "DC=corp,DC=example" /R "CORP\\helpdesk"
+    ```
+
+3. **Check what the principal could already have done**: unexpected replication rights
+   ([AD-ACL-001](AD-ACL-001.md)), new inheritable ACEs, changed domain settings, and the
+   directory service change events (5136) for the domain object.
+
+4. **Delegate narrowly instead**: if a team needs to manage objects, grant the specific
+   rights on the OU that holds them, never on the domain head.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-003"
+
+[[references]]
+title = "An ACE Up the Sleeve: Designing Active Directory DACL Backdoors (SpecterOps)"
+url = "https://specterops.io/wp-content/uploads/sites/3/2022/06/an_ace_up_the_sleeve.pdf"
+kind = "research"
+
+[[references]]
+title = "BloodHound: WriteDacl edge"
+url = "https://bloodhound.specterops.io/resources/edges/write-dacl"
+kind = "tool"
+
+[[references]]
+title = "BloodHound: WriteOwner edge"
+url = "https://bloodhound.specterops.io/resources/edges/write-owner"
+kind = "tool"
+
+[[references]]
+title = "Implementing least-privilege administrative models"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/implementing-least-privilege-administrative-models"
+kind = "vendor"

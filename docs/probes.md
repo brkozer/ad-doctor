@@ -1,0 +1,35 @@
+# Network probes
+
+On top of the LDAP reads, ad-doctor makes a few active, read-only probes. Each is one
+connection per target, nothing is written, and `--no-probes` turns them all off.
+
+| Probe | Against | What it does |
+|---|---|---|
+| LDAP signing | each DC, port 389 | an NTLM bind without signing (`--signing-probe-port 0` skips it) |
+| LDAPS channel binding | each DC, port 636 | an NTLM bind without a channel-binding token |
+| SMB signing | each DC, port 445 | SMB negotiate, then a session as the scanning account |
+| Print Spooler | each DC | opens the `spoolss` named pipe and closes it |
+| Web enrollment (ESC8) | each enterprise CA, port 80 | one `GET /certsrv/` to read the authentication headers |
+| CA registry (ESC6/7/11/16) | each enterprise CA, port 445 | reads the CA's configuration over `\pipe\winreg` (MS-RRP), `KEY_READ` only; `--no-ca-registry` skips it |
+| SYSVOL | the scanned DC | reads GPO files and scripts (`--no-sysvol` skips it) |
+
+The DC being scanned is reached through the address and ports on the command line; the
+other DCs by their DNS names on the standard ports. `--single-dc` limits the DC probes to
+the DC being scanned.
+
+## Intrusiveness of the CA registry probe
+
+Opening `\pipe\winreg` on a CA host is a read, but it is not invisible. On a host where the
+`RemoteRegistry` service is set to start on demand, opening the pipe **trigger-starts the
+service**: a visible change of service state (System event 7036), plus an SMB logon
+(4624 type 3), and reads under `CertSvc` may be audited if object-access auditing is on for
+that key. Remote registry access to a CA is also the kind of activity EDR and Microsoft
+Defender for Identity may alert on.
+
+It is still only a read: nothing in the directory, the CA database or the registry is
+modified. Use `--no-ca-registry` to skip just this probe, or `--no-probes` to skip them all.
+When it is skipped, the CA-side checks (ESC6, ESC7, ESC11, ESC16) simply produce no result
+for that CA.
+
+See [SECURITY.md](https://github.com/brkozer/ad-doctor/blob/main/SECURITY.md) for the
+reporting policy and how ad-doctor handles output.

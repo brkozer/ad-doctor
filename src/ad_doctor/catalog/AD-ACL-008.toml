@@ -1,0 +1,110 @@
+id = "AD-ACL-008"
+aliases = []
+summary = "A principal outside tier 0 owns or can take over the Entra Connect sync account or its server, and that account can DCSync the domain."
+severities = ["high"]
+severity_logic = """
+Always **high**: the check only looks at sync accounts that hold both replication rights,
+so taking one over (or its server, where its password is stored) is a path to every
+password hash in the domain.
+"""
+mitre = ["T1098", "T1003.006"]
+data_sources = ["ldap"]
+attributes = [
+    "sAMAccountName and description of MSOL_* and Sync_*_* accounts",
+    "nTSecurityDescriptor of the domain head (replication rights)",
+    "nTSecurityDescriptor (owner and effective ACEs) of the sync account and its server",
+]
+related = ["AD-PRIV-011", "AD-ACL-001", "AD-ACL-004", "AD-PATH-001"]
+since = "unreleased"
+
+risk = """
+With password hash sync, Entra Connect (formerly Azure AD Connect) runs as an on-premises
+connector account, `MSOL_<hex>` (or `Sync_<server>_<hex>` on older installs), that holds
+*Replicating Directory Changes (All)* on the domain. Its password is stored, encrypted, on
+the Entra Connect server, where a local administrator can recover it.
+
+1. An attacker who can reset the sync account's password, write its
+   `msDS-KeyCredentialLink`, or rewrite its DACL becomes that account directly.
+2. Control of the server's computer object (RBCD, shadow credentials, full control) gives
+   them administrator on the server, from which they extract the connector credentials.
+3. Either way they run DCSync and own the domain, and on the server they can also reach
+   the cloud tenant through the Entra side of the sync.
+
+[AD-PRIV-011](AD-PRIV-011.md) reports when the server is not protected like a domain
+controller; this check reports who, in the directory, can take over either object.
+"""
+
+detection = """
+ad-doctor finds enabled accounts whose name matches the Entra Connect patterns (`MSOL_`
+followed by 12 hex digits, or `Sync_<server>_<12 hex digits>`) and keeps those that hold
+both replication rights on the domain head (as in [AD-ACL-001](AD-ACL-001.md)). The server
+is taken from the account name, or for `MSOL_` accounts from the
+"running on computer ..." text Entra Connect writes into the description, and matched to a
+computer account.
+
+For the sync account and its server it then reports, like [AD-ACL-004](AD-ACL-004.md):
+
+- an **owner** outside tier 0;
+- an ACE for a principal outside tier 0 and the operator groups (SELF and CREATOR OWNER
+  ignored) granting full control, write, WriteDacl, WriteOwner, reset password, or a write
+  to `msDS-KeyCredentialLink`, `msDS-AllowedToActOnBehalfOfOtherIdentity`,
+  `altSecurityIdentities` or `servicePrincipalName`.
+
+Objects look like `MSOL_0a1b2c3d4e5f (sync account): helpdesk (reset password)` or
+`ENTRA01$ (sync server): srv_admins (write RBCD)`.
+"""
+
+false_positives = """
+- **Renamed or custom connector accounts** that do not follow the `MSOL_`/`Sync_` naming are
+  not recognised; this is a false negative, not a false positive. Check the account
+  configured in the Entra Connect wizard by hand.
+- **Delegations to a group that is managed as tier 0** but is not one of the built-in
+  tier-0 groups. Accept with an owner if that is deliberate (../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **Inspect the reported object** (read-only):
+
+    ```powershell
+    $dn = (Get-ADUser MSOL_0a1b2c3d4e5f).DistinguishedName   # or Get-ADComputer ENTRA01
+    $acl = Get-Acl "AD:$dn"
+    $acl.Owner
+    $acl.Access | Where-Object IdentityReference -like '*helpdesk*' |
+        Format-Table ActiveDirectoryRights, ObjectType, IsInherited -AutoSize
+    ```
+
+2. **Move the sync account and the server into an OU only tier-0 admins control** and stop
+   inheriting OU-wide delegations (helpdesk password reset, server admin groups).
+
+3. **Remove the explicit ACEs and reset the owner** (review first; `/R` removes every ACE
+   for the trustee on that object):
+
+    ```powershell
+    # dsacls "CN=MSOL_0a1b2c3d4e5f,CN=Users,DC=corp,DC=example" /R "CORP\\helpdesk"
+    ```
+
+4. **Harden the server as tier 0**, as Microsoft recommends: only tier-0 admins, no
+   delegation, Windows LAPS for its local administrator, and drop the replication rights if
+   password hash sync is not used.
+
+5. **If the rights may have been used**, change the connector account's password (and
+   update it in Entra Connect), and treat the domain's hashes as exposed: reset krbtgt
+   twice and the passwords of privileged accounts.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-008"
+
+[[references]]
+title = "Microsoft Entra Connect: Accounts and permissions"
+url = "https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/reference-connect-accounts-permissions"
+kind = "vendor"
+
+[[references]]
+title = "Microsoft Entra Connect: Prerequisites (Harden your Microsoft Entra Connect server)"
+url = "https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/how-to-connect-install-prerequisites#harden-your-microsoft-entra-connect-server"
+kind = "vendor"
+
+[[references]]
+title = "Azure AD Connect for red teamers (Adam Chester)"
+url = "https://blog.xpnsec.com/azuread-connect-for-redteam/"
+kind = "research"

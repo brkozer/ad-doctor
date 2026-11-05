@@ -1,0 +1,116 @@
+id = "AD-POL-001"
+aliases = ["password-policy"]
+summary = "The default domain password policy allows passwords shorter than 12 characters, has complexity off or has no account lockout, which makes password guessing cheap."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. The finding lists every weakness it found in one line: a minimum length
+below 12, complexity disabled, or a lockout threshold of 0.
+"""
+mitre = ["T1110"]
+data_sources = ["ldap"]
+attributes = ["minPwdLength", "pwdProperties", "lockoutThreshold"]
+related = ["AD-POL-002", "AD-ACC-003", "AD-ACC-011", "AD-KRB-003"]
+since = "0.1.0"
+
+risk = """
+The default domain password policy applies to every account that no fine-grained password
+policy covers, which in most domains means every user.
+
+- **Short passwords** fall to offline cracking quickly once an attacker has a hash: an
+  AS-REP or Kerberoast ticket ([AD-KRB-003](AD-KRB-003.md)), an NTLM response captured by
+  poisoning, or a copy of `ntds.dit`.
+- **No complexity** lets users pick dictionary words and keyboard walks that every
+  wordlist starts with.
+- **No lockout** lets anyone with network access to a DC spray a few common passwords
+  (`Winter2026!`, `Company123`) against every account, over and over, without locking
+  anything out. Password spraying is one of the most common first steps into a domain.
+"""
+
+detection = """
+ad-doctor reads the password policy from the domain head object, where the domain
+controllers store the account policy of the GPO linked at the domain root (normally the
+*Default Domain Policy*):
+
+| Attribute | Reported when |
+|---|---|
+| `minPwdLength` | below 12 |
+| `pwdProperties` | bit `DOMAIN_PASSWORD_COMPLEX` (0x1) clear |
+| `lockoutThreshold` | 0 (no lockout) |
+
+The object of the finding is the domain, and the detail lists what is weak, for example
+`Default Domain Policy: minimum length 7 (< 12); no account lockout.` with object
+`corp.example`.
+
+Fine-grained password policies (PSOs) are **not** judged. When none is visible, ad-doctor
+adds a note that the check covers the default policy only: either none exist, or the
+scanning account cannot read `CN=Password Settings Container`.
+"""
+
+false_positives = """
+- **Fine-grained policies cover everyone who matters.** If a PSO with a long minimum length
+  and a lockout applies to all users, the default policy matters only for accounts outside
+  its groups. Check that no enabled user falls outside, then record the decision in an
+  [accepted-risk file](../ci.md#accepted-risks).
+- **Length below 12 by design**, because a password filter or Entra password protection
+  rejects weak passwords: ad-doctor cannot see filters. Short passwords are still faster
+  to crack offline, so prefer raising the length.
+"""
+
+remediation = """
+1. **Read the current policy and any fine-grained policies.**
+
+    ```powershell
+    Get-ADDefaultDomainPasswordPolicy
+    Get-ADFineGrainedPasswordPolicy -Filter * |
+        Select-Object Name, Precedence, MinPasswordLength, LockoutThreshold, AppliesTo
+    ```
+
+2. **Change the policy where it is defined.** The DCs copy the account policy from the GPO
+   linked at the domain root into the domain object, so edit the *Default Domain Policy*:
+   *Computer Configuration > Policies > Windows Settings > Security Settings > Account
+   Policies*. Set a minimum length of 14 or more, enable complexity, and set a lockout
+   threshold (10 is a common choice) with a lockout duration of 15 minutes or more. A
+   direct change with PowerShell works only if no GPO defines the same values:
+
+    ```powershell
+    Set-ADDefaultDomainPasswordPolicy -Identity corp.example -MinPasswordLength 14 `
+        -ComplexityEnabled $true -LockoutThreshold 10 -WhatIf
+    ```
+
+3. **Use fine-grained password policies for groups that need more**, such as admins and
+   service accounts (a longer minimum length), instead of weakening the default:
+
+    ```powershell
+    New-ADFineGrainedPasswordPolicy -Name 'Admins' -Precedence 10 -MinPasswordLength 20 `
+        -ComplexityEnabled $true -LockoutThreshold 10 `
+        -LockoutDuration '00:30:00' -LockoutObservationWindow '00:30:00' -WhatIf
+    ```
+
+4. **Ban common passwords** with Microsoft Entra Password Protection or another password
+   filter, since length and complexity still allow `Summer2026!`.
+
+5. **Existing passwords keep their old strength** until they change. Plan password
+   changes for privileged and service accounts after raising the policy.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-POL-001"
+
+[[references]]
+title = "Minimum password length (security policy setting)"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/minimum-password-length"
+kind = "vendor"
+
+[[references]]
+title = "Account lockout threshold (security policy setting)"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/account-lockout-threshold"
+kind = "vendor"
+
+[[references]]
+title = "Configure fine grained password policies for AD DS"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/get-started/adac/fine-grained-password-policies"
+kind = "vendor"
+
+[[references]]
+title = "NIST SP 800-63B: Digital Identity Guidelines, Authentication"
+url = "https://pages.nist.gov/800-63-4/sp800-63b.html"
+kind = "spec"

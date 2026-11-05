@@ -1,0 +1,114 @@
+id = "AD-ADCS-003"
+aliases = ["esc3"]
+summary = "A published template that broad groups can enroll in issues Certificate Request Agent certificates, letting any user request certificates on behalf of others."
+severities = ["high"]
+severity_logic = "Always **high**: an enrollment agent certificate is the first half of a request for any user's logon certificate."
+mitre = ["T1649"]
+data_sources = ["ldap"]
+attributes = [
+    "pKIExtendedKeyUsage",
+    "msPKI-Certificate-Application-Policy",
+    "msPKI-Enrollment-Flag",
+    "msPKI-RA-Signature",
+    "nTSecurityDescriptor (template DACL)",
+    "certificateTemplates (on pKIEnrollmentService)",
+]
+related = ["AD-ADCS-001", "AD-ADCS-002", "AD-ADCS-004", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+An **enrollment agent** signs certificate requests on behalf of other users, for
+example a help desk issuing smart cards. The certificate that makes someone an agent
+carries the **Certificate Request Agent** EKU (`1.3.6.1.4.1.311.20.2.1`).
+
+If any domain user can enroll in an agent template, the attack takes two requests:
+
+1. Request an agent certificate from this template.
+2. Use it to co-sign a request for `administrator` through any published template that
+   accepts agent-signed requests: a schema v1 template valid for authentication (the
+   built-in *User* template is one), or a v2+ template that requires one authorized
+   signature with the Certificate Request Agent application policy.
+
+The CA then issues a logon certificate for the victim, valid until it expires or is
+revoked, regardless of the victim's password. Unless the CA has **enrollment agent
+restrictions** configured, an agent may enroll for any user through any template.
+"""
+
+detection = """
+ad-doctor reads every certificate template and the enterprise CAs over LDAP and reports a
+template when **all** of these hold:
+
+| Condition | Attribute |
+|---|---|
+| Published on at least one enterprise CA | `certificateTemplates` of a CA object |
+| No manager approval | `msPKI-Enrollment-Flag` without `CT_FLAG_PEND_ALL_REQUESTS` (0x2) |
+| No authorized signatures | `msPKI-RA-Signature` is 0 |
+| A broad group can enroll | Enroll or AutoEnroll in the template DACL for Everyone, Anonymous Logon, Authenticated Users, BUILTIN\\Users, Pre-Windows 2000 Compatible Access, Domain Users, Domain Guests or Domain Computers |
+| Agent EKU | the EKU list contains `1.3.6.1.4.1.311.20.2.1` |
+
+The EKU list is `msPKI-Certificate-Application-Policy` when set, otherwise
+`pKIExtendedKeyUsage`. Each object names the template and the broad groups that can
+enroll, for example `LabESC3 (enroll: Domain Users)`. Templates with the Any Purpose EKU
+also work as agent templates and are reported by [AD-ADCS-002](AD-ADCS-002.md).
+"""
+
+false_positives = """
+- **Enrollment agent restrictions on the CA** (CA properties, *Enrollment Agents* tab)
+  live in the CA's configuration, not in LDAP, so ad-doctor cannot see them. If the CA
+  limits each agent to specific templates and target groups, the finding is mitigated but
+  not removed: restrict who can enroll in the agent template as well.
+- **The second template** (one that accepts agent-signed requests) is not checked. The
+  built-in *User* template qualifies when it is published, which is common.
+- **Narrower enrollment groups** are not reported here; see [AD-PATH-001](AD-PATH-001.md).
+"""
+
+remediation = """
+1. **Restrict enrollment** in the agent template to the named agents that need it. In
+   `certtmpl.msc`, *Security* tab, remove *Enroll* and *Autoenroll* from Domain Users,
+   Domain Computers, Authenticated Users and Everyone.
+
+2. **Require CA manager approval** for agent certificates (sets
+   `CT_FLAG_PEND_ALL_REQUESTS`):
+
+    ```powershell
+    $cfg = (Get-ADRootDSE).configurationNamingContext
+    $dn  = "CN=LabESC3,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
+    $t   = Get-ADObject $dn -Properties 'msPKI-Enrollment-Flag'
+    Set-ADObject $dn -Replace @{'msPKI-Enrollment-Flag' = ($t.'msPKI-Enrollment-Flag' -bor 2)} -WhatIf
+    ```
+
+3. **Configure enrollment agent restrictions** on the CA: `certsrv.msc` > the CA >
+   *Properties* > *Enrollment Agents* > *Restrict enrollment agents*, and allow each
+   agent only the templates and target groups it serves.
+
+4. **Stop publishing** the agent template if smart card enrollment is not in use:
+
+    ```powershell
+    Remove-CATemplate -Name LabESC3 -WhatIf
+    ```
+
+Then review *Issued Certificates* for requests signed by an agent certificate from this
+template and revoke any that were not sanctioned (`certutil -revoke <serial> 1`).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-003"
+
+[[references]]
+title = "Certified Pre-Owned: Abusing Active Directory Certificate Services (whitepaper, ESC3)"
+url = "https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf"
+kind = "research"
+
+[[references]]
+title = "Defender for Identity: Edit misconfigured enrollment agent certificate template (ESC3)"
+url = "https://learn.microsoft.com/en-us/defender-for-identity/security-posture-assessments/certificates"
+kind = "vendor"
+
+[[references]]
+title = "Certificate template concepts in Windows Server"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-cs/certificate-template-concepts"
+kind = "vendor"
+
+[[references]]
+title = "Certipy wiki: Privilege escalation (ESC3)"
+url = "https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation"
+kind = "tool"

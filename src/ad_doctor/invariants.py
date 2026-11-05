@@ -29,6 +29,15 @@ from typing import Any
 from . import sd
 from .model import DirObject, Finding, Severity, Snapshot
 
+# not in checks.REGISTRY: they only run with --invariants
+IDS = {
+    "AD-INV-001": "Group membership differs from the declared state",
+    "AD-INV-002": "Tier 0 is larger than declared",
+    "AD-INV-003": "Domain settings differ from the declared state",
+    "AD-INV-004": "DCSync rights outside the declared list",
+    "AD-INV-005": "Templates published outside the declared list",
+}
+
 
 class InvariantError(Exception):
     pass
@@ -59,12 +68,10 @@ def load(path: Path) -> dict[str, Any]:
     return data
 
 
-def _finding(
-    check_id: str, title: str, severity: Severity, detail: str, objects: list[str]
-) -> Finding:
+def _finding(check_id: str, severity: Severity, detail: str, objects: list[str]) -> Finding:
     return Finding(
         check_id,
-        title,
+        IDS[check_id],
         severity,
         detail,
         "Bring the directory back to the declared state, or update the invariants file "
@@ -94,8 +101,7 @@ def evaluate(snap: Snapshot, spec: dict[str, Any]) -> list[Finding]:
         drift += [f"{group}: missing {want[m]}" for m in sorted(want.keys() - actual.keys())]
     if drift:
         findings.append(
-            _finding("AD-INV-001", "Group membership differs from the declared state",
-                     Severity.HIGH, "Membership of declared groups drifted.", drift)
+            _finding("AD-INV-001", Severity.HIGH, "Membership of declared groups drifted.", drift)
         )  # fmt: skip
 
     limit = spec.get("limits", {}).get("tier0_users")
@@ -103,7 +109,7 @@ def evaluate(snap: Snapshot, spec: dict[str, Any]) -> list[Finding]:
         users = {d.lower() for members in snap.privileged.values() for d in members}
         if len(users) > limit:
             findings.append(
-                _finding("AD-INV-002", "Tier 0 is larger than declared", Severity.MEDIUM,
+                _finding("AD-INV-002", Severity.MEDIUM,
                          f"{len(users)} distinct accounts in tier-0 groups; the limit is {limit}.",
                          sorted(by_dn[d].sam for d in users if d in by_dn))
             )  # fmt: skip
@@ -117,8 +123,7 @@ def evaluate(snap: Snapshot, spec: dict[str, Any]) -> list[Finding]:
             mismatches.append(f"{name}: {have!r} (declared {op}{want!r})")
     if mismatches:
         findings.append(
-            _finding("AD-INV-003", "Domain settings differ from the declared state",
-                     Severity.MEDIUM, "Declared settings do not hold.", mismatches)
+            _finding("AD-INV-003", Severity.MEDIUM, "Declared settings do not hold.", mismatches)
         )  # fmt: skip
 
     if "dcsync" in spec:
@@ -131,7 +136,7 @@ def evaluate(snap: Snapshot, spec: dict[str, Any]) -> list[Finding]:
         extra = sorted(h for h in holders if h.lower() not in allowed)
         if extra:
             findings.append(
-                _finding("AD-INV-004", "DCSync rights outside the declared list", Severity.HIGH,
+                _finding("AD-INV-004", Severity.HIGH,
                          "These principals can replicate secrets but are not declared.", extra)
             )  # fmt: skip
 
@@ -142,8 +147,7 @@ def evaluate(snap: Snapshot, spec: dict[str, Any]) -> list[Finding]:
         )
         if extra_t:
             findings.append(
-                _finding("AD-INV-005", "Templates published outside the declared list",
-                         Severity.MEDIUM, "Published but not declared.", extra_t)
+                _finding("AD-INV-005", Severity.MEDIUM, "Published but not declared.", extra_t)
             )  # fmt: skip
     return findings
 

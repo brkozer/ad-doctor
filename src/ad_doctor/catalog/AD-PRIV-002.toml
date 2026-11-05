@@ -1,0 +1,101 @@
+id = "AD-PRIV-002"
+summary = "Privileged user accounts that are neither marked sensitive nor in Protected Users, so any service trusted for delegation can impersonate them."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. The account can be impersonated only through a delegation-enabled
+service the attacker already controls, but once that is the case, the result is a
+tier-0 identity.
+"""
+mitre = ["T1558"]
+data_sources = ["ldap"]
+attributes = [
+    "userAccountControl (NOT_DELEGATED, 0x100000)",
+    "memberOf (transitive) of the tier-0 groups and of Protected Users",
+    "primaryGroupID",
+]
+related = ["AD-PRIV-010", "AD-DEL-001", "AD-DEL-002", "AD-DEL-003", "AD-DEL-004", "AD-CHAIN-002"]
+since = "0.1.0"
+
+risk = """
+Kerberos delegation lets a service act as a user towards other services. Unless an
+account is marked *Account is sensitive and cannot be delegated* or is a member of
+Protected Users, the KDC hands out forwardable tickets for it, and:
+
+- a host with **unconstrained delegation** ([AD-DEL-001](AD-DEL-001.md)) receives the
+  admin's TGT whenever the admin connects to it, and can reuse it anywhere;
+- a service with **constrained delegation and protocol transition**
+  ([AD-DEL-002](AD-DEL-002.md)) or **resource-based constrained delegation**
+  ([AD-DEL-003](AD-DEL-003.md)) can obtain a ticket *as the admin* without the admin
+  doing anything (S4U2self + S4U2proxy).
+
+Combined with authentication coercion, an attacker who controls one such service
+impersonates a Domain Admin to a domain controller ([AD-CHAIN-002](AD-CHAIN-002.md)).
+Marking the account sensitive makes the KDC refuse to delegate it, which closes every
+one of these paths for that account.
+"""
+
+detection = """
+ad-doctor takes every **enabled user** account (computers and gMSA/sMSA/dMSA are
+skipped) that is a transitive member of a tier-0 group: Domain Admins, Schema Admins,
+Enterprise Admins, Administrators and the Account, Server, Print and Backup Operators,
+including members through `primaryGroupID`. An account is reported unless:
+
+- `userAccountControl` has the `NOT_DELEGATED` bit (`0x100000`, *Account is sensitive
+  and cannot be delegated*), or
+- it is a transitive member of Protected Users (RID 525).
+
+The objects are the account names, for example `adm_bob`, `svc_sql`.
+"""
+
+false_positives = """
+- **Service accounts in tier-0 groups** sometimes need to be delegated by a front-end
+  service. That is a design problem rather than a false positive: take the account out
+  of tier 0, then the check stops reporting it.
+- **The built-in Administrator (RID 500)** is reported like any other admin; Microsoft
+  recommends marking it sensitive as well.
+"""
+
+remediation = """
+1. **List the privileged accounts that can still be delegated.** `adminCount = 1` is a
+   quick approximation of "privileged"; the finding has the exact list.
+
+    ```powershell
+    Get-ADUser -LDAPFilter '(&(adminCount=1)(!(userAccountControl:1.2.840.113556.1.4.803:=1048576)))' |
+        Select-Object SamAccountName, DistinguishedName
+    ```
+
+2. **Mark each one sensitive** (the same command ad-doctor writes with `--fixes`):
+
+    ```powershell
+    Set-ADAccountControl adm_bob -AccountNotDelegated $true -WhatIf
+    ```
+
+3. **Add administrators to Protected Users** as well, after testing that they do not
+   depend on NTLM, RC4 or DES ([AD-PRIV-010](AD-PRIV-010.md)). Do not add service
+   accounts or computer accounts:
+
+    ```powershell
+    Add-ADGroupMember 'Protected Users' -Members adm_bob -WhatIf
+    ```
+
+4. **Reduce the delegation itself**: remove unconstrained delegation from anything that
+   is not a DC and review constrained and resource-based delegation
+   ([AD-DEL-001](AD-DEL-001.md), [AD-DEL-004](AD-DEL-004.md)).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-002"
+
+[[references]]
+title = "Appendix D: Securing built-in Administrator accounts in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-d--securing-built-in-administrator-accounts-in-active-directory"
+kind = "vendor"
+
+[[references]]
+title = "Protected Users security group"
+url = "https://learn.microsoft.com/en-us/windows-server/security/credentials-protection-and-management/protected-users-security-group"
+kind = "vendor"
+
+[[references]]
+title = "Active Directory Security Risk #101: Kerberos unconstrained delegation (Sean Metcalf)"
+url = "https://adsecurity.org/?p=1667"
+kind = "research"

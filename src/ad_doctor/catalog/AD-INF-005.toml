@@ -1,0 +1,89 @@
+id = "AD-INF-005"
+aliases = ["ldap-signing"]
+summary = "A domain controller accepts an unsigned NTLM bind on plain LDAP, so authentication relayed from a coerced host can be used to modify the directory."
+severities = ["medium"]
+severity_logic = """
+Always **medium** on its own. Combined with a machine account quota above 0 it is part
+of the relay-to-RBCD chain reported as **high** by [AD-CHAIN-001](AD-CHAIN-001.md).
+"""
+mitre = ["T1557"]
+data_sources = ["probe-ldap"]
+attributes = ["LDAP bind result (strongerAuthRequired)"]
+related = ["AD-INF-010", "AD-CHAIN-001", "AD-INF-013", "AD-POL-002"]
+since = "0.1.0"
+
+risk = """
+When a DC does not require LDAP signing, an NTLM authentication captured anywhere can be
+relayed to its plain LDAP port and used as the victim. Attackers get that authentication
+for free: PetitPotam, PrinterBug and similar coercion bugs make a server authenticate to
+a host of the attacker's choice, and WebDAV or name-resolution poisoning collects it from
+workstations.
+
+Relayed to LDAP, a computer account's authentication can write
+`msDS-AllowedToActOnBehalfOfOtherIdentity` on itself (resource-based delegation, then
+local admin on that server) or `msDS-KeyCredentialLink` (shadow credentials); a relayed
+administrator can add accounts to privileged groups. One DC that does not require
+signing is enough, because the attacker chooses which DC to relay to.
+"""
+
+detection = """
+ad-doctor performs an NTLM bind **without signing** on the plain LDAP port of each DC
+(`--signing-probe-port`, 389 by default). A DC that requires signing rejects it with
+`strongerAuthRequired` (result 8); a successful bind means it does not. Any other answer
+is inconclusive and is written to the scan notes, not reported.
+
+The probe needs a `DOMAIN\\user` account with a password (NTLM); it is skipped with a
+note when scanning with Kerberos. By default every enabled DC in the domain is probed by
+its `dNSHostName`; `--single-dc` limits it to the DC being scanned. Each object is a DC
+host name, for example `DC01.adlab.test`, and the detail says how many of the probed DCs
+failed.
+"""
+
+false_positives = """
+None expected: the probe observes the DC's actual behaviour. A DC that could not be
+reached is not reported here; see [AD-INF-013](AD-INF-013.md).
+"""
+
+remediation = '''
+1. **Find clients that still bind without signing** before enforcing: on each DC, raise
+   the LDAP interface event logging (`16 LDAP Interface Events` = 2) and collect event
+   2889 for a few days.
+2. **Require signing on every DC** through the Default Domain Controllers Policy:
+   *Computer Configuration > Policies > Windows Settings > Security Settings > Local
+   Policies > Security Options > Domain controller: LDAP server signing requirements*
+   = **Require signing**. The setting lands in the registry; read it to confirm:
+
+    ```powershell
+    Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters' -Name LDAPServerIntegrity
+    # 2 = require signing; set it through the GPO rather than by hand:
+    Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters' `
+        -Name LDAPServerIntegrity -Value 2 -WhatIf
+    ```
+
+3. **Enforce LDAPS channel binding as well** ([AD-INF-010](AD-INF-010.md)): signing
+   protects plain LDAP only.
+4. Set `ms-DS-MachineAccountQuota` to 0 ([AD-POL-002](AD-POL-002.md)) to take away the
+   easiest follow-up of a successful relay.
+'''
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-005"
+
+[[references]]
+title = "How to enable LDAP signing in Windows Server"
+url = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/enable-ldap-signing-in-windows-server"
+kind = "vendor"
+
+[[references]]
+title = "2020, 2023, and 2024 LDAP channel binding and LDAP signing requirements for Windows (KB4520412)"
+url = "https://support.microsoft.com/en-us/servicing/os/windows/2020/02/2020-2023-and-2024-ldap-channel-binding-and-ldap-signing-requirements-for-windows-kb4520412"
+kind = "vendor"
+
+[[references]]
+title = "Domain controller: LDAP server signing requirements"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/domain-controller-ldap-server-signing-requirements"
+kind = "vendor"
+
+[[references]]
+title = "The Hacker Recipes: NTLM relay"
+url = "https://www.thehacker.recipes/ad/movement/ntlm/relay"
+kind = "research"

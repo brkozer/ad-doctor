@@ -1,0 +1,109 @@
+id = "AD-ADCS-006"
+aliases = ["esc9"]
+summary = "A published authentication template that broad groups can enroll in sets CT_FLAG_NO_SECURITY_EXTENSION, so its certificates carry no SID for strong mapping."
+severities = ["medium"]
+severity_logic = """
+Always **medium**: the template is only exploitable together with write access to another
+account's `userPrincipalName`, and only against domain controllers that are not in full
+enforcement mode for strong certificate mapping.
+"""
+mitre = ["T1649"]
+data_sources = ["ldap"]
+attributes = [
+    "msPKI-Enrollment-Flag (CT_FLAG_NO_SECURITY_EXTENSION 0x80000)",
+    "pKIExtendedKeyUsage",
+    "msPKI-Certificate-Application-Policy",
+    "msPKI-RA-Signature",
+    "nTSecurityDescriptor (template DACL)",
+    "certificateTemplates (on pKIEnrollmentService)",
+]
+related = ["AD-ADCS-015", "AD-ADCS-009", "AD-ACL-004", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+Since the May 2022 updates (KB5014754), a CA writes the requester's SID into every
+certificate (`szOID_NTDS_CA_SECURITY_EXTENSION`), and domain controllers use it to tie
+the certificate to exactly one account. The template flag `CT_FLAG_NO_SECURITY_EXTENSION`
+tells the CA to leave that SID out, so the DC falls back to mapping by the UPN in the
+certificate.
+
+The ESC9 attack needs write access to one other account, for example `GenericWrite` over
+`jdoe`:
+
+1. Set `jdoe`'s `userPrincipalName` to `administrator` (no domain suffix).
+2. Enroll as `jdoe` in this template; the certificate's UPN is now `administrator`, and
+   it carries no SID.
+3. Set `jdoe`'s UPN back, so the name no longer matches `jdoe`.
+4. Authenticate with the certificate: a DC in compatibility mode maps it to
+   `administrator`.
+
+Domain controllers in full enforcement (`StrongCertificateBindingEnforcement = 2`, the
+default since the February 2025 updates) reject a certificate without the SID extension
+unless the account has a strong explicit mapping, which blocks this path for Kerberos.
+"""
+
+detection = """
+ad-doctor reads every certificate template and the enterprise CAs over LDAP and reports a
+template when **all** of these hold:
+
+| Condition | Attribute |
+|---|---|
+| Published on at least one enterprise CA | `certificateTemplates` of a CA object |
+| No manager approval | `msPKI-Enrollment-Flag` without `CT_FLAG_PEND_ALL_REQUESTS` (0x2) |
+| No authorized signatures | `msPKI-RA-Signature` is 0 |
+| A broad group can enroll | Enroll or AutoEnroll in the template DACL for Everyone, Anonymous Logon, Authenticated Users, BUILTIN\\Users, Pre-Windows 2000 Compatible Access, Domain Users, Domain Guests or Domain Computers |
+| No SID extension | `msPKI-Enrollment-Flag` has `CT_FLAG_NO_SECURITY_EXTENSION` (0x80000) |
+| Usable for authentication | EKU includes Client Authentication, Smart Card Logon, PKINIT Client Authentication or Any Purpose, or is empty |
+
+Each object names the template and the broad groups that can enroll, for example
+`LabESC9 (enroll: Domain Users)`. The same effect configured CA-wide is reported by
+[AD-ADCS-015](AD-ADCS-015.md).
+"""
+
+false_positives = """
+- **Full enforcement on every DC.** ad-doctor does not read the DCs'
+  `StrongCertificateBindingEnforcement` value, so it cannot tell whether all of them are
+  in full enforcement mode. The finding still matters for Schannel logons that map
+  certificates by UPN, and the flag has no legitimate use on an authentication template.
+- **Nobody can write other accounts' UPNs.** The attack needs that write access; who holds
+  it over privileged accounts is reported by [AD-ACL-004](AD-ACL-004.md) and
+  [AD-PATH-001](AD-PATH-001.md).
+"""
+
+remediation = """
+1. **Clear the flag** on the template (`CT_FLAG_NO_SECURITY_EXTENSION`, 0x80000):
+
+    ```powershell
+    $cfg = (Get-ADRootDSE).configurationNamingContext
+    $dn  = "CN=LabESC9,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
+    $t   = Get-ADObject $dn -Properties 'msPKI-Enrollment-Flag'
+    Set-ADObject $dn -Replace @{'msPKI-Enrollment-Flag' = ($t.'msPKI-Enrollment-Flag' -band -bnot 0x80000)} -WhatIf
+    ```
+
+2. **Confirm full enforcement on every DC** (read-only; the value should be 2 or absent on
+   a fully updated DC):
+
+    ```powershell
+    Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Kdc' -Name StrongCertificateBindingEnforcement -ErrorAction SilentlyContinue
+    ```
+
+3. **Re-enroll** holders of certificates from this template so their certificates carry
+   the SID, and remove write access to UPNs that non-admins should not have.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-006"
+
+[[references]]
+title = "KB5014754: Certificate-based authentication changes on Windows domain controllers"
+url = "https://support.microsoft.com/en-us/servicing/os/windows-server/2022/05/kb5014754-certificate-based-authentication-changes-on-windows-domain-controllers"
+kind = "vendor"
+
+[[references]]
+title = "[MS-CRTD] msPKI-Enrollment-Flag attribute (CT_FLAG_NO_SECURITY_EXTENSION)"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-crtd/ec71fd43-61c2-407b-83c9-b52272dec8a1"
+kind = "spec"
+
+[[references]]
+title = "Certipy wiki: Privilege escalation (ESC9)"
+url = "https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation"
+kind = "tool"

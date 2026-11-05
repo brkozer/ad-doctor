@@ -1,0 +1,100 @@
+id = "AD-ACL-006"
+aliases = ["gmsa-password"]
+summary = "A group managed service account's password can be retrieved by a broad group, or a privileged gMSA's by someone outside tier 0, so they can act as that service account."
+severities = ["high"]
+severity_logic = """
+Always **high** as the check stands: it reports a gMSA only when a broad group can read
+the password, or when the gMSA is itself privileged and a non-tier-0 principal can read
+it. Both hand the account's identity to people who should not have it.
+"""
+mitre = ["T1555"]
+data_sources = ["ldap"]
+attributes = [
+    "msDS-GroupMSAMembership (PrincipalsAllowedToRetrieveManagedPassword)",
+    "sAMAccountName of msDS-GroupManagedServiceAccount objects",
+    "member (privileged groups, transitively)",
+]
+related = ["AD-ACL-004", "AD-PRIV-001", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+A gMSA's password is generated and rotated by the domain controllers. Any principal listed
+in its `msDS-GroupMSAMembership` security descriptor (shown by the AD module as
+*PrincipalsAllowedToRetrieveManagedPassword*) can read the constructed attribute
+`msDS-ManagedPassword` and derive the account's NT hash from it.
+
+1. An attacker controls any member of the allowed group, for example any domain user when
+   the group is *Domain Users*.
+2. They read `msDS-ManagedPassword` over LDAP (gMSADumper, DSInternals, BloodHound's
+   ReadGMSAPassword edge) and compute the NT hash.
+3. They pass the hash or request Kerberos tickets as the gMSA, and inherit whatever it can
+   do: local admin on the servers it runs on, database access, or more when the gMSA sits
+   in a privileged group.
+
+Automatic rotation does not help: the attacker simply reads the new password.
+"""
+
+detection = """
+ad-doctor reads every `msDS-GroupManagedServiceAccount` object and parses the allow ACEs in
+`msDS-GroupMSAMembership`; every SID they name is treated as a reader. A gMSA is reported
+when a reader is:
+
+- a **broad group** (Everyone, Anonymous Logon, Authenticated Users, Users,
+  Pre-Windows 2000 Compatible Access, Domain Users, Domain Guests, Domain Computers), or
+- **anyone outside tier 0 and the operator groups**, when the gMSA is itself a
+  (transitive) member of a privileged group.
+
+Each object names the gMSA and the risky readers, for example
+`gmsa_web$ (readable by Domain Users)`.
+"""
+
+false_positives = """
+- **Domain Computers as the reader** is a shortcut some installers take so that any server
+  can run the service. It is still a real finding: any computer account, including one a
+  user creates through `ms-DS-MachineAccountQuota`, can read the password.
+"""
+
+remediation = """
+1. **See who can read the password** (read-only):
+
+    ```powershell
+    Get-ADServiceAccount gmsa_web -Properties PrincipalsAllowedToRetrieveManagedPassword |
+        Select-Object -ExpandProperty PrincipalsAllowedToRetrieveManagedPassword
+    ```
+
+2. **Limit the readers to the hosts that run the service**, ideally through a dedicated
+   group that contains only those computer accounts:
+
+    ```powershell
+    Set-ADServiceAccount gmsa_web -PrincipalsAllowedToRetrieveManagedPassword 'WEB01$', 'WEB02$' -WhatIf
+    ```
+
+3. **Assume the identity was exposed**: review what the gMSA can reach and its recent
+   logons. If abuse is suspected, replace it with a new gMSA rather than waiting for the
+   next rotation.
+
+4. **Keep privileged gMSAs readable only from tier-0 hosts**, and do not put gMSAs in
+   tier-0 groups unless the hosts that run them are tier 0.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-006"
+
+[[references]]
+title = "Group Managed Service Accounts overview"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/group-managed-service-accounts/group-managed-service-accounts/group-managed-service-accounts-overview"
+kind = "vendor"
+
+[[references]]
+title = "Set-ADServiceAccount"
+url = "https://learn.microsoft.com/en-us/powershell/module/activedirectory/set-adserviceaccount?view=windowsserver2025-ps"
+kind = "vendor"
+
+[[references]]
+title = "Retrieving cleartext GMSA passwords from Active Directory (DSInternals)"
+url = "https://www.dsinternals.com/en/retrieving-cleartext-gmsa-passwords-from-active-directory/"
+kind = "research"
+
+[[references]]
+title = "BloodHound: ReadGMSAPassword edge"
+url = "https://bloodhound.specterops.io/resources/edges/read-gmsa-password"
+kind = "tool"

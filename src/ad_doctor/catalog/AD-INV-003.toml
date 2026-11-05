@@ -1,0 +1,97 @@
+id = "AD-INV-003"
+summary = "A domain setting declared in the invariants file does not hold, such as the machine account quota, password length, lockout, Recycle Bin or LDAP signing."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. The finding lists every declared setting that does not hold; the single
+checks for the same settings give their own severity.
+"""
+mitre = []
+data_sources = ["ldap", "probe-ldap"]
+attributes = [
+    "ms-DS-MachineAccountQuota",
+    "minPwdLength",
+    "lockoutThreshold",
+    "pwdProperties",
+    "msDS-Behavior-Version",
+    "msDS-EnabledFeature (Recycle Bin)",
+    "probe: unsigned NTLM bind on plain LDAP",
+]
+related = ["AD-POL-001", "AD-POL-002", "AD-INF-002", "AD-INF-003", "AD-INF-005"]
+since = "0.1.0"
+
+risk = """
+Hardening is undone by later changes: a quota raised back for a migration, a lockout
+removed after a help desk complaint, LDAP signing relaxed for an old application. The
+single checks use fixed thresholds; the invariants file records what *this* domain decided,
+for example a minimum length of 16 instead of the 12 that [AD-POL-001](AD-POL-001.md)
+expects, and reports any regression from it.
+"""
+
+detection = """
+Runs only with `--invariants FILE`, for each key under `[settings]`:
+
+| Key | Compared with | Rule |
+|---|---|---|
+| `machine_account_quota` | `ms-DS-MachineAccountQuota` | equal |
+| `min_pwd_length` | `minPwdLength` | at least |
+| `lockout_threshold` | `lockoutThreshold` | at least |
+| `pwd_complexity` | `pwdProperties` bit 0x1 | equal |
+| `functional_level` | `msDS-Behavior-Version` of the domain | at least |
+| `recycle_bin` | Recycle Bin optional feature enabled | equal |
+| `ldap_signing_required` | the LDAP signing probe, over every probed DC | equal |
+
+Each mismatch is one object showing what was found and what was declared, for example
+`machine_account_quota: 10 (declared 0)` or `min_pwd_length: 7 (declared >= 14)`. A key
+outside this table makes ad-doctor stop with an error before the scan, so a typo cannot
+silently disable a rule.
+"""
+
+false_positives = """
+- **`ldap_signing_required` without the probe.** When the signing probe did not run (no
+  `DOMAIN\\user` NTLM account, `--signing-probe-port 0` or `--no-probes`), the value is
+  unknown and is reported as `None (declared True)`. Run the scan with the probe, or drop
+  the key from the file for that run.
+- **Lockout set to 0 on purpose** with other protection against password spraying: change
+  the declared value through review instead of accepting the finding.
+"""
+
+remediation = """
+1. **See which setting changed and when** from the replication metadata of the domain
+   head:
+
+    ```powershell
+    Get-ADReplicationAttributeMetadata (Get-ADDomain).DistinguishedName -Server dc01 |
+        Where-Object AttributeName -in 'ms-DS-MachineAccountQuota', 'minPwdLength', 'lockoutThreshold', 'pwdProperties' |
+        Select-Object AttributeName, LastOriginatingChangeTime, LastOriginatingChangeDirectoryServerIdentity
+    ```
+
+2. **Restore the declared value** where it is defined. For the password policy that is the
+   Default Domain Policy GPO; for the quota, the domain object:
+
+    ```powershell
+    Set-ADDomain -Identity corp.example -Replace @{'ms-DS-MachineAccountQuota' = 0} -WhatIf
+    ```
+
+   The single checks give the full steps: [AD-POL-001](AD-POL-001.md),
+   [AD-POL-002](AD-POL-002.md), [AD-INF-002](AD-INF-002.md), [AD-INF-005](AD-INF-005.md).
+
+3. **If the change was intended, update the invariants file** in a reviewed change; see
+   [Invariants](../invariants.md).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --invariants invariants.toml --only AD-INV-003"
+
+[[references]]
+title = "Set-ADDomain"
+url = "https://learn.microsoft.com/en-us/powershell/module/activedirectory/set-addomain?view=windowsserver2025-ps"
+kind = "vendor"
+
+[[references]]
+title = "Set-ADDefaultDomainPasswordPolicy"
+url = "https://learn.microsoft.com/en-us/powershell/module/activedirectory/set-addefaultdomainpasswordpolicy?view=windowsserver2025-ps"
+kind = "vendor"
+
+[[references]]
+title = "Best practices for securing Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/best-practices-for-securing-active-directory"
+kind = "vendor"

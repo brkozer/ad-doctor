@@ -1,7 +1,9 @@
 """Minimal parser for self-relative security descriptors (nTSecurityDescriptor).
 
 The owner, the DACL-protected flag and the allow ACEs are read: deny ACEs are rare on the
-objects audited here and ignoring them can only over-report, never hide a finding.
+objects audited here and ignoring them can only over-report, never hide a finding. The
+CA's own descriptor is the exception (parse_ca): denying a CA right to a group that a
+broad allow covers is a documented way to restrict CA roles.
 """
 
 from __future__ import annotations
@@ -18,12 +20,14 @@ ACE_OBJECT_TYPE_PRESENT = 0x1
 # Access mask bits as Active Directory uses them.
 CREATE_CHILD = 0x00000001
 SELF = 0x00000008
+READ_PROPERTY = 0x00000010
 WRITE_PROPERTY = 0x00000020
 CONTROL_ACCESS = 0x00000100
 WRITE_DAC = 0x00040000
 WRITE_OWNER = 0x00080000
 GENERIC_ALL = 0x10000000
 GENERIC_WRITE = 0x40000000
+GENERIC_READ = 0x80000000
 FULL_CONTROL = 0x000F01FF
 
 # Extended rights and property sets.
@@ -39,10 +43,20 @@ MEMBER = "bf9679c0-0de6-11d0-a285-00aa003049e2"
 SERVICE_PRINCIPAL_NAME = "f3a64788-5306-11d1-a9c5-0000f80367c1"  # targeted Kerberoasting
 ALT_SECURITY_IDENTITIES = "00fbf30c-91fe-11d1-aebc-0000f80367c1"  # ESC14
 GP_LINK = "f30e3bbe-9ff0-11d1-b603-0000f80367c1"
+APPLY_GROUP_POLICY = "edacfd8f-ffb3-11d1-b41d-00a0c968f939"
 # Classes
 DMSA_CLASS = "0feb936f-47b3-49f2-9386-1dedc2c23765"  # msDS-DelegatedManagedServiceAccount
 
 SE_DACL_PROTECTED = 0x1000
+
+# Certification authority rights (the CA's own security descriptor, not an AD object)
+CA_MANAGE = 0x1  # ManageCA (CA administrator)
+CA_OFFICER = 0x2  # ManageCertificates (certificate manager)
+# CA registry settings
+EDITF_ATTRIBUTESUBJECTALTNAME2 = 0x40000  # policy\EditFlags: SAN from request attributes
+IF_ENFORCEENCRYPTICERTREQUEST = 0x200  # CA\InterfaceFlags: ICPR requires packet privacy
+REQDISP_PENDING = 0x100  # policy\RequestDisposition: every request waits for a manager
+SZOID_NTDS_CA_SECURITY_EXT = "1.3.6.1.4.1.311.25.2"  # the SID extension (KB5014754)
 
 
 CONTAINER_INHERIT = 0x02
@@ -134,6 +148,48 @@ def parse(raw: bytes) -> Descriptor:
     return Descriptor(
         owner, bool(control & SE_DACL_PROTECTED), parse_dacl(raw), parse_dacl(raw, True)
     )
+
+
+ACCESS_DENIED = 0x01
+# a deny for these applies to every principal that can hold a CA right
+_DENY_ALL = ("S-1-1-0", "S-1-5-11")
+
+
+def parse_ca(raw: bytes) -> tuple[str | None, list[Ace]]:
+    """Owner and effective allow ACEs of a CA security descriptor (the registry value
+    CertSvc\\Configuration\\<CA>\\Security).
+
+    Deny ACEs are applied the way Windows evaluates a canonical DACL: a right denied to a
+    SID (or to Everyone or Authenticated Users) by an earlier ACE is removed from later
+    allows. A deny through some other group membership is not seen, which can only
+    over-report. Malformed input raises IndexError or struct.error.
+    """
+    if len(raw) < 20:
+        return None, []
+    owner_offset, _group, _sacl, dacl_offset = struct.unpack_from("<IIII", raw, 4)
+    owner = sid_from_bytes(raw, owner_offset)[0] if owner_offset else None
+    if dacl_offset == 0:
+        return owner, []
+    count = struct.unpack_from("<H", raw, dacl_offset + 4)[0]
+    pos = dacl_offset + 8
+    denied: dict[str, int] = {}
+    aces = []
+    for _ in range(count):
+        ace_type, flags, size = struct.unpack_from("<BBH", raw, pos)
+        if size < 8:
+            raise ValueError("ACE shorter than its header")
+        if not flags & INHERIT_ONLY and ace_type in (ACCESS_ALLOWED, ACCESS_DENIED):
+            mask = struct.unpack_from("<I", raw, pos + 4)[0]
+            sid, _ = sid_from_bytes(raw, pos + 8)
+            if ace_type == ACCESS_DENIED:
+                denied[sid] = denied.get(sid, 0) | mask
+            else:
+                for s in (sid, *_DENY_ALL):
+                    mask &= ~denied.get(s, 0)
+                if mask:
+                    aces.append(Ace(sid, mask))
+        pos += size
+    return owner, aces
 
 
 def parse_dacl(raw: bytes, inheritable: bool = False) -> list[Ace]:

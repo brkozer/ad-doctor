@@ -1,0 +1,73 @@
+id = "AD-ADCS-011"
+aliases = []
+summary = "Published certificate templates allow RSA keys shorter than 2048 bits (msPKI-Minimal-Key-Size), below current guidance."
+severities = ["medium"]
+severity_logic = "Always **medium**: a short key weakens every certificate issued from the template, but exploiting it takes factoring, not a configuration change."
+mitre = ["T1649"]
+data_sources = ["ldap"]
+attributes = ["msPKI-Minimal-Key-Size", "certificateTemplates (on pKIEnrollmentService)"]
+related = ["AD-ADCS-001", "AD-ADCS-002"]
+since = "0.1.0"
+
+risk = """
+`msPKI-Minimal-Key-Size` is the smallest key a client may generate for a template. When it
+is below 2048, enrollment clients may, and older ones will, create 1024-bit RSA keys.
+
+NIST SP 800-131A has disallowed RSA keys shorter than 2048 bits for new signatures since
+2014, and 1024-bit RSA is within reach of a well-funded attacker. Whoever factors the key
+of an authentication certificate can impersonate its subject until the certificate
+expires; for TLS server certificates, they can impersonate the service.
+"""
+
+detection = """
+ad-doctor reads `msPKI-Minimal-Key-Size` of every certificate template over LDAP and
+reports a template that is published on at least one enterprise CA when the value is
+greater than 0 and below 2048. The sizes 256, 384 and 521 are skipped, because they are
+the standard elliptic-curve sizes (P-256, P-384, P-521), not short RSA keys.
+
+Each object names the template and the minimum size, for example
+`LabWeakKey (1024 bits)`.
+"""
+
+false_positives = """
+- **Unpublished templates** and templates with no minimum set (0) are not reported.
+- **Clients that always use 2048 bits or more** are safe even when the template allows
+  less; ad-doctor cannot see the keys of issued certificates. Raise the minimum anyway, so
+  the template enforces it.
+"""
+
+remediation = """
+1. **Raise the minimum key size** to 2048 or more. In `certtmpl.msc`, *Cryptography* tab,
+   *Minimum key size*; editing there also bumps the template revision so clients pick up
+   the change. Or with PowerShell:
+
+    ```powershell
+    $cfg = (Get-ADRootDSE).configurationNamingContext
+    $dn  = "CN=LabWeakKey,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
+    Set-ADObject $dn -Replace @{'msPKI-Minimal-Key-Size' = 2048} -WhatIf
+    ```
+
+2. **Re-enroll** the holders of existing certificates from the template (for autoenrolled
+   templates, *Reenroll All Certificate Holders* in `certtmpl.msc`), then revoke the old
+   short-key certificates (`certutil -revoke <serial> 4`, reason *superseded*).
+
+3. **Schema v1 templates** cannot be edited: duplicate them, set the minimum on the copy,
+   and have it supersede the original.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-011"
+
+[[references]]
+title = "NIST SP 800-131A Rev. 2: Transitioning the Use of Cryptographic Algorithms and Key Lengths"
+url = "https://csrc.nist.gov/pubs/sp/800/131/a/r2/final"
+kind = "spec"
+
+[[references]]
+title = "ms-PKI-Minimal-Key-Size attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-mspki-minimal-key-size"
+kind = "spec"
+
+[[references]]
+title = "Certificate template concepts in Windows Server"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-cs/certificate-template-concepts"
+kind = "vendor"

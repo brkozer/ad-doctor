@@ -12,7 +12,8 @@ from typing import Any
 from xml.sax.saxutils import escape as xml_escape
 from xml.sax.saxutils import quoteattr
 
-from . import __version__
+from . import __version__, docgen
+from . import catalog as docs  # report.catalog() exists
 from .checks import MITRE, REGISTRY
 from .model import CATEGORIES, Finding, Severity, Snapshot
 
@@ -120,6 +121,8 @@ def render_text(r: Report, color: bool = False) -> str:
         f"risk score {c(BOLD, str(r.score))}/100 (grade {r.grade})  "
         + "  ".join(c(SEVERITY_COLOR[s], f"{s!s} {counts[s]}") for s in reversed(Severity))
     )
+    if r.findings:
+        lines.append(c(DIM, "details and fixes for a finding: ad-doctor explain <ID>"))
     return "\n".join(lines)
 
 
@@ -162,8 +165,31 @@ def render_json(r: Report) -> str:
 # --- Markdown ------------------------------------------------------------------------
 
 
+_CONTROL = re.compile("[\x00-\x1f\x7f\x85\u2028\u2029]")
+_BACKTICKS = re.compile("`+")
+
+
+def _flat(text: str) -> str:
+    """One line: object and detail text carries directory names, and a line break in one
+    would end the list item or paragraph and let the rest be read as Markdown."""
+    return _CONTROL.sub(" ", text)
+
+
 def _md(text: str) -> str:
-    return text.replace("|", "\\|").replace("\n", " ")
+    return _flat(text).replace("|", "\\|")
+
+
+def _code(text: str) -> str:
+    """A code span that holds any text: its fence is longer than every backtick run."""
+    text = _flat(text)
+    fence = "`" * (max((len(m) for m in _BACKTICKS.findall(text)), default=0) + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def _docs_suffix(check_id: str) -> str:
+    e = docs.get(check_id)
+    return f" ([docs]({e.url}))" if e else ""
 
 
 def render_markdown(r: Report) -> str:
@@ -193,11 +219,11 @@ def render_markdown(r: Report) -> str:
             f"**Severity:** {f.severity}. **Category:** {f.category}."
             + (f" **ATT&CK:** {', '.join(f.mitre)}." if f.mitre else ""),
             "",
-            f.detail,
+            _flat(f.detail),
             "",
-            f"**Fix:** {f.remediation}",
+            f"**Fix:** {_flat(f.remediation)}" + _docs_suffix(f.check_id),
             "",
-            *[f"- `{o}`" for o in f.objects],
+            *[f"- {_code(o)}" for o in f.objects],
         ]
         if f.check_id == "AD-PATH-001":
             out += ["", *mermaid_paths(f.objects)]
@@ -207,7 +233,7 @@ def render_markdown(r: Report) -> str:
             scope = ", ".join(a.objects) or "all objects"
             out.append(f"- {a.check_id} ({scope}), until {a.expires}: {a.reason}")
     if snap.notes:
-        out += ["", "## Notes", "", *[f"- {n}" for n in snap.notes]]
+        out += ["", "## Notes", "", *[f"- {_flat(n)}" for n in snap.notes]]
     return "\n".join(out) + "\n"
 
 
@@ -221,7 +247,7 @@ def mermaid_paths(paths: list[str], limit: int = 15) -> list[str]:
     def node(name: str) -> str:
         if name not in ids:
             ids[name] = f"n{len(ids)}"
-        label = name.replace('"', "'")
+        label = _flat(name).replace('"', "'")
         return f'{ids[name]}["{label}"]'
 
     lines = ["```mermaid", "flowchart LR"]
@@ -282,6 +308,12 @@ def _color(score: int) -> str:
     return "var(--high)" if score > 45 else "var(--medium)" if score > 10 else "var(--low)"
 
 
+def _doc_link(check_id: str) -> str:
+    code = f"<code>{escape(check_id)}</code>"
+    e = docs.get(check_id)
+    return f'<a href="{escape(e.url)}">{code}</a>' if e else code
+
+
 def render_html(r: Report) -> str:
     snap = r.snap
     counts = r.counts()
@@ -308,7 +340,7 @@ def render_html(r: Report) -> str:
             f"<details{' open' if f.severity is Severity.HIGH else ''}><summary>"
             f'<span class="sev {f.severity}">{f.severity}</span>'
             f"<strong>{escape(f.title)}</strong>{new}"
-            f'<span class="tag">{escape(f.category)} · <code>{f.check_id}</code></span>'
+            f'<span class="tag">{escape(f.category)} · {_doc_link(f.check_id)}</span>'
             f'</summary><div class="body"><p>{escape(f.detail)}</p>'
             f'<div class="objs">{objs}</div>'
             f"<p><strong>Fix:</strong> {escape(f.remediation)}</p>"
@@ -365,6 +397,17 @@ def catalog(r: Report) -> list[tuple[str, str]]:
     return known + sorted(extra.items())
 
 
+def _sarif_help(e: docs.Entry, f: Finding | None) -> dict[str, str]:
+    """GitHub code scanning shows help.markdown under every alert of the rule."""
+    fix = f.remediation if f is not None else f"see {e.url}"
+    refs = "\n".join(f"- [{x.title}]({x.url})" for x in e.references)
+    md = docgen.absolute_links(
+        f"{e.risk}\n\n## Fix\n\n{e.remediation}\n\n## References\n\n{refs}\n\n"
+        f"[Full documentation]({e.url})"
+    )
+    return {"text": f"{e.summary}\n\nFix: {fix}", "markdown": md}
+
+
 def render_sarif(r: Report) -> str:
     by_id = {f.check_id: f for f in r.findings}
     rules: list[dict[str, Any]] = []
@@ -383,8 +426,17 @@ def render_sarif(r: Report) -> str:
             "properties": props,
         }
         f = by_id.get(check_id)
-        if f is not None:
+        e = docs.get(check_id)
+        if e is not None:
+            rule["fullDescription"] = {"text": e.summary}
+            rule["helpUri"] = e.url
+            rule["help"] = _sarif_help(e, f)
+            top = Severity[e.top_severity.upper()]
+            props["security-severity"] = SECURITY_SEVERITY.get(top, "1.0")
+        elif f is not None:
             rule["help"] = {"text": f.remediation}
+        if f is not None:
+            # the severity it fired with beats the worst case the catalog lists
             props["security-severity"] = SECURITY_SEVERITY.get(f.severity, "1.0")
         rules.append(rule)
     results = [
@@ -441,7 +493,10 @@ def render_junit(r: Report, ran: list[str] | None = None) -> str:
         name = quoteattr(f"{check_id} {title}")
         f = by_id.get(check_id)
         if f is not None:
-            body = xml_escape("\n".join([f.detail, *f.objects, f"fix: {f.remediation}"]))
+            lines = [f.detail, *f.objects, f"fix: {f.remediation}"]
+            if (e := docs.get(check_id)) is not None:
+                lines.append(f"docs: {e.url}")
+            body = xml_escape("\n".join(lines))
             cases.append(
                 f'  <testcase classname="ad-doctor.{f.category}" name={name}>'
                 f"<failure type={quoteattr(str(f.severity))} message={quoteattr(f.title)}>"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -15,21 +16,26 @@ from ldap3.core.exceptions import (
 )
 from ldap3.protocol.microsoft import security_descriptor_control
 
-from . import probes, sd, sysvol
+from . import gpo_scope, probes, sd, sysvol
 from .model import (
-    EXCHANGE_GROUPS,
     Account,
+    CaConfig,
     CertTemplate,
     DcProbe,
     DirObject,
     DomainPolicy,
     Gmsa,
+    GpLink,
     Gpo,
+    GpoLocalGroup,
+    GpoSettings,
     Probes,
     Rodc,
     Snapshot,
     Trust,
+    exchange_members,
     filetime_to_datetime,
+    well_known_sid,
 )
 
 IN_CHAIN = "1.2.840.113556.1.4.1941"
@@ -56,6 +62,11 @@ CT_FLAG_NO_SECURITY_EXTENSION = 0x80000
 
 GPLINK = re.compile(r"\[LDAP://([^;\]]+);(\d+)\]", re.IGNORECASE)
 GPLINK_DISABLED = 0x1
+GPLINK_ENFORCED = 0x2
+GPOPTIONS_BLOCK = 0x1
+GPO_GUID = re.compile(r"\{[0-9A-Fa-f-]{36}\}")
+# gPCMachineExtensionNames: [{CSE}{tool}...][{CSE}{tool}...]
+CSE_GROUP = re.compile(r"\[(\{[0-9A-Fa-f-]{36}\})")
 SECRET_TEXT = re.compile(
     r"\b(?:pass(?:word)?|passwd|pwd|parola|şifre|sifre|kennwort|contrase[ñn]a|mot de passe)"
     r"\s*[:=]\s*\S{3,}",
@@ -127,6 +138,8 @@ class Target:
     kerberos: bool = False
     # probe every DC found in the directory, not only the one being scanned
     all_dcs: bool = True
+    # read each CA's configuration over the winreg pipe (part of the probes)
+    ca_registry: bool = True
 
 
 def sid_to_str(raw: bytes) -> str:
@@ -161,6 +174,8 @@ class Collector:
         self.notes: list[str] = []
         self.ca_hosts: list[str] = []
         self.ca_dns_hosts: list[str] = []
+        # CA host (lower-cased dNSHostName) -> enrollment service name
+        self.ca_names: dict[str, str] = {}
         self.rodc_policies: list[tuple[Account, list[str], list[str]]] = []
         self.domain_dn = ""
         self.scanned_ldap_signing: bool | None = None
@@ -235,6 +250,7 @@ class Collector:
                 "ms-DS-MachineAccountQuota",
                 "msDS-Behavior-Version",
                 "gPLink",
+                "gPOptions",
                 "msDS-ReplAttributeMetaData",
             ],
             scope=ldap3.BASE,
@@ -314,7 +330,9 @@ class Collector:
         get_all = {a.sid for a in domain_aces if a.extended_right(sd.DS_REPL_GET_CHANGES_ALL)}
         priv_dns |= {a.dn.lower() for a in accounts if a.sid and a.sid in get & get_all}
         objects = self._objects(domain_dn, accounts, priv_dns)
-        gpos = self._gpos(domain_dn, _first(h, "gPLink"), objects)
+        gpos = self._gpos(domain_dn, config_dn, h, objects)
+        dc_sites, site_count = self._dc_sites(config_dn)
+        ca_configs = self._ca_configs(dc_dns_host)
 
         trustees = {a.sid for aces in acls.values() for a in aces}
         trustees |= {a.sid for t in templates for a in t.aces}
@@ -322,8 +340,15 @@ class Collector:
         trustees |= {a.sid for o in objects for a in o.aces} | {o.owner for o in objects if o.owner}
         gmsas = self._gmsas(domain_dn)
         trustees |= {s for g in gmsas for s in g.readers}
+        trustees |= {a.sid for c in ca_configs for a in c.aces}
+        trustees |= {c.owner for c in ca_configs if c.owner}
 
         sysvol_result = self._sysvol(domain, [g.guid for g in gpos])
+        local_groups, gpo_settings = self._resolve_local_groups(
+            sysvol_result.local_groups, sysvol_result.gpo_settings, domain_dn, config_dn, domain
+        )
+        trustees |= {x.member_sid for x in local_groups if x.member_sid.startswith("S-1-5-21-")}
+        trustees |= {x.group_sid for x in local_groups if x.group_sid.startswith("S-1-5-21-")}
         # one value per attribute; dSASignature changes on every backup
         metadata = "".join(_str(h.get("msds-replattributemetadata", [])))
         snap = Snapshot(
@@ -351,16 +376,22 @@ class Collector:
             ldap_signing_required=None,  # set from the scanned DC's probe below
             probes=self._probes(dc_dns_host, accounts),
             objects=objects,
-            gpo_settings=sysvol_result.gpo_settings,
+            gpo_settings=gpo_settings,
             script_secrets=sysvol_result.script_secrets,
             gmsas=gmsas,
             rodcs=[Rodc(a.sam, a_reveal, a_never) for a, a_reveal, a_never in self.rodc_policies],
             last_backup=_last_backup(metadata),
             backup_checked="dSASignature" in metadata,
             psos_visible=self._psos_visible(domain_dn),
+            gpo_local_groups=local_groups,
+            local_groups_collected=sysvol_result.scanned,
+            dc_sites=dc_sites,
+            site_count=site_count,
             notes=self.notes,
         )
         snap.ldap_signing_required = self.scanned_ldap_signing
+        snap.probes.ca_configs = ca_configs
+        snap.notes += gpo_scope.resolve(snap).notes
         return snap
 
     # --- DACLs and objects -----------------------------------------------------------
@@ -417,7 +448,7 @@ class Collector:
         # Entra Connect sync accounts and their servers, and Exchange servers: whoever
         # controls them controls what they hold over the domain
         sync_hosts = {a.sync_host.lower() for a in accounts if a.sync_host}
-        exchange = _exchange_members(objects)
+        exchange = exchange_members(objects)
         sensitive = [
             a
             for a in accounts
@@ -440,38 +471,201 @@ class Collector:
             dn, "(objectClass=*)", attrs, scope=ldap3.BASE, controls=OWNER_AND_DACL
         )
 
-    def _gpos(self, domain_dn: str, domain_gplink: str, objects: list[DirObject]) -> list[Gpo]:
-        dc_ou = self.optional(
-            f"OU=Domain Controllers,{domain_dn}", "(objectClass=*)", ["gPLink"], scope=ldap3.BASE
-        )
-        links: dict[str, list[str]] = {}
-        for where, gplink in [
-            ("domain", domain_gplink),
-            ("Domain Controllers OU", _first(dc_ou[0], "gPLink") if dc_ou else ""),
-        ]:
-            for dn, options in GPLINK.findall(gplink):
-                if not int(options) & GPLINK_DISABLED:
-                    links.setdefault(dn.lower(), []).append(where)
+    def _gpos(
+        self, domain_dn: str, config_dn: str, head: dict[str, Any], objects: list[DirObject]
+    ) -> list[Gpo]:
+        dc_ou_dn = f"OU=Domain Controllers,{domain_dn}"
+        dc_ou = self.optional(dc_ou_dn, "(objectClass=*)", ["gPLink"], scope=ldap3.BASE)
+        # (container DN, kind, gPLink, gPOptions); the domain head and the DC OU first, as
+        # read before, then every other OU and the sites
+        containers: dict[str, tuple[str, str, str, int]] = {
+            domain_dn.lower(): (
+                domain_dn,
+                "domain",
+                _first(head, "gPLink"),
+                _int(head, "gPOptions"),
+            )
+        }
+        if dc_ou:
+            containers[dc_ou_dn.lower()] = (dc_ou_dn, "ou", _first(dc_ou[0], "gPLink"), 0)
+        for e in self.optional(
+            domain_dn, "(|(gPLink=*)(gPOptions=*))", ["gPLink", "gPOptions", "objectClass"]
+        ):
+            dn = e["distinguishedname"][0]
+            classes = {c.lower() for c in _str(e.get("objectclass", []))}
+            kind = "domain" if "domaindns" in classes else "ou"
+            containers[dn.lower()] = (dn, kind, _first(e, "gPLink"), _int(e, "gPOptions"))
+        for e in self.optional(f"CN=Sites,{config_dn}", "(objectClass=site)", ["gPLink"]):
+            dn = e["distinguishedname"][0]
+            containers[dn.lower()] = (dn, "site", _first(e, "gPLink"), 0)
+
+        by_dn = {o.dn.lower(): o for o in objects}
+        links: dict[str, list[GpLink]] = {}
+        policies = f"cn=policies,cn=system,{domain_dn}".lower()
+        for key, (dn, kind, gplink, options) in containers.items():
+            if options & GPOPTIONS_BLOCK and key in by_dn:
+                by_dn[key].gp_blocked = True
+            for gpo_dn, link in parse_gplink(dn, kind, gplink):
+                if not gpo_dn.lower().endswith("," + policies):
+                    self.notes.append(f"GPO from another domain linked at {dn}: not evaluated")
+                    continue
+                links.setdefault(gpo_dn.lower(), []).append(link)
+
         gpos = []
         for e in self.optional(
             f"CN=Policies,CN=System,{domain_dn}",
             "(objectClass=groupPolicyContainer)",
-            ["displayName", "name", "nTSecurityDescriptor"],
+            [
+                "displayName",
+                "name",
+                "nTSecurityDescriptor",
+                "flags",
+                "versionNumber",
+                "gPCMachineExtensionNames",
+                "gPCWQLFilter",
+            ],
             scope=ldap3.LEVEL,
             controls=OWNER_AND_DACL,
         ):
             dn = e["distinguishedname"][0]
             raw_sd = e.get("ntsecuritydescriptor")
             desc = sd.parse(raw_sd[0]) if raw_sd else sd.Descriptor(None, False, [])
+            gpo_links = links.pop(dn.lower(), [])
+            readable = bool(e.get("versionnumber"))
+            # where the GPO reaches DCs: enabled links on the domain head and the DC OU
+            linked_to = [
+                where
+                for container, where in ((domain_dn, "domain"), (dc_ou_dn, "Domain Controllers OU"))
+                for link in gpo_links
+                if link.enabled and link.container.lower() == container.lower()
+            ]
             gpo = Gpo(
                 name=_first(e, "displayName", dn),
                 guid=_first(e, "name"),
-                linked_to=links.get(dn.lower(), []),
+                linked_to=linked_to,
                 aces=desc.aces,
+                links=gpo_links,
+                flags=_int(e, "flags"),
+                # without versionNumber the GPC attributes were not readable: unknown
+                machine_version=_int(e, "versionNumber") & 0xFFFF if readable else None,
+                machine_extensions=(
+                    machine_extensions(_first(e, "gPCMachineExtensionNames")) if readable else None
+                ),
+                wmi_filter=self._wmi_filter(domain_dn, _first(e, "gPCWQLFilter")),
             )
             gpos.append(gpo)
             objects.append(DirObject(dn, gpo.name, "gpo", owner=desc.owner, aces=desc.aces))
+        for gpo_dn, dangling in sorted(links.items()):
+            where = ", ".join(sorted({link.container for link in dangling}))
+            self.notes.append(f"dangling gPLink at {where}: {gpo_dn} does not exist")
         return sorted(gpos, key=lambda g: g.name.lower())
+
+    def _wmi_filter(self, domain_dn: str, value: str) -> str | None:
+        """Name of the WMI filter in gPCWQLFilter ('[domain;{GUID};0]'), else its GUID."""
+        m = GPO_GUID.search(value)
+        if not m:
+            return None
+        hit = self.optional(
+            f"CN={m.group(0)},CN=SOM,CN=WMIPolicy,CN=System,{domain_dn}",
+            "(objectClass=*)",
+            ["msWMI-Name"],
+            scope=ldap3.BASE,
+        )
+        return (_first(hit[0], "msWMI-Name") if hit else "") or m.group(0)
+
+    def _dc_sites(self, config_dn: str) -> tuple[dict[str, str], int]:
+        """DC computer DN (lower case) -> its site's DN, and the number of sites."""
+        sites = f"CN=Sites,{config_dn}"
+        dc_sites = {}
+        for e in self.optional(sites, "(objectClass=server)", ["serverReference"]):
+            ref = _first(e, "serverReference")
+            if ref:
+                # CN=<server>,CN=Servers,CN=<site>,CN=Sites,...
+                dc_sites[ref.lower()] = _parent(e["distinguishedname"][0], 2)
+        count = len(self.optional(sites, "(objectClass=site)", ["name"], scope=ldap3.LEVEL))
+        return dc_sites, count
+
+    def _resolve_local_groups(
+        self,
+        entries: list[GpoLocalGroup],
+        settings: dict[str, GpoSettings],
+        domain_dn: str,
+        config_dn: str,
+        domain: str,
+    ) -> tuple[list[GpoLocalGroup], dict[str, GpoSettings]]:
+        """Fill in the SIDs of principals the files name instead of giving a SID: in local
+        group entries, and among the holders of the remote logon right, which decides
+        whether Remote Desktop Users membership counts."""
+
+        def named(holder: str) -> bool:
+            return not holder.upper().startswith("S-1-") and not well_known_sid(holder)
+
+        right = gpo_scope.REMOTE_LOGON_RIGHT
+        if not any(
+            (x.member_name and not x.member_sid) or (x.group_name and not x.group_sid)
+            for x in entries
+        ) and not any(named(h) for s in settings.values() for h in s.privileges.get(right, [])):
+            return entries, settings
+        crossref = self.optional(
+            f"CN=Partitions,{config_dn}",
+            f"(&(objectClass=crossRef)(nCName={ldap3.utils.conv.escape_filter_chars(domain_dn)}))",
+            ["nETBIOSName"],
+        )
+        netbios = (_first(crossref[0], "nETBIOSName") if crossref else "") or domain.split(".")[0]
+        cache: dict[str, str] = {}
+        unresolved: list[str] = []
+
+        def resolve(name: str) -> str:
+            if name not in cache:
+                cache[name] = self._principal_sid(name, domain_dn, domain, netbios)
+                if not cache[name]:
+                    unresolved.append(name)
+            return cache[name]
+
+        out = []
+        for x in entries:
+            group_sid = x.group_sid or (resolve(x.group_name) if x.group_name else "")
+            member_sid = x.member_sid or (resolve(x.member_name) if x.member_name else "")
+            out.append(dataclasses.replace(x, group_sid=group_sid, member_sid=member_sid))
+        resolved_settings = {}
+        for guid, s in settings.items():
+            holders = s.privileges.get(right)
+            if holders and any(named(h) for h in holders):
+                # an unresolved name stays as written; gpo_scope then gives it the benefit
+                # of the doubt rather than dropping the grant
+                holders = [(resolve(h) or h) if named(h) else h for h in holders]
+                s = dataclasses.replace(s, privileges={**s.privileges, right: holders})
+            resolved_settings[guid] = s
+        if unresolved:
+            self.notes.append(
+                "GPO group-membership or remote logon settings name principals that could "
+                f"not be resolved: {', '.join(unresolved[:5])}"
+                + (f" (+{len(unresolved) - 5} more)" if len(unresolved) > 5 else "")
+            )
+        return out, resolved_settings
+
+    def _principal_sid(self, name: str, domain_dn: str, domain: str, netbios: str) -> str:
+        """SID of a principal named in a local group setting; "" if unknown or foreign."""
+        name = name.strip()
+        if name.lower().startswith("%domainname%\\"):
+            name = netbios + name[len("%domainname%") :]
+        if "%" in name:
+            return ""  # other GPP variables (%ComputerName%, %LogonUser%...) vary per host
+        sid = well_known_sid(name)
+        if sid:
+            return sid
+        prefix, sep, sam = name.rpartition("\\")
+        if sep and prefix.lower() not in (netbios.lower(), domain.lower()):
+            return ""  # another domain: its principals are not in this snapshot
+        for candidate in (sam, f"{sam}$"):
+            hit = self.optional(
+                domain_dn,
+                f"(sAMAccountName={ldap3.utils.conv.escape_filter_chars(candidate)})",
+                ["objectSid"],
+            )
+            if hit and hit[0].get("objectsid"):
+                return sid_to_str(hit[0]["objectsid"][0])
+        return ""
 
     def _gmsas(self, domain_dn: str) -> list[Gmsa]:
         out = []
@@ -517,6 +711,11 @@ class Collector:
             self.notes.append("no enterprise CA found, so no template is published")
         ca_dns = {_first(s, "name"): s["distinguishedname"][0] for s in services}
         self.ca_dns_hosts = sorted({_first(s, "dNSHostName") for s in services} - {""})
+        self.ca_names = {
+            _first(s, "dNSHostName").lower(): _first(s, "name")
+            for s in services
+            if _first(s, "dNSHostName")
+        }
         # the CA server's own computer account manages its enrollment service object
         self.ca_hosts = sorted(self._computer_name(h) for h in self.ca_dns_hosts)
         published = {n for svc in services for n in _str(svc.get("certificatetemplates", []))}
@@ -575,11 +774,18 @@ class Collector:
                 direction=_int(e, "trustDirection"),
                 trust_type=_int(e, "trustType"),
                 attributes=_int(e, "trustAttributes"),
+                sid=sid_to_str(e["securityidentifier"][0]) if e.get("securityidentifier") else "",
             )
             for e in self.optional(
                 f"CN=System,{domain_dn}",
                 "(objectClass=trustedDomain)",
-                ["trustPartner", "trustDirection", "trustType", "trustAttributes"],
+                [
+                    "trustPartner",
+                    "trustDirection",
+                    "trustType",
+                    "trustAttributes",
+                    "securityIdentifier",
+                ],
             )
         ]
 
@@ -661,6 +867,7 @@ class Collector:
                     f"SYSVOL files not readable by this account: {shown}"
                     + (f" (+{more} more)" if more > 0 else "")
                 )
+            self.notes += result.notes
             return result
         except sysvol.SysvolError as exc:
             self.notes.append(f"SYSVOL not checked: {exc}")
@@ -767,6 +974,41 @@ class Collector:
                     result.web_enrollment_ntlm.append(url)
         return result
 
+    def _ca_configs(self, dc_dns_host: str) -> list[CaConfig]:
+        """Each enterprise CA's configuration, read from its registry over the winreg pipe."""
+        t = self.target
+        if t is None or not t.probes or not self.ca_dns_hosts:
+            return []
+        skipped = "CA configuration (ESC6, ESC7, ESC11, ESC16) not read"
+        if not t.ca_registry:
+            self.notes.append(f"{skipped}: --no-ca-registry")
+            return []
+        if not (t.kerberos or (t.user and t.password is not None)):
+            self.notes.append(f"{skipped}: needs credentials")
+            return []
+        out = []
+        for ca_host in self.ca_dns_hosts:
+            # a CA on the DC being scanned is reached through the address given for it
+            same = ca_host.lower() == dc_dns_host.lower()
+            cfg = probes.ca_registry(
+                t.host if same else ca_host,
+                t.smb_port if same else 445,
+                ca_host,
+                self.ca_names.get(ca_host.lower(), ca_host),
+                t.user,
+                t.password,
+                t.kerberos,
+            )
+            if cfg.error:
+                self.notes.append(f"CA configuration on {ca_host} not read: {cfg.error}")
+            elif cfg.third_party_policy:
+                self.notes.append(
+                    f"{cfg.name} on {ca_host} uses the policy module {cfg.policy_module}: "
+                    "ESC6 and ESC16 not judged"
+                )
+            out.append(cfg)
+        return out
+
     # --- accounts --------------------------------------------------------------------
 
     def _account(self, e: dict[str, list[Any]]) -> Account:
@@ -818,19 +1060,26 @@ class Collector:
         return account
 
 
-def _exchange_members(objects: list[DirObject]) -> set[str]:
-    """Lower-cased DNs of every transitive member of the Exchange groups."""
-    groups = {o.dn.lower(): o for o in objects if o.kind == "group"}
-    todo = [o.dn.lower() for o in groups.values() if o.name.lower() in EXCHANGE_GROUPS]
-    seen: set[str] = set()
-    while todo:
-        dn = todo.pop()
-        for m in groups[dn].members if dn in groups else []:
-            key = m.lower()
-            if key not in seen:
-                seen.add(key)
-                todo.append(key)
-    return seen - {dn for dn in groups if groups[dn].name.lower() in EXCHANGE_GROUPS}
+def parse_gplink(container: str, kind: str, value: str) -> list[tuple[str, GpLink]]:
+    """(GPO DN, link) for each entry of a gPLink value, disabled links included."""
+    out = []
+    for index, (gpo_dn, options) in enumerate(GPLINK.findall(value)):
+        flags = int(options)
+        link = GpLink(
+            container, kind, not flags & GPLINK_DISABLED, bool(flags & GPLINK_ENFORCED), index
+        )
+        out.append((gpo_dn, link))
+    return out
+
+
+def machine_extensions(value: str) -> list[str]:
+    """CSE GUIDs (upper case) listed in gPCMachineExtensionNames."""
+    return [g.upper() for g in CSE_GROUP.findall(value)]
+
+
+def _parent(dn: str, levels: int = 1) -> str:
+    parts = gpo_scope.RDN_SEPARATOR.split(dn, maxsplit=levels)
+    return parts[-1] if len(parts) > levels else ""
 
 
 def _sync_host(sam: str, description: str) -> str | None:

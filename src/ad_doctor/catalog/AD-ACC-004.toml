@@ -1,0 +1,73 @@
+id = "AD-ACC-004"
+summary = "The domain's built-in Guest account is enabled, giving a logon that needs no known password to anyone who can reach a domain member."
+severities = ["high"]
+severity_logic = """
+Always **high**: an enabled domain Guest is a domain identity available to people who
+hold no credentials at all.
+"""
+mitre = ["T1078.001"]
+data_sources = ["ldap"]
+attributes = ["sAMAccountName", "userAccountControl"]
+related = ["AD-PRIV-005", "AD-ACC-001"]
+since = "0.1.0"
+
+risk = """
+The built-in Guest account (RID 501) has no password by default and is disabled when the
+domain is created. Domain controllers have no local accounts, so on them this is *the*
+Guest: once it is enabled, a network logon as Guest, and on servers that still allow
+guest fallback a logon with an unknown user name, is accepted with no known password.
+The session is a member of *Everyone* and *Domain Guests*.
+
+That turns an outsider on the network into a domain principal: they can browse shares
+that grant *Everyone* access, query the directory where anonymous binds are refused,
+and start the enumeration that leads to every other finding in this report.
+"""
+
+detection = """
+From the LDAP snapshot: an **enabled** account whose `sAMAccountName` is `Guest` (case
+does not matter), that is, `userAccountControl` without `ACCOUNTDISABLE` (`0x2`).
+
+The match is by **name**. A Guest account that was renamed is not recognised by its RID
+(501), so a renamed and enabled Guest is not reported.
+
+The object is the account name, `Guest`.
+"""
+
+remediation = """
+1. **Disable the account.** This is what `ad-doctor fix` generates:
+
+    ```powershell
+    Disable-ADAccount Guest -WhatIf
+    ```
+
+2. **Keep it disabled by policy.** In a GPO linked to the domain, set *Computer
+   Configuration > Policies > Windows Settings > Security Settings > Local Policies >
+   Security Options > Accounts: Guest account status* to **Disabled**.
+
+3. **Find out who enabled it and when** (read-only): event 4722 (*A user account was
+   enabled*) on the domain controllers, and the replication metadata of
+   `userAccountControl`:
+
+    ```powershell
+    $guest = Get-ADUser Guest
+    Get-ADReplicationAttributeMetadata -Object $guest.DistinguishedName -Server dc01 `
+        -Properties userAccountControl
+    ```
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-004"
+
+[[references]]
+title = "Accounts: Guest account status"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/accounts-guest-account-status"
+kind = "vendor"
+
+[[references]]
+title = "Active Directory accounts (default local accounts, Guest)"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-default-user-accounts"
+kind = "vendor"
+
+[[references]]
+title = "ANSSI Active Directory checklist (vuln_guest)"
+url = "https://cert.cyber.gouv.fr/uploads/ad_checklist.html"
+kind = "vendor"

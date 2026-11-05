@@ -1,0 +1,82 @@
+id = "AD-PRIV-008"
+summary = "Account, Server, Print or Backup Operators have members, and each of these groups has rights on domain controllers that lead to domain admin."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. Each operator group needs one more step to reach Domain Admin
+(reading the directory database, changing a service, loading a driver, modifying an
+account), but every one of those steps is well documented.
+"""
+mitre = ["T1078.002"]
+data_sources = ["ldap"]
+attributes = ["memberOf (transitive) of S-1-5-32-548, -549, -550 and -551"]
+related = ["AD-PRIV-001", "AD-PRIV-002", "AD-PRIV-004", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+The builtin operator groups date from Windows NT and grant rights on every domain
+controller in the domain:
+
+| Group | What a member can do | Path to domain admin |
+|---|---|---|
+| Account Operators | create and modify most users and groups, log on to DCs | reset passwords or change membership of accounts that AdminSDHolder does not protect |
+| Server Operators | log on to DCs, start and stop services, back up and restore files | change a service binary or configuration on a DC and run code as SYSTEM |
+| Print Operators | log on to DCs, load and unload device drivers | load a vulnerable or malicious driver on a DC |
+| Backup Operators | back up and restore any file on DCs, regardless of permissions | copy `ntds.dit` and the registry hives and extract every hash |
+
+Because they are rarely watched like Domain Admins, they are a quiet route to tier 0.
+"""
+
+detection = """
+ad-doctor collects the **transitive** user and computer members of the four builtin
+groups (by SID: `S-1-5-32-548` Account Operators, `-549` Server Operators, `-550` Print
+Operators, `-551` Backup Operators). Every member is reported as `group: account`, for
+example `Backup Operators: op_user`.
+"""
+
+false_positives = """
+- **Backup software** that runs as a member of Backup Operators is a common case. The
+  account is tier 0 in practice: protect it like one (separate credentials, no
+  interactive use, a gMSA where the product supports it), then accept the finding in an
+  [accepted-risk file](../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **List the members.**
+
+    ```powershell
+    'Account Operators', 'Server Operators', 'Print Operators', 'Backup Operators' |
+        ForEach-Object { $g = $_; Get-ADGroupMember $g -Recursive |
+            Select-Object @{n = 'Group'; e = { $g }}, SamAccountName }
+    ```
+
+2. **Remove them** (the same commands ad-doctor writes with `--fixes`):
+
+    ```powershell
+    Remove-ADGroupMember 'Backup Operators' -Members op_user -WhatIf
+    ```
+
+3. **Delegate the actual task instead**: account management on specific OUs with the
+   Delegation of Control wizard or `dsacls`, service management through tier-0 admins,
+   backups through the backup product's own service account limited to the servers it
+   backs up.
+
+4. **Audit** event 4732 (member added to a security-enabled local group) for these
+   groups on the domain controllers.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-008"
+
+[[references]]
+title = "Active Directory security groups: Backup Operators"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-security-groups#backup-operators"
+kind = "vendor"
+
+[[references]]
+title = "Active Directory security groups: Print Operators"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-security-groups#print-operators"
+kind = "vendor"
+
+[[references]]
+title = "Appendix B: Privileged accounts and groups in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-b--privileged-accounts-and-groups-in-active-directory"
+kind = "vendor"

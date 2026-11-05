@@ -1,0 +1,73 @@
+id = "AD-INV-005"
+summary = "A certificate template is published on an enterprise CA but is not in the declared list, so the CA issues certificates nobody approved."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. An unexpected template is not exploitable by itself; the ESC checks
+report it at their own severity when it is.
+"""
+mitre = []
+data_sources = ["ldap"]
+attributes = ["certificateTemplates (on each enrollment service)", "cn of each pKICertificateTemplate"]
+related = ["AD-ADCS-001", "AD-ADCS-002", "AD-ADCS-003", "AD-ADCS-004", "AD-ADCS-008"]
+since = "0.1.0"
+
+risk = """
+Each published template is an issuance path. Templates are often published for a test or
+a single project and never removed; later someone edits one, or its enrollment rights
+widen, and it becomes an ESC1-style path to the domain ([AD-ADCS-001](AD-ADCS-001.md)).
+Keeping the published set to a reviewed list shrinks what the ESC checks have to catch,
+and makes a template published by an attacker with *ManageCA* rights stand out.
+"""
+
+detection = """
+Runs only with `--invariants FILE` that has a `[templates]` section:
+
+```toml
+[templates]
+published = ["User", "Machine", "DomainController", "WebServer"]
+```
+
+A template counts as published when its name appears in `certificateTemplates` of any
+enrollment service under `CN=Enrollment Services,CN=Public Key Services,CN=Services` in
+the configuration partition. Names are compared, ignoring case, with `published`; each
+extra template is one object, for example `LabESC1`.
+"""
+
+false_positives = """
+- **Templates published by product installs** (for example `DomainControllerAuthentication`,
+  `KerberosAuthentication`, `DirectoryEmailReplication` on a CA set up for domain
+  controllers) are expected in many domains. Add the ones you use to `published`.
+"""
+
+remediation = """
+1. **List the published templates on each CA**:
+
+    ```powershell
+    Get-CATemplate    # on the CA, from the ADCSAdministration module
+    ```
+
+2. **Unpublish the templates nobody needs**. Existing certificates stay valid; nothing new
+   can be issued from the template:
+
+    ```powershell
+    Remove-CATemplate -Name LabESC1 -WhatIf
+    ```
+
+3. **For templates that stay, review their enrollment rights and flags** with the ESC
+   checks before adding them to `published`.
+
+4. **If the template is intended, add it to `published`** in a reviewed change; see
+   [Invariants](../invariants.md).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --invariants invariants.toml --only AD-INV-005"
+
+[[references]]
+title = "Remove-CATemplate"
+url = "https://learn.microsoft.com/en-us/powershell/module/adcsadministration/remove-catemplate"
+kind = "vendor"
+
+[[references]]
+title = "Certified Pre-Owned: abusing Active Directory Certificate Services (SpecterOps)"
+url = "https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf"
+kind = "research"

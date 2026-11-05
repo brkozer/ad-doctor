@@ -1,0 +1,85 @@
+id = "AD-ADCS-014"
+aliases = ["esc11"]
+summary = "A CA does not require packet privacy on its RPC enrollment interface (IF_ENFORCEENCRYPTICERTREQUEST off), so coerced authentication can be relayed to it for a certificate."
+severities = ["medium", "high"]
+severity_logic = """
+**High**: NTLM authentication coerced from a privileged account, a domain controller for
+instance, can be relayed to the CA's RPC enrollment interface (MS-ICPR) and turned into a
+certificate for that account, which under strong mapping leads to DCSync. Drops to **medium**
+when the CA holds every request for a manager (`RequestDisposition` has `REQDISP_PENDING`),
+which adds a manual approval step but does not remove the exposure.
+"""
+mitre = ["T1649", "T1557"]
+data_sources = ["probe-winreg"]
+attributes = ["CA\\InterfaceFlags (IF_ENFORCEENCRYPTICERTREQUEST)", "policy\\RequestDisposition"]
+related = ["AD-ADCS-010", "AD-CHAIN-003", "AD-INF-008", "AD-PATH-001"]
+since = "unreleased"
+
+risk = """
+AD CS accepts certificate requests over RPC through the ICertPassage (MS-ICPR) interface. The
+CA's `IF_ENFORCEENCRYPTICERTREQUEST` flag controls whether that interface demands
+`RPC_C_AUTHN_LEVEL_PKT_PRIVACY`, where every packet is signed and encrypted. It is on by
+default but is sometimes turned off for legacy clients.
+
+With it off, an attacker who can coerce a victim (for example a domain controller, through
+PetitPotam or PrinterBug) into authenticating to a host they control can relay that NTLM
+authentication to the CA's RPC endpoint and request a certificate as the victim. A
+certificate for a DC's machine account yields DCSync and domain compromise. It is the RPC
+counterpart of ESC8 ([AD-ADCS-010](AD-ADCS-010.md)), which relays over HTTP.
+"""
+
+detection = """
+ad-doctor reads `CA\\InterfaceFlags` from the CA registry over `\\pipe\\winreg` and reports
+the CA when the `IF_ENFORCEENCRYPTICERTREQUEST` bit (0x200) is **not** set. ad-doctor does
+not send any ICPR request; the finding is read from the flag alone. When the CA holds
+requests for a manager, that is noted and the severity drops.
+"""
+
+false_positives = """
+- **Mitigated elsewhere.** The relay still needs a coercion primitive and a machine that will
+  authenticate. Enforcing SMB and LDAP signing, Extended Protection, and blocking coercion
+  reduce the practical risk, but the flag is the control this check measures, so it is still
+  reported until the flag is set.
+"""
+
+remediation = """
+1. **Require packet privacy on the CA** and restart the service:
+
+    ```console
+    certutil -config "<host>\\<CA name>" -setreg CA\\InterfaceFlags +IF_ENFORCEENCRYPTICERTREQUEST
+    net stop certsvc & net start certsvc
+    ```
+
+2. **Investigate why it was off**: only very old clients need the lower level. Update or
+   isolate them rather than leaving the interface open.
+
+3. **Reduce coercion and relay generally**: enforce SMB and LDAP signing and channel binding
+   on domain controllers, and keep the CA host patched against coercion techniques.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-014"
+
+[[references]]
+title = "Enforce encryption for RPC certificate enrollment interface (ESC11), Defender for Identity"
+url = "https://learn.microsoft.com/en-us/defender-for-identity/security-posture-assessments/certificates"
+kind = "vendor"
+
+[[references]]
+title = "Relaying to AD Certificate Services over RPC (Compass Security, ESC11)"
+url = "https://blog.compass-security.com/2022/11/relaying-to-ad-certificate-services-over-rpc/"
+kind = "research"
+
+[[references]]
+title = "[MS-ICPR]: ICertPassage Remote Protocol"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-icpr/9b8ed605-6b00-41d1-9a2a-9897e40678fc"
+kind = "spec"
+
+[[references]]
+title = "certutil"
+url = "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/certutil"
+kind = "vendor"
+
+[[references]]
+title = "Certipy wiki: ESC11"
+url = "https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation"
+kind = "tool"

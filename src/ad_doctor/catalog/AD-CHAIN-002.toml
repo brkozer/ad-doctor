@@ -1,0 +1,98 @@
+id = "AD-CHAIN-002"
+aliases = ["printerbug-unconstrained"]
+summary = "A DC runs the Print Spooler and a non-DC host has unconstrained delegation, so whoever controls that host can capture the DC's TGT and DCSync."
+severities = ["high"]
+severity_logic = """
+Always **high**: the combination is a known one-step path from one compromised server to
+the whole domain.
+"""
+mitre = ["T1187", "T1558"]
+data_sources = ["derived"]
+attributes = ["userAccountControl (TRUSTED_FOR_DELEGATION)", "probe: spoolss pipe on each DC"]
+related = ["AD-DEL-001", "AD-INF-009", "AD-ACL-001", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+A host with unconstrained delegation keeps a copy of the TGT of every account that
+authenticates to it with Kerberos. The Print Spooler on a DC lets any domain user make the
+DC authenticate to a host of their choice (`RpcRemoteFindFirstPrinterChangeNotification`,
+the PrinterBug). Together:
+
+1. The attacker controls a server with unconstrained delegation ([AD-DEL-001](AD-DEL-001.md)),
+   or any account that can change such a host's DNS record or SPN.
+2. They tell the DC's spooler to notify that server; the DC authenticates with Kerberos
+   and its TGT lands in the server's memory.
+3. With the DC's TGT they run DCSync and get every hash in the domain, `krbtgt` included.
+
+Across a forest trust that allows TGT delegation, the same trick hands over the other
+forest's DC as well.
+"""
+
+detection = """
+A compound finding. It fires when **both** hold:
+
+- at least one DC answered the SMB probe by opening the `spoolss` named pipe, which means
+  the Print Spooler is running there ([AD-INF-009](AD-INF-009.md)), and
+- at least one enabled account other than a DC has `TRUSTED_FOR_DELEGATION` (0x80000) in
+  `userAccountControl` ([AD-DEL-001](AD-DEL-001.md)).
+
+The objects are the unconstrained-delegation accounts, for example `APP01$`. The spooler
+probe is skipped with `--no-probes`, and probes every DC unless `--single-dc` is given.
+
+ad-doctor does not trigger the spooler; it only opens the pipe and closes it.
+"""
+
+false_positives = """
+- **The host is itself tier 0** and administered like a DC. The chain still turns any
+  compromise of that host into a domain compromise, so fix it rather than accept it.
+- Other coercion methods (EFSRPC, DFSNM) work without the spooler; turning the spooler
+  off clears this finding but not [AD-DEL-001](AD-DEL-001.md).
+"""
+
+remediation = """
+1. **Stop and disable the Print Spooler on every DC.** DCs do not need it unless they are
+   print servers, which they should not be:
+
+    ```powershell
+    Get-Service -ComputerName dc01 -Name Spooler
+    Invoke-Command -ComputerName dc01 { Stop-Service Spooler -WhatIf; Set-Service Spooler -StartupType Disabled -WhatIf }
+    ```
+
+   Better, set *System Services > Print Spooler = Disabled* in the Default Domain
+   Controllers Policy.
+
+2. **Remove unconstrained delegation** from every non-DC account. Use constrained or
+   resource-based delegation for the services that need it:
+
+    ```powershell
+    Get-ADComputer -Filter 'TrustedForDelegation -eq $true -and PrimaryGroupID -ne 516'
+    Set-ADComputer APP01 -TrustedForDelegation $false -WhatIf
+    ```
+
+3. **Protect privileged accounts from delegation**: add them to Protected Users or set
+   *Account is sensitive and cannot be delegated*.
+
+4. **On forest trusts**, keep TGT delegation disabled (`netdom trust ... /EnableTGTDelegation:No`).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-CHAIN-002"
+
+[[references]]
+title = "Not a security boundary: breaking forest trusts (Will Schroeder)"
+url = "https://blog.harmj0y.net/redteaming/not-a-security-boundary-breaking-forest-trusts/"
+kind = "research"
+
+[[references]]
+title = "Domain controller print server + unconstrained Kerberos delegation = pwned forest (Sean Metcalf)"
+url = "https://adsecurity.org/?p=4056"
+kind = "research"
+
+[[references]]
+title = "SpoolSample (Lee Christensen)"
+url = "https://github.com/leechristensen/SpoolSample"
+kind = "tool"
+
+[[references]]
+title = "Guidance on disabling system services on Windows Server"
+url = "https://learn.microsoft.com/en-us/windows-server/security/windows-services/security-guidelines-for-disabling-system-services-in-windows-server"
+kind = "vendor"

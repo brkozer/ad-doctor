@@ -1,0 +1,79 @@
+id = "AD-ACL-005"
+aliases = []
+summary = "Inheritance is enabled on AdminSDHolder, so permissions granted on the System container or the domain flow onto every protected admin account and group."
+severities = ["high"]
+severity_logic = """
+Always **high**: any inheritable ACE on the domain head or `CN=System`, including one an
+attacker adds later, is copied by SDProp onto Domain Admins and every other protected
+object.
+"""
+mitre = ["T1098"]
+data_sources = ["ldap"]
+attributes = ["nTSecurityDescriptor of CN=AdminSDHolder,CN=System (SE_DACL_PROTECTED control bit)"]
+related = ["AD-ACL-002", "AD-ACL-003", "AD-ACL-004"]
+since = "0.1.0"
+
+risk = """
+By default the AdminSDHolder object has inheritance **disabled** (its DACL is protected),
+so it holds only the ACEs written on it. SDProp copies that DACL onto every protected
+account and group every hour, and protected objects have inheritance disabled as well,
+which is what keeps OU-level delegations away from admins.
+
+When inheritance is turned on for AdminSDHolder, the ACEs inherited from `CN=System` and
+from the domain head become part of the template:
+
+1. A delegation on the domain head that was meant for ordinary users (password reset for
+   the helpdesk, for example) now reaches Domain Admins through SDProp.
+2. An attacker with WriteDacl on the domain object ([AD-ACL-003](AD-ACL-003.md)) can add a
+   single inheritable ACE there and wait an hour to control every protected object, a
+   quieter route than touching AdminSDHolder directly ([AD-ACL-002](AD-ACL-002.md)).
+"""
+
+detection = """
+ad-doctor reads the security descriptor of `CN=AdminSDHolder,CN=System,<domain>` and
+reports it when the **SE_DACL_PROTECTED** control bit is clear (inheritance enabled) and
+the DACL could be read. The object is the AdminSDHolder DN, for example
+`CN=AdminSDHolder,CN=System,DC=corp,DC=example`.
+
+The finding is about the state, not about a particular ACE: which inherited principals
+then hold takeover rights is reported by [AD-ACL-002](AD-ACL-002.md).
+"""
+
+remediation = """
+1. **Confirm the state and see what is inherited** (read-only):
+
+    ```powershell
+    $holder = "AD:CN=AdminSDHolder,CN=System,$((Get-ADDomain).DistinguishedName)"
+    $acl = Get-Acl $holder
+    $acl.AreAccessRulesProtected   # False means inheritance is on
+    $acl.Access | Where-Object IsInherited |
+        Format-Table IdentityReference, ActiveDirectoryRights, ObjectType -AutoSize
+    ```
+
+2. **Disable inheritance and drop the inherited ACEs.** `SetAccessRuleProtection($true,
+   $false)` keeps only the explicit ACEs, which on an untouched domain are the defaults.
+   Review the explicit ACEs from step 1 before applying:
+
+    ```powershell
+    # $acl.SetAccessRuleProtection($true, $false); Set-Acl $holder $acl
+    ```
+
+3. **Let SDProp run** (60 minutes) and check that the inherited principals are gone from a
+   protected group such as Domain Admins.
+
+4. **Find out who enabled inheritance and when** (directory service change auditing,
+   event 5136 on the DCs), and review what the inherited principals did with protected
+   accounts since.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-005"
+
+[[references]]
+title = "Appendix C: Protected accounts and groups in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-c--protected-accounts-and-groups-in-active-directory"
+kind = "vendor"
+
+[[references]]
+title = "Sneaky Active Directory Persistence #15: Leverage AdminSDHolder & SDProp (Sean Metcalf)"
+url = "https://adsecurity.org/?p=1906"
+kind = "research"

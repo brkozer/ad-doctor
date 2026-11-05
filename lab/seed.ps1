@@ -22,9 +22,9 @@ function Ensure-User([string]$Name, [hashtable]$Extra = @{}) {
         New-ADUser -Name $Name -SamAccountName $Name -Path $ou -AccountPassword $pw -Enabled $true @Extra
     }
 }
-function Ensure-Computer([string]$Name) {
+function Ensure-Computer([string]$Name, [string]$Path = $ou) {
     if (-not (Get-ADComputer -Filter "Name -eq '$Name'")) {
-        New-ADComputer -Name $Name -SamAccountName "$Name$" -Path $ou -Enabled $true
+        New-ADComputer -Name $Name -SamAccountName "$Name$" -Path $Path -Enabled $true
     }
 }
 
@@ -344,6 +344,200 @@ $msol = Get-ADUser MSOL_0a1b2c3d4e5f
 Grant-Ad $dn $msol.SID ExtendedRight '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2'
 Grant-Ad $dn $msol.SID ExtendedRight '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2'
 Grant-Ad $msol.DistinguishedName $helpdesk ExtendedRight '00299570-246d-11d0-a768-00aa006e0529'
+
+# --- Round 5: the CA's own configuration (ESC6, ESC7, ESC11, ESC16) ---
+# These are registry settings on the CA host, read over \pipe\winreg; they are invisible to
+# LDAP. Seeding ESC6 together with ESC16 makes the lab CA exploitable under strong mapping
+# on purpose (AD-CHAIN-004). Clearing IF_ENFORCEENCRYPTICERTREQUEST also drives AD-ADCS-014.
+$caBase = 'HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration'
+$caName = (Get-ItemProperty $caBase).Active
+$caKey = "$caBase\$caName"
+$policyKey = "$caKey\PolicyModules\CertificateAuthority_MicrosoftDefault.Policy"
+$sidExtOid = '1.3.6.1.4.1.311.25.2'
+$caChanged = $false
+
+# ESC6: accept a SAN from request attributes
+if (-not ((Get-ItemProperty $policyKey).EditFlags -band 0x40000)) {
+    certutil -setreg policy\EditFlags +EDITF_ATTRIBUTESUBJECTALTNAME2 | Out-Null
+    $caChanged = $true
+}
+# ESC11: stop requiring packet privacy on ICPR requests
+if ((Get-ItemProperty $caKey).InterfaceFlags -band 0x200) {
+    certutil -setreg CA\InterfaceFlags -IF_ENFORCEENCRYPTICERTREQUEST | Out-Null
+    $caChanged = $true
+}
+# ESC16: drop the SID security extension from every issued certificate
+$disabled = @((Get-ItemProperty $policyKey -Name DisableExtensionList -ErrorAction SilentlyContinue).DisableExtensionList)
+if ($disabled -notcontains $sidExtOid) {
+    certutil -setreg policy\DisableExtensionList +$sidExtOid | Out-Null
+    $caChanged = $true
+}
+
+# ESC7: give the helpdesk group ManageCertificates (0x2) in the CA security descriptor.
+# $helpdesk is the SecurityIdentifier created earlier in this script.
+$caSecProp = Get-ItemProperty $caKey -Name Security
+$caSd = New-Object Security.AccessControl.RawSecurityDescriptor($caSecProp.Security, 0)
+$hasOfficer = $false
+foreach ($aceEntry in $caSd.DiscretionaryAcl) {
+    if ($aceEntry.SecurityIdentifier -eq $helpdesk -and ($aceEntry.AccessMask -band 0x2)) {
+        $hasOfficer = $true
+    }
+}
+if (-not $hasOfficer) {
+    $caSd.DiscretionaryAcl.InsertAce(0, (New-Object Security.AccessControl.CommonAce(
+        'ObjectInherit,ContainerInherit', 'AccessAllowed', 2, $helpdesk, $false, $null)))
+    $caBytes = New-Object byte[] $caSd.BinaryLength
+    $caSd.GetBinaryForm($caBytes, 0)
+    Set-ItemProperty $caKey -Name Security -Value $caBytes
+    $caChanged = $true
+}
+
+if ($caChanged) { Restart-Service certsvc }
+
+# --- Round 5: local group membership set by Group Policy (AD-GPO-005..007) ---
+# Windows ignores a GPO whose computer version is 0 or whose gPCMachineExtensionNames lacks
+# the extension, so every file written here bumps the version and registers the CSE.
+$CseSecurity = @{ '{827D319E-6EAC-11D2-A4EA-00C04F79F83A}' = '{803E14A0-B4FB-11D0-A0D0-00A0C90F574B}' }
+$CseGroups = @{
+    '{00000000-0000-0000-0000-000000000000}' = '{79F92669-4224-476C-9C5C-6EFB4D87DF4A}'
+    '{17D89FEC-5C44-4972-B12D-241CAEF74509}' = '{79F92669-4224-476C-9C5C-6EFB4D87DF4A}'
+}
+function Ensure-Gpo([string]$Name) {
+    $g = Get-GPO -Name $Name -ErrorAction SilentlyContinue
+    if (-not $g) { $g = New-GPO -Name $Name }
+    $g
+}
+function Ensure-Link([string]$Name, [string]$Target, [string]$Enabled = 'Yes', [string]$Enforced = 'No') {
+    $id = (Get-GPO -Name $Name).Id
+    if ((Get-GPInheritance -Target $Target).GpoLinks.GpoId -notcontains $id) {
+        New-GPLink -Name $Name -Target $Target | Out-Null
+    }
+    Set-GPLink -Name $Name -Target $Target -LinkEnabled $Enabled -Enforced $Enforced | Out-Null
+}
+function Get-Gpc($Gpo) {
+    Get-ADObject "CN={$($Gpo.Id)},CN=Policies,CN=System,$dn" -Properties versionNumber, gPCMachineExtensionNames
+}
+function Step-GpoVersion($Gpo) {
+    # +1 is the computer half (low 16 bits); GPT.INI must carry the same number
+    $gpc = Get-Gpc $Gpo
+    $ver = [int]$gpc.versionNumber + 1
+    Set-ADObject $gpc -Replace @{ versionNumber = $ver }
+    $root = "C:\Windows\SYSVOL\domain\Policies\{$($Gpo.Id.ToString().ToUpper())}"
+    Set-Content -Encoding ASCII "$root\GPT.INI" "[General]`r`nVersion=$ver`r`ndisplayName=New Group Policy Object"
+}
+function Register-Cse($Gpo, [hashtable]$Cse) {
+    # gPCMachineExtensionNames: brackets sorted by CSE GUID, tool GUIDs sorted inside each
+    $gpc = Get-Gpc $Gpo
+    $pairs = @{}
+    foreach ($m in [regex]::Matches([string]$gpc.gPCMachineExtensionNames, '\[(\{[^}]+\})((?:\{[^}]+\})*)\]')) {
+        $pairs[$m.Groups[1].Value.ToUpper()] = @([regex]::Matches($m.Groups[2].Value, '\{[^}]+\}') | ForEach-Object Value)
+    }
+    foreach ($k in $Cse.Keys) { $pairs[$k] = @(@($pairs[$k]) + $Cse[$k] | Where-Object { $_ } | Sort-Object -Unique) }
+    $value = ($pairs.Keys | Sort-Object | ForEach-Object { "[$_$(($pairs[$_] | Sort-Object) -join '')]" }) -join ''
+    if ($value -ne $gpc.gPCMachineExtensionNames) { Set-ADObject $gpc -Replace @{ gPCMachineExtensionNames = $value } }
+}
+function Set-GpoFile($Gpo, [string]$Rel, [string]$Text, [string]$Encoding, [hashtable]$Cse) {
+    $Text = $Text -replace "`r?`n", "`r`n"
+    $file = Join-Path "C:\Windows\SYSVOL\domain\Policies\{$($Gpo.Id.ToString().ToUpper())}" $Rel
+    New-Item -ItemType Directory -Force (Split-Path $file) | Out-Null
+    $old = if (Test-Path $file) { Get-Content -Raw $file } else { $null }
+    if ($old -ne $Text) {                       # bump only on change: idempotent
+        Set-Content -NoNewline -Encoding $Encoding $file $Text
+        Step-GpoVersion $Gpo
+    }
+    Register-Cse $Gpo $Cse
+}
+function Set-RestrictedGroups($Gpo, [string[]]$Lines) {
+    $inf = "[Unicode]`nUnicode=yes`n[Version]`nsignature=`"`$CHICAGO`$`"`nRevision=1`n[Group Membership]`n" + ($Lines -join "`n") + "`n"
+    Set-GpoFile $Gpo 'Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf' $inf Unicode $CseSecurity
+}
+
+# LabDCPolicy (AD-GPO-001, -003) has a GptTmpl.inf but was created with computer version 0
+# and no CSE, which Windows reports as "Not Applied (Empty)": make it a GPO Windows applies.
+$labGpo = Get-GPO -Name LabDCPolicy
+if (((Get-Gpc $labGpo).versionNumber -band 0xFFFF) -eq 0) { Step-GpoVersion $labGpo }
+Register-Cse $labGpo $CseSecurity
+
+foreach ($name in 'Workstations', 'Isolated') {
+    if (-not (Get-ADOrganizationalUnit -Filter "Name -eq '$name'" -SearchBase $ou)) {
+        New-ADOrganizationalUnit -Name $name -Path $ou -ProtectedFromAccidentalDeletion $false
+    }
+}
+Ensure-Computer WS02 "OU=Workstations,$ou"
+Ensure-Computer WS03 "OU=Isolated,$ou"
+Set-GPInheritance -Target "OU=Isolated,$ou" -IsBlocked Yes | Out-Null
+foreach ($name in 'LabServerAdmins', 'LabDcRdp', 'LabNobody') {
+    if (-not (Get-ADGroup -Filter "Name -eq '$name'")) {
+        New-ADGroup $name -GroupScope Global -GroupCategory Security -Path $ou
+    }
+}
+$serverAdmins = (Get-ADGroup LabServerAdmins).SID.Value
+$dcRdp = (Get-ADGroup LabDcRdp).SID.Value
+$users = $domainUsers.Value
+
+# A: a non-tier-0 group made local admin on every server in OU=Lab, Entra Connect and
+# Exchange included (AD-GPO-006). Only "Member of" is set, as the seed writes it.
+$gA = Ensure-Gpo LabLocalAdmins
+Set-RestrictedGroups $gA @("*$serverAdmins`__Memberof = *S-1-5-32-544")
+Ensure-Link LabLocalAdmins $ou
+
+# B: GPP: Domain Users in Remote Desktop Users on OU=Workstations (AD-GPO-007 medium); an
+# item behind item-level targeting and a disabled item stay silent.
+$gB = Ensure-Gpo LabRdp
+$groupsXml = @"
+<?xml version="1.0" encoding="utf-8"?>
+<Groups clsid="{3125E937-EB16-4b4c-9934-544FC6D24D26}">
+  <Group clsid="{6D4A79E4-529C-4481-ABD0-F5BD7EA93BA7}" name="Remote Desktop Users (built-in)" image="2" changed="2026-11-05 00:00:00" uid="{5C0E6A1D-1B2A-4C3D-8E4F-0A1B2C3D4E01}">
+    <Properties action="U" newName="" description="" deleteAllUsers="0" deleteAllGroups="0" removeAccounts="0" groupSid="S-1-5-32-555" groupName="Remote Desktop Users (built-in)">
+      <Members><Member name="ADLAB\Domain Users" action="ADD" sid="$users"/></Members>
+    </Properties>
+  </Group>
+  <Group clsid="{6D4A79E4-529C-4481-ABD0-F5BD7EA93BA7}" name="Administrators (built-in)" image="2" changed="2026-11-05 00:00:00" uid="{5C0E6A1D-1B2A-4C3D-8E4F-0A1B2C3D4E02}">
+    <Properties action="U" newName="" description="" deleteAllUsers="0" deleteAllGroups="0" removeAccounts="0" groupSid="S-1-5-32-544" groupName="Administrators (built-in)">
+      <Members><Member name="ADLAB\Domain Users" action="ADD" sid="$users"/></Members>
+    </Properties>
+    <Filters><FilterComputer bool="AND" not="0" type="NETBIOS" name="WS02"/></Filters>
+  </Group>
+  <Group clsid="{6D4A79E4-529C-4481-ABD0-F5BD7EA93BA7}" name="Administrators (built-in)" image="2" changed="2026-11-05 00:00:00" uid="{5C0E6A1D-1B2A-4C3D-8E4F-0A1B2C3D4E03}" disabled="1">
+    <Properties action="U" newName="" description="" deleteAllUsers="0" deleteAllGroups="0" removeAccounts="0" groupSid="S-1-5-32-544" groupName="Administrators (built-in)">
+      <Members><Member name="Everyone" action="ADD" sid="S-1-1-0"/></Members>
+    </Properties>
+  </Group>
+</Groups>
+"@
+Set-GpoFile $gB 'Machine\Preferences\Groups\Groups.xml' $groupsXml UTF8 $CseGroups
+Ensure-Link LabRdp "OU=Workstations,$ou"
+
+# C: a disabled link never applies
+$gC = Ensure-Gpo LabDisabledLink
+Set-RestrictedGroups $gC @("*$users`__Memberof = *S-1-5-32-544")
+Ensure-Link LabDisabledLink "OU=Workstations,$ou" -Enabled No
+
+# D: enforced at OU=Lab, so it reaches WS03 through the block on OU=Isolated (logon edge
+# only), and ENTRA01/EXCH01, which are tier 0 (AD-GPO-007 high)
+$gD = Ensure-Gpo LabEnforced
+Set-RestrictedGroups $gD @("*$serverAdmins`__Memberof = *S-1-5-32-555")
+Ensure-Link LabEnforced $ou -Enforced Yes
+
+# E: security filtering: computers can read it, only the empty LabNobody may apply it
+$gE = Ensure-Gpo LabFilteredOut
+Set-RestrictedGroups $gE @("*$users`__Memberof = *S-1-5-32-544")
+Ensure-Link LabFilteredOut "OU=Workstations,$ou"
+Set-GPPermission -Name LabFilteredOut -TargetName 'Authenticated Users' -TargetType Group -PermissionLevel GpoRead -Replace | Out-Null
+Set-GPPermission -Name LabFilteredOut -TargetName LabNobody -TargetType Group -PermissionLevel GpoApply | Out-Null
+
+# F: computer side disabled (flags 2)
+$gF = Ensure-Gpo LabComputerOff
+Set-RestrictedGroups $gF @("*$users`__Memberof = *S-1-5-32-544")
+Ensure-Link LabComputerOff "OU=Workstations,$ou"
+if ($gF.GpoStatus -ne 'ComputerSettingsDisabled') { $gF.GpoStatus = 'ComputerSettingsDisabled' }
+
+# G: on DCs Restricted Groups rewrite the domain's BUILTIN\Remote Desktop Users, which
+# grants nothing there (DCs give the remote logon right to Administrators only). Harmless
+# by design: nothing goes into Administrators or the operator groups on DCs.
+$gG = Ensure-Gpo LabDcRdp
+Set-RestrictedGroups $gG @("*$dcRdp`__Memberof = *S-1-5-32-555")
+Ensure-Link LabDcRdp "OU=Domain Controllers,$dn"
 
 # SDProp copies the AdminSDHolder ACL onto protected objects now instead of within the hour
 $rootDse = [ADSI]'LDAP://RootDSE'

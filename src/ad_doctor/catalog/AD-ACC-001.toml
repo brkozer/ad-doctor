@@ -1,0 +1,90 @@
+id = "AD-ACC-001"
+aliases = ["passwd-notreqd"]
+summary = "Enabled accounts carry PASSWD_NOTREQD, so their password may be empty no matter what the domain password policy says."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. ad-doctor cannot tell whether a flagged account's password is actually
+empty, only that nothing stops it from being so.
+"""
+mitre = ["T1078.002"]
+data_sources = ["ldap"]
+attributes = ["userAccountControl"]
+related = ["AD-ACC-010", "AD-POL-001", "AD-ACC-005"]
+since = "0.1.0"
+
+risk = """
+`PASSWD_NOTREQD` (`userAccountControl` bit `0x20`) exempts an account from the password
+policy: its password can be set to an empty string even when the domain requires 14
+characters. Provisioning scripts and older tools often create accounts with
+`userAccountControl = 544` (normal account plus `PASSWD_NOTREQD`) and set a password later,
+or never.
+
+An attacker with any domain account lists the flagged accounts over LDAP and tries an
+empty password against each. One success is a valid domain logon that nobody chose a
+password for, and such accounts are rarely watched. Clearing the flag later does not
+change a password that is already empty.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled** object (users *and* computers) whose
+`userAccountControl` has `PASSWD_NOTREQD` (`0x20`) set. Disabled accounts are skipped.
+
+ad-doctor never tries a logon, so it reports the flag, not an empty password. Computer
+accounts that were pre-created and never used also carry the flag; those are reported a
+second time, as a more specific finding, by [AD-ACC-010](AD-ACC-010.md).
+
+Each object is the account's `sAMAccountName`, for example `blank_ok` or `PRE2K$`.
+"""
+
+false_positives = """
+- **Accounts with a real password.** The flag is reported even when the account was later
+  given a strong password, because LDAP cannot show the password. Clearing the flag costs
+  nothing, so fixing it is usually quicker than accepting it.
+- **Joined computers** sometimes keep the flag from the way they were created. Their
+  password is a random machine password, but the flag is still worth clearing.
+"""
+
+remediation = """
+1. **List the flagged accounts and when their passwords were last set.**
+
+    ```powershell
+    Get-ADObject -LDAPFilter '(&(userAccountControl:1.2.840.113556.1.4.803:=32)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' `
+        -Properties sAMAccountName, pwdLastSet, whenCreated |
+        Select-Object sAMAccountName, whenCreated,
+            @{n = 'PasswordLastSet'; e = { [datetime]::FromFileTime($_.pwdLastSet) }}
+    ```
+
+2. **Clear the flag.** This is what `ad-doctor fix` generates:
+
+    ```powershell
+    Set-ADAccountControl blank_ok -PasswordNotRequired $false -WhatIf
+    ```
+
+3. **Reset the password** of any account whose password could be empty: one created by a
+   script, or whose `pwdLastSet` is 0 or equals `whenCreated`. Clearing the flag does not
+   touch the current password.
+
+    ```powershell
+    Set-ADAccountPassword blank_ok -Reset -NewPassword (Read-Host -AsSecureString 'New password') -WhatIf
+    ```
+
+4. **Fix the source.** Find the provisioning script or tool that sets `0x20` and change it
+   to create accounts with a password (or disabled) instead.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-001"
+
+[[references]]
+title = "UserAccountControl property flags"
+url = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/useraccountcontrol-manipulate-account-properties"
+kind = "vendor"
+
+[[references]]
+title = "[MS-SAMR] USER_ACCOUNT codes (USER_PASSWORD_NOT_REQUIRED)"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-samr/b10cfda1-f24f-441b-8f43-80cb93e786ec"
+kind = "spec"
+
+[[references]]
+title = "Defender for Identity: accounts security posture assessments"
+url = "https://learn.microsoft.com/en-us/defender-for-identity/security-posture-assessments/accounts"
+kind = "vendor"

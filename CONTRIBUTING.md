@@ -37,7 +37,8 @@ against the seeded lab DC in [`lab/`](lab/README.md) and is skipped unless the
    reused or renumbered; users accept risks and set baselines by ID.
 2. **Write the check** in `src/ad_doctor/checks.py` as a pure function of the snapshot,
    decorated with `@check(id, title)`. Return one finding that lists every affected object,
-   or `None`. Map it to MITRE ATT&CK in `MITRE`.
+   or `None`. Its MITRE ATT&CK techniques go in the catalog entry (step 6), which is the
+   only source of `checks.MITRE`.
 3. **Collect what it needs** in `collect.py`, through `optional()` when the data may be
    missing or unreadable, so the scan goes on with a note instead of failing. New snapshot
    fields need defaults so that older snapshots still load.
@@ -46,8 +47,14 @@ against the seeded lab DC in [`lab/`](lab/README.md) and is skipped unless the
 5. **Test it**: at least one test where it fires, one where it stays quiet, and the
    default configuration must stay clean (`test_clean_domain_has_no_findings`). If the lab
    can reproduce it, seed it in `lab/seed.ps1` and assert it in `tests/test_lab.py`.
-6. **Document it** in the check table in the README, and in `fixes.py` if the fix can be
-   expressed as a safe, `-WhatIf` command.
+6. **Document it.** Add `src/ad_doctor/catalog/<ID>.toml` (copy an existing entry for the
+   schema; the loader in `catalog/__init__.py` validates it). Add a row to the check table
+   in the README, and a `-WhatIf` fix in `fixes.py` if the fix is a safe command.
+   `tests/test_catalog.py` fails when a check has no entry, and the severity gate in
+   `tests/conftest.py` fails the run when a test makes a check emit a severity its entry's
+   `severities` does not list, so write a test for every grade. `uv run python
+   scripts/gen_docs.py` regenerates the site pages and
+   `uv run --group docs zensical build --strict` builds them.
 
 Keep the finding text short and concrete: what an attacker can do, then how to fix it.
 

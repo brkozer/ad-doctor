@@ -9,8 +9,8 @@ import os
 
 import pytest
 
-from ad_doctor import opengraph
-from ad_doctor.checks import run_all
+from ad_doctor import gpo_scope, opengraph, paths
+from ad_doctor.checks import run_all, tier0_hosts
 from ad_doctor.collect import Target, collect
 from ad_doctor.model import Snapshot
 
@@ -47,6 +47,11 @@ EXPECTED = {
     "AD-ADCS-006": {"LabESC9 (enroll: Domain Users)"},
     "AD-ADCS-007": {"LabESC13 (enroll: Domain Users)"},
     "AD-ADCS-008": {"LabESC15 (enroll: Domain Users)"},
+    "AD-ADCS-012": {"adlab-CA"},
+    "AD-ADCS-013": {"adlab-CA: helpdesk (ManageCertificates)"},
+    "AD-ADCS-014": {"adlab-CA"},
+    "AD-ADCS-015": {"adlab-CA"},
+    "AD-CHAIN-004": {"adlab-CA"},
     "AD-GPO-001": {"LabDCPolicy -> Domain Controllers OU (helpdesk)"},
     "AD-ACC-006": {"ex_admin"},
     "AD-PRIV-003": {"Schema Admins: Administrator", "Enterprise Admins: Administrator"},
@@ -88,6 +93,8 @@ EXPECTED = {
     "AD-PATH-001": {
         "gpo_linker -[link GPOs]-> Domain Controllers",
         "kc_writer -[write msDS-KeyCredentialLink]-> DC01$",
+        "LabServerAdmins -[admin to via GPO LabLocalAdmins]-> ENTRA01$ -[hosts sync account]-> "
+        "MSOL_0a1b2c3d4e5f -[DCSync]-> adlab.test",
     },
     "AD-ACL-007": {"Exchange Windows Permissions: WriteDacl on the domain object"},
     "AD-PRIV-011": {"MSOL_0a1b2c3d4e5f on ENTRA01: not in a tier-0 group, no LAPS"},
@@ -95,6 +102,22 @@ EXPECTED = {
     "AD-GPP-001": {
         r"Policies\{4B1D7A55-0C1E-4A3B-9D2F-7E6A5C3B2A10}\Machine\Preferences\Groups\Groups.xml"
         " (localadmin)"
+    },
+    # Round 5 GPO cases A-G: only A, B and D surface; C (disabled link), E (security
+    # filtering), F (computer side off), G (DC remote desktop without the logon right) and
+    # the disabled GPP item stay silent. The item-level targeted item is listed with a
+    # caveat (its targeting is not evaluated; here it names WS02, the OU's only computer).
+    "AD-GPO-005": {
+        "LabRdp: Domain Users -> Administrators on WS02$ [item-level targeting not evaluated]"
+    },
+    "AD-GPO-006": {
+        "LabLocalAdmins: LabServerAdmins -> Administrators on ENTRA01$ (Entra Connect server), "
+        "EXCH01$ (Exchange server)"
+    },
+    "AD-GPO-007": {
+        "LabEnforced: LabServerAdmins -> Remote Desktop Users on ENTRA01$ (Entra Connect "
+        "server), EXCH01$ (Exchange server)",
+        "LabRdp: Domain Users -> Remote Desktop Users on WS02$",
     },
 }
 
@@ -172,6 +195,45 @@ def test_clean_and_default_objects_not_flagged(findings: dict[str, set[str]]) ->
         "AD-DEL-004",
         "AD-GPP-002",
         "AD-PRIV-007",
+        "AD-GPO-005",
+        "AD-GPO-006",
+        "AD-GPO-007",
     )
     for check_id in exact:
         assert findings[check_id] == EXPECTED[check_id]
+    # every CA setting was read: nothing is left unknown
+    assert "AD-ADCS-016" not in findings
+
+
+def test_gpo_local_group_scope(snap: Snapshot) -> None:
+    scope = gpo_scope.resolve(snap)
+    assert scope.clears == [] and scope.notes == []
+    targeted = [g for g in scope.grants if gpo_scope.ILT_CAVEAT in g.caveats]
+    assert [(g.gpo.name, g.computer.sam if g.computer else "") for g in targeted] == [
+        ("LabRdp", "WS02$")
+    ]
+    by_gpo: dict[str, set[str]] = {}
+    for g in scope.grants:
+        by_gpo.setdefault(g.gpo.name, set()).add(g.computer.sam if g.computer else "DCs")
+    # Block Inheritance on OU=Isolated stops LabLocalAdmins but not the enforced LabEnforced
+    assert "WS03$" not in by_gpo["LabLocalAdmins"]
+    assert "WS03$" in by_gpo["LabEnforced"]
+    for silent in ("LabDisabledLink", "LabFilteredOut", "LabComputerOff"):
+        assert silent not in by_gpo
+    gpos = {g.name: g for g in snap.gpos}
+    assert [link.enabled for link in gpos["LabDisabledLink"].links] == [False]
+    assert gpos["LabComputerOff"].flags == 2
+    assert [link.enforced for link in gpos["LabEnforced"].links] == [True]
+    # on the DC the setting rewrites the domain's Remote Desktop Users, which grants no logon
+    dc_rdp = [g for g in scope.grants if g.gpo.name == "LabDcRdp"]
+    assert [(g.domain_group, g.computer, g.effective) for g in dc_rdp] == [(True, None, False)]
+    roles = tier0_hosts(snap)
+    assert sorted(roles.values()) == [
+        "Entra Connect server",
+        "Exchange server",
+        "domain controller",
+    ]
+    g = paths.build(snap)
+    ws03 = next(a.sid for a in snap.accounts if a.sam == "WS03$")
+    server_admins = next(o.sid for o in snap.objects if o.name == "LabServerAdmins")
+    assert (f"sid:{ws03}", "can RDP via GPO LabEnforced") in g.logon_edges[f"sid:{server_admins}"]

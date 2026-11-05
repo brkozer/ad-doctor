@@ -1,0 +1,94 @@
+id = "AD-PRIV-007"
+aliases = ["primarygroupid"]
+summary = "Enabled accounts are made members of a privileged or domain controller group through primaryGroupID, which does not appear in the group's member list."
+severities = ["high"]
+severity_logic = """
+Always **high**. The account holds tier-0 rights (or the rights of a domain controller)
+and the usual membership reviews do not show it, which is typical of a backdoor.
+"""
+mitre = ["T1078.002", "T1564"]
+data_sources = ["ldap"]
+attributes = ["primaryGroupID", "userAccountControl"]
+related = ["AD-PRIV-001", "AD-PRIV-006", "AD-ACC-006", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+Every account has a *primary group*, stored as a RID in `primaryGroupID` (513 Domain
+Users for users, 515 Domain Computers for computers, 516 Domain Controllers for DCs).
+The account is a member of that group for every access check, but the membership is
+**not** written to the group's `member` attribute or to the account's `memberOf`. Tools
+that list members from `member`, including the *Members* tab and many scripts, do not
+show it.
+
+An attacker who had Domain Admin rights for a moment can set an account's
+`primaryGroupID` to 512 and keep a domain admin that does not appear in Domain Admins.
+Setting the primary group of a user or a workstation to 516 gives it every right granted
+to Domain Controllers, such as *Replicating Directory Changes All* on the domain object
+(half of what DCSync needs), again without any visible membership.
+"""
+
+detection = """
+For every **enabled** account in the LDAP snapshot, ad-doctor compares `primaryGroupID`
+with two lists:
+
+- **users** (not computers) whose primary group is 512 (Domain Admins), 518 (Schema
+  Admins) or 519 (Enterprise Admins);
+- **any account that is not a DC** (neither `SERVER_TRUST_ACCOUNT` nor
+  `PARTIAL_SECRETS_ACCOUNT` in `userAccountControl`) whose primary group is 516 (Domain
+  Controllers), 521 (Read-only Domain Controllers) or 498 (Enterprise Read-only Domain
+  Controllers).
+
+Examples: `hidden_admin (primary group Domain Admins)`,
+`WS01$ (primary group Domain Controllers, but not a DC)`.
+
+These accounts are also added back into the tier-0 groups for every other check, so
+[AD-PRIV-001](AD-PRIV-001.md) counts them and [AD-PATH-001](AD-PATH-001.md) treats them
+as tier 0.
+"""
+
+false_positives = """
+- No legitimate configuration needs these values. Some old provisioning tools set
+  `primaryGroupID` to an admin group when creating admin accounts; the fix is the same,
+  with the account added to the group through `member` instead.
+"""
+
+remediation = """
+1. **Find every account with a non-default primary group** (read-only):
+
+    ```powershell
+    Get-ADObject -LDAPFilter '(|(primaryGroupID=512)(primaryGroupID=518)(primaryGroupID=519)(primaryGroupID=516)(primaryGroupID=521)(primaryGroupID=498))' `
+        -Properties primaryGroupID, userAccountControl, whenChanged |
+        Select-Object Name, ObjectClass, primaryGroupID, userAccountControl, whenChanged
+    ```
+
+2. **Investigate before changing anything.** An unexplained value is a sign of a past
+   compromise: check `whenChanged`, the replication metadata of `primaryGroupID`
+   (`repadmin /showobjmeta`) and who could write the attribute.
+
+3. **Set the primary group back** to 513 for users and 515 for computers (the same
+   command ad-doctor writes with `--fixes`). The account must already be a member of
+   the target group, which Domain Users and Domain Computers normally are:
+
+    ```powershell
+    Set-ADObject (Get-ADObject -Filter "sAMAccountName -eq 'hidden_admin'") `
+        -Replace @{primaryGroupID = 513} -WhatIf
+    ```
+
+4. **If the account really needs the rights**, add it to the group through `member`
+   (`Add-ADGroupMember`) so it shows in reviews, then reset the primary group.
+
+5. **Rotate the credentials** of the account and of anything it could reach while it
+   held the hidden rights.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-007"
+
+[[references]]
+title = "Primary-Group-ID attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-primarygroupid"
+kind = "spec"
+
+[[references]]
+title = "ANSSI Active Directory checklist (vuln_primary_group_id_nochange)"
+url = "https://cert.cyber.gouv.fr/uploads/ad_checklist.html"
+kind = "vendor"

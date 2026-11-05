@@ -1,0 +1,108 @@
+id = "AD-SEC-001"
+aliases = ["laps"]
+summary = "Enabled Windows computers have no LAPS-managed local administrator password, so one shared local admin password can open many machines."
+severities = ["medium"]
+severity_logic = """
+Always **medium**, whatever the number of computers. The detail gives the count.
+"""
+mitre = ["T1550.002"]
+data_sources = ["ldap"]
+attributes = [
+    "ms-Mcs-AdmPwdExpirationTime",
+    "msLAPS-PasswordExpirationTime",
+    "operatingSystem",
+    "userAccountControl",
+]
+related = ["AD-SEC-002"]
+since = "0.1.0"
+
+risk = """
+Without LAPS, the built-in local Administrator password is whatever the image or the
+person who installed the machine set, and it is usually the same on every computer built
+from that image. An attacker who gets SYSTEM on one workstation dumps the local SAM, takes
+the Administrator NT hash and uses it (pass-the-hash) on every other machine with the same
+password, collecting the credentials of whoever is logged on there until a server or
+helpdesk admin turns up.
+
+LAPS gives every computer its own random local admin password, rotated on a schedule and
+stored in AD (or Entra ID) where only authorized admins can read it.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled** computer account that is not a domain controller
+and has neither of the LAPS expiry attributes set:
+
+- `ms-Mcs-AdmPwdExpirationTime` (legacy Microsoft LAPS)
+- `msLAPS-PasswordExpirationTime` (Windows LAPS)
+
+The expiry time is written by the LAPS client each time it rotates the password, so an
+empty value means LAPS has never managed that computer. Computers whose `operatingSystem`
+does not contain "Windows" (NAS appliances, Linux joins) are skipped; computers with no
+`operatingSystem` value are kept, which includes cluster name objects.
+
+The objects are sAMAccountNames, for example `WS02$`, `FS01$`.
+"""
+
+false_positives = """
+- **Windows LAPS backing up to Entra ID** only writes to Entra ID, not to AD, so ad-doctor
+  sees nothing. Accept those computers in an [accepted-risk file](../ci.md#accepted-risks)
+  if Entra ID is the intended store.
+- **The scanning account cannot read the expiry attributes.** They are readable by
+  authenticated users by default; if your schema extension removed that, every computer is
+  reported. Run the scan with an account that can read them.
+- **Cluster name objects and failover cluster virtual names** have no local administrator;
+  accept them.
+- **Computers that were just joined** report until the LAPS client first rotates the
+  password.
+"""
+
+remediation = """
+1. **List the computers and their LAPS state.**
+
+    ```powershell
+    Get-ADComputer -Filter 'Enabled -eq $true' `
+        -Properties operatingSystem, 'msLAPS-PasswordExpirationTime', 'ms-Mcs-AdmPwdExpirationTime' |
+        Where-Object { -not $_.'msLAPS-PasswordExpirationTime' -and -not $_.'ms-Mcs-AdmPwdExpirationTime' } |
+        Select-Object Name, operatingSystem, DistinguishedName
+    ```
+
+2. **Prepare the directory for Windows LAPS** (once per forest, as Schema Admin), and let
+   the computers in each OU write their own password:
+
+    ```powershell
+    Update-LapsADSchema -WhatIf
+    Set-LapsADComputerSelfPermission -Identity 'OU=Workstations,DC=corp,DC=example' -WhatIf
+    ```
+
+3. **Grant read access only to the admins of each tier**, not to helpdesk groups for
+   tier-0 servers (see [AD-SEC-002](AD-SEC-002.md)):
+
+    ```powershell
+    Set-LapsADReadPasswordPermission -Identity 'OU=Workstations,DC=corp,DC=example' `
+        -AllowedPrincipals 'CORP\\Workstation Admins' -WhatIf
+    ```
+
+4. **Turn on the policy** with a GPO: *Computer Configuration > Administrative Templates >
+   System > LAPS > Configure password backup directory = Active Directory*, and enable
+   password encryption. Windows LAPS is built into supported Windows versions.
+
+5. **Rescan after the next policy refresh**, and alert on local accounts used for network
+   logons (event 4624, logon type 3, with a local account name) in the meantime.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-SEC-001"
+
+[[references]]
+title = "Windows LAPS overview"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/laps/laps-overview"
+kind = "vendor"
+
+[[references]]
+title = "Get started with Windows LAPS and Windows Server Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/laps/laps-scenarios-windows-server-active-directory"
+kind = "vendor"
+
+[[references]]
+title = "Microsoft LAPS security and Active Directory LAPS configuration recon (Sean Metcalf)"
+url = "https://adsecurity.org/?p=3164"
+kind = "research"

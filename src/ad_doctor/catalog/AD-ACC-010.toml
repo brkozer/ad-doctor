@@ -1,0 +1,105 @@
+id = "AD-ACC-010"
+aliases = ["pre2k-computers"]
+summary = "Pre-created computer accounts that were never used still have the lower-cased computer name as their password, so anyone can take them over."
+severities = ["high"]
+severity_logic = """
+Always **high**: the password is predictable from the account name, and a computer
+account is a working domain identity (LDAP queries, Kerberos tickets, RBCD targets).
+"""
+mitre = ["T1078.002"]
+data_sources = ["ldap"]
+attributes = ["userAccountControl", "logonCount", "objectClass"]
+related = ["AD-ACC-001", "AD-POL-002", "AD-DEL-003", "AD-CHAIN-001"]
+since = "0.1.0"
+
+risk = """
+When a computer account is created with *Assign this computer account as a pre-Windows
+2000 computer*, its password is set to the computer name in lower case (without the
+`$`). The same happens when an admin uses *Reset Account* on such an account. The
+password stays predictable until a machine actually joins with the account and changes
+it.
+
+An attacker lists the enabled computers with `PASSWD_NOTREQD` and a `logonCount` of 0
+and tries the lower-cased name. A logon then fails with
+`STATUS_NOLOGON_WORKSTATION_TRUST_ACCOUNT`, which confirms the password; the attacker
+changes it (or requests a Kerberos ticket) and owns a domain computer account. That is
+enough for authenticated enumeration, and it gives the attacker the account with an SPN
+that resource-based delegation attacks need ([AD-DEL-003](AD-DEL-003.md)), without
+using the machine account quota ([AD-POL-002](AD-POL-002.md)).
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled computer** that is not a domain controller, has
+`PASSWD_NOTREQD` (`0x20`) in `userAccountControl` and a `logonCount` of **0**. Accounts
+for which `logonCount` came back empty are skipped.
+
+`logonCount` is **not replicated**: the value is the one held by the DC ad-doctor
+queried. The same accounts are also reported, less specifically, by
+[AD-ACC-001](AD-ACC-001.md).
+
+Each object is the computer's `sAMAccountName`, for example `PRE2K$`.
+"""
+
+false_positives = """
+- **A computer that joined through another DC.** Its logons were counted there, so the
+  queried DC still shows 0. Its password is a random machine password; clear
+  `PASSWD_NOTREQD` and the finding goes away.
+"""
+
+remediation = """
+1. **List the candidates** (read-only):
+
+    ```powershell
+    Get-ADComputer -LDAPFilter '(userAccountControl:1.2.840.113556.1.4.803:=32)' `
+        -Properties logonCount, whenCreated, pwdLastSet |
+        Where-Object { $_.Enabled -and $_.logonCount -eq 0 } |
+        Select-Object Name, whenCreated, logonCount
+    ```
+
+2. **Delete accounts no machine will use**, or disable them until the machine is built:
+
+    ```powershell
+    Remove-ADComputer PRE2K -WhatIf
+    ```
+
+3. **For accounts that must stay, set a random password** with PowerShell. Do **not** use
+   *Reset Account* in Active Directory Users and Computers: that sets the lower-cased
+   name again.
+
+    ```powershell
+    Add-Type -AssemblyName System.Web
+    $pw = [System.Web.Security.Membership]::GeneratePassword(64, 16)
+    Set-ADAccountPassword 'PRE2K$' -Reset -NewPassword (ConvertTo-SecureString $pw -AsPlainText -Force) -WhatIf
+    ```
+
+4. **Clear `PASSWD_NOTREQD`.** This is what `ad-doctor fix` generates; on its own it
+   does not change the password, so do step 2 or 3 first.
+
+    ```powershell
+    Set-ADAccountControl 'PRE2K$' -PasswordNotRequired $false -WhatIf
+    ```
+
+5. **Stop creating them**: pre-stage computers without the pre-Windows 2000 option.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-010"
+
+[[references]]
+title = "Diving into pre-created computer accounts (TrustedSec)"
+url = "https://www.trustedsec.com/blog/diving-into-pre-created-computer-accounts"
+kind = "research"
+
+[[references]]
+title = "The Hacker Recipes: Pre-Windows 2000 computers"
+url = "https://www.thehacker.recipes/ad/movement/builtins/pre-windows-2000-computers"
+kind = "research"
+
+[[references]]
+title = "pre2k: query for pre-Windows 2000 computer objects"
+url = "https://github.com/garrettfoster13/pre2k"
+kind = "tool"
+
+[[references]]
+title = "Logon-Count attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-logoncount"
+kind = "spec"

@@ -1,0 +1,85 @@
+id = "AD-ACC-009"
+summary = "Password attributes (userPassword, unixUserPassword, msSFU30Password, orclCommonAttribute) are set on accounts and readable by an ordinary user."
+severities = ["high"]
+severity_logic = """
+Always **high**: the value came back to the low-privileged scanning account, and these
+attributes usually hold a clear-text, encoded or weakly hashed password.
+"""
+mitre = ["T1552"]
+data_sources = ["ldap"]
+attributes = ["userPassword", "unixUserPassword", "msSFU30Password", "orclCommonAttribute"]
+related = ["AD-ACC-008", "AD-SEC-002", "AD-GPP-001"]
+since = "0.1.0"
+
+risk = """
+Active Directory keeps real password hashes in attributes no one can read over LDAP.
+The attributes this check looks at are different: they are ordinary directory attributes
+that other software writes to.
+
+- `unixUserPassword` and `msSFU30Password` were used by *Services for UNIX* and *Identity
+  Management for UNIX* to serve NIS clients, often with a crypt(3) hash or clear text.
+- `userPassword` is, in AD DS, a plain attribute unless the `fUserPwdSupport` flag of
+  `dSHeuristics` is set; scripts and LDAP tools from other directories write passwords
+  into it.
+- `orclCommonAttribute` is written by some Oracle directory integrations and can hold
+  password material.
+
+When any of them is readable, every domain user can collect the values and log on with
+them or crack them offline.
+"""
+
+detection = """
+From the LDAP snapshot: every account (users and computers, **enabled or not**) for which
+the scanning user's search returned a value in `userPassword`, `unixUserPassword`,
+`msSFU30Password` or `orclCommonAttribute`. ad-doctor records which attributes were
+present, never their values.
+
+Because the check depends on what the scanning account can read, it only shows values
+readable by that account. On Windows Server 2025 `unixUserPassword` is a confidential
+attribute, so an ordinary user does not see it there.
+
+Each object names the account and the attributes, for example
+`svc_nfs (unixUserPassword, userPassword)`.
+"""
+
+remediation = """
+1. **See who has the attributes** (run as an admin; read-only):
+
+    ```powershell
+    Get-ADObject -LDAPFilter '(|(userPassword=*)(unixUserPassword=*)(msSFU30Password=*)(orclCommonAttribute=*))' `
+        -Properties sAMAccountName | Select-Object sAMAccountName, DistinguishedName
+    ```
+
+2. **Change the password** of every reported account: assume the values have been read.
+
+    ```powershell
+    Set-ADAccountPassword svc_nfs -Reset -NewPassword (Read-Host -AsSecureString 'New password') -WhatIf
+    ```
+
+3. **Clear the attributes.** `ad-doctor fix` generates the first three; add
+   `orclCommonAttribute` when it is reported.
+
+    ```powershell
+    Set-ADUser svc_nfs -Clear userPassword, unixUserPassword, msSFU30Password -WhatIf
+    ```
+
+4. **Stop the writer**: retire the NIS or Oracle integration, or the script that sets
+   `userPassword`, so the values do not come back.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-009"
+
+[[references]]
+title = "User-Password attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-userpassword"
+kind = "spec"
+
+[[references]]
+title = "unixUserPassword attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-unixuserpassword"
+kind = "spec"
+
+[[references]]
+title = "[MS-ADTS] dSHeuristics (fUserPwdSupport)"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/e5899be4-862e-496f-9a38-33950617d2c5"
+kind = "spec"

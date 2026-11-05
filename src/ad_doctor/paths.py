@@ -3,18 +3,23 @@
 Nodes are principals (by SID) and objects without a SID (OUs, GPOs, PKI objects, the
 domain head). An edge A -> B means "A controls B or becomes B": group membership, an ACE
 that allows a takeover, ownership, DCSync, editing a GPO, enrolling in an exploitable
-certificate template, reading a gMSA password. A reverse breadth-first search from every
-tier-0 node finds the shortest path from any other principal.
+certificate template, reading a gMSA password, local admin rights a GPO hands out (admin
+on a computer is SYSTEM there, so it becomes the computer account), a sync server holding
+its sync account's password. A reverse breadth-first search from every tier-0 node finds
+the shortest path from any other principal.
+
+Remote logon rights a GPO grants (RDP, WinRM, DCOM) are kept apart as logon edges: they
+are exported, but logon is not control, so the path search does not follow them.
 """
 
 from __future__ import annotations
 
-import re
 from collections import deque
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
-from . import sd
+from . import gpo_scope, sd
 from .checks import (
     CREATOR_OWNER,
     EKU_ANY,
@@ -24,13 +29,17 @@ from .checks import (
     _finding,
     _issuable,
     _risky_rights,
+    _sync_accounts,
+    _sync_servers,
     _tier0_group_sids,
+    ca_control,
     check,
+    officer_templates,
 )
 from .model import Account, Finding, Severity, Snapshot
 
 Edge = tuple[str, str]  # (target node, label)
-UNESCAPED_COMMA = re.compile(r"(?<!\\),")
+UNESCAPED_COMMA = gpo_scope.RDN_SEPARATOR
 
 
 @dataclass
@@ -38,6 +47,10 @@ class Graph:
     edges: dict[str, list[Edge]]
     names: dict[str, str]
     tier0: set[str]
+    # remote logon rights (not traversed by the path search)
+    logon_edges: dict[str, list[Edge]] = field(default_factory=dict)
+    # (source, target, label) -> extra edge properties: the GPO and its caveats
+    edge_props: dict[tuple[str, str, str], dict[str, Any]] = field(default_factory=dict)
 
     def name(self, node: str) -> str:
         return self.names.get(node, node.split(":", 1)[-1])
@@ -189,6 +202,36 @@ def build(snap: Snapshot) -> Graph:
         for where in g.linked_to:
             add(gpo_node, domain_node if where == "domain" else "tier0:dc-ou", f"linked to {where}")
 
+    # local groups set by Group Policy: an admin-equivalent group makes the member SYSTEM on
+    # the computer, so it becomes the computer account; a domain group rewritten through
+    # the DCs is plain membership
+    logon_edges: dict[str, list[Edge]] = {}
+    edge_props: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for grant in gpo_scope.grants(snap):
+        member = principal(grant.item.member_sid)
+        via = f" via GPO {grant.gpo.name}"
+        if grant.computer is None:
+            target, how = _sid_node(grant.item.group_sid), "member of" + via
+            names.setdefault(target, snap.name_of(grant.item.group_sid))
+            add(member, target, how)
+        else:
+            group = gpo_scope.LOCAL_GROUPS[grant.item.group_sid]
+            target, how = _sid_node(grant.computer.sid), group.verb + via
+            if group.admin:
+                add(member, target, how)
+            elif grant.effective:
+                logon_edges.setdefault(member, []).append((target, how))
+            else:
+                continue
+        props: dict[str, Any] = {"gpo": grant.gpo.name}
+        if grant.caveats:
+            props["caveats"] = list(grant.caveats)
+        edge_props[(member, target, how)] = props
+    # the ADSync service keeps the sync account's password on its server
+    for account in _sync_accounts(snap):
+        for server in _sync_servers(snap, account):
+            add(_sid_node(server.sid), _sid_node(account.sid), "hosts sync account")
+
     # exploitable certificate templates turn enrollment into tier 0 (ESC1-3), and write
     # access to any published template makes it exploitable (ESC4)
     for t in snap.templates:
@@ -218,6 +261,18 @@ def build(snap: Snapshot) -> Graph:
             for ace in aces:
                 if ace.takeover and ace.sid != f"{snap.domain_sid}-517":
                     add(principal(ace.sid), node, "full control")
+    # managing a CA controls a tier-0 server (ESC7); ManageCertificates alone only when a
+    # published template lets the requester name the subject
+    hosts = {a.dns_host.lower(): _sid_node(a.sid) for a in snap.accounts if a.dns_host and a.sid}
+    officer = bool(officer_templates(snap))
+    ca_nodes: set[str] = set()
+    for c, sid, right in ca_control(snap):
+        if right == "ManageCertificates" and not officer:
+            continue
+        ca_node = hosts.get(c.host.lower(), f"tier0:ca:{c.name}")
+        ca_nodes.add(ca_node)
+        names.setdefault(ca_node, f"CA {c.name}")
+        add(principal(sid), ca_node, f"{right} (ESC7)")
 
     # gMSA password readers become the gMSA
     for gm in snap.gmsas:
@@ -229,7 +284,7 @@ def build(snap: Snapshot) -> Graph:
     # tier-0 nodes
     tier0 = {_sid_node(s) for s in _tier0_group_sids(snap)}
     tier0 |= {node_of(dn) for dn in snap.tier0_dns()}
-    tier0 |= {domain_node, "tier0:dc-ou"}
+    tier0 |= {domain_node, "tier0:dc-ou"} | ca_nodes
     tier0 |= {n for n in names if n.startswith("tier0:")}
     for o in snap.objects:
         dn = o.dn.lower()
@@ -241,7 +296,7 @@ def build(snap: Snapshot) -> Graph:
         for a in snap.accounts:
             if a.sam.upper() == ca.upper() and a.sid:
                 tier0.add(_sid_node(a.sid))
-    return Graph(edges, names, tier0)
+    return Graph(edges, names, tier0, logon_edges, edge_props)
 
 
 def paths_to_tier0(g: Graph) -> dict[str, Path]:

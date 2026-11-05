@@ -1,0 +1,102 @@
+id = "AD-CHAIN-003"
+aliases = ["esc8-chain"]
+summary = "A DC runs the Print Spooler and a CA's web enrollment accepts NTLM over HTTP, so any user can relay the DC's authentication into a DC certificate (ESC8)."
+severities = ["high"]
+severity_logic = """
+Always **high**: with both halves present, a domain user gets a certificate for a domain
+controller and from it DCSync, with public tools and no other foothold.
+"""
+mitre = ["T1187", "T1557.001", "T1649"]
+data_sources = ["derived"]
+attributes = ["probe: spoolss pipe on each DC", "probe: GET /certsrv/ over HTTP (WWW-Authenticate)"]
+related = ["AD-ADCS-010", "AD-INF-009", "AD-CHAIN-002", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+The ESC8 attack from *Certified Pre-Owned*:
+
+1. Any domain user makes a DC authenticate to their host through the Print Spooler (or
+   EFSRPC, PetitPotam).
+2. They relay that NTLM authentication to the CA's web enrollment page (`/certsrv/`) over
+   plain HTTP, which has no signing or channel binding to stop a relay
+   ([AD-ADCS-010](AD-ADCS-010.md)).
+3. Acting as the DC's computer account, they request a certificate from the
+   *DomainController* (or *Machine*) template.
+4. They use the certificate for PKINIT, get the DC's TGT and run DCSync.
+
+The whole chain runs in minutes and leaves the attacker with a certificate that stays
+valid after password changes.
+"""
+
+detection = """
+A compound finding. It fires when **both** hold:
+
+- at least one DC answered the SMB probe by opening the `spoolss` named pipe (the Print
+  Spooler is running, [AD-INF-009](AD-INF-009.md)), and
+- the HTTP probe found web enrollment on a CA host: `GET /certsrv/` over plain HTTP
+  returned 401 with `NTLM` or `Negotiate` in `WWW-Authenticate`
+  ([AD-ADCS-010](AD-ADCS-010.md)).
+
+The objects are the web enrollment URLs, for example `http://ca01.corp.example/certsrv/`.
+The HTTP probe uses `--http-port` (80 by default, 0 skips it); both probes are skipped with
+`--no-probes`. HTTPS endpoints without Extended Protection are not probed, so this check
+can miss them.
+
+The spooler is the only coercion method ad-doctor checks. A DC with the spooler off can
+still often be coerced through EFSRPC, so [AD-ADCS-010](AD-ADCS-010.md) on its own remains
+serious.
+"""
+
+false_positives = """
+- **The CA's web enrollment requires HTTPS with Extended Protection** on another port while
+  plain HTTP still answers: the HTTP endpoint is still relayable. Remove it.
+- There is no benign reason to keep both halves; fix at least one.
+"""
+
+remediation = """
+Fixing **either** side breaks this chain; fix the CA side first, because it is also
+reachable without the spooler:
+
+1. **Remove web enrollment** if nobody uses it:
+
+    ```powershell
+    Uninstall-AdcsWebEnrollment -WhatIf
+    ```
+
+2. **Otherwise require HTTPS and Extended Protection for Authentication** on `/certsrv/`
+   and the CES endpoints, and disable NTLM there (KB5005413): in IIS, require SSL and set
+   *Extended Protection* to *Required* under Windows Authentication, then remove the plain
+   HTTP binding.
+
+3. **Stop and disable the Print Spooler on every DC**, preferably with the Default Domain
+   Controllers Policy (*System Services > Print Spooler = Disabled*).
+
+4. **Look for certificates already issued to DCs from unexpected requesters**, and revoke
+   them:
+
+    ```console
+    certutil -view -restrict "CertificateTemplate=DomainController" -out "RequestID,RequesterName,NotBefore,SerialNumber"
+    ```
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-CHAIN-003"
+
+[[references]]
+title = "Certified Pre-Owned: abusing Active Directory Certificate Services (SpecterOps)"
+url = "https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf"
+kind = "research"
+
+[[references]]
+title = "KB5005413: Mitigating NTLM relay attacks on Active Directory Certificate Services"
+url = "https://support.microsoft.com/en-us/servicing/os/windows-server/2021/07/kb5005413-mitigating-ntlm-relay-attacks-on-active-directory-certificate-services-ad-cs"
+kind = "vendor"
+
+[[references]]
+title = "ADV210003: Mitigating NTLM relay attacks on AD CS"
+url = "https://msrc.microsoft.com/update-guide/vulnerability/ADV210003"
+kind = "vendor"
+
+[[references]]
+title = "PetitPotam (topotam)"
+url = "https://github.com/topotam/PetitPotam"
+kind = "tool"

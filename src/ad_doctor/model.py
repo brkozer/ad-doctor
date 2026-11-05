@@ -132,6 +132,25 @@ class Trust:
     direction: int  # 1 inbound, 2 outbound, 3 both
     trust_type: int  # 1 downlevel, 2 uplevel (AD), 3 MIT
     attributes: int
+    sid: str = ""  # the partner domain's SID (securityIdentifier); "" when not read
+
+    @property
+    def within_forest(self) -> bool:
+        return bool(self.attributes & TRUST_WITHIN_FOREST)
+
+
+TRUST_WITHIN_FOREST = 0x20
+
+
+@dataclass
+class GpLink:
+    """One entry of a gPLink attribute."""
+
+    container: str  # DN of the domain head, an OU or a site
+    kind: str  # "domain", "ou" or "site"
+    enabled: bool
+    enforced: bool
+    index: int  # position in the gPLink value
 
 
 @dataclass
@@ -141,6 +160,33 @@ class Gpo:
     # where the GPO is linked among the places that reach domain controllers
     linked_to: list[str]
     aces: list[Ace]
+    # every link, disabled ones included (empty in older snapshots)
+    links: list[GpLink] = field(default_factory=list)
+    flags: int = 0  # 1 user side disabled, 2 computer side disabled
+    # low 16 bits of versionNumber; None when not collected
+    machine_version: int | None = None
+    # client-side extension GUIDs from gPCMachineExtensionNames; None when not collected
+    machine_extensions: list[str] | None = None
+    # name (or GUID, when unreadable) of the WMI filter
+    wmi_filter: str | None = None
+
+
+@dataclass
+class GpoLocalGroup:
+    """One membership entry of Restricted Groups (GptTmpl.inf) or GPP Local Groups."""
+
+    gpo: str  # GPO GUID, upper case with braces
+    source: str  # "restricted" or "gpp"
+    path: str  # SYSVOL-relative file
+    group_sid: str  # "" when not resolved
+    group_name: str  # as written in the file
+    member_sid: str  # "" when not resolved, and for a clear
+    member_name: str  # as written ("" for a clear)
+    action: str  # "add", "remove" or "set" (Restricted Groups X__Members)
+    # the group's other members are removed: X__Members, GPP action R, deleteAll*
+    replaces: bool = False
+    disabled: bool = False  # GPP item (or its collection) disabled
+    filtered: bool = False  # GPP item-level targeting present
 
 
 @dataclass
@@ -158,6 +204,8 @@ class DirObject:
     members: list[str] = field(default_factory=list)
     # ACEs that child objects inherit (OUs, containers, the domain head)
     inheritable: list[Ace] = field(default_factory=list)
+    # OU or domain head with Block Inheritance (gPOptions & 1)
+    gp_blocked: bool = False
 
     def rid_is(self, snap: Snapshot, rid: int) -> bool:
         return self.sid == f"{snap.domain_sid}-{rid}"
@@ -209,6 +257,37 @@ class DcProbe:
     error: str | None = None
 
 
+DEFAULT_POLICY_MODULE = "CertificateAuthority_MicrosoftDefault.Policy"
+
+
+@dataclass
+class CaConfig:
+    """An enterprise CA's own configuration, read from its registry over MS-RRP.
+
+    None means unknown (not readable, value absent, or owned by a third-party policy
+    module), never "off".
+    """
+
+    name: str  # CA name as the registry knows it (Configuration\Active)
+    host: str  # dNSHostName of the enrollment service
+    policy_module: str | None = None
+    edit_flags: int | None = None
+    interface_flags: int | None = None
+    request_disposition: int | None = None
+    disabled_extensions: list[str] | None = None
+    # allow ACEs of the CA security descriptor, with CA rights masks (sd.CA_*)
+    aces: list[Ace] = field(default_factory=list)
+    owner: str | None = None
+    # why the configuration could not be read
+    error: str | None = None
+
+    @property
+    def third_party_policy(self) -> bool:
+        return self.policy_module is not None and (
+            self.policy_module.lower() != DEFAULT_POLICY_MODULE.lower()
+        )
+
+
 @dataclass
 class Probes:
     """Results of the active network checks; None means not run or inconclusive."""
@@ -220,6 +299,8 @@ class Probes:
     web_enrollment_ntlm: list[str] = field(default_factory=list)
     # every DC that was probed, the scanned one included (empty in older snapshots)
     dcs: list[DcProbe] = field(default_factory=list)
+    # configuration of each enterprise CA (empty when not read, and in older snapshots)
+    ca_configs: list[CaConfig] = field(default_factory=list)
 
     def per_dc(self, attr: str, fallback: bool | None, scanned: str) -> dict[str, bool | None]:
         """DC name -> result of one probe; older snapshots only hold the scanned DC."""
@@ -281,6 +362,13 @@ class Snapshot:
     backup_checked: bool = False
     # whether any fine-grained password policy was readable
     psos_visible: bool = False
+    # local group membership set by Restricted Groups and GPP Local Groups
+    gpo_local_groups: list[GpoLocalGroup] = field(default_factory=list)
+    # False in older snapshots and when SYSVOL was not read: "not collected", not "clean"
+    local_groups_collected: bool = False
+    # DC computer DN (lower case) -> DN of its site
+    dc_sites: dict[str, str] = field(default_factory=dict)
+    site_count: int = 0
     # parts of the collection that could not run (no AD CS, SYSVOL unreachable, ...)
     notes: list[str] = field(default_factory=list)
 
@@ -355,7 +443,16 @@ class Snapshot:
             principals=data.get("principals", {}),
             gpp_passwords=[GppPassword(**g) for g in data.get("gpp_passwords", [])],
             trusts=[Trust(**t) for t in data.get("trusts", [])],
-            gpos=[Gpo(**{**g, "aces": _aces(g["aces"])}) for g in data.get("gpos", [])],
+            gpos=[
+                Gpo(
+                    **{
+                        **g,
+                        "aces": _aces(g["aces"]),
+                        "links": [GpLink(**x) for x in g.get("links", [])],
+                    }
+                )
+                for g in data.get("gpos", [])
+            ],
             oid_group_links=data.get("oid_group_links", {}),
             ca_hosts=data.get("ca_hosts", []),
             root_sid=data.get("root_sid", ""),
@@ -377,6 +474,10 @@ class Snapshot:
             last_backup=_dt(data.get("last_backup")),
             backup_checked=data.get("backup_checked", False),
             psos_visible=data.get("psos_visible", False),
+            gpo_local_groups=[GpoLocalGroup(**x) for x in data.get("gpo_local_groups", [])],
+            local_groups_collected=data.get("local_groups_collected", False),
+            dc_sites=data.get("dc_sites", {}),
+            site_count=data.get("site_count", 0),
             dns_admins=data.get("dns_admins", []),
             pre2k_members=data.get("pre2k_members", []),
             ds_heuristics=data.get("ds_heuristics", ""),
@@ -397,6 +498,13 @@ WELL_KNOWN_SIDS = {
     "S-1-5-32-545": "Users",
     "S-1-5-32-548": "Account Operators",
     "S-1-5-32-554": "Pre-Windows 2000 Compatible Access",
+    "S-1-5-4": "Interactive",
+    "S-1-5-15": "This Organization",
+    "S-1-5-32-551": "Backup Operators",
+    "S-1-5-32-555": "Remote Desktop Users",
+    "S-1-5-32-562": "Distributed COM Users",
+    "S-1-5-32-578": "Hyper-V Administrators",
+    "S-1-5-32-580": "Remote Management Users",
 }
 WELL_KNOWN_RIDS = {
     "498": "Enterprise Read-only Domain Controllers",
@@ -413,6 +521,32 @@ WELL_KNOWN_RIDS = {
     "526": "Key Admins",
     "527": "Enterprise Key Admins",
 }
+# English names of the built-in and well-known principals local group settings name.
+# Localized names are left unresolved and reported rather than guessed.
+WELL_KNOWN_NAMES = {
+    "administrators": "S-1-5-32-544",
+    "users": "S-1-5-32-545",
+    "guests": "S-1-5-32-546",
+    "backup operators": "S-1-5-32-551",
+    "remote desktop users": "S-1-5-32-555",
+    "distributed com users": "S-1-5-32-562",
+    "hyper-v administrators": "S-1-5-32-578",
+    "remote management users": "S-1-5-32-580",
+    "everyone": "S-1-1-0",
+    "authenticated users": "S-1-5-11",
+    "interactive": "S-1-5-4",
+}
+
+
+def well_known_sid(name: str) -> str:
+    """SID of a built-in or well-known name such as 'BUILTIN\\Administrators' or
+    'Administrators (built-in)'; "" for anything else."""
+    key = name.strip().lower().removesuffix("(built-in)").strip()
+    for prefix in ("builtin\\", "nt authority\\"):
+        key = key.removeprefix(prefix)
+    return WELL_KNOWN_NAMES.get(key, "")
+
+
 # Pre-Windows 2000 Compatible Access holds Authenticated Users on a default domain
 BROAD_SIDS = {"S-1-1-0", "S-1-5-7", "S-1-5-11", "S-1-5-32-545", "S-1-5-32-554"}
 BROAD_RIDS = {"513", "514", "515"}
@@ -427,12 +561,36 @@ TIER0_RIDS = {"498", "500", "512", "516", "518", "519", "521"}
 FOREST_ROOT_RIDS = {"498", "500", "512", "518", "519"}
 
 
+def exchange_members(objects: list[DirObject]) -> set[str]:
+    """Lower-cased DNs of every transitive member of the Exchange groups."""
+    groups = {o.dn.lower(): o for o in objects if o.kind == "group"}
+    todo = [o.dn.lower() for o in groups.values() if o.name.lower() in EXCHANGE_GROUPS]
+    seen: set[str] = set()
+    while todo:
+        dn = todo.pop()
+        for m in groups[dn].members if dn in groups else []:
+            key = m.lower()
+            if key not in seen:
+                seen.add(key)
+                todo.append(key)
+    return seen - {dn for dn in groups if groups[dn].name.lower() in EXCHANGE_GROUPS}
+
+
 def _aces(items: list[dict[str, Any]]) -> list[Ace]:
     return [Ace(**a) for a in items]
 
 
 def _probes(data: dict[str, Any]) -> Probes:
-    return Probes(**{**data, "dcs": [DcProbe(**d) for d in data.get("dcs", [])]})
+    return Probes(
+        **{
+            **data,
+            "dcs": [DcProbe(**d) for d in data.get("dcs", [])],
+            "ca_configs": [
+                CaConfig(**{**c, "aces": _aces(c.get("aces", []))})
+                for c in data.get("ca_configs", [])
+            ],
+        }
+    )
 
 
 def _encode(value: Any) -> Any:

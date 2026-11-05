@@ -1,0 +1,99 @@
+id = "AD-ADCS-004"
+aliases = ["esc4"]
+summary = "Broad groups hold write, WriteDacl or WriteOwner rights on a certificate template, so any user can reconfigure it into an ESC1 template."
+severities = ["high"]
+severity_logic = "Always **high**: write access to a template is one LDAP modify away from a certificate for any user."
+mitre = ["T1649"]
+data_sources = ["ldap"]
+attributes = ["nTSecurityDescriptor (template DACL)"]
+related = ["AD-ADCS-001", "AD-ADCS-005", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+A certificate template is an ordinary directory object, and its settings are attributes:
+`msPKI-Certificate-Name-Flag`, `msPKI-Enrollment-Flag`, `pKIExtendedKeyUsage`, the
+template's own DACL. Whoever can write those attributes decides what the CA issues.
+
+With write access an attacker turns the template into an ESC1 template
+([AD-ADCS-001](AD-ADCS-001.md)): enable *Supply in the request*, add the Client
+Authentication EKU, clear manager approval, grant themselves Enroll, request a
+certificate naming a domain admin, then restore the original settings. The change is
+brief and the certificate stays valid long after. WriteDacl and WriteOwner reach the same
+result one step later, by granting the attacker the write rights first.
+"""
+
+detection = """
+ad-doctor reads the DACL of every certificate template over LDAP and reports a template
+when Everyone, Anonymous Logon, Authenticated Users, BUILTIN\\Users, Pre-Windows 2000
+Compatible Access, Domain Users, Domain Guests or Domain Computers hold any of:
+
+- `GenericAll` (full control) or `GenericWrite`
+- `WriteDacl` or `WriteOwner`
+- `WriteProperty` on all attributes (an ACE with no object type)
+
+Write access to a single attribute or property set is not counted. Templates are reported
+whether or not a CA publishes them, because an unpublished template can be published
+later. Each object names the template and the groups, for example
+`LabESC4 (Authenticated Users)`.
+"""
+
+false_positives = """
+- **Narrower groups and single accounts** with write access are not reported here; they
+  appear as `write template (ESC4)` edges in [AD-PATH-001](AD-PATH-001.md) when the
+  template is published.
+- **The template owner** is not evaluated: ad-doctor reads only the DACL, and an owner can
+  always rewrite it. Check owners with the read-only command in the remediation.
+- **An unpublished template** cannot be used until someone with ManageCA publishes it, so
+  the immediate risk is lower; fix it anyway, or delete the template.
+"""
+
+remediation = """
+1. **Review the template's permissions** (read-only):
+
+    ```powershell
+    $cfg  = (Get-ADRootDSE).configurationNamingContext
+    $path = "AD:CN=LabESC4,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
+    $acl  = Get-Acl $path
+    $acl.Owner
+    $acl.Access | Where-Object ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner|WriteProperty'
+    ```
+
+2. **Remove the write grants** from the broad group, leaving its Read and Enroll rights
+   alone, or use the template's *Security* tab in `certtmpl.msc`:
+
+    ```powershell
+    $acl.Access |
+        Where-Object { $_.IdentityReference -eq 'NT AUTHORITY\\Authenticated Users' -and
+                       $_.ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner|WriteProperty' } |
+        ForEach-Object { [void]$acl.RemoveAccessRule($_) }
+    Set-Acl $path $acl -WhatIf
+    ```
+
+3. **Set the owner** to Enterprise Admins or another tier-0 group if it is not one.
+
+4. **Check whether it was abused**: compare the template's `whenChanged` with your change
+   records, and review *Issued Certificates* for this template for certificates whose
+   subject differs from the requester; revoke those (`certutil -revoke <serial> 1`).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-004"
+
+[[references]]
+title = "Certified Pre-Owned: Abusing Active Directory Certificate Services (whitepaper, ESC4)"
+url = "https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf"
+kind = "research"
+
+[[references]]
+title = "Defender for Identity: Edit misconfigured certificate templates ACL (ESC4)"
+url = "https://learn.microsoft.com/en-us/defender-for-identity/security-posture-assessments/certificates"
+kind = "vendor"
+
+[[references]]
+title = "Certipy wiki: Privilege escalation (ESC4)"
+url = "https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation"
+kind = "tool"
+
+[[references]]
+title = "Locksmith: find and fix AD CS misconfigurations"
+url = "https://github.com/jakehildreth/Locksmith"
+kind = "tool"

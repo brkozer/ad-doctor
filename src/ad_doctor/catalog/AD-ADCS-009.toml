@@ -1,0 +1,97 @@
+id = "AD-ADCS-009"
+aliases = ["esc14"]
+summary = "Enabled accounts have weak explicit certificate mappings in altSecurityIdentities (by subject or e-mail), which any certificate with a matching name satisfies."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when at least one mapped account is privileged (a transitive member of a tier-0
+group) or a domain controller. **Medium** otherwise: the mapping still lets whoever obtains
+a certificate with that name log on as the account.
+"""
+mitre = ["T1649"]
+data_sources = ["ldap"]
+attributes = ["altSecurityIdentities", "userAccountControl (enabled)"]
+related = ["AD-ADCS-006", "AD-ADCS-015", "AD-ACL-004", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+`altSecurityIdentities` maps certificates to an account explicitly, overriding the
+default UPN or SID mapping. Some mapping types identify the certificate itself (issuer
+and serial number, subject key identifier, public key hash); others only match a
+**name**:
+
+| Mapping | Format | Strength |
+|---|---|---|
+| Subject | `X509:<S>subject` | weak |
+| Issuer and subject | `X509:<I>issuer<S>subject` | weak |
+| RFC 822 e-mail | `X509:<RFC822>user@corp.example` | weak |
+| Issuer and serial number | `X509:<I>issuer<SR>serial` | strong |
+| Subject key identifier | `X509:<SKI>ski` | strong |
+| SHA1 of the public key | `X509:<SHA1-PUKEY>hash` | strong |
+
+With a weak mapping, anyone who can get a certificate with the same subject or e-mail
+address, for example through a template that builds the subject from an attribute they
+can edit, such as their own `mail`, logs on as the mapped account. KB5014754 treats these
+mappings as weak, so DCs in full enforcement reject them for Kerberos, but Schannel and
+DCs in compatibility mode still accept them.
+"""
+
+detection = """
+ad-doctor reads `altSecurityIdentities` of every account over LDAP and reports an enabled
+account when one of its values is an `X509:` mapping that contains `<S>` or `<RFC822>`
+and none of `<SR>`, `<SKI>` or `<SHA1-PUKEY>`. Each object is the account's
+`sAMAccountName`, for example `map_user`; privileged accounts and DCs are also named in
+the finding's detail.
+
+The other half of ESC14, write access to a privileged account's `altSecurityIdentities`,
+is reported as `write altSecurityIdentities (ESC14)` by [AD-ACL-004](AD-ACL-004.md).
+"""
+
+false_positives = """
+- **Full enforcement everywhere and no Schannel use.** If every DC is in
+  `StrongCertificateBindingEnforcement = 2` and no service maps certificates through
+  Schannel, weak mappings no longer work for logon. They also stop the legitimate
+  certificate from working, so they are dead configuration: replace or remove them.
+- **Disabled accounts** are not reported.
+"""
+
+remediation = """
+1. **List the explicit mappings** (read-only):
+
+    ```powershell
+    Get-ADObject -LDAPFilter '(altSecurityIdentities=X509:*)' -Properties altSecurityIdentities |
+        Select-Object Name, @{n='Mappings'; e={$_.altSecurityIdentities -join '; '}}
+    ```
+
+2. **Replace each weak mapping with a strong one**, issuer and serial number being the
+   most common. The serial number is written in reversed byte order (see KB5014754):
+
+    ```powershell
+    Set-ADUser map_user -Replace @{altSecurityIdentities = 'X509:<I>DC=example,DC=corp,CN=corp-CA<SR>1200000000ac11000000002b'} -WhatIf
+    ```
+
+3. **Or remove the mapping** when the certificate's own SID or UPN is enough:
+
+    ```powershell
+    Set-ADUser map_user -Clear altSecurityIdentities -WhatIf
+    ```
+
+4. **Limit who can write** `altSecurityIdentities` on privileged accounts; see
+   [AD-ACL-004](AD-ACL-004.md).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-009"
+
+[[references]]
+title = "ADCS ESC14 Abuse Technique (SpecterOps)"
+url = "https://specterops.io/blog/2024/02/28/adcs-esc14-abuse-technique/"
+kind = "research"
+
+[[references]]
+title = "KB5014754: Certificate-based authentication changes on Windows domain controllers"
+url = "https://support.microsoft.com/en-us/servicing/os/windows-server/2022/05/kb5014754-certificate-based-authentication-changes-on-windows-domain-controllers"
+kind = "vendor"
+
+[[references]]
+title = "altSecurityIdentities attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-altsecurityidentities"
+kind = "spec"

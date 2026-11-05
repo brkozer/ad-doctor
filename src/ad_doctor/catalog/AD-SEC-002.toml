@@ -1,0 +1,100 @@
+id = "AD-SEC-002"
+aliases = ["laps-readable"]
+summary = "The ordinary account used for the scan could read LAPS passwords, so the local administrator password of those computers is open to too many people."
+severities = ["high"]
+severity_logic = """
+Always **high**: a readable LAPS password is local administrator access to that computer
+for anyone who holds the same rights as the scanning account.
+"""
+mitre = ["T1555"]
+data_sources = ["ldap"]
+attributes = ["ms-Mcs-AdmPwd", "msLAPS-Password", "msLAPS-EncryptedPassword"]
+related = ["AD-SEC-001", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+LAPS is only as strong as the permission to read its passwords. The password attributes
+are confidential: a principal needs *Control Access* (or an *All Extended Rights* or full
+control ACE) on the computer object or an OU above it. Those rights are often granted far
+too widely: to a whole helpdesk group across every OU, through *All Extended Rights* left
+on an OU by an old delegation, or to the creator of each computer.
+
+If an ordinary account can read the local administrator password of a server, everyone
+with that account's rights is a local admin there: they can log on, dump the credentials
+of whoever else is logged on, and move on. When one of those computers is a tier-0 server,
+that is a path to the domain.
+"""
+
+detection = """
+During collection ad-doctor asks for the LAPS password attributes on every computer:
+`ms-Mcs-AdmPwd` (legacy LAPS), `msLAPS-Password` and `msLAPS-EncryptedPassword` (Windows
+LAPS). The directory returns them only to principals allowed to read them. A computer is
+reported when **any** of the three comes back with a value.
+
+The value is never written to the snapshot or the report; only the fact that it was
+readable is kept. Objects are sAMAccountNames, for example `WS01$`.
+
+The finding depends on the account that ran the scan: run ad-doctor with an ordinary,
+non-administrative user, so it shows what any user can see.
+"""
+
+false_positives = """
+- **The scan ran as an admin** who is meant to read these passwords. Rescan with an
+  ordinary account; findings from an admin scan say nothing about exposure.
+- **Encrypted Windows LAPS passwords.** Reading `msLAPS-EncryptedPassword` returns a blob
+  that only the authorized decryptors can open. The read access is still wider than
+  intended and should be fixed, but the password itself may not be exposed.
+"""
+
+remediation = """
+1. **See who can read the passwords on each OU.**
+
+    ```powershell
+    Find-LapsADExtendedRights -Identity 'OU=Workstations,DC=corp,DC=example'
+    # legacy LAPS module:
+    # Find-AdmPwdExtendedRights -Identity 'OU=Workstations,DC=corp,DC=example' | Format-List
+    ```
+
+2. **Remove the broad grants** found in step 1. Look for *All Extended Rights* and full
+   control ACEs held by broad or non-admin groups, on the OUs and on the computer objects
+   themselves, and remove them with *Active Directory Users and Computers* (Advanced
+   Features, Security tab) or `dsacls` after review.
+
+3. **Grant read access per tier**, to the admin group of that tier only:
+
+    ```powershell
+    Set-LapsADReadPasswordPermission -Identity 'OU=Servers,DC=corp,DC=example' `
+        -AllowedPrincipals 'CORP\\Server Admins' -WhatIf
+    ```
+
+4. **Enable password encryption** in the Windows LAPS policy and set *Configure authorized
+   password decryptors* to the same admin group.
+
+5. **Rotate the passwords that were exposed**, since they may already have been read:
+
+    ```powershell
+    Reset-LapsPassword    # run on each affected computer
+    ```
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-SEC-002"
+
+[[references]]
+title = "Key concepts in Windows LAPS"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/laps/laps-concepts-overview"
+kind = "vendor"
+
+[[references]]
+title = "Find-LapsADExtendedRights"
+url = "https://learn.microsoft.com/en-us/powershell/module/laps/find-lapsadextendedrights?view=windowsserver2025-ps"
+kind = "vendor"
+
+[[references]]
+title = "Set-LapsADReadPasswordPermission"
+url = "https://learn.microsoft.com/en-us/powershell/module/laps/set-lapsadreadpasswordpermission?view=windowsserver2025-ps"
+kind = "vendor"
+
+[[references]]
+title = "Microsoft LAPS security and Active Directory LAPS configuration recon (Sean Metcalf)"
+url = "https://adsecurity.org/?p=3164"
+kind = "research"

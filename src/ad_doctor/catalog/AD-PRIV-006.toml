@@ -1,0 +1,110 @@
+id = "AD-PRIV-006"
+summary = "Tier-0 groups contain disabled accounts, non-DC computer accounts or foreign security principals, members that nobody watches as tier 0."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. Each kind of member is one step away from tier 0 for whoever
+controls it: the right to enable an account, local admin on a computer, or an account
+in another forest.
+"""
+mitre = ["T1078.002"]
+data_sources = ["ldap"]
+attributes = [
+    "memberOf (transitive) of the tier-0 groups",
+    "member of tier-0 groups (direct, for foreign security principals)",
+    "userAccountControl (ACCOUNTDISABLE, SERVER_TRUST_ACCOUNT, PARTIAL_SECRETS_ACCOUNT)",
+    "objectSid",
+]
+related = ["AD-PRIV-001", "AD-ACL-004", "AD-INF-006", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+Three kinds of tier-0 member tend to escape review:
+
+- **Disabled accounts** keep their group membership. Anyone who can write
+  `userAccountControl` on the account (an OU delegate, a help desk group) can enable it,
+  reset its password and log on as a domain admin. A disabled admin is often an old
+  account whose owner left, so nobody notices it coming back.
+- **Computer accounts** other than domain controllers: the computer is a tier-0
+  principal, so local administrators of that machine, and anyone who can extract its
+  machine account secret, act with tier-0 rights. The host is rarely protected like a DC.
+- **Foreign security principals** (accounts from a trusted domain or forest, or well-known
+  SIDs such as Authenticated Users) extend tier 0 across the trust: the security of
+  this domain then depends on the administrators of the other forest.
+"""
+
+detection = """
+ad-doctor walks the collected tier-0 groups (Domain Admins, Schema Admins, Enterprise
+Admins, Administrators and the four operator groups) and reports each transitive member
+that is:
+
+- **disabled** (`ACCOUNTDISABLE` in `userAccountControl`), as `group: account (disabled)`;
+- a **computer** that is not a domain controller (neither `SERVER_TRUST_ACCOUNT` nor
+  `PARTIAL_SECRETS_ACCOUNT` is set), as `group: account (computer)`.
+
+It then reads the direct `member` values of every group whose SID is tier 0 (the groups
+above plus Domain Controllers, Read-only Domain Controllers and Enterprise Read-only
+Domain Controllers) and reports each value under `CN=ForeignSecurityPrincipals` as
+`group: SID (foreign)`.
+
+Examples: `Domain Admins: old_admin (disabled)`, `Administrators: APP01$ (computer)`,
+`Administrators: S-1-5-21-1004336348-1177238915-682003330-1105 (foreign)`.
+"""
+
+false_positives = """
+- **Break-glass accounts kept disabled on purpose** are still a risk for the reason
+  above. If the account is in a protected OU that only tier 0 can modify, accept it in an
+  [accepted-risk file](../ci.md#accepted-risks) with an owner.
+- **Computers that are tier 0 by design** (a PKI or identity server that is managed
+  like a DC) are better given the rights they need directly than group membership;
+  accept the finding only if the server is administered as tier 0.
+"""
+
+remediation = """
+1. **Review each reported member** with its owner. For a foreign SID, resolve the name
+   through the trust (read-only):
+
+    ```powershell
+    (New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-21-1004336348-1177238915-682003330-1105').
+        Translate([System.Security.Principal.NTAccount])
+    ```
+
+2. **Remove disabled accounts and computers** from the group that grants the
+   membership. A member of Domain Admins is also reported under Administrators, which
+   contains Domain Admins; removing it from Domain Admins clears both.
+
+    ```powershell
+    Remove-ADGroupMember 'Domain Admins' -Members old_admin -WhatIf
+    Remove-ADGroupMember 'Administrators' -Members 'APP01$' -WhatIf
+    ```
+
+3. **Remove foreign principals** by DN, since they are not regular AD principals:
+
+    ```powershell
+    $fsp = "CN=S-1-5-21-1004336348-1177238915-682003330-1105,CN=ForeignSecurityPrincipals,$((Get-ADDomain).DistinguishedName)"
+    Set-ADGroup 'Administrators' -Remove @{member = $fsp} -WhatIf
+    ```
+
+4. **Delete disabled admin accounts** that are no longer needed once nothing depends on
+   them, rather than leaving them in tier-0 OUs.
+
+5. **Give administrators of the other forest their own accounts** in this domain if
+   they really need tier-0 rights here, and make sure SID filtering is on for the trust
+   ([AD-INF-006](AD-INF-006.md)).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-006"
+
+[[references]]
+title = "Appendix B: Privileged accounts and groups in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-b--privileged-accounts-and-groups-in-active-directory"
+kind = "vendor"
+
+[[references]]
+title = "Appendix G: Securing Administrators groups in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-g--securing-administrators-groups-in-active-directory"
+kind = "vendor"
+
+[[references]]
+title = "ANSSI Active Directory checklist (privileged group members)"
+url = "https://cert.cyber.gouv.fr/uploads/ad_checklist.html"
+kind = "vendor"

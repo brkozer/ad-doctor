@@ -1,0 +1,40 @@
+# Permissions needed
+
+An enabled domain user is enough. ad-doctor needs no group memberships and no delegated
+rights; it reads only what an ordinary authenticated user can read, and it never writes to
+the directory.
+
+## What it reads over LDAP
+
+- users, computers, groups, OUs, GPOs and trusts
+- AD CS certificate templates, enrollment services and issuance-policy OIDs
+- gMSAs and their password-read permissions
+- the replication metadata of the domain head (for the last backup date)
+- the owners and DACLs of the security-critical objects
+
+Security descriptors are requested with the SD-flags control for owner and DACL, which
+ordinary users may read, and parsed by a small built-in parser (`sd.py`).
+
+## Group Policy scope
+
+For the local-group and remote-logon checks (AD-GPO-005 to -007) ad-doctor also reads
+`gPLink` and `gPOptions` on the domain, every OU and every site, each GPO's status, version
+and client-side-extension attributes, WMI filter names, and which site each DC is in. From
+SYSVOL it reads Group Policy Preferences (passwords and Local Groups), `GptTmpl.inf`
+security templates (including Restricted Groups) and logon scripts, keeping only paths, line
+numbers, account names and setting values &mdash; never a secret.
+
+## Authentication
+
+- **NTLM** with the account you give it, including channel binding where the DC enforces it.
+- **Kerberos** from the current ticket cache (`-k`, after `kinit`); install the optional
+  `kerberos` extra for this.
+
+ad-doctor runs from any Linux box with an ordinary account: no domain-joined host, no RSAT
+and no admin rights.
+
+## What it never does
+
+It does not modify any object, create accounts, or write to the CA, the CA database or any
+registry. The only things it does beyond LDAP reads are the active [probes](probes.md), all
+read-only, which `--no-probes` turns off.

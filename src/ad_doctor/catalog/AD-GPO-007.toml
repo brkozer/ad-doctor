@@ -1,0 +1,92 @@
+id = "AD-GPO-007"
+aliases = []
+summary = "Group Policy grants remote logon (RDP, WinRM or DCOM) to broad groups, or to non-tier-0 principals on servers that control the domain."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when the grant lands on a tier-0 server (a DC, CA, Entra Connect or Exchange host, or a
+tier-0 domain group through the DCs): a remote logon there leaves credentials to steal and is one
+local exploit away from SYSTEM. **Medium** when a broad group is granted remote logon on ordinary
+computers. Remote logon is not direct control, so these go into the graph as non-traversable
+logon edges; they widen the attack surface rather than forming a path by themselves.
+"""
+mitre = ["T1021.001", "T1021.006", "T1021.003"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "GptTmpl.inf [Group Membership] and GPP Local Groups (Remote Desktop Users, Remote Management Users, Distributed COM Users)",
+    "SeRemoteInteractiveLogonRight in GptTmpl.inf [Privilege Rights]",
+    "gPLink and GPO scope attributes",
+]
+related = ["AD-GPO-005", "AD-GPO-006", "AD-PATH-001"]
+since = "unreleased"
+
+risk = """
+Putting a principal in **Remote Desktop Users**, **Remote Management Users** (WinRM) or
+**Distributed COM Users** lets it log on remotely to a computer. Remote logon is not
+administrative control on its own, but it hands an attacker an interactive or semi-interactive
+foothold: credentials of other sessions to harvest, and a local vulnerability away from SYSTEM.
+
+Two situations are dangerous. A **broad group** granted remote logon on many machines gives any
+phished user a foothold everywhere. And **any non-tier-0 principal** granted remote logon on a
+tier-0 server (a DC, CA, Entra Connect or Exchange host) can log on to a machine that controls
+the domain, which is why that case is rated high regardless of how broad the principal is.
+"""
+
+detection = """
+Using the same GPO scope engine as [AD-GPO-005](AD-GPO-005.md), ad-doctor reports entries that
+place a principal in Remote Desktop Users, Remote Management Users or Distributed COM Users when
+the principal is a broad group, or when the host is a tier-0 server (or a tier-0 domain group is
+rewritten through the DCs). For Remote Desktop Users it counts the grant only where the effective
+`SeRemoteInteractiveLogonRight` includes RDU or the member; with no GPO setting that right, the
+Windows default applies (Administrators only on DCs, Administrators plus Remote Desktop Users
+elsewhere), so an RDU grant on a DC with the default right is *not* reported. Holders of the
+right named by account name are resolved to SIDs during collection; one that cannot be resolved
+is assumed to cover the member, with the caveat `remote logon right holders not resolved`.
+Each object names the GPO, principal, group and hosts.
+"""
+
+false_positives = """
+- **Deny rights not evaluated.** `SeDenyRemoteInteractiveLogonRight` is not read, so a grant that
+  a deny setting would actually block is still reported (over-reporting).
+- **Scope over-reporting** applies as for [AD-GPO-005](AD-GPO-005.md): WMI filters assumed to
+  match, items with item-level targeting assumed to apply, Deny ACEs on GPO permissions ignored, sites possibly
+  over-assumed.
+- Remote logon for a scoped admin group on its own tier of servers is expected; accept it with an
+  owner and expiry.
+"""
+
+remediation = """
+1. **Remove the entry** named in the finding, or narrow it to the specific group that needs remote
+   access to that tier of servers.
+
+2. **Keep remote logon to tier-0 servers tier-0 only**, administered from privileged access
+   workstations; consider Remote Credential Guard so credentials are not left on the target.
+
+3. **Prefer scoped, per-tier groups** over broad groups for RDP, WinRM and DCOM access.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-007"
+
+[[references]]
+title = "Allow log on through Remote Desktop Services"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/allow-log-on-through-remote-desktop-services"
+kind = "vendor"
+
+[[references]]
+title = "Remote Credential Guard"
+url = "https://learn.microsoft.com/en-us/windows/security/identity-protection/remote-credential-guard"
+kind = "vendor"
+
+[[references]]
+title = "BloodHound: CanRDP edge"
+url = "https://bloodhound.specterops.io/resources/edges/can-rdp"
+kind = "tool"
+
+[[references]]
+title = "BloodHound: CanPSRemote edge"
+url = "https://bloodhound.specterops.io/resources/edges/can-ps-remote"
+kind = "tool"
+
+[[references]]
+title = "BloodHound: ExecuteDCOM edge"
+url = "https://bloodhound.specterops.io/resources/edges/execute-dcom"
+kind = "tool"

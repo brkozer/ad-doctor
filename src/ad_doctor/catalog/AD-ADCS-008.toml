@@ -1,0 +1,108 @@
+id = "AD-ADCS-008"
+aliases = ["esc15", "ekuwu"]
+summary = "A published schema v1 template that broad groups can enroll in lets the enrollee supply the subject; unpatched CAs (CVE-2024-49019) let them add any application policy."
+severities = ["high"]
+severity_logic = """
+Always **high**: ad-doctor cannot see whether the CA has the November 2024 update, and on
+an unpatched CA one request yields an authentication certificate for any user.
+"""
+mitre = ["T1649"]
+data_sources = ["ldap"]
+attributes = [
+    "msPKI-Template-Schema-Version",
+    "msPKI-Certificate-Name-Flag",
+    "msPKI-Enrollment-Flag",
+    "msPKI-RA-Signature",
+    "nTSecurityDescriptor (template DACL)",
+    "certificateTemplates (on pKIEnrollmentService)",
+]
+related = ["AD-ADCS-001", "AD-ADCS-003", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+Schema version 1 templates (the original Windows 2000 templates such as *WebServer*)
+cannot define application policies of their own. Before the November 2024 updates, a CA
+issuing from a v1 template copied an **Application Policies** extension from the request
+into the certificate (CVE-2024-49019, "EKUwu").
+
+When the template also lets the enrollee supply the subject, a requester can therefore:
+
+- add the **Client Authentication** application policy and name a domain admin in the
+  subject: Schannel (for example LDAPS) honours the application policy and logs the
+  attacker on as that admin, even though the template's EKU is only Server
+  Authentication;
+- or add **Certificate Request Agent** and use the certificate as an enrollment agent
+  (ESC3, see [AD-ADCS-003](AD-ADCS-003.md)) to obtain a PKINIT certificate for anyone.
+
+The stock *WebServer* template has exactly this shape; it is only dangerous once a broad
+group can enroll in it.
+"""
+
+detection = """
+ad-doctor reads every certificate template and the enterprise CAs over LDAP and reports a
+template when **all** of these hold:
+
+| Condition | Attribute |
+|---|---|
+| Published on at least one enterprise CA | `certificateTemplates` of a CA object |
+| No manager approval | `msPKI-Enrollment-Flag` without `CT_FLAG_PEND_ALL_REQUESTS` (0x2) |
+| No authorized signatures | `msPKI-RA-Signature` is 0 |
+| A broad group can enroll | Enroll or AutoEnroll in the template DACL for Everyone, Anonymous Logon, Authenticated Users, BUILTIN\\Users, Pre-Windows 2000 Compatible Access, Domain Users, Domain Guests or Domain Computers |
+| Schema v1 | `msPKI-Template-Schema-Version` is 1 (or absent) |
+| Enrollee supplies the subject | `msPKI-Certificate-Name-Flag` has `CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT` (0x1) |
+
+The template's own EKU is not considered, because the attack replaces it. Each object
+names the template and the broad groups that can enroll, for example
+`LabESC15 (enroll: Domain Users)`.
+"""
+
+false_positives = """
+- **Patched CA.** On a CA with the November 2024 cumulative update the CA no longer copies
+  application policies from the request into v1 certificates. ad-doctor cannot read the
+  CA's patch level, so it keeps reporting the template: it is still a v1 template that any
+  user can enroll in with a subject of their choice, and the fix below is cheap. Accept
+  the risk with an owner once the CA is confirmed patched; see
+  [the accepted-risks file](../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **Install the November 2024 (or later) cumulative update** on every CA that publishes
+   the template. This closes CVE-2024-49019.
+
+2. **Restrict enrollment** to the group that needs the template (for *WebServer*, the web
+   server admins or their computers), in the template's *Security* tab.
+
+3. **Replace the v1 template**: in `certtmpl.msc`, *Duplicate Template* creates a v2+
+   copy whose application policies the CA enforces. Configure the copy, publish it, and
+   stop publishing the original:
+
+    ```powershell
+    Remove-CATemplate -Name LabESC15 -WhatIf
+    ```
+
+4. **Look for abuse**: in *Issued Certificates* for this template, look for certificates
+   that carry an Application Policies extension with Client Authentication or Certificate
+   Request Agent, and revoke them (`certutil -revoke <serial> 1`).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-008"
+
+[[references]]
+title = "EKUwu: Not just another AD CS ESC (TrustedSec)"
+url = "https://trustedsec.com/blog/ekuwu-not-just-another-ad-cs-esc"
+kind = "research"
+
+[[references]]
+title = "CVE-2024-49019: Active Directory Certificate Services elevation of privilege"
+url = "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-49019"
+kind = "vendor"
+
+[[references]]
+title = "Defender for Identity: Prevent certificate enrollment with arbitrary application policies (ESC15)"
+url = "https://learn.microsoft.com/en-us/defender-for-identity/security-posture-assessments/certificates"
+kind = "vendor"
+
+[[references]]
+title = "Certipy wiki: Privilege escalation (ESC15)"
+url = "https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation"
+kind = "tool"

@@ -1,0 +1,143 @@
+id = "AD-PATH-001"
+aliases = ["attack-paths", "tier0-paths"]
+summary = "Principals outside tier 0 have a chain of memberships, ACLs, GPO, certificate or delegation rights that ends in control of tier 0."
+severities = ["high"]
+severity_logic = """
+Always **high**: every path reported ends in control of a tier-0 object, so the start of
+the path is in effect tier 0. The detail adds when a broad group (Domain Users,
+Authenticated Users, Everyone and similar) has a path, which makes every user tier 0.
+"""
+mitre = ["T1098", "T1484"]
+data_sources = ["derived"]
+attributes = [
+    "member",
+    "nTSecurityDescriptor (owner, ACEs, inheritable ACEs)",
+    "gPLink",
+    "GPO local group settings in SYSVOL",
+    "certificate template and CA ACLs",
+    "msDS-GroupMSAMembership",
+]
+related = [
+    "AD-ACL-001",
+    "AD-ACL-004",
+    "AD-ACL-007",
+    "AD-ACL-008",
+    "AD-GPO-004",
+    "AD-GPO-006",
+    "AD-ADCS-001",
+    "AD-ADCS-013",
+    "AD-ACL-006",
+]
+since = "0.1.0"
+
+risk = """
+Single checks look at one object at a time. Attackers do not: they chain whatever they
+find. A help desk group with *reset password* on a server admin, who is local admin on the
+Entra Connect server, which holds the sync account's password, which can DCSync, is four
+ordinary-looking delegations and one domain compromise.
+
+Any principal with such a chain is tier 0 whether or not it is in an admin group: its
+password, its sessions and every machine it logs on to are as valuable as a domain
+admin's. Attack tools such as BloodHound find these paths in minutes.
+"""
+
+detection = """
+ad-doctor builds a control graph from the snapshot, without a graph database. An edge
+A -> B means A controls B or can become B:
+
+| Edge | Source |
+|---|---|
+| `member of` | group `member`, including memberships a GPO writes through the DCs |
+| `owns`, takeover rights (`full control`, `write/WriteDacl/WriteOwner`, `write msDS-KeyCredentialLink`, reset password, ...) | owner and ACEs on users, computers, groups, OUs and the domain head |
+| `... (inherited)`, `contains` | inheritable ACEs on OUs and containers, and control of a container over what is below it; AdminSDHolder-protected objects are excluded |
+| `DCSync` | both replication rights on the domain head |
+| `link GPOs`, `linked to domain` | write access to `gPLink`, and GPO links to the domain or the Domain Controllers OU |
+| `admin to via GPO ...` | local administrator (or equivalent) groups set by Group Policy; admin on a computer becomes that computer account |
+| `hosts sync account` | an Entra Connect server holds its sync account's password |
+| `enroll (ESC1-3)`, `write template (ESC4)`, `full control` on PKI objects, `ManageCA (ESC7)` | certificate templates, PKI containers and CA permissions |
+| `read gMSA password` | `msDS-GroupMSAMembership` |
+
+Tier 0 is the built-in admin and operator groups, domain controllers, `krbtgt`, the domain
+head, the Domain Controllers OU, AdminSDHolder, CA servers and the PKI objects. A reverse
+breadth-first search from tier 0 gives the shortest path from every other principal.
+
+Each object is one principal that holds a right itself, with its shortest path, broad
+groups first, for example:
+
+```text
+Domain Users -[enroll (ESC1-3)]-> template LabESC1
+LabServerAdmins -[admin to via GPO LabLocalAdmins]-> ENTRA01$ -[hosts sync account]-> MSOL_0a1b2c3d4e5f -[DCSync]-> corp.example
+```
+
+Members who only inherit a path through a group are counted in the detail ("19 of 20
+enabled users (95%) have a path") instead of being listed. Remote logon rights a GPO grants
+(RDP, WinRM, DCOM) are exported to BloodHound but not followed, because logon is not
+control.
+"""
+
+false_positives = """
+- **Intended delegations into tier 0**, such as the Entra Connect sync account's DCSync
+  right. The path is real; the fix is to treat the start of it as tier 0 (see
+  [AD-PRIV-011](AD-PRIV-011.md)). Accept it only after that, in an
+  [accepted-risk file](../ci.md#accepted-risks).
+- **Local accounts and local groups** on servers are invisible over LDAP, so paths through
+  them are missed rather than over-reported; the same goes for sessions and logons.
+- **Deny ACEs** that cancel an allow are not modelled; a reported ACL step may be blocked
+  in practice. Confirm with the steps below before removing a right in a hurry.
+"""
+
+remediation = """
+1. **Start with broad groups and the shortest paths.** A path from Domain Users or
+   Authenticated Users makes every account tier 0, so it comes first in the list.
+
+2. **See what one principal can reach**, from a saved snapshot:
+
+    ```console
+    ad-doctor collect dc01.corp.example --ldaps -u 'CORP\\auditor' -o snap.json
+    ad-doctor blast-radius snap.json helpdesk
+    ```
+
+3. **Break each path at its first step**: remove the ACE, the group membership, the GPO
+   edit right, the template enrollment right or the local admin grant that starts it. The
+   single check named in the step usually says how, for example
+   [AD-ACL-004](AD-ACL-004.md), [AD-GPO-006](AD-GPO-006.md) or [AD-ADCS-001](AD-ADCS-001.md).
+   Review an ACE before removing it:
+
+    ```powershell
+    (Get-Acl 'AD:CN=Server Admins,OU=Groups,DC=corp,DC=example').Access |
+        Where-Object IdentityReference -like '*helpdesk*'
+    ```
+
+4. **Where the step cannot be removed, promote its start to tier 0**: move the account or
+   server under tier-0 administration, with the same logon restrictions as domain admins.
+
+5. **Explore the graph in BloodHound** when many paths share steps:
+
+    ```console
+    ad-doctor export-graph snap.json -o graph.json --paths-only
+    ```
+
+   See [BloodHound export](../bloodhound.md).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PATH-001"
+
+[[references]]
+title = "An ACE Up the Sleeve: designing Active Directory DACL backdoors (SpecterOps)"
+url = "https://specterops.io/wp-content/uploads/sites/3/2022/06/an_ace_up_the_sleeve.pdf"
+kind = "research"
+
+[[references]]
+title = "Enterprise access model"
+url = "https://learn.microsoft.com/en-us/security/privileged-access-workstations/privileged-access-access-model"
+kind = "vendor"
+
+[[references]]
+title = "Implementing least-privilege administrative models"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/implementing-least-privilege-administrative-models"
+kind = "vendor"
+
+[[references]]
+title = "BloodHound documentation (SpecterOps)"
+url = "https://bloodhound.specterops.io/home"
+kind = "tool"

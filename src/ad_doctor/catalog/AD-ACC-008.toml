@@ -1,0 +1,82 @@
+id = "AD-ACC-008"
+summary = "The description or info attribute of enabled accounts appears to contain a password, readable by the scanning user and anyone with the same rights."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. The match is a text pattern, not a confirmed credential, and the
+password may already have been changed.
+"""
+mitre = ["T1552"]
+data_sources = ["ldap"]
+attributes = ["description", "info"]
+related = ["AD-ACC-009", "AD-GPP-001", "AD-GPP-002"]
+since = "0.1.0"
+
+risk = """
+Help desks and admins write temporary passwords into the *Description* or *Notes* field
+of an account ("temp pwd: Welcome2026") because it is convenient. Those attributes are
+not secret: ad-doctor read them as an ordinary domain user, so every account with the
+same rights can read them too.
+
+Dumping all user descriptions is one of the first things an attacker does after getting
+any foothold (for example NetExec's `get-desc-users` module). A password found there
+often still works, or shows the pattern used for every new account.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled** account whose `description` and `info` values,
+joined together, match a pattern of a password keyword followed by `:` or `=` and at
+least three non-space characters. The keywords are `pass`, `password`, `passwd`, `pwd`
+and the Turkish, German, Spanish and French words for password (`parola`, `şifre`,
+`sifre`, `kennwort`, `contraseña`, `mot de passe`), case-insensitive.
+
+The matched text is **not** copied into the report or the snapshot, only the fact that
+it matched. Each object is the account's `sAMAccountName`, for example `notes_user`.
+"""
+
+false_positives = """
+- **Text that names a password without containing one**, such as `Password: see vault`
+  or `pwd=never expires`. Rewrite it, or record it in an
+  [accepted-risk file](../ci.md#accepted-risks).
+- Passwords written without a `:` or `=` (`pw Welcome1`) are **not** found.
+"""
+
+remediation = """
+1. **Read the matching text yourself** (read-only):
+
+    ```powershell
+    Get-ADUser notes_user -Properties Description, info | Select-Object SamAccountName, Description, info
+    ```
+
+2. **Change the password of every reported account first**: assume the text has been
+   read.
+
+    ```powershell
+    Set-ADAccountPassword notes_user -Reset -NewPassword (Read-Host -AsSecureString 'New password') -WhatIf
+    ```
+
+3. **Remove the text** (or replace it with something that is not a secret):
+
+    ```powershell
+    Set-ADUser notes_user -Clear description, info -WhatIf
+    ```
+
+4. **Fix the habit**: hand out initial passwords out of band, with *User must change
+   password at next logon* set, instead of writing them into the directory.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-008"
+
+[[references]]
+title = "Description attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-description"
+kind = "spec"
+
+[[references]]
+title = "Comment (info) attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-info"
+kind = "spec"
+
+[[references]]
+title = "The Hacker Recipes: LDAP reconnaissance (users' descriptions)"
+url = "https://www.thehacker.recipes/ad/recon/ldap"
+kind = "research"

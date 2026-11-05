@@ -1,0 +1,110 @@
+id = "AD-ACL-004"
+aliases = []
+summary = "A principal outside tier 0 owns or can take over a tier-0 account, group or domain controller (password reset, shadow credentials, RBCD, group membership, full control)."
+severities = ["high"]
+severity_logic = """
+Always **high**: each reported right is a known one-step takeover of an object that
+already controls the domain, so the principal holding it is tier 0 in practice.
+"""
+mitre = ["T1098", "T1556"]
+data_sources = ["ldap"]
+attributes = [
+    "nTSecurityDescriptor (owner and effective ACEs) of tier-0 users, groups and computers",
+    "member (tier-0 groups, transitively)",
+    "primaryGroupID, userAccountControl (domain controllers)",
+]
+related = ["AD-ACL-002", "AD-ACL-005", "AD-ACL-008", "AD-PRIV-001", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+Tier 0 is only as strong as the weakest permission on its objects. A principal that can
+change one of them can become it:
+
+| Right on the object | Attack |
+|---|---|
+| Reset password (user) | Set a new password and log on as the admin |
+| Write `msDS-KeyCredentialLink` (user, computer) | Shadow credentials: add a key, get a TGT with PKINIT |
+| Write `msDS-AllowedToActOnBehalfOfOtherIdentity` (computer) | RBCD: impersonate a domain admin to the DC |
+| Write `member` or add self (group) | Join Domain Admins or another tier-0 group |
+| Write `altSecurityIdentities` (user, computer) | ESC14: map an attacker's certificate to the account |
+| Write `servicePrincipalName` (user) | Targeted Kerberoasting of the admin |
+| GenericAll, GenericWrite, WriteDacl, WriteOwner, ownership | Any of the above |
+
+Helpdesk delegations applied to a whole OU, accounts created by a non-admin who stays
+owner, and rights left from migrations are the usual sources.
+"""
+
+detection = """
+ad-doctor builds the set of tier-0 objects: members (transitive) of the tier-0 groups,
+domain controllers, `krbtgt`, the tier-0 groups themselves and the operator groups
+(Account, Server, Print and Backup Operators). For each tier-0 **user, computer or group**
+it reads the owner and the effective ACEs and reports:
+
+- an **owner** outside tier 0 (an owner can always rewrite the DACL);
+- an ACE for a principal outside tier 0 (SELF and CREATOR OWNER are ignored) granting a
+  takeover right (GenericAll, GenericWrite, WriteDacl, WriteOwner, WriteProperty on all
+  attributes) or one of the specific rights in the table above, matched by attribute or
+  property-set GUID and by the kind of object it applies to.
+
+Key Admins and Enterprise Key Admins writing `msDS-KeyCredentialLink` is the default and is
+not reported. Objects look like `adm_bob: helpdesk (write/WriteDacl/WriteOwner)`,
+`DC01$: kc_writer (write msDS-KeyCredentialLink)` or `adm_bob: owned by helpdesk`.
+"""
+
+false_positives = """
+- **A tier-0 group ad-doctor does not know about**, such as a custom PAM or AD admin group
+  that holds rights on admin accounts. If it really is managed as tier 0, accept the
+  finding with an owner (../ci.md#accepted-risks).
+- **Protected objects between SDProp runs.** For objects covered by AdminSDHolder, SDProp
+  overwrites the security descriptor within an hour; a finding that disappears on the next
+  scan was a temporary ACE, which is still worth asking about.
+"""
+
+remediation = """
+1. **Inspect the object** named in the finding (read-only):
+
+    ```powershell
+    $dn = (Get-ADUser adm_bob).DistinguishedName   # Get-ADGroup / Get-ADComputer as needed
+    $acl = Get-Acl "AD:$dn"
+    $acl.Owner
+    $acl.Access | Where-Object IdentityReference -like '*helpdesk*' |
+        Format-Table ActiveDirectoryRights, ObjectType, InheritedObjectType, IsInherited -AutoSize
+    ```
+
+2. **If the ACE is inherited**, fix it where it is defined (usually the OU) rather than on
+   the object; move tier-0 accounts into an OU that only tier-0 admins control.
+
+3. **Remove the explicit ACE or reset the owner** to Domain Admins (review the trustee
+   first; `/R` removes all of its ACEs on the object):
+
+    ```powershell
+    # dsacls "CN=adm_bob,OU=Admins,DC=corp,DC=example" /R "CORP\\helpdesk"
+    # dsacls "CN=adm_bob,OU=Admins,DC=corp,DC=example" /takeownership
+    ```
+
+4. **Protected objects**: also check AdminSDHolder ([AD-ACL-002](AD-ACL-002.md)), or SDProp
+   puts the ACE back. For a key written to `msDS-KeyCredentialLink` that nobody can explain,
+   clear the value and treat the account as compromised.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-004"
+
+[[references]]
+title = "Shadow Credentials: Abusing Key Trust Account Mapping for Account Takeover (SpecterOps)"
+url = "https://specterops.io/blog/2021/06/17/shadow-credentials-abusing-key-trust-account-mapping-for-account-takeover/"
+kind = "research"
+
+[[references]]
+title = "BloodHound: AddKeyCredentialLink edge"
+url = "https://bloodhound.specterops.io/resources/edges/add-key-credential-link"
+kind = "tool"
+
+[[references]]
+title = "BloodHound: ForceChangePassword edge"
+url = "https://bloodhound.specterops.io/resources/edges/force-change-password"
+kind = "tool"
+
+[[references]]
+title = "Enterprise access model"
+url = "https://learn.microsoft.com/en-us/security/privileged-access-workstations/privileged-access-access-model"
+kind = "vendor"

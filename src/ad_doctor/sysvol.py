@@ -1,5 +1,6 @@
 """SYSVOL over SMB: Group Policy Preferences passwords (MS14-025), GPO security templates
-(GptTmpl.inf) and credentials written into logon scripts.
+(GptTmpl.inf), local group membership set by Group Policy (Restricted Groups and GPP Local
+Groups) and credentials written into logon scripts.
 
 Only file names, line numbers, account names and setting values are kept; secrets never
 leave this module.
@@ -8,12 +9,13 @@ leave this module.
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
 import smbclient
 from smbprotocol.exceptions import SMBException
 
-from .model import GpoSettings, GppPassword, ScriptSecret
+from .model import GpoLocalGroup, GpoSettings, GppPassword, ScriptSecret, well_known_sid
 
 MAX_FILE = 1_000_000
 CPASSWORD = re.compile(rb'\bcpassword="([^"]+)"')
@@ -46,9 +48,20 @@ SECRET_PATTERNS = [
 ]
 
 LSA = r"MACHINE\System\CurrentControlSet\Control\Lsa"
+GPTTMPL = r"MACHINE\Microsoft\Windows NT\SecEdit\GptTmpl.inf"
+_GUID = r"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}"
+MACHINE_GROUPS = re.compile(
+    rf"^Policies\\({_GUID})\\Machine\\Preferences\\Groups\\Groups\.xml$", re.I
+)
+USER_GROUPS = re.compile(rf"^Policies\\({_GUID})\\User\\Preferences\\Groups\\Groups\.xml$", re.I)
+XML_DECLARATION = re.compile(r"^\s*<\?xml[^>]*\?>")
 
 
 class SysvolError(Exception):
+    pass
+
+
+class MalformedXml(ValueError):
     pass
 
 
@@ -58,6 +71,10 @@ class SysvolResult:
     gpo_settings: dict[str, GpoSettings] = field(default_factory=dict)
     script_secrets: list[ScriptSecret] = field(default_factory=list)
     unreadable: list[str] = field(default_factory=list)
+    local_groups: list[GpoLocalGroup] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    # False when SYSVOL was not read, so "no local group settings" means "not collected"
+    scanned: bool = False
 
 
 def scan_xml(data: bytes) -> list[str]:
@@ -118,9 +135,135 @@ def _int(value: str) -> int | None:
         return None
 
 
+def _principal(token: str) -> tuple[str, str]:
+    """(SID, name as written) of a Restricted Groups token: '*S-1-...' or a name."""
+    bare = token.lstrip("*")
+    if bare.upper().startswith("S-1-"):
+        return bare.upper(), token
+    return well_known_sid(token), token
+
+
+def _unquote(value: str) -> str:
+    return value.strip().strip('"').strip()
+
+
+def parse_group_membership(text: str, guid: str, path: str) -> list[GpoLocalGroup]:
+    """Restricted Groups: the [Group Membership] section of a GptTmpl.inf.
+
+    'X__Members = A,B' makes A and B the only members of X (an empty value empties X;
+    GPMC writes that line whenever only "This group is a member of" is filled in), and
+    'X__Memberof = G1,G2' adds X to G1 and G2.
+    """
+    out = []
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        if section != "group membership" or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        left, sep, suffix = key.strip().rpartition("__")  # names may contain '_'
+        left = _unquote(left)
+        if not sep or not left:
+            continue
+        items = [v for v in (_unquote(v) for v in value.split(",")) if v]
+        if suffix.lower() == "members":
+            members = items or [""]  # empty: the group is emptied
+            out += [_restricted(guid, path, left, m, "set", True) for m in members]
+        elif suffix.lower() == "memberof":
+            out += [_restricted(guid, path, g, left, "add", False) for g in items]
+    return out
+
+
+def _restricted(
+    guid: str, path: str, group: str, member: str, action: str, replaces: bool
+) -> GpoLocalGroup:
+    group_sid, group_name = _principal(group)
+    member_sid, member_name = _principal(member) if member else ("", "")
+    return GpoLocalGroup(
+        guid, "restricted", path, group_sid, group_name, member_sid, member_name, action, replaces
+    )
+
+
+def _has_filters(element: ET.Element) -> bool:
+    filters = element.find("Filters")
+    return filters is not None and len(filters) > 0
+
+
+def parse_groups_xml(data: bytes, guid: str, path: str) -> list[GpoLocalGroup]:
+    """GPP Local Users and Groups: the Group items of a Machine Groups.xml.
+
+    Disabled items and item-level targeting are kept (flagged) so the scope engine can
+    count them; a disabled or filtered Collection passes that on to everything inside it.
+    """
+    text = XML_DECLARATION.sub("", _decode(data), count=1)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        raise MalformedXml(str(exc)) from exc
+    out: list[GpoLocalGroup] = []
+
+    def visit(node: ET.Element, disabled: bool, filtered: bool) -> None:
+        for child in node:
+            off = disabled or child.get("disabled") == "1"
+            targeted = filtered or _has_filters(child)
+            if child.tag == "Collection":
+                visit(child, off, targeted)
+            elif child.tag == "Group":
+                out.extend(_group_item(child, guid, path, off, targeted))
+
+    visit(root, False, False)
+    return out
+
+
+def _group_item(
+    item: ET.Element, guid: str, path: str, disabled: bool, filtered: bool
+) -> list[GpoLocalGroup]:
+    props = item.find("Properties")
+    if props is None:
+        return []
+    action = (props.get("action") or "U").upper()
+    if action == "D":
+        return []  # built-in groups cannot be deleted
+    replaces = action == "R" or "1" in (props.get("deleteAllUsers"), props.get("deleteAllGroups"))
+    group_name = props.get("groupName") or item.get("name") or ""
+    group_sid = (props.get("groupSid") or "").upper() or well_known_sid(group_name)
+
+    def entry(sid: str, name: str, how: str) -> GpoLocalGroup:
+        return GpoLocalGroup(
+            guid, "gpp", path, group_sid, group_name, sid, name, how, replaces, disabled, filtered
+        )
+
+    members = [
+        entry(
+            (m.get("sid") or "").upper(),
+            m.get("name") or "",
+            "remove" if (m.get("action") or "").upper() == "REMOVE" else "add",
+        )
+        for m in props.findall("Members/Member")
+    ]
+    if not members and replaces:
+        return [entry("", "", "set")]
+    return members
+
+
+def machine_groups_gpo(rel: str, gpo_guids: set[str]) -> str | None:
+    """GUID of the GPO whose Machine Groups.xml this SYSVOL path is, if it is a known GPO."""
+    m = MACHINE_GROUPS.match(rel)
+    return m.group(1).upper() if m and m.group(1).upper() in gpo_guids else None
+
+
 def _decode(data: bytes) -> str:
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         return data.decode("utf-16", errors="replace")
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data[3:].decode("utf-8", errors="replace")
+    # UTF-16LE without a BOM: ASCII text with a zero in every odd byte
+    odd = data[1:64:2]
+    if len(odd) >= 4 and odd.count(0) * 4 >= len(odd) * 3:
+        return data.decode("utf-16-le", errors="replace")
     return data.decode("utf-8", errors="replace")
 
 
@@ -135,6 +278,8 @@ def scan(
 ) -> SysvolResult:
     base = rf"\\{host}\SYSVOL\{domain}"
     result = SysvolResult()
+    known = {g.upper() for g in gpo_guids}
+    user_side: list[str] = []
     try:
         smbclient.register_session(
             host,
@@ -165,17 +310,33 @@ def scan(
                         continue
                     if wanted:
                         result.gpp_passwords += [GppPassword(rel, u) for u in scan_xml(data)]
+                        guid = machine_groups_gpo(rel, known)
+                        if guid:
+                            try:
+                                result.local_groups += parse_groups_xml(data, guid, rel)
+                            except MalformedXml:
+                                result.notes.append(f"{rel}: malformed XML, not evaluated")
+                        elif (m := USER_GROUPS.match(rel)) and m.group(1).upper() in known:
+                            user_side.append(rel)
                     else:
                         text = _decode(data)
                         result.script_secrets += [
                             ScriptSecret(rel, line, kind) for line, kind in scan_script(text)
                         ]
         for guid in gpo_guids:
-            path = rf"{base}\Policies\{guid}\MACHINE\Microsoft\Windows NT\SecEdit\GptTmpl.inf"
+            rel = rf"Policies\{guid}\{GPTTMPL}"
             try:
-                result.gpo_settings[guid] = parse_gpttmpl(_decode(_read(path, port)))
+                text = _decode(_read(rf"{base}\{rel}", port))
             except (SMBException, OSError):
                 continue  # no security settings in this GPO
+            result.gpo_settings[guid] = parse_gpttmpl(text)
+            result.local_groups += parse_group_membership(text, guid.upper(), rel)
+        if user_side:
+            result.notes.append(
+                f"{len(user_side)} GPOs set local groups in the user context "
+                f"(User\\Preferences\\Groups), not evaluated: {', '.join(user_side[:5])}"
+            )
+        result.scanned = True
         return result
     except (SMBException, OSError, ValueError) as exc:
         raise SysvolError(str(exc) or type(exc).__name__) from exc

@@ -1,0 +1,147 @@
+id = "AD-ACL-007"
+aliases = ["privexchange"]
+summary = "Exchange security groups hold WriteDacl over the domain, so control of any Exchange server (or a relayed Exchange authentication) becomes DCSync."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when an Exchange group holds WriteDacl, WriteOwner, full control or
+*Replicating Directory Changes All* on the domain object itself (the pre-2019 PrivExchange
+state). **Medium** when the rights are only inheritable to user and group objects (the
+state left by the February 2019 fix): whoever controls Exchange can still take over any
+account that AdminSDHolder does not protect.
+"""
+mitre = ["T1098", "T1557.001", "T1003.006"]
+data_sources = ["ldap"]
+attributes = [
+    "nTSecurityDescriptor of the domain head (effective and inheritable ACEs)",
+    "member of Exchange Windows Permissions, Exchange Trusted Subsystem, Organization Management",
+]
+related = ["AD-ACL-001", "AD-ACL-003", "AD-INF-005", "AD-INF-010", "AD-PATH-001"]
+since = "unreleased"
+
+risk = """
+Exchange setup (`/PrepareAD`) grants its groups broad rights in the domain so Exchange
+can manage recipients. Before the February 2019 updates, *Exchange Windows Permissions*
+held **WriteDacl on the domain object**. Exchange servers are members of that group
+through *Exchange Trusted Subsystem*, so:
+
+1. An attacker with any mailbox calls the EWS *PushSubscription* API and makes the
+   Exchange server authenticate to a host they control (PrivExchange).
+2. They relay that NTLM authentication to LDAP on a domain controller.
+3. Acting as the Exchange server, they add *Replicating Directory Changes (All)* for
+   themselves to the domain DACL and run DCSync.
+
+The relay needs DCs that accept LDAP without signing or channel binding
+([AD-INF-005](AD-INF-005.md), [AD-INF-010](AD-INF-010.md)), but **any compromise of an
+Exchange server**, by an exploit for example, leads to the same place without a relay.
+"""
+
+detection = """
+ad-doctor finds the groups Exchange creates (*Exchange Windows Permissions*, *Exchange
+Trusted Subsystem*, *Organization Management*) by name and reads the DACL of the domain
+head with the SD flags control, which an ordinary user may do.
+
+- **Effective ACEs on the domain object** granting one of these groups WriteDacl,
+  WriteOwner, GenericAll or *DS-Replication-Get-Changes-All* make the finding **high**.
+- **Inheritable ACEs** that apply to user objects, group objects or all descendants and
+  grant WriteDacl, WriteOwner or GenericAll make it **medium** when nothing direct is found.
+
+The finding names each right and lists the non-group members behind those groups, which
+are normally the Exchange servers' computer accounts (for example `EXCH01$`). Exchange
+servers are also added to the control graph, so [AD-PATH-001](AD-PATH-001.md) shows who
+else can reach tier 0 through them.
+"""
+
+false_positives = """
+- **Exchange already removed.** If Exchange was uninstalled but its groups and ACEs were
+  left behind, the finding is real (anyone who can add themselves to those groups
+  inherits the rights) but the fix is simply to remove the ACEs and the groups.
+- **Split permissions.** Organizations on Active Directory split permissions no longer
+  have these ACEs; if the finding persists, `/PrepareAD` was not rerun after the switch.
+"""
+
+remediation = """
+1. **See what is there.**
+
+    ```powershell
+    $domain = (Get-ADDomain).DistinguishedName
+    (Get-Acl "AD:$domain").Access |
+        Where-Object { $_.IdentityReference -like '*Exchange*' -and
+                       $_.ActiveDirectoryRights -match 'WriteDacl|WriteOwner|GenericAll' } |
+        Format-Table IdentityReference, ActiveDirectoryRights, InheritanceType,
+                     PropagationFlags, InheritedObjectType -AutoSize
+    ```
+
+    `PropagationFlags = InheritOnly` means the 2019 fix is applied and the finding is the
+    medium variant.
+
+2. **Install a supported Exchange cumulative update and rerun `/PrepareAD`**, which
+   rewrites the ACEs as inherit-only:
+
+    ```console
+    Setup.exe /IAcceptExchangeServerLicenseTerms_DiagnosticDataON /PrepareAD
+    ```
+
+    Exchange 2010 needs the manual steps in KB4490059.
+
+3. **Remove the remaining rights with Active Directory split permissions** if your
+   organisation can create recipients with AD tools instead of Exchange:
+
+    ```console
+    Setup.exe /IAcceptExchangeServerLicenseTerms_DiagnosticDataON /PrepareAD /ActiveDirectorySplitPermissions:true
+    ```
+
+4. **Close the relay path**: require LDAP signing and LDAPS channel binding on every DC,
+   and keep Extended Protection on Exchange (on by default since Exchange 2019 CU14).
+
+5. **Until the rights are gone, treat Exchange servers as tier 0**: patch them first,
+   restrict who administers them, and watch them like domain controllers.
+
+6. **Exchange decommissioned?** Remove the ACEs from the domain object (review first; this
+   removes every ACE for that trustee):
+
+    ```powershell
+    # dsacls "DC=corp,DC=example" /R "CORP\\Exchange Windows Permissions"
+    ```
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-007"
+
+[[references]]
+title = "Abusing Exchange: one API call away from Domain Admin (Dirk-jan Mollema)"
+url = "https://dirkjanm.io/abusing-exchange-one-api-call-away-from-domain-admin/"
+kind = "research"
+
+[[references]]
+title = "PrivExchange proof of concept"
+url = "https://github.com/dirkjanm/PrivExchange"
+kind = "tool"
+
+[[references]]
+title = "ADV190007: Guidance for 'PrivExchange' elevation of privilege vulnerability"
+url = "https://msrc.microsoft.com/update-guide/vulnerability/ADV190007"
+kind = "vendor"
+
+[[references]]
+title = "CVE-2019-0686: Microsoft Exchange Server elevation of privilege vulnerability"
+url = "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2019-0686"
+kind = "vendor"
+
+[[references]]
+title = "KB4490059: Reducing permissions required to run Exchange Server when you use the shared permissions model"
+url = "https://support.microsoft.com/kb/4490059"
+kind = "vendor"
+
+[[references]]
+title = "Prepare Active Directory and domains for Exchange Server"
+url = "https://learn.microsoft.com/en-us/exchange/plan-and-deploy/prepare-ad-and-domains"
+kind = "vendor"
+
+[[references]]
+title = "Configure Exchange Server for split permissions"
+url = "https://learn.microsoft.com/en-us/exchange/permissions/split-permissions/configure-exchange-for-split-permissions"
+kind = "vendor"
+
+[[references]]
+title = "Exchange Server support for Windows Extended Protection"
+url = "https://learn.microsoft.com/en-us/exchange/plan-and-deploy/post-installation-tasks/security-best-practices/exchange-extended-protection"
+kind = "vendor"

@@ -1,0 +1,35 @@
+.sev {
+  display: inline-block;
+  padding: 0 0.45em;
+  border-radius: 0.2em;
+  font-size: 0.75em;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #fff;
+  white-space: nowrap;
+}
+.sev-high { background: #c62828; }
+.sev-medium { background: #b26a00; }
+.sev-low { background: #1565c0; }
+.sev-info { background: #546e7a; }
+
+.catalog-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 1rem 0;
+}
+.catalog-filter input,
+.catalog-filter select {
+  font: inherit;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--md-default-fg-color--lighter);
+  border-radius: 0.2rem;
+  background: var(--md-default-bg-color);
+  color: var(--md-default-fg-color);
+}
+.catalog-filter input { flex: 1 1 16rem; }
+#cf-count { color: var(--md-default-fg-color--light); font-size: 0.8em; }
+#catalog { width: 100%; }
+#catalog small { color: var(--md-default-fg-color--light); }

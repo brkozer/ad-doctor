@@ -1,0 +1,81 @@
+id = "AD-INV-002"
+summary = "More distinct accounts sit in tier-0 groups than the limit declared in the invariants file allows."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. Growth of tier 0 is not an attack by itself, but every extra account
+is another password, session and workstation that leads to the domain.
+"""
+mitre = []
+data_sources = ["ldap"]
+attributes = ["member", "sAMAccountName"]
+related = ["AD-INV-001", "AD-PRIV-001", "AD-PRIV-008", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+Tier 0 grows quietly: a service account added for an install, an admin who changed roles
+and kept the rights, a vendor account. Each member can take over the domain, so the
+attack surface grows with every one of them. A hard limit is easier to keep than an exact
+list in organizations where admins change often, and still forces a review when the
+number goes up.
+"""
+
+detection = """
+Runs only with `--invariants FILE` that has a limit:
+
+```toml
+[limits]
+tier0_users = 5
+```
+
+ad-doctor counts the distinct accounts that are transitive members of the privileged
+groups it collects (Domain Admins, Enterprise Admins, Schema Admins, Administrators, and
+Account, Server, Print and Backup Operators, with `primaryGroupID` members added back) and
+reports when the count is above the limit. An account in several groups counts once.
+
+The detail gives the count and the limit (`6 distinct accounts in tier-0 groups; the limit
+is 5.`) and the objects list every counted account by `sAMAccountName`, for example
+`Administrator`, `adm_bob`, `svc_sql`.
+"""
+
+false_positives = """
+- **Computer accounts in tier-0 groups** count too. They should not be there (see
+  [AD-PRIV-006](AD-PRIV-006.md)), but if one is, raise the limit only after review.
+- **Members of operator groups** (Account, Server, Backup, Print Operators) count. They can
+  reach tier 0 in a few steps, so empty those groups ([AD-PRIV-008](AD-PRIV-008.md))
+  rather than raising the limit.
+"""
+
+remediation = """
+1. **Review every listed account**: who owns it, why it needs tier 0, and when it last
+   logged on.
+
+    ```powershell
+    foreach ($g in 'Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Administrators') {
+        Get-ADGroupMember $g -Recursive | Select-Object @{n = 'Group'; e = { $g }}, SamAccountName
+    }
+    ```
+
+2. **Remove the accounts that do not need tier 0** and give them narrower delegated
+   rights instead:
+
+    ```powershell
+    Remove-ADGroupMember 'Domain Admins' -Members old_admin -WhatIf
+    ```
+
+3. **Move service accounts out of admin groups**; a service seldom needs Domain Admins.
+
+4. **If the larger tier 0 is intended, raise `tier0_users`** in a reviewed change to the
+   invariants file; see [Invariants](../invariants.md).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --invariants invariants.toml --only AD-INV-002"
+
+[[references]]
+title = "Implementing least-privilege administrative models"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/implementing-least-privilege-administrative-models"
+kind = "vendor"
+
+[[references]]
+title = "Appendix B: Privileged accounts and groups in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-b--privileged-accounts-and-groups-in-active-directory"
+kind = "vendor"

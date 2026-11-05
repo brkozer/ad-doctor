@@ -1,0 +1,90 @@
+id = "AD-PRIV-010"
+aliases = ["protected-users"]
+summary = "Protected Users is empty while Domain Admins has enabled user members, so admin credentials can still be cached, delegated and used with NTLM, DES or RC4."
+severities = ["info"]
+severity_logic = """
+Always **info**. It is a hardening recommendation: the group adds protections, and
+adding members needs testing first because it disables NTLM and RC4 for them.
+"""
+mitre = ["T1558"]
+data_sources = ["ldap"]
+attributes = [
+    "memberOf (transitive) of Domain Admins (RID 512)",
+    "memberOf (transitive) of Protected Users (RID 525)",
+]
+related = ["AD-PRIV-002", "AD-KRB-005", "AD-DEL-001", "AD-ACC-011"]
+since = "0.1.0"
+
+risk = """
+Members of **Protected Users** get protections that the domain controller and every
+supported Windows client enforce without further configuration:
+
+- no NTLM authentication, so no pass-the-hash and no NTLM relay of the account;
+- no DES or RC4 in Kerberos pre-authentication, so no RC4 keys to crack or reuse;
+- no unconstrained or constrained delegation of the account;
+- TGTs that cannot be renewed beyond the initial four hours;
+- no cached plaintext credentials or NT hash in CredSSP, WDigest or NTLM on the hosts
+  the account logs on to, and no cached logon verifier.
+
+Without it, a domain admin who logs on to a compromised server leaves behind material
+an attacker can reuse for hours or crack offline.
+"""
+
+detection = """
+The check fires when the domain has at least one **enabled user** (not a computer, not
+a gMSA/sMSA/dMSA) that is a transitive member of Domain Admins, including through
+`primaryGroupID`, and Protected Users (`<domain SID>-525`) has **no** user or computer
+members at all. The objects are the Domain Admins members, for example
+`Administrator`, `adm_bob`.
+
+Once Protected Users has any member, this check is silent; the per-account gap is
+covered by [AD-PRIV-002](AD-PRIV-002.md), which reports privileged accounts that are
+neither in Protected Users nor marked sensitive.
+"""
+
+false_positives = """
+- **Environments that still need NTLM or RC4 for admins** (old management tools,
+  applications that authenticate by IP address) cannot add those accounts yet. Accept
+  the finding in an [accepted-risk file](../ci.md#accepted-risks) with an expiry date
+  while the dependency is removed.
+"""
+
+remediation = """
+1. **Check that the domain is ready.** Protected Users needs a domain functional level of
+   Windows Server 2012 R2 or later for the DC-side protections, and admin accounts must
+   have AES keys, which means a password set after the domain reached Windows Server
+   2008 functional level:
+
+    ```powershell
+    (Get-ADDomain).DomainMode
+    Get-ADGroupMember 'Domain Admins' -Recursive |
+        Get-ADUser -Properties PasswordLastSet | Select-Object SamAccountName, PasswordLastSet
+    ```
+
+2. **Add one test admin account first** and use it for a few days: logon to admin
+   workstations, remote management, every admin tool the team uses.
+
+    ```powershell
+    Add-ADGroupMember 'Protected Users' -Members adm_bob -WhatIf
+    ```
+
+3. **Add the remaining administrators.** Do not add service accounts, computer accounts
+   or the only break-glass account: a break-glass account must still work when Kerberos
+   does not.
+
+4. **Watch for failures** in the *Microsoft-Windows-Authentication/ProtectedUser-Client*
+   and *ProtectedUserFailures-DomainController* logs, which name the blocked
+   authentication.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-010"
+
+[[references]]
+title = "Protected Users security group"
+url = "https://learn.microsoft.com/en-us/windows-server/security/credentials-protection-and-management/protected-users-security-group"
+kind = "vendor"
+
+[[references]]
+title = "ANSSI Active Directory checklist (vuln_protected_users)"
+url = "https://cert.cyber.gouv.fr/uploads/ad_checklist.html"
+kind = "vendor"

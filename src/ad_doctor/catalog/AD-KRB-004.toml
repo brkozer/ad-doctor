@@ -1,0 +1,87 @@
+id = "AD-KRB-004"
+aliases = ["des-only"]
+summary = "Enabled accounts flagged to use only DES Kerberos encryption, a broken cipher that current Windows disables by default."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. DES is disabled by default on Windows 7 / Server 2008 R2 and later,
+so the flag is usually a leftover; it becomes dangerous when someone re-enables DES on
+the domain controllers to make the account work again.
+"""
+mitre = ["T1558"]
+data_sources = ["ldap"]
+attributes = ["userAccountControl"]
+related = ["AD-KRB-005", "AD-KRB-003"]
+since = "0.1.0"
+
+risk = """
+**Use only Kerberos DES encryption types for this account** tells the KDC to issue
+tickets for the account with DES (`DES-CBC-CRC` or `DES-CBC-MD5`). DES has a 56-bit
+key: a ticket encrypted with it can be brute-forced to the account's key regardless of
+how strong the password is, and the key then lets an attacker forge service tickets to
+that account (a silver ticket) or, for a user account, act as that user.
+
+Windows 7, Windows Server 2008 R2 and later do not support DES by default, so the
+account mostly just fails Kerberos. The usual "fix" for that failure is to turn DES back
+on in *Network security: Configure encryption types allowed for Kerberos* on the
+domain controllers, which reopens the weakness for this account and for any other
+account that asks for DES.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled** account, user or computer, with the
+`USE_DES_KEY_ONLY` bit (`0x200000`) in `userAccountControl`. One finding lists the
+accounts by `sAMAccountName`, for example `des_user`.
+
+ad-doctor does not read the DCs' Kerberos encryption policy, so it cannot tell whether
+DES is actually usable in the domain; the flag alone is reported.
+"""
+
+false_positives = """
+- **A DES-only application that is still in use.** Then the real problem is the
+  application: plan its replacement, and record the account in an
+  [accepted-risk file](../ci.md#accepted-risks) with an owner and an expiry date until
+  then.
+"""
+
+remediation = """
+1. **List the accounts** (read-only):
+
+    ```powershell
+    Get-ADUser -Filter 'UseDESKeyOnly -eq $true' -Properties PasswordLastSet |
+        Select-Object SamAccountName, Enabled, PasswordLastSet
+    ```
+
+2. **Clear the flag** on each account:
+
+    ```powershell
+    Set-ADAccountControl des_user -UseDESKeyOnly $false -WhatIf
+    ```
+
+3. **Reset the account's password** so that AES keys are generated for it, and allow
+   only AES if the account has an SPN:
+
+    ```powershell
+    Set-ADUser des_user -KerberosEncryptionType AES128, AES256 -WhatIf
+    ```
+
+4. **Make sure DES stays off** on domain controllers: the policy *Network security:
+   Configure encryption types allowed for Kerberos* should not include
+   `DES_CBC_CRC` or `DES_CBC_MD5`.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-KRB-004"
+
+[[references]]
+title = "Network security: Configure encryption types allowed for Kerberos"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/network-security-configure-encryption-types-allowed-for-kerberos"
+kind = "vendor"
+
+[[references]]
+title = "Use the UserAccountControl flags to manipulate user account properties"
+url = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/useraccountcontrol-manipulate-account-properties"
+kind = "vendor"
+
+[[references]]
+title = "[MS-KILE]: Supported Encryption Types Bit Flags"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-kile/6cfc7b50-11ed-4b4d-846d-6f08f0812919"
+kind = "spec"

@@ -1,0 +1,81 @@
+id = "AD-INF-004"
+aliases = ["dsheuristics"]
+summary = "The forest-wide dSHeuristics value allows anonymous LDAP operations or excludes operator groups from AdminSDHolder protection."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when anonymous LDAP operations are allowed (7th character `2`). **Medium** when
+the only issue is the AdminSDHolder exclusion (16th character not `0`).
+"""
+mitre = ["T1087.002", "T1098"]
+data_sources = ["ldap"]
+attributes = ["dSHeuristics"]
+related = ["AD-PRIV-005", "AD-PRIV-008", "AD-ACL-002", "AD-ACL-005"]
+since = "0.1.0"
+
+risk = '''
+`dSHeuristics` on `CN=Directory Service,CN=Windows NT,CN=Services` in the configuration
+partition is a string of single-character switches that change directory behaviour for
+the whole forest. Two of them weaken security:
+
+- **7th character `2` (`fLDAPBlockAnonOps` off).** Anonymous LDAP clients may run
+  operations beyond the rootDSE, limited only by ACLs. Together with Anonymous Logon or
+  Everyone in Pre-Windows 2000 Compatible Access ([AD-PRIV-005](AD-PRIV-005.md)), anyone
+  on the network can enumerate users, groups and computers without an account, which
+  feeds password spraying and target selection.
+- **16th character (`dwAdminSDExMask`) not `0`.** The hex digit removes Account,
+  Server, Print and/or Backup Operators from AdminSDHolder protection. Their members
+  then keep whatever ACL their own objects carry, so a helpdesk ACE inherited from an
+  OU can be used to reset the password of an operator and, through the operator group's
+  rights on DCs, climb to domain admin ([AD-PRIV-008](AD-PRIV-008.md)).
+'''
+
+detection = """
+ad-doctor reads `dSHeuristics` from the configuration partition and checks two
+positions: the 7th character equal to `2`, and the 16th character anything other than
+`0`. Shorter strings, or a value that is not set (the default), are clean.
+
+The object is the dSHeuristics string itself, for example `0000002` (anonymous
+operations allowed).
+"""
+
+false_positives = """
+- **Applications that need anonymous LDAP**, such as some old printers or Unix clients.
+  Give them a service account instead; if that is impossible, accept the finding with an
+  owner and an expiry date ([accepted risks](../ci.md#accepted-risks)).
+- **A deliberate AdminSDHolder exclusion** for an operator group that is kept empty is
+  low risk, but the clean fix is to reset the character and leave the group empty.
+"""
+
+remediation = '''
+1. **Read the current value.**
+
+    ```powershell
+    $ds = "CN=Directory Service,CN=Windows NT,CN=Services,$((Get-ADRootDSE).configurationNamingContext)"
+    (Get-ADObject $ds -Properties dSHeuristics).dSHeuristics
+    ```
+
+2. **Reset the affected characters to `0`.** If no other character is set on purpose,
+   clear the attribute; otherwise write the string back with only those positions
+   changed (keep the 10th character `1` and the 20th `2` when the string is that long:
+   they are check characters). Run as an Enterprise Admin:
+
+    ```powershell
+    Set-ADObject $ds -Clear dSHeuristics -WhatIf
+    Set-ADObject $ds -Replace @{dSHeuristics = '0000000'} -WhatIf
+    ```
+
+3. If the AdminSDHolder exclusion was removed, wait for SDProp to run (every 60 minutes)
+   and check that the operator accounts got the protected ACL.
+'''
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-004"
+
+[[references]]
+title = "[MS-ADTS]: dSHeuristics"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/e5899be4-862e-496f-9a38-33950617d2c5"
+kind = "spec"
+
+[[references]]
+title = "Appendix C: Protected Accounts and Groups in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-c--protected-accounts-and-groups-in-active-directory"
+kind = "vendor"

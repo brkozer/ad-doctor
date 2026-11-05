@@ -1,0 +1,137 @@
+id = "AD-PRIV-011"
+aliases = ["msol-dcsync"]
+summary = "An Entra Connect sync account holds DCSync rights, but the server that stores its password is not protected like a domain controller."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. The rights are there by design for password hash sync; the finding
+is that the server holding them is reachable by people outside tier 0 (no tier-0
+membership, no LAPS) or forwards credentials (unconstrained delegation).
+"""
+mitre = ["T1003.006", "T1078.002"]
+data_sources = ["ldap"]
+attributes = [
+    "sAMAccountName (MSOL_<12 hex> or Sync_<host>_<12 hex>)",
+    "description (\"... running on computer <host> ...\")",
+    "nTSecurityDescriptor of the domain head (DS-Replication-Get-Changes and -All)",
+    "userAccountControl (TRUSTED_FOR_DELEGATION)",
+    "ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime",
+]
+related = ["AD-ACL-008", "AD-ACL-001", "AD-SEC-001", "AD-DEL-001", "AD-GPO-006", "AD-PATH-001"]
+since = "unreleased"
+
+risk = """
+Microsoft Entra Connect (formerly Azure AD Connect) synchronises on-premises accounts to
+Entra ID. With password hash sync enabled, its **AD DS connector account** (`MSOL_…`, or
+a custom account) is granted *Replicating Directory Changes* and *Replicating Directory
+Changes All* on the domain: the same rights DCSync uses to pull every password hash,
+`krbtgt` included.
+
+The connector account's password is stored, encrypted, in the Entra Connect database on
+the sync server, and anyone with local administrator rights there can decrypt it (public
+tools automate this). So:
+
+1. An attacker becomes local admin on the Entra Connect server, through a shared local
+   admin password, a server admin group, or a delegated ticket.
+2. They extract the connector account's credentials.
+3. They DCSync the domain and forge tickets for any account.
+
+Microsoft documents that the server must be treated as a tier-0 (control plane) asset;
+when it is administered like an ordinary member server, the domain is only as safe as
+that server.
+"""
+
+detection = """
+ad-doctor recognises sync accounts by name: `MSOL_` followed by 12 hex characters, or
+`Sync_<host>_` followed by 12 hex characters. The sync server comes from the name, or
+for `MSOL_` accounts from the description Entra Connect writes ("… running on computer
+`<host>` …").
+
+A sync account is checked only when it is **enabled** and its own SID holds both
+*DS-Replication-Get-Changes* and *DS-Replication-Get-Changes-All* in the domain head's
+DACL. ad-doctor then looks up the server's computer account and notes:
+
+- **not in a tier-0 group**: the server is not a transitive member of a tier-0 group;
+- **unconstrained delegation**: `TRUSTED_FOR_DELEGATION` is set on the server;
+- **no LAPS**: neither legacy nor Windows LAPS manages its local administrator password.
+
+Examples: `MSOL_0a1b2c3d4e5f on ENTRA01: not in a tier-0 group, no LAPS`, or
+`MSOL_0a1b2c3d4e5f (server ENTRA01, not found in the domain)` when no computer account
+matches.
+
+Who can control the account or the server is reported separately by
+[AD-ACL-008](AD-ACL-008.md).
+"""
+
+false_positives = """
+- **A sync account with a non-standard name** is not recognised, and its DCSync rights
+  are reported by [AD-ACL-001](AD-ACL-001.md) instead.
+- **"not in a tier-0 group"** is reported even when the server is administered as tier 0
+  through other means (dedicated admin accounts, a tier-0 OU with restricted GPOs). If
+  that is the case, and LAPS is in place, accept the finding in an
+  [accepted-risk file](../ci.md#accepted-risks).
+- **"not found in the domain"** can mean the server name in the description is out of
+  date (the server was replaced) or the server is in another domain. An orphaned sync
+  account with DCSync rights should be disabled.
+"""
+
+remediation = """
+1. **Find the connector account and the server** (on the Entra Connect server, read-only):
+
+    ```powershell
+    Import-Module 'C:\\Program Files\\Microsoft Azure Active Directory Connect\\AdSyncConfig\\AdSyncConfig.psm1'
+    Get-ADSyncADConnectorAccount
+    ```
+
+2. **Administer the server as tier 0**: only tier-0 admins in its local Administrators
+   group, logon restricted to them, the same patching and monitoring as domain
+   controllers, and the server in a tier-0 OU with tier-0 GPOs.
+
+3. **Manage its local administrator password with LAPS** and remove unconstrained
+   delegation from its computer account:
+
+    ```powershell
+    Set-ADComputer ENTRA01 -TrustedForDelegation $false -WhatIf
+    ```
+
+4. **Lock down the connector account itself** with the AdSyncConfig module, which
+   removes inherited ACEs so only administrators can change it:
+
+    ```powershell
+    Set-ADSyncRestrictedPermissions -ADConnectorAccountDN 'CN=MSOL_0a1b2c3d4e5f,CN=Users,DC=corp,DC=example' `
+        -Credential (Get-Credential) -WhatIf
+    ```
+
+5. **If password hash sync is not used**, remove the replication rights from the
+   connector account. Review the ACEs first (read-only), then remove them with
+   `dsacls` or ADSI Edit:
+
+    ```powershell
+    (Get-Acl "AD:$((Get-ADDomain).DistinguishedName)").Access |
+        Where-Object IdentityReference -like '*MSOL_*' |
+        Format-Table IdentityReference, ActiveDirectoryRights, ObjectType -AutoSize
+    ```
+
+6. **Disable sync accounts left behind** by old installations once nothing uses them.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-011"
+
+[[references]]
+title = "Microsoft Entra Connect: Accounts and permissions"
+url = "https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/reference-connect-accounts-permissions"
+kind = "vendor"
+
+[[references]]
+title = "Prerequisites for Microsoft Entra Connect (server hardening)"
+url = "https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/how-to-connect-install-prerequisites"
+kind = "vendor"
+
+[[references]]
+title = "Configure AD DS connector account permissions"
+url = "https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/how-to-connect-configure-ad-ds-connector-account"
+kind = "vendor"
+
+[[references]]
+title = "Azure AD Connect for red teamers (Adam Chester)"
+url = "https://blog.xpnsec.com/azuread-connect-for-redteam/"
+kind = "research"

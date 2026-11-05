@@ -1,0 +1,131 @@
+id = "AD-KRB-003"
+aliases = ["kerberoasting", "kerberoast"]
+summary = "Enabled user accounts with a service principal name, whose service tickets any domain user can request and crack offline."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when at least one reported account is privileged: a transitive member of a
+tier-0 group, or an account with `adminCount = 1`. **Medium** otherwise.
+"""
+mitre = ["T1558.003"]
+data_sources = ["ldap"]
+attributes = ["servicePrincipalName", "userAccountControl", "adminCount", "objectClass"]
+related = ["AD-KRB-005", "AD-PRIV-002", "AD-ACC-011"]
+since = "0.1.0"
+
+risk = """
+Any authenticated user can ask the KDC for a service ticket to any service principal
+name (SPN) in the domain. Part of that ticket is encrypted with a key derived from the
+password of the account that owns the SPN. When the owner is a user account, its
+password was chosen by a person and can be guessed offline, with no failed logons and
+no lockout. RC4-encrypted tickets (etype 23) crack far faster than AES ones, which is
+why [AD-KRB-005](AD-KRB-005.md) makes this worse.
+
+A cracked service account password gives the attacker that account, and service
+accounts are often over-privileged: a Kerberoastable member of Domain Admins is a
+one-step domain compromise.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled** user object with at least one value in
+`servicePrincipalName`, excluding `krbtgt`. Computer accounts and managed service
+accounts (gMSA, sMSA, dMSA) are skipped because their passwords are long random values
+that the system rotates.
+
+Privilege comes from the transitive membership of the tier-0 groups collected in the
+same snapshot and from `adminCount`.
+
+ad-doctor does **not** request any service ticket: the check is a pure function of the
+directory data, so running it leaves no 4769 events behind.
+"""
+
+false_positives = """
+- **Long random passwords.** A user account whose password is 25+ random characters from
+  a vault, rotated regularly, is not practically crackable. ad-doctor cannot see password
+  strength, so it still reports the account. Record the decision in an
+  [accepted-risk file](../ci.md#accepted-risks) with an owner and an expiry date.
+- **Honeypot accounts** created on purpose to catch Kerberoasting: accept them the same way.
+- **Stale SPNs** left behind by uninstalled software are true positives: the fix is to
+  remove the SPN.
+"""
+
+remediation = """
+1. **List the accounts and how they are configured.**
+
+    ```powershell
+    Get-ADUser -LDAPFilter '(&(servicePrincipalName=*)(!(sAMAccountName=krbtgt)))' `
+        -Properties servicePrincipalName, PasswordLastSet, adminCount, 'msDS-SupportedEncryptionTypes' |
+        Select-Object SamAccountName, PasswordLastSet, adminCount, 'msDS-SupportedEncryptionTypes',
+            @{n = 'SPNs'; e = { $_.servicePrincipalName -join ', ' }}
+    ```
+
+2. **Remove SPNs nothing uses any more.**
+
+    ```powershell
+    Set-ADUser svc_web -ServicePrincipalNames @{Remove = 'HTTP/web01.corp.example'} -WhatIf
+    ```
+
+3. **Move services to a group managed service account (gMSA).** The domain needs a KDS
+   root key once (`Add-KdsRootKey -EffectiveImmediately`, then wait for replication).
+   Remove the SPN from the old account first, since an SPN must be unique.
+
+    ```powershell
+    New-ADServiceAccount -Name gmsa_sql -DNSHostName gmsa_sql.corp.example `
+        -PrincipalsAllowedToRetrieveManagedPassword 'SQL Servers' `
+        -ServicePrincipalNames 'MSSQLSvc/sql01.corp.example:1433' -WhatIf
+    ```
+
+4. **Where a gMSA is not possible**, give the account a random password of 25 or more
+   characters, allow only AES, and reset the password afterwards so that AES keys exist:
+
+    ```powershell
+    Set-ADUser svc_sql -KerberosEncryptionType AES128, AES256 -WhatIf
+    ```
+
+5. **Take service accounts out of tier-0 groups.** A service rarely needs Domain Admins;
+   grant the specific rights it needs instead.
+
+6. **Detect attempts**: on domain controllers, alert on event 4769 for user-owned SPNs
+   with ticket encryption type `0x17` (RC4).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-KRB-003"
+
+[[references]]
+title = "Microsoft's guidance to help mitigate Kerberoasting"
+url = "https://www.microsoft.com/en-us/security/blog/2024/10/11/microsofts-guidance-to-help-mitigate-kerberoasting/"
+kind = "vendor"
+
+[[references]]
+title = "Group Managed Service Accounts overview"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/group-managed-service-accounts/group-managed-service-accounts/group-managed-service-accounts-overview"
+kind = "vendor"
+
+[[references]]
+title = "Detect and remediate RC4 usage in Kerberos"
+url = "https://learn.microsoft.com/en-us/windows-server/security/kerberos/detect-remediate-rc4-kerberos"
+kind = "vendor"
+
+[[references]]
+title = "Decrypting the selection of supported Kerberos encryption types"
+url = "https://techcommunity.microsoft.com/blog/coreinfrastructureandsecurityblog/decrypting-the-selection-of-supported-kerberos-encryption-types/1628797"
+kind = "vendor"
+
+[[references]]
+title = "Event 4769: A Kerberos service ticket was requested"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4769"
+kind = "vendor"
+
+[[references]]
+title = "Kerberoasting without Mimikatz (Will Schroeder)"
+url = "https://blog.harmj0y.net/powershell/kerberoasting-without-mimikatz/"
+kind = "research"
+
+[[references]]
+title = "Cracking Kerberos TGS tickets using Kerberoast (Sean Metcalf)"
+url = "https://adsecurity.org/?p=2293"
+kind = "research"
+
+[[references]]
+title = "The Hacker Recipes: Kerberoast"
+url = "https://www.thehacker.recipes/ad/movement/kerberos/roasting/kerberoast"
+kind = "research"

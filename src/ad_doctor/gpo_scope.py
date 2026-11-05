@@ -1,0 +1,343 @@
+"""Which computers the local group settings in GPOs reach, worked out from a snapshot.
+
+Scope follows Group Policy processing for the computer side: links on the site, the
+domain and each OU above the computer, Block Inheritance and Enforced, disabled links,
+the GPO's status flags, an empty computer version or a missing client-side extension
+(Windows reports both as "Not Applied (Empty)"), and security filtering (Read plus Apply
+Group Policy for any SID in the computer's token).
+
+Domain controllers have no local groups: Restricted Groups applied to a writable DC
+rewrite the domain group with that SID (BUILTIN\\Administrators, or Domain Admins itself).
+GPP Local Groups items are processed on a DC but leave domain groups alone (checked on
+Windows Server 2025), so they are skipped there.
+
+Approximations, each of which can only over-report:
+- WMI filters are assumed to match, and items with item-level targeting are assumed to
+  apply (each such grant carries a caveat).
+- Deny ACEs are not parsed, so a "Deny Apply" exclusion still counts as applied.
+- An ordinary user cannot map member computers to sites; with more than one site every
+  site's links are assumed to apply.
+- Removals and precedence between GPOs are ignored: the result is the union of additions,
+  although a higher-precedence X__Members can remove what a lower one adds.
+- The token comes from the groups in the snapshot; groups of other domains are not seen.
+- A holder of the remote logon right that could not be resolved to a SID is assumed to
+  cover the member (with a caveat).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import re
+from dataclasses import dataclass
+
+from . import sd
+from .model import Account, DirObject, Gpo, GpoLocalGroup, Snapshot, well_known_sid
+
+CSE_SECURITY = "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}"  # Restricted Groups, user rights
+CSE_GROUPS = "{17D89FEC-5C44-4972-B12D-241CAEF74509}"  # GPP Local Users and Groups
+CSE_OF_SOURCE = {"restricted": CSE_SECURITY, "gpp": CSE_GROUPS}
+GPO_COMPUTER_DISABLED = 0x2
+
+EVERYONE = "S-1-1-0"
+AUTHENTICATED_USERS = "S-1-5-11"
+THIS_ORGANIZATION = "S-1-5-15"
+ENTERPRISE_DCS = "S-1-5-9"
+INTERACTIVE = "S-1-5-4"
+ADMINISTRATORS = "S-1-5-32-544"
+RDP_USERS = "S-1-5-32-555"
+REMOTE_LOGON_RIGHT = "SeRemoteInteractiveLogonRight"
+# a comma that ends an RDN: not escaped, i.e. after an even number of backslashes
+RDN_SEPARATOR = re.compile(r"(?<!\\)(?:\\\\)*,")
+ILT_CAVEAT = "item-level targeting not evaluated"
+UNRESOLVED_LOGON = "remote logon right holders not resolved"
+
+
+@dataclass(frozen=True)
+class LocalGroup:
+    name: str
+    verb: str  # graph edge label
+    admin: bool  # admin-equivalent (control) rather than a logon right
+
+
+# Local groups whose membership matters; any other group name is ignored
+LOCAL_GROUPS = {
+    ADMINISTRATORS: LocalGroup("Administrators", "admin to", True),
+    # SeBackup/SeRestore read the SAM and SECURITY hives: admin-equivalent
+    "S-1-5-32-551": LocalGroup("Backup Operators", "backup operator on", True),
+    "S-1-5-32-578": LocalGroup("Hyper-V Administrators", "Hyper-V admin on", True),
+    RDP_USERS: LocalGroup("Remote Desktop Users", "can RDP", False),
+    "S-1-5-32-580": LocalGroup("Remote Management Users", "can PSRemote", False),
+    "S-1-5-32-562": LocalGroup("Distributed COM Users", "DCOM", False),
+}
+
+
+@dataclass(frozen=True)
+class Grant:
+    """A principal a GPO puts into a group: a local group on one computer, or a domain
+    group rewritten through the writable DCs (computer None, domain_group True)."""
+
+    gpo: Gpo
+    item: GpoLocalGroup
+    computer: Account | None
+    domain_group: bool
+    caveats: tuple[str, ...] = ()
+    # False for Remote Desktop Users when the remote logon right does not include it
+    effective: bool = True
+
+
+@dataclass(frozen=True)
+class Scope:
+    grants: list[Grant]
+    # Restricted Groups that empty a domain group through the writable DCs
+    clears: list[Grant]
+    notes: list[str]
+
+
+def computer_side_applies(gpo: Gpo, source: str) -> bool:
+    """False when Windows would not process this kind of setting in the GPO at all.
+
+    Older snapshots carry no version or extension list; the GPO is then assumed to apply.
+    """
+    if gpo.flags & GPO_COMPUTER_DISABLED or gpo.machine_version == 0:
+        return False
+    extensions = gpo.machine_extensions
+    return extensions is None or CSE_OF_SOURCE[source] in extensions
+
+
+def containers(dn: str, domain_dn: str) -> list[str]:
+    """Lower-cased OUs above an object, nearest first, then the domain head."""
+    key, head = dn.lower(), domain_dn.lower()
+    out = []
+    for comma in RDN_SEPARATOR.finditer(key):
+        parent = key[comma.end() :]
+        if parent == head:
+            out.append(parent)
+            break
+        if parent.startswith("ou="):
+            out.append(parent)
+    return out
+
+
+def security_filter(gpo: Gpo, token: set[str]) -> bool | None:
+    """Whether the token may read and apply the GPO; None when its DACL was not read.
+
+    Read and Apply may come from different ACEs. AD stores mapped rights, so READ_PROPERTY
+    is the real test; the generic bits are accepted for hand-made descriptors.
+    """
+    if not gpo.aces:
+        return None
+    read = sd.READ_PROPERTY | sd.GENERIC_READ | sd.GENERIC_ALL
+    apply = any(a.sid in token and a.extended_right(sd.APPLY_GROUP_POLICY) for a in gpo.aces)
+    return apply and any(a.sid in token and a.mask & read for a in gpo.aces)
+
+
+class _Resolver:
+    def __init__(self, snap: Snapshot) -> None:
+        self.snap = snap
+        self.links_at: dict[str, list[tuple[bool, bool, Gpo]]] = {}  # (enabled, enforced)
+        self.site_links: list[tuple[str, bool, bool, Gpo]] = []
+        for g in snap.gpos:
+            for link in g.links:
+                where = link.container.lower()
+                if link.kind == "site":
+                    self.site_links.append((where, link.enabled, link.enforced, g))
+                else:
+                    self.links_at.setdefault(where, []).append((link.enabled, link.enforced, g))
+        self.blocked = {o.dn.lower() for o in snap.objects if o.gp_blocked}
+        self.sid_dn = {o.sid: o.dn.lower() for o in snap.objects if o.sid}
+        self.member_of: dict[str, list[DirObject]] = {}
+        for o in snap.objects:
+            if o.kind == "group":
+                for m in o.members:
+                    self.member_of.setdefault(m.lower(), []).append(o)
+        self._tokens: dict[str, set[str]] = {}
+
+    def linked(self, a: Account) -> list[tuple[Gpo, tuple[str, ...]]]:
+        """GPOs linked where they reach this computer, with caveats (no filtering yet)."""
+        found: dict[str, tuple[Gpo, tuple[str, ...]]] = {}
+        blocked = False
+        for c in containers(a.dn, self.snap.domain_dn):
+            for enabled, enforced, g in self.links_at.get(c, []):
+                # a disabled link never applies, even when it is enforced
+                if enabled and (not blocked or enforced):
+                    found[g.guid.upper()] = (g, ())
+            if c in self.blocked:
+                blocked = True  # stops the links above c, never c's own
+        site = self.snap.dc_sites.get(a.dn.lower(), "").lower() if a.is_dc else ""
+        for container, enabled, enforced, g in self.site_links:
+            if not enabled or (blocked and not enforced):
+                continue
+            if site:
+                if container != site:
+                    continue
+                caveats: tuple[str, ...] = ()
+            else:
+                single = self.snap.site_count <= 1
+                caveats = () if single else ("site membership assumed",)
+            if g.guid.upper() not in found or not caveats:
+                found[g.guid.upper()] = (g, caveats)
+        return list(found.values())
+
+    def token(self, a: Account) -> set[str]:
+        """SIDs in the computer's token: its own, the well-known ones, the primary group
+        and every group that holds any of them, through nesting and through the
+        foreignSecurityPrincipal objects that stand for well-known SIDs."""
+        if a.dn.lower() in self._tokens:
+            return self._tokens[a.dn.lower()]
+        dom = self.snap.domain_sid
+        sids = {a.sid, EVERYONE, AUTHENTICATED_USERS, THIS_ORGANIZATION}
+        sids.add(f"{dom}-{a.primary_group or 515}")
+        if a.is_dc:
+            sids |= {ENTERPRISE_DCS, f"{dom}-{521 if a.is_rodc else 516}"}
+        sids.discard("")
+        head = self.snap.domain_dn.lower()
+        todo = [a.dn.lower()]
+        todo += [
+            self.sid_dn.get(s, f"cn={s.lower()},cn=foreignsecurityprincipals,{head}") for s in sids
+        ]
+        seen = set(todo)
+        while todo:
+            for group in self.member_of.get(todo.pop(), []):
+                key = group.dn.lower()
+                if key not in seen:
+                    seen.add(key)
+                    if group.sid:
+                        sids.add(group.sid)
+                    todo.append(key)
+        self._tokens[a.dn.lower()] = sids
+        return sids
+
+    def applied(self, a: Account, source: str) -> list[tuple[Gpo, tuple[str, ...]]]:
+        """GPOs whose settings of this kind Windows would process on the computer."""
+        out = []
+        for g, caveats in self.linked(a):
+            if not computer_side_applies(g, source):
+                continue
+            allowed = security_filter(g, self.token(a))
+            if allowed is False:
+                continue
+            extra = ("security filtering not readable",) if allowed is None else ()
+            wmi = (f"WMI filter {g.wmi_filter}",) if g.wmi_filter else ()
+            out.append((g, caveats + extra + wmi))
+        return out
+
+    def remote_logon(self, a: Account, member_sid: str) -> tuple[bool, bool]:
+        """Whether Remote Desktop Users (or the member itself) holds the remote logon right,
+        and whether that is only assumed because some holder is a name, not a SID.
+
+        Without a GPO that sets it, the built-in default applies: Administrators on a DC,
+        Administrators and Remote Desktop Users on any other computer. Deny rights are
+        not evaluated.
+        """
+        holders: set[str] | None = None
+        for g, _ in self.applied(a, "restricted"):
+            settings = self.snap.gpo_settings.get(g.guid)
+            if settings is not None and REMOTE_LOGON_RIGHT in settings.privileges:
+                named = settings.privileges[REMOTE_LOGON_RIGHT]
+                holders = (holders or set()) | {_holder(h) for h in named}
+        if holders is None:
+            holders = {ADMINISTRATORS} if a.is_dc else {ADMINISTRATORS, RDP_USERS}
+        if RDP_USERS in holders or member_sid in holders:
+            return True, False
+        unresolved = any(not h.startswith("S-1-") for h in holders)
+        return unresolved, unresolved
+
+
+def _holder(value: str) -> str:
+    if value.upper().startswith("S-1-"):
+        return value.upper()
+    return well_known_sid(value) or value.lower()
+
+
+def _computers(snap: Snapshot) -> list[Account]:
+    return [a for a in snap.accounts if a.is_computer and a.enabled and not a.managed and a.sid]
+
+
+def resolve(snap: Snapshot) -> Scope:
+    """Every principal the GPOs' local group settings add somewhere, deduplicated."""
+    items: dict[str, list[GpoLocalGroup]] = {}
+    for x in snap.gpo_local_groups:
+        items.setdefault(x.gpo.upper(), []).append(x)
+    if not snap.local_groups_collected or not items:
+        return Scope([], [], [])
+    r = _Resolver(snap)
+    grants: dict[tuple[str, ...], Grant] = {}
+    clears: dict[tuple[str, str], Grant] = {}
+    rodcs: set[str] = set()
+    gpp_on_dcs: set[str] = set()
+
+    def keep(key: tuple[str, ...], grant: Grant) -> None:
+        old = grants.get(key)
+        if old is not None:
+            merged = tuple(sorted(set(old.caveats) | set(grant.caveats)))
+            grant = dataclasses.replace(old, caveats=merged)
+        grants[key] = grant
+
+    def place(a: Account, g: Gpo, x: GpoLocalGroup, caveats: tuple[str, ...]) -> None:
+        guid = g.guid.upper()
+        if x.filtered:
+            caveats = (*caveats, ILT_CAVEAT)
+        adds = x.action in ("add", "set") and bool(x.member_sid)
+        if not a.is_dc:
+            # only local groups exist here: an entry for a domain group has no effect
+            if adds and x.group_sid in LOCAL_GROUPS:
+                keep((guid, x.group_sid, x.member_sid, a.sid), Grant(g, x, a, False, caveats))
+        elif not x.group_sid:
+            return
+        elif adds:  # any group: Domain Admins__Members on DCs rewrites Domain Admins
+            keep((guid, x.group_sid, x.member_sid, ""), Grant(g, x, None, True, caveats))
+        elif x.replaces and not x.member_name:
+            clears[(guid, x.group_sid)] = Grant(g, x, None, True, caveats)
+
+    for a in _computers(snap):
+        if not any(g.guid.upper() in items for g, _ in r.linked(a)):
+            continue
+        for source in ("restricted", "gpp"):
+            for g, caveats in r.applied(a, source):
+                active = [
+                    x
+                    for x in items.get(g.guid.upper(), [])
+                    if x.source == source and not x.disabled
+                ]
+                if active and a.is_rodc:
+                    rodcs.add(a.sam)  # an RODC cannot write domain groups
+                elif active and a.is_dc and source == "gpp":
+                    gpp_on_dcs.add(g.name)
+                else:
+                    for x in active:
+                        place(a, g, x, caveats)
+
+    writable_dcs = [a for a in _computers(snap) if a.is_dc and not a.is_rodc]
+    out = []
+    for grant in grants.values():
+        if grant.item.group_sid == RDP_USERS:
+            targets = [grant.computer] if grant.computer else writable_dcs
+            results = [r.remote_logon(t, grant.item.member_sid) for t in targets]
+            effective = any(holds for holds, _ in results)
+            assumed = effective and all(guess for holds, guess in results if holds)
+            caveats = (*grant.caveats, UNRESOLVED_LOGON) if assumed else grant.caveats
+            grant = dataclasses.replace(grant, effective=effective, caveats=caveats)
+        out.append(grant)
+
+    notes = []
+    for grant in clears.values():
+        notes.append(
+            f"GPO {grant.gpo.name} empties the domain group {snap.name_of(grant.item.group_sid)} "
+            "on every writable DC (Restricted Groups '__Members' with no members; GPMC writes "
+            "that line when only 'This group is a member of' is filled in)"
+        )
+    if rodcs:
+        notes.append(
+            "local group settings in GPOs reaching read-only DCs are not evaluated: "
+            + ", ".join(sorted(rodcs))
+        )
+    if gpp_on_dcs:
+        notes.append(
+            "GPP local group items in GPOs that reach domain controllers are ignored, as "
+            "Windows ignores them there: " + ", ".join(sorted(gpp_on_dcs))
+        )
+    return Scope(out, list(clears.values()), notes)
+
+
+def grants(snap: Snapshot) -> list[Grant]:
+    return resolve(snap).grants

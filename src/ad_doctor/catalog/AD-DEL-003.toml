@@ -1,0 +1,96 @@
+id = "AD-DEL-003"
+aliases = ["rbcd"]
+summary = "Accounts with msDS-AllowedToActOnBehalfOfOtherIdentity set, whose listed principals can impersonate any user to them; each entry needs to be intended."
+severities = ["low"]
+severity_logic = """
+Always **low**: resource-based constrained delegation (RBCD) is a supported feature and
+the check reports only that it is configured. The dangerous cases are reported
+elsewhere: RBCD on a domain controller by [AD-DEL-004](AD-DEL-004.md), and the
+conditions that let an attacker plant RBCD through an NTLM relay by
+[AD-CHAIN-001](AD-CHAIN-001.md).
+"""
+mitre = ["T1558", "T1134"]
+data_sources = ["ldap"]
+attributes = ["msDS-AllowedToActOnBehalfOfOtherIdentity"]
+related = ["AD-DEL-004", "AD-CHAIN-001", "AD-POL-002", "AD-ACL-004", "AD-DEL-002"]
+since = "0.1.0"
+
+risk = """
+With RBCD the *target* decides who may delegate to it: its
+`msDS-AllowedToActOnBehalfOfOtherIdentity` attribute holds a security descriptor that
+lists the accounts allowed in. Any listed account can use S4U2Self and S4U2Proxy to get
+a service ticket to the target **as any user** who is not protected from delegation,
+and so gets admin access to that host.
+
+Unlike the other delegation types, setting this attribute needs no special privilege:
+write access to the target object is enough. That is why it is a favourite takeover
+step:
+
+1. An attacker with write access to a computer object, or an NTLM authentication relayed
+   to LDAP, adds an account they control to the attribute. Any domain user can usually
+   create such an account ([AD-POL-002](AD-POL-002.md)).
+2. They request tickets as a domain admin to that computer and own it.
+
+An entry nobody remembers adding may be the trace of exactly that.
+"""
+
+detection = """
+From the LDAP snapshot: every account, enabled or not, whose
+`msDS-AllowedToActOnBehalfOfOtherIdentity` is non-empty. One finding lists them by
+`sAMAccountName`, for example `FS01$`.
+
+ad-doctor reports the presence of the attribute; it does not list which principals the
+security descriptor allows, so check that with the command below.
+"""
+
+false_positives = """
+- **RBCD you configured on purpose**, for example a web server allowed to delegate to a
+  file server. Confirm each allowed principal is expected and as well protected as the
+  target, then record it in an [accepted-risk file](../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **See who is allowed** on each reported account (read-only; for a user account use
+   `Get-ADUser` and `Set-ADUser` with the same parameter):
+
+    ```powershell
+    Get-ADComputer FS01 -Properties PrincipalsAllowedToDelegateToAccount |
+        Select-Object Name, PrincipalsAllowedToDelegateToAccount
+    ```
+
+2. **Remove entries nobody can explain.** Clearing the attribute removes all of them:
+
+    ```powershell
+    Set-ADComputer FS01 -PrincipalsAllowedToDelegateToAccount $null -WhatIf
+    ```
+
+    To keep the intended ones, set the attribute to just those accounts instead
+    (`-PrincipalsAllowedToDelegateToAccount 'WEB01$'`).
+
+3. **If an entry was unexpected, investigate it as a compromise**: find who wrote the
+   attribute (directory service change auditing, event 5136) and what the allowed
+   account did.
+
+4. **Limit who can write the attribute**: review write access to computer objects
+   ([AD-ACL-004](AD-ACL-004.md) reports it for tier-0 ones), set
+   `ms-DS-MachineAccountQuota` to 0 ([AD-POL-002](AD-POL-002.md)), and require LDAP
+   signing and channel binding so relayed authentication cannot write it
+   ([AD-CHAIN-001](AD-CHAIN-001.md)).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-DEL-003"
+
+[[references]]
+title = "Kerberos constrained delegation overview"
+url = "https://learn.microsoft.com/en-us/windows-server/security/kerberos/kerberos-constrained-delegation-overview"
+kind = "vendor"
+
+[[references]]
+title = "Wagging the Dog: Abusing Resource-Based Constrained Delegation (Elad Shamir)"
+url = "https://shenaniganslabs.io/2019/01/28/Wagging-the-Dog.html"
+kind = "research"
+
+[[references]]
+title = "The Hacker Recipes: Resource-based constrained delegation"
+url = "https://www.thehacker.recipes/ad/movement/kerberos/delegations/rbcd"
+kind = "research"

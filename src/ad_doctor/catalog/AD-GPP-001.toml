@@ -1,0 +1,92 @@
+id = "AD-GPP-001"
+aliases = ["gpp-password", "cpassword"]
+summary = "Group Policy Preferences files in SYSVOL hold cpassword values, encrypted with a key Microsoft published, so every domain user can read and decrypt the passwords."
+severities = ["high"]
+severity_logic = """
+Always **high**: the decryption key is public, the files are readable by every
+authenticated user, and the passwords are typically those of local administrator or
+service accounts.
+"""
+mitre = ["T1552.006"]
+data_sources = ["sysvol"]
+attributes = [
+    "Policies\\{GUID}\\...\\Groups.xml, Services.xml, ScheduledTasks.xml, DataSources.xml, Drives.xml, Printers.xml",
+    "cpassword, userName, accountName, runAs, newName (XML attributes)",
+]
+related = ["AD-GPP-002", "AD-ACC-008", "AD-GPO-005"]
+since = "0.1.0"
+
+risk = """
+Before May 2014, Group Policy Preferences (GPP) could set passwords for local users,
+services, scheduled tasks, mapped drives and data sources. The password is stored in the
+preference XML under SYSVOL as `cpassword`, AES-256 encrypted with a key Microsoft
+documented in the MS-GPPREF specification. SYSVOL is readable by every authenticated user.
+
+1. Any domain user lists SYSVOL and finds `cpassword` in, for example, a `Groups.xml`.
+2. They decrypt it offline (`gpp-decrypt`, PowerSploit `Get-GPPPassword`, NetExec's
+   `gpp_password` module).
+3. The password is usually a local administrator password set on every workstation, or a
+   service account's, which gives lateral movement or more.
+
+MS14-025 removed the password fields from the GPMC editor, but it did **not** delete
+existing files: preference items created before the update stay in SYSVOL and keep
+applying until someone removes them.
+"""
+
+detection = """
+ad-doctor connects to the `SYSVOL` share over SMB as the scanning user and walks
+`<domain>\\Policies`. In every `Groups.xml`, `Services.xml`, `ScheduledTasks.xml`,
+`DataSources.xml`, `Drives.xml` and `Printers.xml` (machine and user side) it looks for
+items with a non-empty `cpassword="..."` attribute and records the account name from
+`userName`, `accountName`, `runAs` or `newName` (`?` when none is present).
+
+The value is never decrypted, stored or printed. Each object is the file path relative to
+SYSVOL and the account, for example
+`Policies\\{4B1D7A55-0C1E-4A3B-9D2F-7E6A5C3B2A10}\\Machine\\Preferences\\Groups\\Groups.xml (localadmin)`.
+Files the scanning user cannot read are skipped and listed in the scan notes.
+"""
+
+false_positives = """
+- **Orphaned GPO folders.** A file in a GPO folder whose GPO was deleted no longer applies,
+  but the password in it is still readable and still needs changing.
+"""
+
+remediation = """
+1. **Find every file** (read-only):
+
+    ```powershell
+    Get-ChildItem "\\\\$env:USERDNSDOMAIN\\SYSVOL\\$env:USERDNSDOMAIN\\Policies" -Recurse -Include *.xml |
+        Select-String -Pattern 'cpassword="[^"]+' -List | Select-Object Path
+    ```
+
+2. **Change the passwords first**: assume every account named in the finding is
+   compromised, because any user could have read it at any time.
+
+3. **Delete the preference items** in GPMC (or remove the XML files from the GPO folders),
+   and confirm the files are gone from SYSVOL on every DC after replication.
+
+4. **Manage local administrator passwords with Windows LAPS** and service account
+   passwords with gMSAs instead of distributing a shared password.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPP-001"
+
+[[references]]
+title = "MS14-025: Vulnerability in Group Policy Preferences could allow elevation of privilege"
+url = "https://learn.microsoft.com/en-us/security-updates/securitybulletins/2014/ms14-025"
+kind = "vendor"
+
+[[references]]
+title = "[MS-GPPREF]: Password encryption"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gppref/2c15cbf0-f086-4c74-8b70-1f2fa45dd4be"
+kind = "spec"
+
+[[references]]
+title = "Finding passwords in SYSVOL & exploiting Group Policy Preferences (Sean Metcalf)"
+url = "https://adsecurity.org/?p=2288"
+kind = "research"
+
+[[references]]
+title = "Windows LAPS overview"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/laps/laps-overview"
+kind = "vendor"

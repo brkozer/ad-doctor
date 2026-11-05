@@ -1,0 +1,104 @@
+id = "AD-ADCS-007"
+aliases = ["esc13"]
+summary = "A published authentication template that broad groups can enroll in carries an issuance policy linked to a group, so every enrollee gets that group's rights."
+severities = ["high"]
+severity_logic = """
+Always **high**: ad-doctor does not weigh what the linked group can do. Downgrade by
+accepting the risk only after confirming the group grants nothing of value.
+"""
+mitre = ["T1649"]
+data_sources = ["ldap"]
+attributes = [
+    "msPKI-Certificate-Policy (template issuance policies)",
+    "msDS-OIDToGroupLink (on msPKI-Enterprise-Oid objects)",
+    "msPKI-Cert-Template-OID",
+    "pKIExtendedKeyUsage",
+    "msPKI-Certificate-Application-Policy",
+    "msPKI-Enrollment-Flag",
+    "msPKI-RA-Signature",
+    "nTSecurityDescriptor (template DACL)",
+]
+related = ["AD-ADCS-001", "AD-ADCS-004", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+*Authentication mechanism assurance* lets an administrator link an issuance policy (an
+`msPKI-Enterprise-Oid` object under `CN=OID`) to a universal group through its
+`msDS-OIDToGroupLink` attribute. When someone logs on with a certificate that carries
+that issuance policy, the domain controller adds the linked group to their Kerberos
+ticket, even though they are not a member of it.
+
+The feature is meant for "this logon used a smart card" style groups. If the template
+that issues the policy is open to Domain Users, every user can enroll, authenticate with
+the certificate (PKINIT) and act with the linked group's permissions: its ACL grants,
+file shares, or whatever it was nested into. The group membership never appears in
+Active Directory, so group-based reviews miss it.
+"""
+
+detection = """
+ad-doctor reads every `msPKI-Enterprise-Oid` object under
+`CN=OID,CN=Public Key Services,CN=Services,CN=Configuration` that has `msDS-OIDToGroupLink`
+set, then reports a template when **all** of these hold:
+
+| Condition | Attribute |
+|---|---|
+| Published on at least one enterprise CA | `certificateTemplates` of a CA object |
+| No manager approval | `msPKI-Enrollment-Flag` without `CT_FLAG_PEND_ALL_REQUESTS` (0x2) |
+| No authorized signatures | `msPKI-RA-Signature` is 0 |
+| A broad group can enroll | Enroll or AutoEnroll in the template DACL for Everyone, Anonymous Logon, Authenticated Users, BUILTIN\\Users, Pre-Windows 2000 Compatible Access, Domain Users, Domain Guests or Domain Computers |
+| Linked issuance policy | an OID in `msPKI-Certificate-Policy` has an `msDS-OIDToGroupLink` |
+| Usable for authentication | EKU includes Client Authentication, Smart Card Logon, PKINIT Client Authentication or Any Purpose, or is empty |
+
+Each object names the template and the broad groups that can enroll, for example
+`LabESC13 (enroll: Domain Users)`. Find the linked group with the read-only command in
+the remediation.
+"""
+
+false_positives = """
+- **A linked group with no rights.** If the group is used only as a marker (for example,
+  for conditional access on a file share that holds nothing sensitive), the impact is
+  small. Confirm what the group can do before accepting the risk; see
+  [the accepted-risks file](../ci.md#accepted-risks).
+- **Narrower enrollment groups** are not reported here; their members still gain the
+  linked group.
+"""
+
+remediation = """
+1. **Find the linked group** (read-only):
+
+    ```powershell
+    $cfg = (Get-ADRootDSE).configurationNamingContext
+    Get-ADObject -SearchBase "CN=OID,CN=Public Key Services,CN=Services,$cfg" `
+        -LDAPFilter '(msDS-OIDToGroupLink=*)' `
+        -Properties 'msPKI-Cert-Template-OID', 'msDS-OIDToGroupLink' |
+        Select-Object Name, 'msPKI-Cert-Template-OID', 'msDS-OIDToGroupLink'
+    ```
+
+2. **Restrict enrollment** in the template to the users who should receive the group,
+   for example the group's intended members, in the template's *Security* tab.
+
+3. **Or remove the link** if the feature is not in use:
+
+    ```powershell
+    Set-ADObject '<DN of the msPKI-Enterprise-Oid object>' -Clear 'msDS-OIDToGroupLink' -WhatIf
+    ```
+
+4. **Review what the linked group can do** and keep it as small as the design allows.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-007"
+
+[[references]]
+title = "ADCS ESC13 Abuse Technique (SpecterOps)"
+url = "https://specterops.io/blog/2024/02/14/adcs-esc13-abuse-technique/"
+kind = "research"
+
+[[references]]
+title = "msDS-OIDToGroupLink attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-msds-oidtogrouplink"
+kind = "spec"
+
+[[references]]
+title = "Certipy wiki: Privilege escalation (ESC13)"
+url = "https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation"
+kind = "tool"

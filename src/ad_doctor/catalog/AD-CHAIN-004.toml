@@ -1,0 +1,91 @@
+id = "AD-CHAIN-004"
+aliases = []
+summary = "The same CA has ESC6 and ESC16, so a requester can put any user's SID in a SAN URL and authenticate as that user even under strong-mapping enforcement."
+severities = ["medium", "high"]
+severity_logic = """
+**High**. On its own, ESC6 is blocked by the SID check of patched DCs and ESC16 needs a DC
+in compatibility mode; together on one CA they defeat full enforcement, so any enrollee can
+authenticate as any user, a domain admin included, on a fully patched domain. Drops to
+**medium** when every such CA holds requests for a manager (`RequestDisposition` has
+`REQDISP_PENDING`), since a CA manager must then approve the forged request.
+"""
+mitre = ["T1649"]
+data_sources = ["derived"]
+attributes = [
+    "policy\\EditFlags (EDITF_ATTRIBUTESUBJECTALTNAME2)",
+    "policy\\DisableExtensionList (szOID_NTDS_CA_SECURITY_EXT)",
+]
+related = ["AD-ADCS-012", "AD-ADCS-015", "AD-PATH-001"]
+since = "unreleased"
+
+risk = """
+The two CA-side weaknesses cancel out the protection that KB5014754 added:
+
+- **ESC6** ([AD-ADCS-012](AD-ADCS-012.md)) lets a requester supply an arbitrary subject
+  alternative name on any request.
+- **ESC16** ([AD-ADCS-015](AD-ADCS-015.md)) stops the CA from stamping the requester's real
+  SID into the certificate.
+
+With both on one CA, the attacker supplies not just a victim's name but the victim's SID in a
+SAN URL of the form `tag:microsoft.com,2022-09-14:sid:<SID>`. A DC in full strong-mapping mode
+reads that SID from the SAN, finds no conflicting SID extension (ESC16 removed it), and accepts
+the certificate as a strong mapping to the victim. The result is authentication as any account
+even on a fully patched, fully enforcing domain, which is why the pair is rated far above either
+weakness alone.
+"""
+
+detection = """
+A compound finding derived from the CA-side registry reads: ad-doctor reports a CA here when
+**both** `policy\\EditFlags` has `EDITF_ATTRIBUTESUBJECTALTNAME2` (ESC6) **and**
+`policy\\DisableExtensionList` contains the SID extension OID `1.3.6.1.4.1.311.25.2` (ESC16).
+No extra probe is made; it combines the two single-weakness checks on the same CA object.
+"""
+
+false_positives = """
+- There is no benign reason for a CA to both accept SANs from attributes and drop the SID
+  extension. Treat this as a live path to domain compromise and fix at least one side at once.
+"""
+
+remediation = """
+Fixing **either** side breaks the chain; fix both:
+
+1. **Clear the SAN flag:**
+
+    ```console
+    certutil -config "<host>\\<CA name>" -setreg policy\\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2
+    ```
+
+2. **Re-enable the SID extension:**
+
+    ```console
+    certutil -config "<host>\\<CA name>" -setreg policy\\DisableExtensionList -1.3.6.1.4.1.311.25.2
+    ```
+
+3. Restart the service and review recently issued certificates:
+
+    ```console
+    net stop certsvc & net start certsvc
+    ```
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-CHAIN-004"
+
+[[references]]
+title = "Certificates and Pwnage and Patches, Oh My! (SpecterOps)"
+url = "https://specterops.io/blog/2022/11/09/certificates-and-pwnage-and-patches-oh-my/"
+kind = "research"
+
+[[references]]
+title = "ESC16 Strips the SID Extension Strong Mapping Depends On (Trackr.Live)"
+url = "https://www.trackr.live/2026/07/01/esc16-adcs-strong-mapping-sid-extension/"
+kind = "research"
+
+[[references]]
+title = "KB5014754: Certificate-based authentication changes on Windows domain controllers"
+url = "https://support.microsoft.com/en-us/topic/kb5014754-certificate-based-authentication-changes-on-windows-domain-controllers-ad2c23b0-15d8-4340-a468-4d4f3b188f16"
+kind = "vendor"
+
+[[references]]
+title = "Certipy wiki: ESC16 and SID in SAN"
+url = "https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation"
+kind = "tool"

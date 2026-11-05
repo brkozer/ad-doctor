@@ -1,0 +1,103 @@
+id = "AD-GPO-001"
+aliases = []
+summary = "A GPO linked to the domain or the Domain Controllers OU can be edited by a principal outside tier 0, who can then run code as SYSTEM on every domain controller."
+severities = ["high"]
+severity_logic = """
+Always **high**: a GPO that reaches the DCs is a code-execution channel onto them, so
+whoever can edit it controls the domain.
+"""
+mitre = ["T1484.001"]
+data_sources = ["ldap"]
+attributes = [
+    "gPLink on the domain head and OU=Domain Controllers (enabled links)",
+    "nTSecurityDescriptor of each groupPolicyContainer (effective ACEs)",
+    "displayName, name (GPO GUID)",
+]
+related = ["AD-GPO-002", "AD-GPO-003", "AD-GPO-004", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+A Group Policy Object is code distribution: an immediate scheduled task, a startup script,
+a service, a registry value or a user right added to a GPO runs on every computer it
+applies to, with SYSTEM privileges for the computer side. GPOs linked to the domain head
+apply to every computer in the domain unless blocked, domain controllers included, and
+GPOs linked to the Domain Controllers OU apply to the DCs.
+
+1. An attacker controls a principal with edit rights on such a GPO (a delegated GPO
+   admin group, an old owner, a helpdesk group).
+2. They add an immediate scheduled task (SharpGPOAbuse, pyGPOAbuse) and bump the version.
+3. At the next policy refresh (90 minutes by default, 5 minutes on DCs) every DC runs the
+   task as SYSTEM, and the attacker dumps the domain.
+"""
+
+detection = """
+ad-doctor reads every `groupPolicyContainer` with its DACL and works out where each one is
+linked from the `gPLink` attributes. A GPO is in scope when it has an **enabled** link on
+the domain head or on `OU=Domain Controllers`. It is reported when a principal outside the
+default tier-0 set holds a **takeover** right on the GPO object: GenericAll or full control,
+GenericWrite, WriteDacl, WriteOwner, or WriteProperty on all attributes. Edit settings in
+GPMC grant these rights.
+
+Default tier 0 is Administrators, Domain Admins, Enterprise Admins, Schema Admins, Domain
+Controllers, Enterprise Domain Controllers, the read-only DC groups, the built-in
+Administrator and SYSTEM. Each object names the GPO, where it is linked and who can edit
+it, for example `LabDCPolicy -> Domain Controllers OU (helpdesk)`.
+
+Only the directory side (the GPC) is checked; the NTFS permissions on the GPO's SYSVOL
+folder are not read. Links on sites, security filtering and WMI filters are not taken into
+account, so a domain-linked GPO filtered away from the DCs is still reported. GPOs not
+linked there are covered by [AD-GPO-004](AD-GPO-004.md).
+"""
+
+false_positives = """
+- **A GPO linked to the domain that is filtered to exclude the DCs.** The editor still runs
+  code on every other computer in the domain, so the finding is real; the severity for the
+  DCs may be lower than stated.
+- **A GPO admin group managed as tier 0** but not nested in a built-in tier-0 group. Accept
+  with an owner if deliberate (../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **List who can edit the GPO** (read-only):
+
+    ```powershell
+    Get-GPPermission -Name 'LabDCPolicy' -All |
+        Where-Object Permission -in 'GpoEdit', 'GpoEditDeleteModifySecurity' |
+        Format-Table Trustee, TrusteeType, Permission -AutoSize
+    ```
+
+2. **Take the edit rights away** from principals outside tier 0, keeping read access if
+   they need to see the settings:
+
+    ```powershell
+    Set-GPPermission -Name 'LabDCPolicy' -TargetName 'helpdesk' -TargetType Group -PermissionLevel GpoRead -Replace -WhatIf
+    ```
+
+3. **Check the GPO for changes you did not make** (scheduled tasks, scripts, user rights):
+   `Get-GPOReport -Name 'LabDCPolicy' -ReportType Html -Path .\\LabDCPolicy.html`.
+
+4. **Keep DC and domain-wide GPOs separate** from GPOs that other teams manage, and give
+   edit rights on them to tier-0 administrators only.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-001"
+
+[[references]]
+title = "A Red Teamer's Guide to GPOs and OUs (Andy Robbins)"
+url = "https://wald0.com/?p=179"
+kind = "research"
+
+[[references]]
+title = "SharpGPOAbuse"
+url = "https://github.com/ReversecLabs/SharpGPOAbuse"
+kind = "tool"
+
+[[references]]
+title = "Set-GPPermission"
+url = "https://learn.microsoft.com/en-us/powershell/module/grouppolicy/set-gppermission?view=windowsserver2025-ps"
+kind = "vendor"
+
+[[references]]
+title = "Get-GPPermission"
+url = "https://learn.microsoft.com/en-us/powershell/module/grouppolicy/get-gppermission?view=windowsserver2025-ps"
+kind = "vendor"

@@ -7,11 +7,21 @@ administrator has read it and removed the guards.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 
+from . import catalog
 from .model import Finding, Snapshot
 
 Fix = Callable[[Finding, Snapshot], list[str]]
+# Control characters, line breaks among them: object text comes from the directory (GPO
+# and CA names), and a newline in it must not end a comment and start a command.
+_CONTROL = re.compile("[\x00-\x1f\x7f\x85\u2028\u2029]")
+
+
+def one_line(text: str) -> str:
+    """The text with every control character written as a visible escape."""
+    return _CONTROL.sub(lambda m: f"\\x{ord(m.group(0)):02x}", text)
 
 
 def _name(obj: str) -> str:
@@ -49,6 +59,30 @@ def _dsacls(target: str) -> Fix:
 def _remove_member(obj: str) -> str:
     group, _, member = obj.partition(": ")
     return f"Remove-ADGroupMember {_q(group)} -Members {_q(member)} -WhatIf"
+
+
+def _certutil(setting: str) -> Fix:
+    """CA registry changes: certutil has no dry run, so the lines stay commented out."""
+
+    def fix(f: Finding, snap: Snapshot) -> list[str]:
+        hosts = {c.name: c.host for c in snap.probes.ca_configs}
+        return [
+            f'# certutil -config "{hosts.get(o, "<host>")}\\{o}" -setreg {setting}; '
+            "Restart-Service certsvc  # on the CA"
+            for o in f.objects
+        ]
+
+    return fix
+
+
+def _gpo_entries(f: Finding, snap: Snapshot) -> list[str]:
+    """Local group entries in GPOs: SYSVOL edits have no dry run, so only pointers."""
+    return [
+        "# In GPMC, edit each GPO below: Computer Configuration > Policies > Windows Settings >",
+        "# Security Settings > Restricted Groups, and Preferences > Control Panel Settings >",
+        "# Local Users and Groups. Remove the entry (or Remove-GPLink the GPO from the OU).",
+        *(f"#   {o}" for o in f.objects),
+    ]
 
 
 def _manual(f: Finding, snap: Snapshot) -> list[str]:
@@ -116,6 +150,12 @@ FIXES: dict[str, Fix] = {
     "AD-ACL-001": _dsacls("{domain}"),
     "AD-ACL-002": _dsacls("CN=AdminSDHolder,CN=System,{domain}"),
     "AD-ACL-003": _dsacls("{domain}"),
+    "AD-ADCS-012": _certutil("policy\\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2"),
+    "AD-ADCS-014": _certutil("CA\\InterfaceFlags +IF_ENFORCEENCRYPTICERTREQUEST"),
+    "AD-ADCS-015": _certutil("policy\\DisableExtensionList -1.3.6.1.4.1.311.25.2"),
+    "AD-GPO-005": _gpo_entries,
+    "AD-GPO-006": _gpo_entries,
+    "AD-GPO-007": _gpo_entries,
 }
 
 
@@ -130,6 +170,8 @@ def render_fixes(findings: list[Finding], snap: Snapshot) -> str:
     ]
     for f in findings:
         out.append(f"# --- {f.check_id} [{f.severity}] {f.title}")
+        if (e := catalog.get(f.check_id)) is not None:
+            out.append(f"# docs: {e.url}")
         out += FIXES.get(f.check_id, _manual)(f, snap)
         out.append("")
-    return "\n".join(out)
+    return "\n".join(one_line(line) for line in out)

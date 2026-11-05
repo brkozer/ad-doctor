@@ -1,0 +1,92 @@
+id = "AD-GPP-002"
+aliases = []
+summary = "A script in SYSVOL or NETLOGON appears to contain a literal password, and every domain user can read those shares."
+severities = ["high"]
+severity_logic = """
+Always **high**: the credential is readable by every authenticated user, and logon and
+deployment scripts tend to carry the passwords of service or administrator accounts.
+"""
+mitre = ["T1552.001"]
+data_sources = ["sysvol"]
+attributes = [
+    "SYSVOL Policies\\ and scripts\\ (NETLOGON): *.bat, *.cmd, *.ps1, *.psm1, *.vbs, *.kix, *.ini, *.txt",
+]
+related = ["AD-GPP-001", "AD-ACC-008"]
+since = "0.1.0"
+
+risk = """
+Logon scripts, startup scripts and deployment helpers live in `SYSVOL` (under each GPO's
+folder) and in `NETLOGON` (`SYSVOL\\<domain>\\scripts`). Both shares are readable by every
+authenticated user, by design, because every computer and user has to run what is in them.
+
+A script that maps a drive with `net use ... /user:svc_backup P@ss...`, builds a
+`PSCredential` from a plain-text string, or sets `password=` in an INI file hands that
+credential to anyone who logs on to the domain. Attackers grep these shares early in an
+intrusion (Snaffler, NetExec's `spider_plus`), because the accounts involved are often
+service accounts with broad rights, or the local administrator.
+"""
+
+detection = """
+ad-doctor connects to the `SYSVOL` share over SMB as the scanning user and walks
+`<domain>\\Policies` and `<domain>\\scripts` (NETLOGON). It reads files ending in `.bat`,
+`.cmd`, `.ps1`, `.psm1`, `.vbs`, `.kix`, `.ini` or `.txt` (except `gpt.ini`), the first
+1 MB of each, skips blank and comment lines (`#`, `::`, `'`, `;`, `rem`), and reports the first
+pattern that matches on a line:
+
+| Kind | What matches |
+|---|---|
+| net use with a password | `net use ... /user:NAME <literal>` |
+| plain-text SecureString | `ConvertTo-SecureString "<literal>" -AsPlainText` |
+| password argument | `-Password <literal>` |
+| password assignment | `password`, `passwd` or `pwd` followed by `=` or `:` and a literal |
+
+A literal is at least three characters and does not start with `%`, `$` or `!`, so
+`%PASSWORD%`, `$pw` and `!pw!` (variables) are not reported. The secret itself is never
+stored or printed: each object is the path relative to SYSVOL, the line number and the
+kind, for example `scripts\\map.bat:1 (net use with a password)`.
+"""
+
+false_positives = """
+- **Placeholders and examples** such as `password=CHANGEME` in a template or a README
+  saved as `.txt`. Remove them anyway or accept with an owner (../ci.md#accepted-risks).
+- **Values that are not passwords** after a `pwd:` or `password=` key (a hash, a file
+  path, a prompt text).
+- Obfuscated or encoded credentials (Base64, a password split over variables) are **not**
+  found; a clean result is not proof that SYSVOL holds no secrets.
+"""
+
+remediation = """
+1. **Open the file and line** named in the finding, for example
+   `\\\\corp.example\\NETLOGON\\map.bat` line 1, and identify the account.
+
+2. **Change that account's password**: any domain user could have read it.
+
+3. **Remove the credential from the script.** Map drives with the user's own identity,
+   run startup tasks as SYSTEM or a gMSA, and keep secrets in a vault the script fetches
+   from at run time with its own identity.
+
+4. **Search for others the check cannot see** (read-only):
+
+    ```powershell
+    Get-ChildItem "\\\\$env:USERDNSDOMAIN\\SYSVOL" -Recurse -File -ErrorAction SilentlyContinue |
+        Select-String -Pattern 'password|passwd|pwd|/user:|AsPlainText' -List |
+        Select-Object Path, LineNumber
+    ```
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPP-002"
+
+[[references]]
+title = "Finding passwords in SYSVOL & exploiting Group Policy Preferences (Sean Metcalf)"
+url = "https://adsecurity.org/?p=2288"
+kind = "research"
+
+[[references]]
+title = "Group Managed Service Accounts overview"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/group-managed-service-accounts/group-managed-service-accounts/group-managed-service-accounts-overview"
+kind = "vendor"
+
+[[references]]
+title = "Snaffler"
+url = "https://github.com/SnaffCon/Snaffler"
+kind = "tool"

@@ -1,0 +1,119 @@
+id = "AD-INF-007"
+aliases = ["badsuccessor"]
+summary = "On a Windows Server 2025 domain, principals outside tier 0 can create a delegated managed service account (dMSA) and use it to inherit any account's rights (BadSuccessor)."
+severities = ["high"]
+severity_logic = """
+Always **high**: creating one dMSA and pointing it at a domain admin or `krbtgt` is a
+direct domain compromise.
+"""
+mitre = ["T1098", "T1136.002"]
+data_sources = ["ldap"]
+attributes = [
+    "nTSecurityDescriptor",
+    "msDS-ManagedAccountPrecededByLink",
+    "msDS-Behavior-Version",
+    "operatingSystem",
+]
+related = ["AD-ACL-004", "AD-PATH-001", "AD-ACL-003"]
+since = "0.1.0"
+
+risk = """
+Windows Server 2025 added delegated managed service accounts (dMSA) to replace legacy
+service accounts. During a migration, the KDC gives a dMSA the privileges of the account
+it supersedes: it reads `msDS-ManagedAccountPrecededByLink` on the dMSA and puts the
+superseded account's SIDs into the dMSA's ticket.
+
+The KDC trusted that link without checking that the old account agreed to the migration.
+Anyone who can create a dMSA in some OU or container, which only takes `CreateChild` for
+that class (or ownership or full control of the OU), can create one, point
+`msDS-ManagedAccountPrecededByLink` at a domain admin or `krbtgt`, and request a ticket as
+that dMSA. The result carries the victim's privileges, and the ticket response also
+holds the victim's keys. This works as soon as one Windows Server 2025 DC exists in the
+domain. Microsoft fixed the abuse in August 2025 (CVE-2025-53779), but the delegated
+creation rights stay a tier-0 path on unpatched DCs and are worth removing in any case.
+"""
+
+detection = """
+The check runs only when the domain looks like it has Windows Server 2025: a domain
+functional level of 10, or a domain controller whose `operatingSystem` contains `2025`.
+It then reports, from the security descriptors in the LDAP snapshot:
+
+- every OU, container or the domain object **owned** by a principal outside tier 0 (an
+  owner can always rewrite the DACL to grant itself `CreateChild`), as
+  `<object>: <principal> (owner)`;
+- every ACE for a principal outside tier 0 (`CREATOR OWNER` excluded) that allows
+  creating `msDS-DelegatedManagedServiceAccount` objects (`CreateChild` on that class or
+  on all classes, or `GenericAll`), or that is a takeover right (`WriteDacl`,
+  `WriteOwner`, `GenericWrite`, write to all properties), as `<object>: <principal>`;
+- every existing dMSA whose `msDS-ManagedAccountPrecededByLink` already points at a
+  privileged account or `krbtgt`, as `<dMSA>: dMSA superseding <victim>`.
+
+Tier 0 here is SYSTEM, Enterprise Domain Controllers, Administrators, the built-in
+Administrator, Domain, Enterprise and Schema Admins, the domain controller and RODC
+groups, plus Account, Server, Print and Backup Operators. Only allow ACEs are read.
+In the lab, the finding object is
+`Lab: ou_admin`.
+"""
+
+false_positives = """
+- **No Windows Server 2025 DC yet.** The check stays silent; it does not report rights
+  that would become dangerous after a 2025 DC is added. Re-run it before promoting one.
+- **Patched DCs.** The August 2025 updates close the BadSuccessor abuse itself, and
+  ad-doctor does not check the patch level. The rights reported here still give control
+  over the OU and its objects; review them rather than accepting them wholesale.
+"""
+
+remediation = """
+1. **Install the August 2025 (or later) cumulative updates** on every Windows Server 2025
+   domain controller (CVE-2025-53779).
+2. **List who can create objects in the reported OUs.**
+
+    ```powershell
+    (Get-Acl 'AD:OU=Lab,DC=corp,DC=example').Access |
+        Where-Object { $_.ActiveDirectoryRights -match 'CreateChild|GenericAll|WriteDacl|WriteOwner' } |
+        Select-Object IdentityReference, ActiveDirectoryRights, ObjectType, InheritanceType
+    ```
+
+3. **Remove the rights**, or narrow `CreateChild` to the object classes the delegated
+   team really needs (users, groups, computers). With `dsacls`, show the ACL first, then
+   remove the principal's ACEs:
+
+    ```
+    dsacls "OU=Lab,DC=corp,DC=example"
+    dsacls "OU=Lab,DC=corp,DC=example" /R "CORP\\ou_admin"
+    ```
+
+4. **Give non-tier-0 owners' objects back to Domain Admins**:
+
+    ```powershell
+    $p = 'AD:OU=Lab,DC=corp,DC=example'; $acl = Get-Acl $p
+    $acl.SetOwner([System.Security.Principal.NTAccount]'CORP\\Domain Admins')
+    Set-Acl $p $acl -WhatIf
+    ```
+
+5. **Inspect existing dMSAs** that supersede privileged accounts and delete those nobody
+   created on purpose:
+
+    ```powershell
+    Get-ADServiceAccount -Filter * -Properties msDS-ManagedAccountPrecededByLink |
+        Where-Object 'msDS-ManagedAccountPrecededByLink' |
+        Select-Object Name, 'msDS-ManagedAccountPrecededByLink'
+    ```
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-007"
+
+[[references]]
+title = "Delegated Managed Service Accounts overview"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/delegated-managed-service-accounts/delegated-managed-service-accounts-overview"
+kind = "vendor"
+
+[[references]]
+title = "CVE-2025-53779: Windows Kerberos elevation of privilege vulnerability"
+url = "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-53779"
+kind = "vendor"
+
+[[references]]
+title = "When Good Accounts Go Bad: Exploiting Delegated Managed Service Accounts in Active Directory (Unit 42)"
+url = "https://unit42.paloaltonetworks.com/badsuccessor-attack-vector/"
+kind = "research"

@@ -1,0 +1,85 @@
+id = "AD-GPO-006"
+aliases = []
+summary = "Group Policy makes non-tier-0 principals local administrators of servers that control the domain (DCs, CA, Entra Connect or Exchange hosts)."
+severities = ["high"]
+severity_logic = """
+Always **high**: a local administrator of a tier-0 server controls the domain. This covers
+non-tier-0 members (broad groups are [AD-GPO-005](AD-GPO-005.md)) granted an
+administrator-equivalent local group on a DC, CA host, Entra Connect server or Exchange server,
+or added to a tier-0 domain group through a writable DC.
+"""
+mitre = ["T1078.002", "T1021.002"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "GptTmpl.inf [Group Membership] (Restricted Groups)",
+    "Machine\\Preferences\\Groups\\Groups.xml (GPP Local Users and Groups)",
+    "gPLink and GPO scope attributes",
+    "roles of each computer (DC, CA, Entra Connect, Exchange, tier-0 member)",
+]
+related = ["AD-GPO-005", "AD-GPO-007", "AD-PATH-001", "AD-ACL-004"]
+since = "unreleased"
+
+risk = """
+Tier-0 servers, the domain controllers and the hosts that can take the domain over (the CA, an
+Entra Connect server with a sync account that can DCSync, Exchange servers with rights over the
+domain), must be administered only by tier-0 principals. If a GPO makes anyone outside tier 0 a
+local administrator of one of these servers, that principal can read its secrets (LAPS
+passwords, the DPAPI backup key, the sync account, the CA's private key) and escalate to full
+domain control. The same holds when a Restricted Groups entry reaches a writable DC and rewrites
+a tier-0 *domain* group, since DCs have no local groups of their own.
+
+This is the tier-0 slice of local-admin-by-GPO: while [AD-GPO-005](AD-GPO-005.md) flags broad
+groups anywhere, this check flags any non-tier-0 principal specifically on the servers that
+matter most.
+"""
+
+detection = """
+ad-doctor builds the set of tier-0 hosts (domain controllers, CA hosts, Entra Connect servers,
+Exchange servers, and computers in a tier-0 group or holding DCSync) and, using the same GPO
+scope engine as [AD-GPO-005](AD-GPO-005.md), reports entries where a non-tier-0,
+non-broad-group principal is placed in an administrator-equivalent local group on one of those
+hosts, or in a tier-0 domain group through the DCs. Each object names the GPO, the principal, the
+group, and the tier-0 host with its role, for example
+`LabLocalAdmins: LabServerAdmins -> Administrators on EXCH01$ (Exchange server)`.
+"""
+
+false_positives = """
+- **Over-reporting by design**, as for [AD-GPO-005](AD-GPO-005.md): WMI filters are assumed to
+  match, items with item-level targeting are assumed to apply, Deny ACEs are ignored, and sites may be
+  over-assumed. Confirm on a sample host with `gpresult`.
+- **A legitimate tier-0 operator** granted admin this way should be made a tier-0 principal
+  (so it is expected), not left as a recurring finding.
+"""
+
+remediation = """
+1. **Remove the entry** from the GPO (Restricted Groups or GPP Local Users and Groups), or move
+   the tier-0 servers into an OU that only tier-0 GPOs reach.
+
+2. **Administer tier-0 servers only from tier-0**: dedicated admin groups, privileged access
+   workstations, and LAPS for the local administrator password.
+
+3. **Audit who already has access** to the named servers and rotate any secrets they could have
+   read while the grant was in place.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-006"
+
+[[references]]
+title = "Securing privileged access: enterprise access model"
+url = "https://learn.microsoft.com/en-us/security/privileged-access-workstations/privileged-access-access-model"
+kind = "vendor"
+
+[[references]]
+title = "Implementing Least-Privilege Administrative Models"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/implementing-least-privilege-administrative-models"
+kind = "vendor"
+
+[[references]]
+title = "Windows LAPS overview"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/laps/laps-overview"
+kind = "vendor"
+
+[[references]]
+title = "BloodHound: AdminTo edge"
+url = "https://bloodhound.specterops.io/resources/edges/admin-to"
+kind = "tool"

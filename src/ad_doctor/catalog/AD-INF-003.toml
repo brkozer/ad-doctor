@@ -1,0 +1,73 @@
+id = "AD-INF-003"
+aliases = ["functional-level"]
+summary = "The domain functional level is below Windows Server 2016, which leaves out security features that need it and usually means old domain controllers remain."
+severities = ["low"]
+severity_logic = """
+Always **low**: a low functional level is not exploitable by itself, but it holds back
+protections and points at old domain controllers.
+"""
+mitre = []
+data_sources = ["ldap"]
+attributes = ["msDS-Behavior-Version"]
+related = ["AD-INF-001", "AD-PRIV-010", "AD-INF-002"]
+since = "0.1.0"
+
+risk = """
+The functional level decides which features the domain controllers can use. Below
+Windows Server 2012 R2 the DC-side restrictions for members of Protected Users (no NTLM,
+no DES or RC4 in Kerberos pre-authentication, no delegation, four-hour TGTs) do not apply,
+which weakens [AD-PRIV-010](AD-PRIV-010.md). Below Windows Server 2016 the DCs cannot
+roll the NTLM secrets of accounts that require smart-card logon, so a stolen hash of
+such an account stays valid indefinitely; the 2016 forest level is also what
+time-bound group membership (Privileged Access Management) needs.
+
+A low level usually exists because an old domain controller is still around, and an old
+DC carries the unpatched vulnerabilities of its version ([AD-INF-001](AD-INF-001.md)).
+"""
+
+detection = """
+ad-doctor reads `msDS-Behavior-Version` on the domain object and reports the domain when
+the value is below 7 (Windows Server 2016). The detail names the level in words, for
+example `2012 R2` for 6. Windows Server 2019 and 2022 have no level of their own; 2016
+(7) is the highest level they support, and 10 is Windows Server 2025.
+
+The finding has one object, the domain name, for example `corp.example`. The forest
+functional level is not checked separately.
+"""
+
+false_positives = """
+None expected. If a DC on an old version must stay for a while, accept the finding with
+a date by which it will be retired ([accepted risks](../ci.md#accepted-risks)).
+"""
+
+remediation = """
+1. **Find what holds the level down**: every DC must run at least the target version.
+
+    ```powershell
+    Get-ADDomainController -Filter * | Select-Object Name, OperatingSystem
+    (Get-ADDomain).DomainMode; (Get-ADForest).ForestMode
+    ```
+
+2. **Replace old DCs**: promote DCs on a supported version, move FSMO roles, then demote
+   the old ones. Check that applications relying on old behaviour (for example DES) are
+   gone.
+3. **Raise the domain level, then the forest level.** The change replicates to every DC
+   and cannot easily be undone, so dry-run it first:
+
+    ```powershell
+    Set-ADDomainMode -Identity corp.example -DomainMode Windows2016Domain -WhatIf
+    Set-ADForestMode -Identity corp.example -ForestMode Windows2016Forest -WhatIf
+    ```
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-003"
+
+[[references]]
+title = "Active Directory Domain Services functional levels"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/active-directory-functional-levels"
+kind = "vendor"
+
+[[references]]
+title = "Protected Users security group"
+url = "https://learn.microsoft.com/en-us/windows-server/security/credentials-protection-and-management/protected-users-security-group"
+kind = "vendor"

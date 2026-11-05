@@ -1,0 +1,121 @@
+id = "AD-ADCS-013"
+aliases = ["esc7"]
+summary = "Principals outside tier 0 hold ManageCA or ManageCertificates on an enterprise CA, which can be turned into a certificate for any user."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when a non-tier-0 principal holds **ManageCA** (it can reconfigure the CA, publish
+any template including SubCA, turn on ESC6 and grant itself ManageCertificates), or when it
+holds **ManageCertificates** *and* a published authentication template lets the requester
+supply the subject (the manager can then approve or issue a forged request). **Medium** when
+only ManageCertificates is held and no such template is published, so it cannot yet produce a
+certificate for another user on its own. The owner of the CA security descriptor can rewrite
+it, so ownership counts as ManageCA.
+"""
+mitre = ["T1649"]
+data_sources = ["probe-winreg", "ldap"]
+attributes = [
+    "Security (the CA security descriptor, over winreg)",
+    "owner of the CA security descriptor",
+    "msPKI-Certificate-Name-Flag and pKIExtendedKeyUsage of published templates",
+]
+related = ["AD-ADCS-005", "AD-ADCS-012", "AD-ADCS-001", "AD-PATH-001"]
+since = "unreleased"
+
+risk = """
+A certification authority keeps its own access control list, separate from the template
+ACLs. Two of its rights are dangerous in the wrong hands:
+
+- **ManageCA** (CA administrator) can change the CA's configuration: it can set
+  `EDITF_ATTRIBUTESUBJECTALTNAME2` (ESC6), publish the built-in **SubCA** template or any
+  other, and add **ManageCertificates** for itself. From there it reaches a certificate for
+  any user, so ManageCA is effectively domain compromise.
+- **ManageCertificates** (certificate manager) can approve requests that are pending for a
+  manager and issue requests that were denied. On its own that is limited, but combined with
+  a published authentication template whose requester supplies the subject, the manager can
+  submit a request for a domain admin and approve it.
+
+Because these rights are held by a *principal* rather than attached to a template, they do
+not show up in a template-only audit.
+"""
+
+detection = """
+ad-doctor reads each enterprise CA's security descriptor from the registry over
+`\\pipe\\winreg` and lists every principal, other than tier 0, the CA hosts themselves and
+the administrators of the forest's domains, that owns the descriptor or holds ManageCA (0x1)
+or ManageCertificates (0x2). Deny ACEs are applied in DACL order: a right denied to the
+same SID, or to Everyone or Authenticated Users, before an allow does not count. For the
+ManageCertificates grade it also checks the LDAP snapshot for a published template that is
+valid for authentication and lets the enrollee supply the subject.
+
+Each object names the CA, the principal and the right, for example
+`adlab-CA: helpdesk (ManageCertificates)`. ESC7 principals are added to the control graph
+and the BloodHound export (`ADD_ManageCA`, `ADD_ManageCertificates`), so attack paths run
+through them.
+"""
+
+false_positives = """
+- **Member-server CA.** When the CA runs on a member server (not a DC), `BUILTIN\\Administrators`
+  in the CA security descriptor is that server's *local* Administrators group, whose members
+  are invisible over LDAP. A local admin of the CA host therefore holds ManageCA; ad-doctor
+  cannot enumerate those members, so treat local administrators of a CA host as tier 0.
+- **Other domains of the forest.** The default descriptor of a CA grants the Domain Admins
+  of the CA's own domain. Administrator, Domain Admins, Schema Admins and Enterprise Admins of
+  every domain whose SID a within-forest trust object gives are expected. A CA in a domain
+  with no such trust object (a sibling or grandchild of the scanned domain) gets the benefit
+  of the doubt instead: any other domain's Administrator and Domain Admins are accepted on it,
+  which can hide an external forest's admins there. Scan from the CA's own domain to be sure.
+- **Deny through group membership.** A deny ACE for a group the principal belongs to (other
+  than Everyone or Authenticated Users) is not resolved, so such a principal is still listed.
+- **Intended delegation.** A dedicated PKI operations team may legitimately hold these
+  rights. Add it to tier 0 (so it is expected) rather than accepting the finding repeatedly.
+"""
+
+remediation = """
+1. **Review the CA's security settings** in `certsrv.msc` > the CA > *Properties* >
+   *Security*, or with:
+
+    ```console
+    certutil -config "<host>\\<CA name>" -getreg CA\\Security
+    ```
+
+2. **Remove ManageCA and ManageCertificates** from any principal that is not a monitored
+   tier-0 PKI operator, and reset the descriptor owner to a privileged account.
+
+3. **Where the rights must stay**, treat those principals and the CA host as tier 0: manage
+   them from privileged access workstations and watch them like domain controllers.
+
+4. **Reduce what ManageCertificates can reach** by fixing published templates that let the
+   requester supply the subject ([AD-ADCS-001](AD-ADCS-001.md)).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-013"
+
+[[references]]
+title = "Edit misconfigured Certificate Authority ACL (ESC7), Defender for Identity"
+url = "https://learn.microsoft.com/en-us/defender-for-identity/security-posture-assessments/certificates"
+kind = "vendor"
+
+[[references]]
+title = "Certified Pre-Owned: Abusing Active Directory Certificate Services (whitepaper, ESC7)"
+url = "https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf"
+kind = "research"
+
+[[references]]
+title = "[MS-CSRA]: Certificate Services Remote Administration Protocol"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-csra/40e74714-14bf-4f97-a264-35efbd63a813"
+kind = "spec"
+
+[[references]]
+title = "certutil"
+url = "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/certutil"
+kind = "vendor"
+
+[[references]]
+title = "Certipy wiki: ESC7"
+url = "https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation"
+kind = "tool"
+
+[[references]]
+title = "Locksmith: find and fix AD CS misconfigurations"
+url = "https://github.com/jakehildreth/Locksmith"
+kind = "tool"

@@ -6,12 +6,13 @@
 Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
-(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 78
+(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 87
 checks for what attackers look for first: roastable accounts, risky delegation,
-exploitable certificate templates (ESC1–5, 8, 9, 13–15), DCSync and other takeover rights,
+exploitable certificate templates and CA settings (ESC1–9, 11, 13–16), DCSync and other takeover rights,
 shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync accounts,
-editable GPOs on domain controllers, passwords in Group Policy and scripts, relay-friendly
-DCs, weak trusts and legacy configuration. It then finds every control path from a
+editable GPOs on domain controllers, local admin and remote logon rights handed out by
+Group Policy, passwords in Group Policy and scripts, relay-friendly DCs, weak trusts and
+legacy configuration. It then finds every control path from a
 non-admin to tier 0. It writes nothing to the directory.
 
 <p align="center"><img src="docs/demo.svg" alt="ad-doctor scanning the lab domain: ESC8 web enrollment, a relay-to-RBCD chain, a password in a logon script, BadSuccessor rights and the control paths to tier 0" width="100%"></p>
@@ -23,12 +24,15 @@ DC seeded with one instance of every misconfiguration that a single domain can h
 
 - **Attack paths without a graph database.** `AD-PATH-001` builds the control graph
   (group membership, takeover ACEs, ownership, DCSync, GPO links, exploitable templates,
-  gMSA readers) from the snapshot and reports the shortest path from every non-tier-0
+  gMSA readers, local admin rights that Group Policy hands out, an Entra Connect server
+  holding its sync account) from the snapshot and reports the shortest path from every non-tier-0
   principal to tier 0, plus the share of users that have one. `ad-doctor blast-radius`
   answers "what does this account control if it is phished?".
 - **Plays well with BloodHound.** `ad-doctor export-graph` writes the same graph as a
   BloodHound OpenGraph payload. Principals keep their SIDs, so the edges attach to an
-  existing SharpHound graph of the domain instead of building a second one.
+  existing SharpHound graph of the domain instead of building a second one. Remote logon
+  rights that GPOs grant (RDP, WinRM, DCOM) are exported with `traversable: false`: logon
+  is not control, so the path search does not follow them.
 - **Every DC, not just one.** LDAP signing, SMB signing, the spooler and channel binding
   are probed on each domain controller, and findings name the ones that drift from the
   rest; DCs that cannot be reached are reported rather than assumed fine.
@@ -128,36 +132,62 @@ against a live DC.
 | | AD-ADCS-009 | ESC14: weak explicit certificate mappings | medium/high |
 | | AD-ADCS-010 | ESC8: web enrollment accepts NTLM over HTTP (probe) | high |
 | | AD-ADCS-011 | Published templates allowing RSA keys under 2048 bits | medium |
+| | AD-ADCS-012 | ESC6: CA accepts a SAN from request attributes (registry probe) | medium/low |
+| | AD-ADCS-013 | ESC7: non-tier-0 principals manage the CA (ManageCA high; ManageCertificates graded by what it reaches) | medium/high |
+| | AD-ADCS-014 | ESC11: CA does not require encryption for ICPR requests (registry probe) | high/medium |
+| | AD-ADCS-015 | ESC16: CA leaves out the SID security extension (registry probe) | medium/low |
+| | AD-ADCS-016 | CA configuration could not be read (registry probe) | low |
 | Permissions | AD-ACL-001 | Non-default principals with DCSync rights | high |
 | | AD-ACL-002 | Non-default control over AdminSDHolder | high |
 | | AD-ACL-003 | Non-default control over the domain object | high |
 | | AD-ACL-004 | Takeover rights or ownership on tier-0 accounts, groups and DCs (shadow credentials, RBCD, members, password reset, SPN) | high |
 | | AD-ACL-005 | AdminSDHolder inherits permissions | high |
-| | AD-ACL-006 | gMSA passwords readable outside tier 0 | medium/high |
+| | AD-ACL-006 | gMSA passwords readable outside tier 0 | high |
 | | AD-ACL-007 | Exchange groups with WriteDacl over the domain (PrivExchange); medium when only inherited | medium/high |
 | | AD-ACL-008 | Entra Connect sync account or server controllable outside tier 0 | high |
 | Group Policy | AD-GPO-001 | GPOs linked to the domain or DC OU editable outside tier 0 | high |
 | | AD-GPO-002 | Non-tier-0 principals can link GPOs to the domain or DCs | high |
 | | AD-GPO-003 | NTLMv1/LM, LM hashes, reversible encryption or dangerous privileges in those GPOs | medium/high |
 | | AD-GPO-004 | Other GPOs editable outside tier 0 | medium |
+| | AD-GPO-005 | GPOs make broad groups local administrators (Restricted Groups, GPP Local Groups) | high |
+| | AD-GPO-006 | GPOs make non-tier-0 principals admins of tier-0 servers (DCs, CAs, Entra Connect, Exchange) | high |
+| | AD-GPO-007 | GPOs grant RDP, WinRM or DCOM to broad groups (medium) or on tier-0 servers (high) | medium/high |
 | | AD-GPP-001 | Passwords in Group Policy Preferences (MS14-025) | high |
 | | AD-GPP-002 | Credentials in SYSVOL or NETLOGON scripts (values never reproduced) | high |
 | Attack paths | AD-PATH-001 | Control paths from non-tier-0 principals to tier 0 | high |
 | | AD-CHAIN-001 | Relay to RBCD (signing or channel binding off, plus machine account quota) | high |
 | | AD-CHAIN-002 | Coercion plus unconstrained delegation | high |
 | | AD-CHAIN-003 | Coercion plus web enrollment relay (ESC8) | high |
+| | AD-CHAIN-004 | ESC6 plus ESC16 on the same CA (SID in a SAN under strong mapping) | high/medium |
 
 Template checks fire only for templates published on an enterprise CA that issue without
 manager approval or authorized signatures and that broad groups (Domain Users, Domain
 Computers, Authenticated Users, Everyone) can enroll in. "Tier 0" means
 Domain/Enterprise/Schema Admins, Administrators, the operator groups, domain controllers,
-SYSTEM and the built-in Administrator; well-known delegations (SELF, Key Admins on
+SYSTEM and the built-in Administrator; for the Group Policy local group checks, tier-0
+servers are DCs, CA hosts, Entra Connect servers, Exchange servers and computers that are
+in a tier-0 group or hold DCSync. Well-known delegations (SELF, Key Admins on
 `msDS-KeyCredentialLink`, Cert Publishers and the CA server on PKI objects) are not
 reported. Every finding carries its MITRE ATT&CK techniques (`ad-doctor checks -f json`).
 
 The risk score adds 15 per high, 6 per medium and 2 per low finding, capped at 100;
 grades run from A (10 or less) to F (above 70). It is meant for tracking one domain over
 time, not for comparing domains.
+
+## Documentation
+
+Full docs, including a page for every check, are at
+<https://brkozer.github.io/ad-doctor/> (published from `main` once the repo is public).
+The same per-check explanation is available offline:
+
+```bash
+ad-doctor explain AD-ADCS-001      # by ID
+ad-doctor explain esc1             # or by alias
+ad-doctor explain AD-KRB-003 -f markdown
+```
+
+Every finding in a report links to its catalog page, and SARIF rules carry the
+explanation and a `helpUri` so code-scanning alerts show it too.
 
 ## Usage
 
@@ -193,9 +223,11 @@ ad-doctor export-graph 2026-11.json -o graph.json --paths-only
 | `--invariants FILE` | declared state to enforce (see [`examples/invariants.toml`](examples/invariants.toml)) |
 | `--fixes FILE` | write the PowerShell remediation script |
 | `--only ID ...` | run a subset of checks (`ad-doctor checks` lists them) |
+| `explain ID\|alias` | print a check's full explanation and fix offline (`-f text\|markdown\|json`, `--web`) |
 | `-k`, `--kerberos` | bind with Kerberos instead of a password |
 | `--no-sysvol`, `--smb-port` | skip or redirect the SMB part |
-| `--no-probes`, `--http-port` | skip the SMB, channel binding and ESC8 probes, or move the web enrollment port |
+| `--no-probes`, `--http-port` | skip every probe (SMB, channel binding, ESC8, CA registry), or move the web enrollment port |
+| `--no-ca-registry` | skip reading CA settings (ESC6/7/11/16) over `\pipe\winreg` |
 | `--single-dc` | probe only the DC being scanned instead of every DC in the domain |
 | `--signing-probe-port PORT` | plain LDAP port for the signing probe; `0` skips it |
 
@@ -221,28 +253,76 @@ reads users, computers, groups, OUs, GPOs, trusts, AD CS templates, enrollment s
 and OIDs, gMSAs, the replication metadata of the domain head (for the backup date) and
 the owners and DACLs of the security-critical objects. Security descriptors are requested
 with the SD flags control for owner and DACL, which ordinary users may read, and parsed
-by a small built-in parser (`sd.py`). From SYSVOL it reads Group Policy Preferences,
-`GptTmpl.inf` security templates and scripts, and keeps only paths, line numbers, account
+by a small built-in parser (`sd.py`). For Group Policy scope it also reads `gPLink` and
+`gPOptions` on the domain, OUs and sites, the GPOs' status, version and extension
+attributes, WMI filter names and which site each DC is in. From SYSVOL it reads Group
+Policy Preferences (passwords and Local Groups), `GptTmpl.inf` security templates
+(including Restricted Groups) and scripts, and keeps only paths, line numbers, account
 names and setting values, never a secret.
 
 Active probes, each one connection per DC: an unsigned NTLM bind on 389 (LDAP signing),
 an NTLM bind on LDAPS without a channel binding token, an SMB negotiate plus an attempt
-to open the `spoolss` pipe, and an unauthenticated `GET /certsrv/` on each CA. The DC
-being scanned is reached through the address and ports given on the command line, the
-others by their DNS names on the standard ports. `--single-dc`, `--no-probes` and
-`--signing-probe-port 0` narrow or turn them off; [SECURITY.md](SECURITY.md) lists every
-probe.
+to open the `spoolss` pipe, and an unauthenticated `GET /certsrv/` on each CA. On each
+enterprise CA it also reads the CA's own configuration (ESC6, ESC7, ESC11, ESC16) over
+`\pipe\winreg` (MS-RRP) with a small built-in client: every call is a `KEY_READ`, nothing
+is written. Opening that pipe trigger-starts the RemoteRegistry service on the CA host if
+it is set to start on demand (a visible change of service state), and remote registry
+access to `CertSvc` is the kind of thing EDR and Microsoft Defender for Identity may alert
+on; `--no-ca-registry` skips just that read. The DC being scanned is reached through the
+address and ports given on the command line, the others by their DNS names on the standard
+ports. `--single-dc`, `--no-probes`, `--no-ca-registry` and `--signing-probe-port 0`
+narrow or turn them off; [SECURITY.md](SECURITY.md) lists every probe.
 
 ## Limits
 
 - One domain per run; trusts are inspected from this side only.
-- CA-side settings that LDAP cannot see (ESC6, ESC7, ESC11, ESC16, EPA on HTTPS
-  enrollment) are out of scope, and so are host settings beyond what the DC probes see
-  (local admins on Exchange or Entra Connect servers, for instance).
+- The CA-side checks (ESC6, ESC7, ESC11, ESC16) read the CA's registry over
+  `\pipe\winreg`, which needs TCP 445 to each CA and credentials; a run that cannot reach a
+  CA, where RemoteRegistry is disabled, or where a GPO has removed `CertSvc` from the
+  winreg AllowedPaths reports AD-ADCS-016 rather than a clean result. A third-party policy
+  module leaves ESC6 and ESC16 unknown, and a value that is absent or unparseable leaves its
+  check unknown (both reported by AD-ADCS-016, never "clean"). ESC7 reads the CA security
+  descriptor: on a CA that is a member server, `BUILTIN\Administrators` there is that
+  server's *local* Administrators group, whose members are invisible over LDAP. Deny ACEs
+  in it are applied for the same SID, Everyone and Authenticated Users, not through other
+  group memberships. The admins of other domains in the forest are expected CA managers
+  when a within-forest trust object gives their domain's SID; on a CA outside the scanned
+  domain with no such trust object, any other domain's Administrator and Domain Admins are
+  accepted. ESC10 and ESC12 (DC certificate-mapping registry settings, a CA key on an HSM
+  reachable from a shell on the CA) are not checked. EPA on
+  HTTPS web enrollment, and host settings beyond what the DC probes see, remain out of
+  scope: local group membership that Group Policy sets is covered, changes made directly
+  in a computer's local SAM are not.
+- Group Policy scope for local groups (AD-GPO-005 to -007 and the graph edges) is worked
+  out offline and errs toward over-reporting. Links, Block Inheritance, Enforced, disabled
+  links, the GPO status, an empty computer version or a missing client-side extension, and
+  security filtering (Read plus Apply Group Policy for any SID in the computer's token,
+  well-known SIDs and foreignSecurityPrincipals included) are evaluated. Not evaluated:
+  WMI filters (assumed to match), item-level targeting (the item is listed as applying,
+  with a caveat), Deny ACEs in GPO permissions, member computers' sites (with more than one site,
+  every site's links are assumed to apply), removals and precedence between GPOs (the
+  result is the union of additions, though a higher-precedence `X__Members` can remove
+  what another GPO adds), groups of other domains in the token, user-side GPP groups
+  (noted), and `SeDenyRemoteInteractiveLogonRight` (a deny-RDP setting does not silence
+  AD-GPO-007). Remote Desktop Users counts only where `SeRemoteInteractiveLogonRight`
+  includes it; without a GPO that sets it, the Windows default applies (Administrators
+  only on DCs, Administrators and Remote Desktop Users elsewhere). A holder of that right
+  named by an account name that cannot be resolved is assumed to include the member, with
+  a caveat.
+- Domain controllers have no local groups: Restricted Groups that reach a writable DC
+  rewrite the *domain* group with that SID and are reported as such, and an empty
+  `X__Members =` line there (GPMC writes one whenever only "This group is a member of" is
+  set) empties domain group X, which the scan notes. GPP Local Groups items are processed
+  on DCs but leave domain groups alone (checked on Windows Server 2025), so they are
+  skipped with a note; RODCs are skipped with a note.
+- AD-GPO-003 judges only GPOs Windows would apply: a GPO with computer version 0, without
+  the security extension in `gPCMachineExtensionNames`, or with its computer side disabled
+  is not reported, whatever its `GptTmpl.inf` says.
 - Exchange and Entra Connect are recognised from their directory footprint (the groups
   Exchange setup creates, `MSOL_` sync accounts); the lab seeds that footprint without
   installing either product.
-- Deny ACEs are ignored, which can only over-report, never hide a finding.
+- Deny ACEs on directory objects are ignored, which can only over-report, never hide a
+  finding (the CA's own descriptor is the exception, see above).
 - An ordinary user cannot read fine-grained password policies; the report says so
   instead of assuming the default policy applies to admins.
 - Some checks cannot be reproduced in a single lab DC and are covered by unit tests only:
@@ -262,7 +342,7 @@ flowchart LR
     P --> S
     S -- "collect -o / redact" --> F[(snapshot.json)]
     F --> A
-    S --> A[checks.py + paths.py<br/>78 pure functions]
+    S --> A[checks.py + paths.py<br/>87 pure functions]
     A --> I[invariants.py<br/>accept.py]
     I --> R[report.py<br/>text, JSON, Markdown,<br/>HTML, SARIF, JUnit]
     I --> X[fixes.py<br/>remediation script]

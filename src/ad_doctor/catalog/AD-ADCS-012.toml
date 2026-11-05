@@ -1,0 +1,112 @@
+id = "AD-ADCS-012"
+aliases = ["esc6"]
+summary = "A CA accepts a subject alternative name from request attributes (EDITF_ATTRIBUTESUBJECTALTNAME2), so any enrollee can name another user in a certificate."
+severities = ["low", "medium"]
+severity_logic = """
+**Medium** on its own. The CA still embeds the requester's own SID in the certificate, and
+domain controllers with the KB5014754 updates (May 2022 on) refuse a certificate whose SID
+does not match the account for Kerberos logon; the April 2023 updates removed the setting
+that turned this check off. ESC6 alone works against DCs without those updates, and against
+services that map certificates by name.
+Drops to **low** when the CA holds every request for a manager (`RequestDisposition` has
+`REQDISP_PENDING`). Paired with ESC16 on the same CA it becomes a full bypass and is
+reported as **high** by [AD-CHAIN-004](AD-CHAIN-004.md).
+"""
+mitre = ["T1649"]
+data_sources = ["probe-winreg"]
+attributes = [
+    "policy\\EditFlags (EDITF_ATTRIBUTESUBJECTALTNAME2)",
+    "policy\\RequestDisposition",
+    "PolicyModules\\Active",
+]
+related = ["AD-ADCS-001", "AD-ADCS-015", "AD-CHAIN-004", "AD-ADCS-016"]
+since = "unreleased"
+
+risk = """
+When a CA has the `EDITF_ATTRIBUTESUBJECTALTNAME2` policy flag set, a requester can put an
+arbitrary subject alternative name (SAN) in the attributes of *any* request, no matter how
+the template is configured. If the issued certificate is valid for client authentication,
+the CA will produce one that names a victim, for example a domain administrator, and
+Kerberos (PKINIT) or Schannel will accept it as that victim.
+
+Unlike ESC1 ([AD-ADCS-001](AD-ADCS-001.md)), the weakness is in the CA, not in one
+template, so it affects every authentication template the CA issues. Since the May 2022
+updates (KB5014754) a certificate also carries the requester's own SID in the `szOID_NTDS_CA_SECURITY_EXT`
+extension; a DC in strong-mapping mode compares that SID against the SAN and rejects the
+mismatch, which blocks ESC6 by itself. It still works where strong mapping is disabled, or
+when the same CA also drops the SID extension ([AD-ADCS-015](AD-ADCS-015.md)).
+"""
+
+detection = """
+ad-doctor reads the CA's configuration from its registry over `\\pipe\\winreg` (MS-RRP,
+`KEY_READ` only) and reports the CA when `policy\\EditFlags` has the
+`EDITF_ATTRIBUTESUBJECTALTNAME2` bit (0x40000) set.
+
+If `PolicyModules\\Active` names a module other than Microsoft's default, `EditFlags` may
+mean something else; the value is then treated as unknown and reported by
+[AD-ADCS-016](AD-ADCS-016.md) instead, never as clean. When the CA sets
+`RequestDisposition` to hold requests for a manager, the finding is noted as such and its
+severity drops one level.
+"""
+
+false_positives = """
+- **Every DC patched.** DCs with the KB5014754 updates refuse a certificate whose SID
+  extension does not match the account, and since the April 2023 updates that check cannot
+  be turned off. While the CA does *not* also disable the SID extension, ESC6 alone then no
+  longer yields a Kerberos logon as another user. ad-doctor still reports it medium,
+  because services that map certificates by name remain exposed and the flag becomes
+  critical the moment the SID extension is disabled; the pairing is tracked by
+  [AD-CHAIN-004](AD-CHAIN-004.md).
+- **Deliberate SAN issuance.** Some environments turn the flag on for a specific internal
+  need. Restrict who can enroll authentication templates and accept the risk with an owner
+  and expiry if the flag must stay.
+"""
+
+remediation = """
+1. **Clear the flag on the CA** and restart the service:
+
+    ```console
+    certutil -config "<host>\\<CA name>" -setreg policy\\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2
+    net stop certsvc & net start certsvc
+    ```
+
+2. **Keep every DC on current updates.** DCs with the KB5014754 updates check the
+   certificate's SID against the account, and after the September 2025 updates they always
+   run in full enforcement (they no longer read `StrongCertificateBindingEnforcement`), so
+   the SID must match even if the flag is ever turned back on.
+
+3. **Review issued certificates** for ones whose SAN does not match the requester, and
+   revoke them (`certutil -revoke <serial> 1`).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-012"
+
+[[references]]
+title = "Certificates and Pwnage and Patches, Oh My! (SpecterOps, ESC6 after KB5014754)"
+url = "https://specterops.io/blog/2022/11/09/certificates-and-pwnage-and-patches-oh-my/"
+kind = "research"
+
+[[references]]
+title = "Certified Pre-Owned: Abusing Active Directory Certificate Services (whitepaper)"
+url = "https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf"
+kind = "research"
+
+[[references]]
+title = "Edit vulnerable Certificate Authority setting (ESC6), Defender for Identity"
+url = "https://learn.microsoft.com/en-us/defender-for-identity/security-posture-assessments/certificates"
+kind = "vendor"
+
+[[references]]
+title = "KB5014754: Certificate-based authentication changes on Windows domain controllers"
+url = "https://support.microsoft.com/en-us/topic/kb5014754-certificate-based-authentication-changes-on-windows-domain-controllers-ad2c23b0-15d8-4340-a468-4d4f3b188f16"
+kind = "vendor"
+
+[[references]]
+title = "certutil"
+url = "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/certutil"
+kind = "vendor"
+
+[[references]]
+title = "Certipy wiki: ESC6"
+url = "https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation"
+kind = "tool"

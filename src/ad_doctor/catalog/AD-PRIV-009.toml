@@ -1,0 +1,94 @@
+id = "AD-PRIV-009"
+summary = "Cert Publishers has members other than enterprise CA servers, giving them write access to every user's certificates and to the AIA container."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. Cert Publishers is not tier 0 by itself, but its rights over
+certificate data are meant only for certificate authorities, and abuse of them supports
+certificate-based persistence and impersonation.
+"""
+mitre = ["T1649"]
+data_sources = ["ldap"]
+attributes = [
+    "member of Cert Publishers (<domain SID>-517, direct)",
+    "dNSHostName of pKIEnrollmentService objects",
+    "sAMAccountName",
+]
+related = ["AD-ADCS-005", "AD-ADCS-009", "AD-ADCS-013"]
+since = "0.1.0"
+
+risk = """
+When an enterprise CA is installed, its computer account is added to **Cert Publishers**
+so it can publish issued certificates to Active Directory. The group's rights are
+broad:
+
+- the default security descriptor of the `user` class lets Cert Publishers **write
+  `userCertificate` on every user object**, so a member can add or remove certificates
+  on any account (certificates used for encryption, or for explicit certificate
+  mappings that some systems trust, see [AD-ADCS-009](AD-ADCS-009.md));
+- the group has **full control of the AIA container** under Public Key Services, where
+  clients download intermediate CA certificates while building chains.
+
+A user, service account or ordinary server in the group holds those rights without
+being managed as part of the PKI.
+"""
+
+detection = """
+ad-doctor finds the group by SID (`<domain SID>-517`) and reads its **direct** `member`
+values. The enterprise CA servers come from the `dNSHostName` of each
+`pKIEnrollmentService` object in the configuration partition, resolved to computer
+`sAMAccountName`s in the scanned domain. Every member that is not one of those computer
+accounts is reported by name; nested groups are reported by their own name and not
+expanded.
+
+For example, with the CA on `DC01`, a membership of `DC01$` and `helpdesk` reports
+`helpdesk`.
+"""
+
+false_positives = """
+- **An enterprise CA in another domain of the forest** that was added to this domain's
+  Cert Publishers (so it can publish certificates for users here) is resolved by the
+  name in its DN and does not match a local computer account, so it is reported. Accept
+  it in an [accepted-risk file](../ci.md#accepted-risks) once you have confirmed it is a
+  CA.
+- **A decommissioned CA** that is still a member is a true positive: remove it.
+"""
+
+remediation = """
+1. **Compare the members with the enterprise CAs.**
+
+    ```powershell
+    Get-ADGroupMember 'Cert Publishers' | Select-Object SamAccountName, objectClass
+    $cfg = (Get-ADRootDSE).configurationNamingContext
+    Get-ADObject -SearchBase "CN=Enrollment Services,CN=Public Key Services,CN=Services,$cfg" `
+        -Filter 'objectClass -eq "pKIEnrollmentService"' -Properties dNSHostName |
+        Select-Object Name, dNSHostName
+    ```
+
+2. **Remove every member that is not an enterprise CA computer account** (the same
+   command ad-doctor writes with `--fixes`):
+
+    ```powershell
+    Remove-ADGroupMember 'Cert Publishers' -Members helpdesk -WhatIf
+    ```
+
+3. **Check what the extra members may have written**: certificates added to
+   `userCertificate` of privileged accounts, and certificates in the AIA container that
+   your CAs did not publish.
+
+    ```powershell
+    Get-ADUser -LDAPFilter '(&(adminCount=1)(userCertificate=*))' -Properties userCertificate |
+        Select-Object SamAccountName, @{n = 'Certs'; e = { $_.userCertificate.Count }}
+    ```
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-009"
+
+[[references]]
+title = "Active Directory security groups: Cert Publishers"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-security-groups#cert-publishers"
+kind = "vendor"
+
+[[references]]
+title = "Certified Pre-Owned: Abusing Active Directory Certificate Services (SpecterOps)"
+url = "https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf"
+kind = "research"

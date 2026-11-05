@@ -1,0 +1,108 @@
+id = "AD-ACL-001"
+aliases = ["dcsync"]
+summary = "A principal outside tier 0 holds both replication rights on the domain object, so it can pull every password hash, krbtgt's included, from a domain controller (DCSync)."
+severities = ["high"]
+severity_logic = """
+Always **high**: the two rights together are enough to read the NT hash and Kerberos keys
+of every account in the domain without touching a DC's disk or running code on it.
+"""
+mitre = ["T1003.006"]
+data_sources = ["ldap"]
+attributes = [
+    "nTSecurityDescriptor of the domain head (effective ACEs)",
+    "DS-Replication-Get-Changes (1131f6aa-9c07-11d1-f79f-00c04fc2dcd2)",
+    "DS-Replication-Get-Changes-All (1131f6ad-9c07-11d1-f79f-00c04fc2dcd2)",
+]
+related = ["AD-ACL-003", "AD-ACL-007", "AD-ACL-008", "AD-PRIV-011", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+Domain controllers replicate with each other over MS-DRSR. The DC does not check that the
+caller is another DC; it checks two control-access rights on the domain object:
+*Replicating Directory Changes* and *Replicating Directory Changes All*. Whoever holds
+both can ask any DC for the secrets of any account, which is what Mimikatz `lsadump::dcsync`
+and Impacket `secretsdump.py` do.
+
+1. The attacker compromises an account (or a group member) that holds the two rights.
+2. They request replication of `krbtgt`, `Administrator` or every account at once.
+3. With krbtgt's key they forge Golden Tickets; with the other hashes they pass the hash
+   or crack passwords. Nothing runs on the DC, so endpoint protection there sees nothing.
+
+Legitimate holders outside the default groups are usually sync products (Entra Connect,
+identity management, some backup tools). Each one is a tier-0 asset whether or not it is
+managed like one.
+"""
+
+detection = """
+ad-doctor reads the DACL of the domain head (the effective ACEs, not inherit-only ones)
+and collects the SIDs that hold *DS-Replication-Get-Changes* and the SIDs that hold
+*DS-Replication-Get-Changes-All*. An ACE counts when it grants GenericAll, or the
+control-access right with that right's GUID or with no object type (all extended rights).
+
+A principal is reported when it holds **both** rights and is not a default tier-0
+principal: Administrators, Domain Admins, Enterprise Admins, Domain Controllers,
+Enterprise Domain Controllers, (Enterprise) Read-only Domain Controllers, Schema Admins,
+the built-in Administrator and SYSTEM. Each object is the principal's name, for example
+`MSOL_0a1b2c3d4e5f` or `svc_sync`.
+
+*Get-Changes-In-Filtered-Set* is not considered, and group membership is not expanded
+here: a group is reported by name, and [AD-PATH-001](AD-PATH-001.md) shows who reaches it.
+"""
+
+false_positives = """
+- **Entra Connect with password hash sync.** The `MSOL_` account needs both rights. The
+  finding is still correct, the account can DCSync, but the fix is to protect it, not to
+  remove the rights: see [AD-PRIV-011](AD-PRIV-011.md) and [AD-ACL-008](AD-ACL-008.md),
+  and accept this finding with an owner (../ci.md#accepted-risks).
+- **Other sync and backup products** that document a need for the rights. Confirm with the
+  vendor, then treat the account and its server as tier 0.
+"""
+
+remediation = """
+1. **List who holds the rights** (read-only):
+
+    ```powershell
+    $domain = (Get-ADDomain).DistinguishedName
+    (Get-Acl "AD:$domain").Access |
+        Where-Object { $_.AccessControlType -eq 'Allow' -and
+                       $_.ActiveDirectoryRights -match 'ExtendedRight|GenericAll' } |
+        Format-Table IdentityReference, ActiveDirectoryRights, ObjectType, IsInherited -AutoSize
+    ```
+
+    `1131f6aa-...` is *Get-Changes*, `1131f6ad-...` is *Get-Changes-All*, and an
+    all-zero `ObjectType` means every extended right.
+
+2. **Find out why each principal has them.** A sanctioned sync account stays; anything
+   else (a helpdesk group, an old migration account, an attacker's backdoor) goes.
+
+3. **Remove the grants** that are not needed. `dsacls /R` removes every ACE for the
+   trustee on the domain object, so review step 1 first:
+
+    ```powershell
+    # dsacls "DC=corp,DC=example" /R "CORP\\svc_sync"
+    ```
+
+4. **If the account was not sanctioned, assume the hashes are gone**: reset the krbtgt
+   password twice (with replication in between) and the passwords of privileged accounts.
+
+5. **Protect the accounts that keep the rights as tier 0**: strong unique password or
+   gMSA, no interactive logon outside tier-0 hosts, and the server they run on managed
+   like a domain controller.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-001"
+
+[[references]]
+title = "How to grant the Replicating Directory Changes permission"
+url = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/windows-security/grant-replicating-directory-changes-permission-adma-service"
+kind = "vendor"
+
+[[references]]
+title = "Mimikatz DCSync usage, exploitation, and detection (Sean Metcalf)"
+url = "https://adsecurity.org/?p=1729"
+kind = "research"
+
+[[references]]
+title = "BloodHound: DCSync edge"
+url = "https://bloodhound.specterops.io/resources/edges/dc-sync"
+kind = "tool"

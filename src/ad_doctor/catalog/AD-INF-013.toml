@@ -1,0 +1,72 @@
+id = "AD-INF-013"
+aliases = ["unprobed-dcs"]
+summary = "Some domain controllers could not be reached over SMB, so the per-DC probe checks say nothing about them."
+severities = ["low"]
+severity_logic = """
+Always **low**: this is a gap in coverage, not a weakness. It matters because settings
+often drift between DCs and an attacker only needs the weakest one.
+"""
+mitre = ["T1557"]
+data_sources = ["probe-smb"]
+attributes = ["SMB connection to TCP 445"]
+related = ["AD-INF-005", "AD-INF-008", "AD-INF-009", "AD-INF-010", "AD-ADCS-016"]
+since = "unreleased"
+
+risk = """
+SMB signing ([AD-INF-008](AD-INF-008.md)) and the Print Spooler
+([AD-INF-009](AD-INF-009.md)) are judged per domain controller, as are LDAP signing
+([AD-INF-005](AD-INF-005.md)) and LDAPS channel binding ([AD-INF-010](AD-INF-010.md)).
+A DC that could not be probed is simply absent from those results, so a clean report can
+hide a DC where signing was turned off or the spooler still runs. Relay and coercion
+attacks pick the weakest DC, so one DC that nobody checked is enough.
+"""
+
+detection = """
+With probes enabled, ad-doctor connects to every enabled DC listed in the directory (by
+its `dNSHostName`), or only to the scanned DC with `--single-dc`. The scanned DC is
+reached through the address and `--smb-port` given on the command line, the others on
+TCP 445. When the SMB connection to a DC cannot be established, that DC is reported
+with the reason, for example `DC02.corp.example: no SMB connection`.
+
+The LDAP signing and channel binding probes run separately; when one of them is
+inconclusive or fails for a DC, the reason is written to the scan notes rather than
+reported here. Nothing is reported with `--no-probes`.
+"""
+
+false_positives = """
+- **Scanning from a segment without access to every DC.** The DCs are probably fine; the
+  scan just cannot tell. Scan again from a host that reaches them, or accept the finding
+  for the DCs another scan covers ([accepted risks](../ci.md#accepted-risks)).
+- **Stale DC computer accounts** of servers that were removed without a clean demotion
+  are reported as unreachable. Clean up their metadata.
+"""
+
+remediation = """
+1. **Check reachability** from the scanning host to each reported DC (TCP 445, and 389
+   and 636 for the LDAP probes):
+
+    ```powershell
+    Test-NetConnection DC02.corp.example -Port 445
+    ```
+
+2. **Run the scan from a host that reaches every DC**, or scan each site's DCs from a
+   host in that site with `--single-dc` and the DC's own name.
+3. **Remove DCs that no longer exist** from the directory (metadata cleanup), after
+   confirming they are really gone:
+
+    ```powershell
+    Get-ADDomainController -Filter * | Select-Object HostName, Site, IPv4Address
+    ```
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-013"
+
+[[references]]
+title = "Service overview and network port requirements for Windows"
+url = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/service-overview-and-network-port-requirements"
+kind = "vendor"
+
+[[references]]
+title = "Configure firewall for AD domain and trusts"
+url = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/config-firewall-for-ad-domains-and-trusts"
+kind = "vendor"

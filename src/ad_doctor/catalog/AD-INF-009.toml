@@ -1,0 +1,103 @@
+id = "AD-INF-009"
+aliases = ["print-spooler"]
+summary = "The Print Spooler service runs on a domain controller, so any domain user can force the DC to authenticate to a host of their choice (PrinterBug)."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when the domain also has an enabled non-DC account trusted for unconstrained
+delegation ([AD-DEL-001](AD-DEL-001.md)): coercing the DC to that host hands over the DC's
+TGT. **Medium** otherwise. The pairing is also reported on its own by
+[AD-CHAIN-002](AD-CHAIN-002.md), and the pairing with web enrollment over HTTP by
+[AD-CHAIN-003](AD-CHAIN-003.md).
+"""
+mitre = ["T1187"]
+data_sources = ["probe-smb", "ldap"]
+attributes = ["IPC$ named pipe spoolss","userAccountControl (TRUSTED_FOR_DELEGATION)"]
+related = ["AD-CHAIN-002", "AD-CHAIN-003", "AD-DEL-001", "AD-INF-013"]
+since = "0.1.0"
+
+risk = '''
+The print spooler's RPC interface (MS-RPRN) has a call,
+`RpcRemoteFindFirstPrinterChangeNotificationEx`, that makes the server connect back to a
+host named by the caller, and any authenticated user may call it. On a DC this means
+anyone in the domain can make the domain controller authenticate, as its machine
+account, to a machine they control.
+
+What the attacker does with that authentication decides the impact:
+
+- sent to a host with **unconstrained delegation**, it leaves the DC's TGT there, and
+  with the DC's TGT the attacker can DCSync the domain;
+- relayed to AD CS web enrollment over HTTP (ESC8), it yields a certificate for the DC;
+- relayed to LDAP on another DC without signing or channel binding, it can configure
+  delegation or shadow credentials.
+
+Domain controllers rarely need to print. The same service was also the target of
+PrintNightmare (CVE-2021-34527), another reason to keep it off on tier-0 servers.
+'''
+
+detection = '''
+After an authenticated SMB session to each DC, ad-doctor connects to the `IPC$` share
+and tries to open the `\pipe\spoolss` named pipe with read access. If the pipe opens,
+the spooler is listening and the DC is reported; `STATUS_OBJECT_NAME_NOT_FOUND` means it
+is not running. Nothing is sent over the pipe: no RPC call is made, so the probe cannot
+trigger the coercion itself. Any other error is treated as unknown.
+
+Severity uses the LDAP snapshot: an enabled account other than a DC with
+`TRUSTED_FOR_DELEGATION` in `userAccountControl` makes it high. The probe is skipped with
+`--no-probes`. Each object is a DC host name, for example `DC01.corp.example`.
+'''
+
+false_positives = """
+- **A DC that really is a print server.** Move the printers to a member server: there is
+  no safe way to keep the spooler reachable on a DC.
+- **Printer pruning.** A DC uses its spooler to remove stale printers published in
+  Active Directory. If you publish printers, stopping the spooler on every DC stops that
+  cleanup; remove stale print queue objects with a script instead of keeping the
+  spooler on.
+- Coercion through other interfaces (MS-EFSR, MS-DFSNM) is not covered by this check;
+  stopping the spooler removes one coercion method, not all of them.
+"""
+
+remediation = """
+1. **Check the service on each DC.**
+
+    ```powershell
+    Invoke-Command -ComputerName (Get-ADDomainController -Filter *).HostName {
+        Get-Service Spooler | Select-Object Status, StartType
+    }
+    ```
+
+2. **Stop and disable it** on every DC:
+
+    ```powershell
+    Stop-Service Spooler -WhatIf
+    Set-Service Spooler -StartupType Disabled -WhatIf
+    ```
+
+3. **Keep it disabled with Group Policy**: in the Default Domain Controllers Policy set
+   *Computer Configuration > Policies > Windows Settings > Security Settings > System
+   Services > Print Spooler* to **Disabled**.
+4. **Remove unconstrained delegation** from non-DC hosts ([AD-DEL-001](AD-DEL-001.md))
+   so that a coerced authentication has nowhere useful to go.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-009"
+
+[[references]]
+title = "Security guidelines for system services in Windows Server 2016 (Print Spooler)"
+url = "https://learn.microsoft.com/en-us/windows-server/security/windows-services/security-guidelines-for-disabling-system-services-in-windows-server"
+kind = "vendor"
+
+[[references]]
+title = "Domain Controller Print Server + Unconstrained Kerberos Delegation = Pwned Active Directory Forest (Sean Metcalf)"
+url = "https://adsecurity.org/?p=4056"
+kind = "research"
+
+[[references]]
+title = "Not a Security Boundary: Breaking Forest Trusts (SpecterOps)"
+url = "https://specterops.io/blog/2018/11/28/not-a-security-boundary-breaking-forest-trusts/"
+kind = "research"
+
+[[references]]
+title = "krbrelayx: Kerberos relaying and unconstrained delegation abuse toolkit (printerbug.py)"
+url = "https://github.com/dirkjanm/krbrelayx"
+kind = "tool"

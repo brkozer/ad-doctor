@@ -1,0 +1,79 @@
+id = "AD-INF-011"
+aliases = ["ad-backup"]
+summary = "The domain partition has not been backed up in the last seven days, or never, so recovering from ransomware or a forest compromise would mean rebuilding."
+severities = ["medium"]
+severity_logic = """
+Always **medium**: a missing backup is not an attack path, but it turns any destructive
+attack into a rebuild of the forest.
+"""
+mitre = ["T1490"]
+data_sources = ["ldap"]
+attributes = ["msDS-ReplAttributeMetaData (dSASignature)"]
+related = ["AD-INF-002"]
+since = "0.1.0"
+
+risk = """
+Ransomware operators who reach domain admin routinely encrypt or wipe domain controllers
+together with everything else, and some delete backups first. A forest compromise can
+also leave so many unknown changes behind that the only trustworthy way back is a
+restore from before the intrusion. Both depend on a recent, AD-aware system-state
+backup of at least one DC per domain.
+
+The Recycle Bin ([AD-INF-002](AD-INF-002.md)) covers deleted objects only; it does not
+help when DCs are destroyed or the directory itself cannot be trusted. A backup older
+than the tombstone lifetime (180 days by default) cannot be restored at all.
+"""
+
+detection = """
+Every AD-aware backup of a DC updates the `dSASignature` attribute on the naming
+contexts it backs up. ad-doctor reads `msDS-ReplAttributeMetaData` on the domain object
+and takes the `ftimeLastOriginatingChange` of `dSASignature` as the time of the last
+backup of the domain partition, from any DC.
+
+The domain is reported when that time is more than seven days before the scan, or when
+it is the zero date (1601-01-01), which means the partition was never backed up. If the
+metadata does not contain `dSASignature` at all, the check stays silent. The finding has
+one object, the domain name, for example `corp.example`, and the detail gives the age in
+days.
+"""
+
+false_positives = """
+- **Backups that are not AD-aware**, such as hypervisor snapshots taken without the VSS
+  writer for Active Directory, or file copies, do not update `dSASignature`. They are
+  also not supported ways to restore a DC, so the finding stands.
+- **Lab and test domains** without backups by design: accept the finding
+  ([accepted risks](../ci.md#accepted-risks)).
+"""
+
+remediation = """
+1. **Check when each partition was last backed up**, as seen by a DC:
+
+    ```
+    repadmin /showbackup *
+    ```
+
+2. **Take a system-state backup** of at least one DC per domain, daily, with Windows
+   Server Backup or an AD-aware backup product. With Windows Server Backup (the feature
+   must be installed):
+
+    ```
+    wbadmin start systemstatebackup -backupTarget:E:
+    ```
+
+3. **Keep copies offline or immutable**, out of reach of the domain's own administrators,
+   so an attacker with domain admin cannot delete them.
+4. **Test restores** regularly in an isolated network, following the forest recovery
+   guide, and document the procedure.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-011"
+
+[[references]]
+title = "AD Forest Recovery: backing up a full server"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/forest-recovery-guide/ad-forest-recovery-backing-up-a-full-server"
+kind = "vendor"
+
+[[references]]
+title = "Active Directory Forest Recovery Guide"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/forest-recovery-guide/ad-forest-recovery-guide"
+kind = "vendor"

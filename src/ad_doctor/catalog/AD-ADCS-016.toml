@@ -1,0 +1,80 @@
+id = "AD-ADCS-016"
+aliases = []
+summary = "An enterprise CA's own configuration could not be read, so the CA-side ESC checks (ESC6, ESC7, ESC11, ESC16) say nothing about it."
+severities = ["low"]
+severity_logic = """
+Always **low**: this is a coverage gap, not a misconfiguration. It means ad-doctor could not
+reach or parse the CA's registry, so the CA-side findings are neither present nor ruled out
+for that CA. A third-party policy module is reported here too, because the Microsoft-specific
+`EditFlags` and `DisableExtensionList` cannot be interpreted, and so is a CA where one of the
+values was absent or empty (each object names the checks it affects).
+"""
+mitre = ["T1649"]
+data_sources = ["probe-winreg"]
+attributes = [
+    "SYSTEM\\CurrentControlSet\\Services\\CertSvc (over \\pipe\\winreg)",
+    "PolicyModules\\Active",
+]
+related = ["AD-ADCS-012", "AD-ADCS-013", "AD-ADCS-014", "AD-ADCS-015"]
+since = "unreleased"
+
+risk = """
+The CA-side checks (ESC6, ESC7, ESC11, ESC16) read settings that live only in the CA's
+registry, not in LDAP. When ad-doctor cannot read them, their results are silent for that CA,
+which could hide a real misconfiguration. This finding makes that blind spot explicit so a
+clean report is not mistaken for a safe CA.
+
+Common causes: the CA host is not reachable on TCP 445, the scanning account has no
+credentials or no access to the winreg pipe, the RemoteRegistry service is disabled, a GPO has
+removed `CertSvc` from the remotely accessible registry paths, or the CA runs a non-Microsoft
+policy module whose `EditFlags`/`DisableExtensionList` have a different meaning.
+"""
+
+detection = """
+During collection ad-doctor opens `\\pipe\\winreg` on each enterprise CA host and reads under
+`SYSTEM\\CurrentControlSet\\Services\\CertSvc`. Every CA whose read failed (with the error) or
+that runs a third-party policy module (with a note that ESC6 and ESC16 were not judged) is
+listed, as is a CA where `InterfaceFlags` (ESC11), the `Security` descriptor (ESC7),
+`EditFlags` (ESC6) or `DisableExtensionList` (ESC16) was missing or unusable: an absent value
+is unknown, never clean. A security descriptor that cannot be parsed counts as a read
+error. `--no-ca-registry` and `--no-probes` skip the read entirely; a run made that way does
+not raise this finding, but also produces no CA-side findings.
+"""
+
+false_positives = """
+- **Intentionally skipped.** If you run with `--no-ca-registry` because the probe is too
+  intrusive for your environment, this finding will not appear, and the absence of ESC6/7/11/16
+  findings simply means they were not checked. Note that in your report.
+- **Not a CA problem.** The cause is almost always on the network or the scanning side, not a
+  weakness of the CA itself.
+"""
+
+remediation = """
+1. **Run the scan from a host that can reach TCP 445 on each CA**, with credentials
+   (`-u` or `-k`), so the winreg pipe can be opened.
+
+2. **Check the CA host**: `RemoteRegistry` must not be disabled (it is trigger-started on
+   demand), and `SYSTEM\\CurrentControlSet\\Services\\CertSvc` must stay in the winreg
+   *AllowedPaths* list. A GPO that sets *Network access: Remotely accessible registry paths and
+   subpaths* replaces the whole list, so re-add `CertSvc` there if it is missing.
+
+3. **Third-party policy module**: audit ESC6 and ESC16 for that CA by hand, since their
+   registry values do not follow the Microsoft default module's meaning.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-016"
+
+[[references]]
+title = "Network access: Remotely accessible registry paths and subpaths"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/network-access-remotely-accessible-registry-paths-and-subpaths"
+kind = "vendor"
+
+[[references]]
+title = "[MS-RRP]: Windows Remote Registry Protocol"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rrp/0fa3191d-bb79-490a-81bd-54c2601b7a78"
+kind = "spec"
+
+[[references]]
+title = "Install the Certification Authority on Windows Server"
+url = "https://learn.microsoft.com/en-us/windows-server/networking/core-network-guide/cncg/server-certs/install-the-certification-authority"
+kind = "vendor"

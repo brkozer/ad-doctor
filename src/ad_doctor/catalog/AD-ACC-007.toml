@@ -1,0 +1,108 @@
+id = "AD-ACC-007"
+aliases = ["sid-history"]
+summary = "Enabled accounts carry sIDHistory, which adds the old SIDs to every logon token; privileged or same-domain SIDs there are a persistence backdoor."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when at least one reported account has a SID in `sIDHistory` that ends in
+`-500` (Administrator), `-512` (Domain Admins), `-518` (Schema Admins) or `-519`
+(Enterprise Admins) in any domain, is `S-1-5-32-544` (Administrators), or belongs to the
+scanned domain itself. **Medium** when every SID found looks like an ordinary leftover of
+a migration from another domain.
+"""
+mitre = ["T1134.005"]
+data_sources = ["ldap"]
+attributes = ["sIDHistory", "objectSid of the domain", "userAccountControl"]
+related = ["AD-INF-006", "AD-ACL-004", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+`sIDHistory` exists so that a user migrated from another domain keeps access to resources
+that still name the old SID. Every SID in it is added to the account's Kerberos PAC and
+access token at each logon, exactly as if the account were a member of that principal.
+
+Attackers who once held Domain Admin rights use it for persistence: with Mimikatz
+(`sid::add`) or DSInternals (`Add-ADDBSidHistory`, offline on `ntds.dit`) they write the
+SID of Domain Admins or of the built-in Administrator into an ordinary account. That
+account appears in no admin group and has no `adminCount`, yet logs on as an
+administrator. A SID from the **same** domain never comes from a real migration, which
+is why the check treats it as high.
+
+Across trusts, SID filtering normally strips foreign SIDs; trusts that let SID history
+through are reported by [AD-INF-006](AD-INF-006.md).
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled** account (users and computers) with at least one
+value in `sIDHistory`. The binary SIDs are converted to strings and compared with the
+domain SID read from the domain head.
+
+The detail lists the accounts with privileged or same-domain SIDs; each object is a
+`sAMAccountName`, for example `mig_user`.
+"""
+
+false_positives = """
+- **Migrations in progress.** Accounts migrated with ADMT keep SID history until resource
+  ACLs are translated. Those are medium findings; record them in an
+  [accepted-risk file](../ci.md#accepted-risks) with an expiry date that matches the end
+  of the migration.
+- A **high** finding can come from a migration (the old domain's Domain Admins SID), but
+  the account is still an admin wherever that old SID is honoured, so fix it rather
+  than accept it.
+"""
+
+remediation = """
+1. **List every account with SID history** (read-only):
+
+    ```powershell
+    Get-ADObject -LDAPFilter '(sIDHistory=*)' -Properties sAMAccountName, sIDHistory, whenChanged |
+        Select-Object sAMAccountName, whenChanged,
+            @{n = 'SIDHistory'; e = { $_.sIDHistory.Value -join ', ' }}
+    ```
+
+2. **Treat high findings as a possible compromise.** Find when the value was written and
+   from where: event 4765 (*SID History was added to an account*) on the DCs, and the
+   replication metadata:
+
+    ```powershell
+    $dn = (Get-ADUser mig_user).DistinguishedName
+    Get-ADReplicationAttributeMetadata -Object $dn -Server dc01 -Properties sIDHistory
+    ```
+
+   Then reset the account's password and look for other persistence.
+
+3. **Remove the SID history** once resource ACLs no longer need it. To remove one SID:
+
+    ```powershell
+    Set-ADUser mig_user -Remove @{sIDHistory = 'S-1-5-21-1111111111-2222222222-3333333333-1105'} -WhatIf
+    ```
+
+   or all of them (what `ad-doctor fix` generates; use `Set-ADComputer` for a computer):
+
+    ```powershell
+    Set-ADUser mig_user -Clear sIDHistory -WhatIf
+    ```
+
+4. **Keep SID filtering on** for every trust (see [AD-INF-006](AD-INF-006.md)).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-007"
+
+[[references]]
+title = "Sneaky Active Directory Persistence #14: SID History (Sean Metcalf)"
+url = "https://adsecurity.org/?p=1772"
+kind = "research"
+
+[[references]]
+title = "SID-History attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-sidhistory"
+kind = "spec"
+
+[[references]]
+title = "4765(S): SID History was added to an account"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4765"
+kind = "vendor"
+
+[[references]]
+title = "Active Directory forest trusts part 1: How does SID filtering work? (Dirk-jan Mollema)"
+url = "https://dirkjanm.io/active-directory-forest-trusts-part-one-how-does-sid-filtering-work/"
+kind = "research"

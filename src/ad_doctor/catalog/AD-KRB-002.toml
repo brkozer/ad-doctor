@@ -1,0 +1,87 @@
+id = "AD-KRB-002"
+aliases = ["asrep-roasting", "asreproast"]
+summary = "Enabled user accounts that do not require Kerberos pre-authentication, so anyone can get material encrypted with their password and crack it offline."
+severities = ["high"]
+severity_logic = """
+Always **high**: one such account is enough, and no credentials are needed to attack
+it.
+"""
+mitre = ["T1558.004"]
+data_sources = ["ldap"]
+attributes = ["userAccountControl", "objectClass"]
+related = ["AD-KRB-003", "AD-POL-001", "AD-ACC-003"]
+since = "0.1.0"
+
+risk = """
+Normally a client proves it knows the user's password before the KDC answers: the
+AS-REQ carries a timestamp encrypted with the user's key (*pre-authentication*). With
+**Do not require Kerberos preauthentication** set, the KDC skips that step and returns
+an AS-REP to anyone who asks for the account. Part of that reply is encrypted with a key
+derived from the user's password.
+
+The attacker does not need a domain account, only network access to a DC and the user
+name. They take the AS-REP offline and guess the password with no failed logons and no
+lockout (*AS-REP roasting*). The flag is usually set for an old Unix or Java Kerberos
+client that once could not do pre-authentication, and then forgotten.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled** user account with the
+`DONT_REQ_PREAUTH` bit (`0x400000`) in `userAccountControl`. Computer accounts and
+managed service accounts (gMSA, sMSA, dMSA) are skipped. One finding lists every
+account by `sAMAccountName`, for example `legacy_app`.
+
+ad-doctor does not send any AS-REQ: the result comes from the directory data alone.
+"""
+
+false_positives = """
+- **An application that really cannot pre-authenticate.** Check with the vendor first:
+  current Kerberos clients support it. If one remains, give the account a long random
+  password and record the decision in an [accepted-risk file](../ci.md#accepted-risks)
+  with an owner and an expiry date.
+- **Honeypot accounts** created to catch AS-REP roasting: accept them the same way.
+"""
+
+remediation = """
+1. **List the accounts** (read-only):
+
+    ```powershell
+    Get-ADUser -Filter 'DoesNotRequirePreAuth -eq $true' -Properties PasswordLastSet |
+        Select-Object SamAccountName, Enabled, PasswordLastSet
+    ```
+
+2. **Require pre-authentication again** on each account, then test the application
+   that uses it:
+
+    ```powershell
+    Set-ADAccountControl legacy_app -DoesNotRequirePreAuth $false -WhatIf
+    ```
+
+3. **Reset the password** of every account that had the flag. Its AS-REP may already
+   have been collected and cracked.
+
+4. **Detect attempts**: on domain controllers, event 4768 with *Pre-Authentication
+   Type* `0` shows a TGT issued without pre-authentication.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-KRB-002"
+
+[[references]]
+title = "Roasting AS-REPs (Will Schroeder)"
+url = "https://blog.harmj0y.net/activedirectory/roasting-as-reps/"
+kind = "research"
+
+[[references]]
+title = "The Hacker Recipes: ASREProast"
+url = "https://www.thehacker.recipes/ad/movement/kerberos/roasting/asreproast"
+kind = "research"
+
+[[references]]
+title = "Use the UserAccountControl flags to manipulate user account properties"
+url = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/useraccountcontrol-manipulate-account-properties"
+kind = "vendor"
+
+[[references]]
+title = "Event 4768: A Kerberos authentication ticket (TGT) was requested"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4768"
+kind = "vendor"

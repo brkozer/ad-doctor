@@ -1,0 +1,97 @@
+id = "AD-POL-002"
+aliases = ["machineaccountquota", "maq"]
+summary = "ms-DS-MachineAccountQuota is above 0, so any domain user can create computer accounts, a building block of RBCD, relay and noPac attacks."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. A quota above 0 is not an attack by itself, but it hands every user an
+account with a known password and an SPN. When the DCs also accept relayed LDAP, the
+combination is reported separately as [AD-CHAIN-001](AD-CHAIN-001.md) (high).
+"""
+mitre = ["T1136.002"]
+data_sources = ["ldap"]
+attributes = ["ms-DS-MachineAccountQuota"]
+related = ["AD-CHAIN-001", "AD-DEL-003", "AD-ACC-010", "AD-INF-005"]
+since = "0.1.0"
+
+risk = """
+By default every authenticated user may create up to 10 computer accounts
+(`ms-DS-MachineAccountQuota = 10`), through the *Add workstations to domain* right that
+the Default Domain Controllers Policy grants to Authenticated Users. The creator chooses
+the password, and the new account has SPNs. That is exactly what several attacks need:
+
+- **Resource-based constrained delegation (RBCD).** An attacker who can write
+  `msDS-AllowedToActOnBehalfOfOtherIdentity` on a computer, for example by relaying that
+  computer's authentication to LDAP, points it at their new computer account and then
+  uses S4U to get a service ticket to the target as any user, an administrator included.
+  See [AD-CHAIN-001](AD-CHAIN-001.md).
+- **noPac (CVE-2021-42278/42287)** on unpatched DCs renamed a self-created computer
+  account to impersonate a DC.
+- **Shadow accounts and persistence:** computer accounts are rarely reviewed, never expire
+  and are not removed when the user who created them leaves.
+"""
+
+detection = """
+ad-doctor reads `ms-DS-MachineAccountQuota` from the domain head and reports any value
+above 0. When the attribute is absent it assumes the default of 10.
+
+Example: detail `ms-DS-MachineAccountQuota is 10; any user can create computer accounts`,
+object `corp.example`.
+
+ad-doctor does not check who holds *Add workstations to domain* (`SeMachineAccountPrivilege`)
+in the Default Domain Controllers Policy; the quota is reported whatever that right says.
+"""
+
+false_positives = """
+- **The right was removed instead.** If no ordinary user holds *Add workstations to
+  domain* on the DCs, the quota has no effect. Setting the quota to 0 as well costs nothing
+  and makes the state visible to every tool, so prefer that over accepting the finding.
+"""
+
+remediation = """
+1. **See who has used the quota.** Computers created through it carry the creator's SID in
+   `ms-DS-CreatorSID`:
+
+    ```powershell
+    Get-ADComputer -LDAPFilter '(ms-DS-CreatorSID=*)' -Properties 'ms-DS-CreatorSID', whenCreated |
+        Select-Object Name, whenCreated, @{n = 'Creator'; e = {
+            (New-Object Security.Principal.SecurityIdentifier $_.'ms-DS-CreatorSID', 0).Translate(
+                [Security.Principal.NTAccount]) }}
+    ```
+
+2. **Give domain join to a dedicated group** before the change, so imaging and help desk
+   processes keep working: delegate *Create Computer objects* (and the reset-password and
+   validated writes) on the OU where new computers go, or pre-stage computer accounts.
+
+3. **Set the quota to 0:**
+
+    ```powershell
+    Set-ADDomain -Identity corp.example -Replace @{'ms-DS-MachineAccountQuota' = 0} -WhatIf
+    ```
+
+4. **Optionally** remove Authenticated Users from *Add workstations to domain* in the Default
+   Domain Controllers Policy, so the quota stops mattering even if someone raises it again.
+
+5. **Review the computers found in step 1** and delete the ones nobody owns.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-POL-002"
+
+[[references]]
+title = "Default limit to number of workstations a user can join to the domain"
+url = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/default-workstation-numbers-join-domain"
+kind = "vendor"
+
+[[references]]
+title = "ms-DS-MachineAccountQuota attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-ms-ds-machineaccountquota"
+kind = "spec"
+
+[[references]]
+title = "MachineAccountQuota is useful sometimes (Kevin Robertson, NetSPI)"
+url = "https://www.netspi.com/blog/technical-research/network-pentesting/machineaccountquota-is-useful-sometimes/"
+kind = "research"
+
+[[references]]
+title = "The Hacker Recipes: MachineAccountQuota"
+url = "https://www.thehacker.recipes/ad/movement/builtins/machineaccountquota"
+kind = "research"

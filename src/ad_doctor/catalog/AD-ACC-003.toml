@@ -1,0 +1,93 @@
+id = "AD-ACC-003"
+summary = "Enabled members of tier-0 groups have 'password never expires' set, so a leaked admin password stays valid indefinitely."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. The flag does not open a path by itself; it removes the forced
+rotation that would eventually invalidate a stolen tier-0 password. Old passwords are
+reported separately by [AD-ACC-011](AD-ACC-011.md).
+"""
+mitre = ["T1078.002"]
+data_sources = ["ldap"]
+attributes = ["userAccountControl", "member (transitive) of the tier-0 groups", "primaryGroupID"]
+related = ["AD-ACC-011", "AD-PRIV-001", "AD-PRIV-010", "AD-KRB-003"]
+since = "0.1.0"
+
+risk = """
+`DONT_EXPIRE_PASSWORD` (`userAccountControl` bit `0x10000`) exempts an account from the
+domain's maximum password age. On an administrator that means the password chosen years
+ago, possibly typed into scripts, scheduled tasks and jump hosts since then, is still
+the password today.
+
+Admin credentials leak in many ways: a cached logon on a compromised workstation, a
+script in a share, a cracked Kerberos ticket ([AD-KRB-003](AD-KRB-003.md)), an old
+backup. Without rotation, a password obtained once keeps working as Domain Admin until
+someone notices.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled user** (computers and managed service accounts
+excluded) that is a transitive member of a tier-0 group and has `DONT_EXPIRE_PASSWORD`
+(`0x10000`) set.
+
+The tier-0 groups are Domain Admins, Schema Admins, Enterprise Admins, Administrators,
+Account Operators, Server Operators, Print Operators and Backup Operators. Membership
+through `primaryGroupID` counts, since it never shows in `member`.
+
+Each object is the account's `sAMAccountName`, for example `adm_bob`. The built-in
+`Administrator` is reported like any other member when it has the flag.
+"""
+
+false_positives = """
+- **Break-glass accounts** whose long random password is kept in a safe and rotated by a
+  procedure, not by expiry. Record them in an
+  [accepted-risk file](../ci.md#accepted-risks) with an owner and an expiry date.
+- **Smart-card-only admins** (`SMARTCARD_REQUIRED`) in a domain that rolls their NTLM
+  secret on expiry are still reported; ad-doctor does not look at that setting.
+"""
+
+remediation = """
+1. **List the privileged accounts with the flag** (read-only; `adminCount = 1` is a
+   close approximation of tier-0 membership):
+
+    ```powershell
+    Get-ADUser -LDAPFilter '(&(adminCount=1)(userAccountControl:1.2.840.113556.1.4.803:=65536))' `
+        -Properties PasswordLastSet, LastLogonDate |
+        Select-Object SamAccountName, Enabled, PasswordLastSet, LastLogonDate
+    ```
+
+2. **Rotate the password first**, then remove the flag. If the password is already older
+   than the maximum password age, removing the flag makes it expire immediately.
+
+    ```powershell
+    Set-ADUser adm_bob -PasswordNeverExpires $false -WhatIf
+    ```
+
+3. **Give administrators their own password policy** if the domain policy is too weak or
+   has no maximum age:
+
+    ```powershell
+    New-ADFineGrainedPasswordPolicy -Name 'Tier0' -Precedence 10 -MinPasswordLength 16 `
+        -ComplexityEnabled $true -MaxPasswordAge '180.00:00:00' -WhatIf
+    Add-ADFineGrainedPasswordPolicySubject 'Tier0' -Subjects 'Domain Admins' -WhatIf
+    ```
+
+4. **Take service accounts out of tier-0 groups.** A service that needs a non-expiring
+   password should run as a group managed service account, not as a Domain Admin.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-003"
+
+[[references]]
+title = "Maximum password age"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/maximum-password-age"
+kind = "vendor"
+
+[[references]]
+title = "Attractive accounts for credential theft"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/attractive-accounts-for-credential-theft"
+kind = "vendor"
+
+[[references]]
+title = "ANSSI Active Directory checklist (vuln_dont_expire_priv)"
+url = "https://cert.cyber.gouv.fr/uploads/ad_checklist.html"
+kind = "vendor"

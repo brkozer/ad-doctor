@@ -1,0 +1,88 @@
+id = "AD-INF-008"
+aliases = ["smb-signing"]
+summary = "A domain controller does not require SMB signing, so NTLM authentication relayed from another host can be used against it over SMB."
+severities = ["high"]
+severity_logic = """
+Always **high**: domain controllers require SMB signing by default, so a DC that does not
+has been weakened on purpose, and a relayed administrator on a DC owns the domain.
+"""
+mitre = ["T1557"]
+data_sources = ["probe-smb"]
+attributes = ["SMB2 NEGOTIATE SecurityMode (SIGNING_REQUIRED)"]
+related = ["AD-INF-005", "AD-INF-013", "AD-GPO-003"]
+since = "0.1.0"
+
+risk = '''
+SMB signing ties every message of an SMB session to the session key, so an attacker
+who relays someone's NTLM authentication cannot use the resulting session. When a DC
+does not require it, an attacker who captures the authentication of an administrator
+(through coercion, name-resolution poisoning or a malicious link) can relay it to the
+DC's SMB service and act as that administrator: read `\\DC\C$`, create services, or
+dump the registry hives that hold secrets.
+
+Windows domain controllers require SMB signing out of the box through the Default Domain
+Controllers Policy, so this finding usually means that policy, or a GPO linked above
+it, was changed to accommodate an old client.
+'''
+
+detection = """
+ad-doctor opens an SMB connection to each DC on TCP 445 (for the DC being scanned, the
+port given with `--smb-port`) and reads the server's `SecurityMode` from the SMB2
+NEGOTIATE response. When the `SIGNING_REQUIRED` flag is missing, the DC is reported. No
+share is opened for this; the negotiation alone answers the question.
+
+The probe is skipped with `--no-probes`. DCs that do not answer on SMB are listed by
+[AD-INF-013](AD-INF-013.md) instead. Each object is a DC host name, for example
+`DC02.corp.example`, and the detail says how many of the probed DCs failed.
+"""
+
+false_positives = """
+None expected: the probe reads what the DC announces. A host that sits behind a device
+which terminates SMB would be judged by that device's answer.
+"""
+
+remediation = """
+1. **Read the setting on each DC.**
+
+    ```powershell
+    Invoke-Command -ComputerName (Get-ADDomainController -Filter *).HostName {
+        Get-SmbServerConfiguration | Select-Object RequireSecuritySignature
+    }
+    ```
+
+2. **Require signing through Group Policy**: in the Default Domain Controllers Policy set
+   *Computer Configuration > Policies > Windows Settings > Security Settings > Local
+   Policies > Security Options > Microsoft network server: Digitally sign communications
+   (always)* = **Enabled**. Check that no GPO linked to the Domain Controllers OU with
+   higher precedence sets it to Disabled.
+3. To fix one DC at once while the GPO replicates:
+
+    ```powershell
+    Set-SmbServerConfiguration -RequireSecuritySignature $true -WhatIf
+    ```
+
+4. Find the client that needed signing off (old NAS, scanners, Linux SMB1 clients) and
+   upgrade or replace it rather than weakening the DC again.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-008"
+
+[[references]]
+title = "Overview of Server Message Block signing in Windows"
+url = "https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-signing-overview"
+kind = "vendor"
+
+[[references]]
+title = "Microsoft network server: Digitally sign communications (always)"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/microsoft-network-server-digitally-sign-communications-always"
+kind = "vendor"
+
+[[references]]
+title = "SMB security hardening in Windows Server and Windows Client"
+url = "https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-security-hardening"
+kind = "vendor"
+
+[[references]]
+title = "The Hacker Recipes: NTLM relay"
+url = "https://www.thehacker.recipes/ad/movement/ntlm/relay"
+kind = "research"

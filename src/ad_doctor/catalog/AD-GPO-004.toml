@@ -1,0 +1,99 @@
+id = "AD-GPO-004"
+aliases = []
+summary = "A GPO not linked to the domain or the domain controllers can be edited by a principal outside tier 0, who can run code on every computer or user it reaches."
+severities = ["medium"]
+severity_logic = """
+Always **medium**: the editor gains code execution wherever the GPO is linked, now or
+later, but not on the domain controllers (that case is [AD-GPO-001](AD-GPO-001.md)). Use
+[AD-PATH-001](AD-PATH-001.md) to see whether the computers it reaches lead to tier 0.
+"""
+mitre = ["T1484.001"]
+data_sources = ["ldap"]
+attributes = [
+    "nTSecurityDescriptor of each groupPolicyContainer (effective ACEs)",
+    "gPLink on the domain head and OU=Domain Controllers (enabled links)",
+    "displayName, name (GPO GUID)",
+]
+related = ["AD-GPO-001", "AD-GPO-002", "AD-GPO-005", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+Editing a GPO is running code as SYSTEM (computer settings) or as the user (user
+settings) on everything it applies to. Delegating edit rights on an OU's GPO to the team
+that owns those machines is normal; the risk is when the editor is broader or less
+trusted than the machines and users the GPO reaches:
+
+1. A helpdesk group, an old owner or a broad group can edit a GPO linked to a server OU.
+2. The attacker adds an immediate scheduled task or a startup script (SharpGPOAbuse,
+   pyGPOAbuse) and waits for the next refresh.
+3. Every server in the OU runs it as SYSTEM, and the attacker harvests whatever
+   credentials are on those servers, often including an admin who leads to tier 0.
+
+An unlinked GPO is a latent version of the same problem: the moment someone links it, the
+editor's changes go live.
+"""
+
+detection = """
+ad-doctor reads every `groupPolicyContainer` with its DACL and skips the GPOs that have an
+enabled link on the domain head or on `OU=Domain Controllers` (those are
+[AD-GPO-001](AD-GPO-001.md)). Every other GPO, linked to an OU or site or not linked at
+all, is reported when a principal outside the default tier-0 set holds a **takeover**
+right on it: GenericAll or full control, GenericWrite, WriteDacl, WriteOwner, or
+WriteProperty on all attributes (which GPMC's *Edit settings* grants). CREATOR OWNER is
+ignored.
+
+Each object names the GPO and the editors, for example `LabUserPolicy (helpdesk)`. The
+NTFS permissions on the GPO's SYSVOL folder are not read.
+"""
+
+false_positives = """
+- **Intended delegation.** A server team editing the GPOs of its own servers is often by
+  design. The finding stays useful as an inventory: accept it with an owner where the
+  editor is no less trusted than the computers the GPO reaches
+  (../ci.md#accepted-risks).
+- **Unlinked GPOs** have no effect until linked; delete the ones nobody needs.
+"""
+
+remediation = """
+1. **List who can edit the GPO and where it is linked** (read-only):
+
+    ```powershell
+    Get-GPPermission -Name 'LabUserPolicy' -All |
+        Where-Object Permission -in 'GpoEdit', 'GpoEditDeleteModifySecurity' |
+        Format-Table Trustee, TrusteeType, Permission -AutoSize
+    [xml](Get-GPOReport -Name 'LabUserPolicy' -ReportType Xml) |
+        ForEach-Object { $_.GPO.LinksTo } | Format-Table SOMPath, Enabled
+    ```
+
+2. **Reduce edit rights to the administrators of the tier the GPO applies to**, keeping
+   read access where needed:
+
+    ```powershell
+    Set-GPPermission -Name 'LabUserPolicy' -TargetName 'helpdesk' -TargetType Group -PermissionLevel GpoRead -Replace -WhatIf
+    ```
+
+3. **Delete unlinked GPOs that nobody owns** after a backup (`Backup-GPO`), instead of
+   leaving them editable.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-004"
+
+[[references]]
+title = "A Red Teamer's Guide to GPOs and OUs (Andy Robbins)"
+url = "https://wald0.com/?p=179"
+kind = "research"
+
+[[references]]
+title = "pyGPOAbuse"
+url = "https://github.com/Hackndo/pyGPOAbuse"
+kind = "tool"
+
+[[references]]
+title = "Set-GPPermission"
+url = "https://learn.microsoft.com/en-us/powershell/module/grouppolicy/set-gppermission?view=windowsserver2025-ps"
+kind = "vendor"
+
+[[references]]
+title = "Get-GPPermission"
+url = "https://learn.microsoft.com/en-us/powershell/module/grouppolicy/get-gppermission?view=windowsserver2025-ps"
+kind = "vendor"

@@ -1,0 +1,94 @@
+id = "AD-KRB-006"
+aliases = ["seamless-sso", "azureadssoacc"]
+summary = "The Kerberos key of the Entra ID Seamless SSO account AZUREADSSOACC$ is older than 30 days; whoever holds it can forge tickets to Entra ID."
+severities = ["medium"]
+severity_logic = """
+Always **medium**: the check fires only when the `AZUREADSSOACC$` password is more than
+30 days old, the rollover interval Microsoft recommends.
+"""
+mitre = ["T1558.002"]
+data_sources = ["ldap"]
+attributes = ["sAMAccountName", "pwdLastSet"]
+related = ["AD-KRB-001", "AD-PRIV-011", "AD-ACL-008"]
+since = "0.1.0"
+
+risk = """
+Seamless single sign-on lets domain-joined machines sign in to Microsoft Entra ID with
+Kerberos. Entra Connect creates a computer account, `AZUREADSSOACC$`, that stands for
+Entra ID in the on-premises forest, and shares that account's Kerberos key with Entra
+ID. Browsers then get an ordinary service ticket for it and Entra ID decrypts the ticket
+with the shared key.
+
+Anyone who obtains that key (by DCSync, from `ntds.dit`, or from a DC backup) can forge
+a service ticket for **any synced user** (a silver ticket) and sign in to Entra ID as
+them, from anywhere, without that user's password. The key does not change by itself,
+so a key stolen months ago keeps working until someone rolls it over.
+"""
+
+detection = """
+From the LDAP snapshot: the account whose `sAMAccountName` is `AZUREADSSOACC$`, and its
+`pwdLastSet`. ad-doctor reports it when the password is more than **30 days** older than
+the snapshot, and gives the age:
+
+```text
+The AZUREADSSOACC$ Kerberos key is 95 days old; whoever has it can forge tickets to
+Entra ID for any synced user (silver ticket).
+```
+
+The object is `AZUREADSSOACC$`. The account is checked whether or not it is enabled.
+When Seamless SSO was never set up, the account does not exist and the check is silent.
+"""
+
+false_positives = """
+- **Seamless SSO was turned off but the account was left behind.** The finding is still
+  worth acting on: follow Microsoft's clean-up steps and delete `AZUREADSSOACC$`, which
+  removes the key entirely.
+"""
+
+remediation = """
+1. **Check the age** (read-only):
+
+    ```powershell
+    Get-ADComputer AZUREADSSOACC -Properties PasswordLastSet |
+        Select-Object Name, PasswordLastSet
+    ```
+
+2. **Roll the key over** on the Entra Connect server, as in Microsoft's FAQ. You need
+   Hybrid Identity Administrator rights in the tenant and a domain admin account that is
+   not in Protected Users. Run `Update-AzureADSSOForest` **once per forest**; running it
+   twice breaks sign-in until users' Kerberos tickets expire.
+
+    ```powershell
+    cd "$env:ProgramFiles\\Microsoft Azure Active Directory Connect"
+    Import-Module .\\AzureADSSO.psd1
+    New-AzureADSSOAuthenticationContext
+    Get-AzureADSSOStatus | ConvertFrom-Json   # read-only: forests using it
+    $creds = Get-Credential                    # CORP\\domainadmin
+    Update-AzureADSSOForest -OnPremCredentials $creds
+    ```
+
+3. **Schedule it** at least every 30 days.
+
+4. **If Seamless SSO is not needed**, disable it in Entra Connect (*Change user
+   sign-in*) and delete the `AZUREADSSOACC$` account afterwards, as the FAQ describes.
+
+5. **Treat the account as tier 0**: only tier-0 admins should be able to read its keys
+   or change it.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-KRB-006"
+
+[[references]]
+title = "Microsoft Entra Seamless SSO: frequently asked questions (key rollover)"
+url = "https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/how-to-connect-sso-faq"
+kind = "vendor"
+
+[[references]]
+title = "Microsoft Entra Seamless SSO: technical deep dive"
+url = "https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/how-to-connect-sso-how-it-works"
+kind = "vendor"
+
+[[references]]
+title = "Impersonating Office 365 Users With Mimikatz (Michael Grafnetter)"
+url = "https://www.dsinternals.com/en/impersonating-office-365-users-mimikatz/"
+kind = "research"

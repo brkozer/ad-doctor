@@ -1,0 +1,101 @@
+id = "AD-INF-001"
+aliases = ["obsolete-os"]
+summary = "Enabled computer accounts report a Windows version past Microsoft's end of extended support, which no longer receives security updates."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when at least one reported computer is a domain controller: an unpatched DC is
+a direct route to the whole domain. **Medium** otherwise.
+"""
+mitre = ["T1210"]
+data_sources = ["ldap"]
+attributes = ["operatingSystem", "userAccountControl"]
+related = ["AD-INF-003", "AD-SEC-001"]
+since = "0.1.0"
+
+risk = """
+A Windows version past the end of extended support gets no security updates. Every
+remote code execution or privilege escalation bug published after that date stays open
+for good, and public exploits for old versions are easy to find. An attacker who reaches
+such a host on the network can often take it over without any credentials, then harvest
+the credentials of everyone who logs on to it.
+
+Old systems also hold the domain back: they keep NTLMv1, SMBv1, RC4 or weak TLS alive,
+and an old domain controller blocks raising the functional level
+([AD-INF-003](AD-INF-003.md)). A DC on an unsupported version is one exploit away from
+domain compromise.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled** computer account whose `operatingSystem` value
+matches a version in ad-doctor's end-of-support table, when that date is on or before
+the day of the scan. The table holds the end of *extended* support:
+
+| `operatingSystem` contains | End of support |
+| --- | --- |
+| Windows 2000 / XP / Vista | 2010-07-13 / 2014-04-08 / 2017-04-11 |
+| Windows 7 / 8 / 8.1 | 2020-01-14 / 2016-01-12 / 2023-01-10 |
+| Windows 10 | 2025-10-14 |
+| Windows Server 2003 / 2008 (and R2) | 2015-07-14 / 2020-01-14 |
+| Windows Server 2012 (and R2) | 2023-10-10 |
+| Windows Server 2016 / 2019 | 2027-01-12 / 2029-01-09 |
+
+Versions not in the table (Windows 11, Windows Server 2022 and 2025, non-Windows hosts)
+are never reported. Domain controllers are recognised from `userAccountControl`
+(`SERVER_TRUST_ACCOUNT`). Each object is the account name and the reported version, for
+example `OLD2008$ (Windows Server 2008 R2 Standard)`.
+
+The check trusts what the computer last wrote to its own `operatingSystem` attribute;
+it does not connect to the hosts.
+"""
+
+false_positives = """
+- **Extended Security Updates.** Windows 10 is reported from 2025-10-14 and Windows
+  Server 2008/2012 from their end dates even when the host is enrolled in the paid ESU
+  program, which ad-doctor cannot see. Record enrolled hosts in an
+  [accepted-risk file](../ci.md#accepted-risks) with the ESU end date as the expiry.
+- **Long-term servicing editions.** Windows 10 Enterprise LTSC releases have their own,
+  later end dates but report `Windows 10` in `operatingSystem`; accept them the same way.
+- **Stale accounts.** A computer that was decommissioned but whose account is still
+  enabled is reported too. That is a real finding: disable or delete the account.
+"""
+
+remediation = """
+1. **List the hosts with their last logon**, to separate live systems from stale
+   accounts:
+
+    ```powershell
+    Get-ADComputer -Filter 'Enabled -eq $true' -Properties OperatingSystem, LastLogonDate |
+        Where-Object OperatingSystem -match 'Windows (XP|Vista|7|8|10)|Server (2003|2008|2012)' |
+        Select-Object Name, OperatingSystem, LastLogonDate
+    ```
+
+2. **Disable accounts of machines that no longer exist.**
+
+    ```powershell
+    Disable-ADAccount -Identity 'OLD2008$' -WhatIf
+    ```
+
+3. **Upgrade or replace live systems** with a supported version. For a domain
+   controller, promote a new DC on a supported version, move any FSMO roles to it, then
+   demote and remove the old one.
+4. **Isolate what cannot be upgraded yet**: put it in its own network segment, block
+   inbound SMB/RDP from user networks, keep administrators from logging on to it with
+   tier-0 accounts, and enrol it in Extended Security Updates where available.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-001"
+
+[[references]]
+title = "Microsoft Lifecycle: search product and services lifecycle information"
+url = "https://learn.microsoft.com/en-us/lifecycle/products/"
+kind = "vendor"
+
+[[references]]
+title = "Product Lifecycle FAQ: Extended Security Updates"
+url = "https://learn.microsoft.com/en-us/lifecycle/faq/extended-security-updates"
+kind = "vendor"
+
+[[references]]
+title = "Extended Security Updates (ESU) program for Windows 10"
+url = "https://learn.microsoft.com/en-us/windows/whats-new/extended-security-updates"
+kind = "vendor"

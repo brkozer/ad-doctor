@@ -1,0 +1,88 @@
+id = "AD-INV-001"
+summary = "The membership of a group declared in the invariants file differs from the declared list: someone was added to it, or a declared member is gone."
+severities = ["high"]
+severity_logic = """
+Always **high**. The groups people declare are almost always tier 0, and an unexpected
+member of one is either a mistake or an attacker's persistence.
+"""
+mitre = []
+data_sources = ["ldap"]
+attributes = ["member", "sAMAccountName"]
+related = ["AD-INV-002", "AD-PRIV-001", "AD-PRIV-003", "AD-PRIV-007"]
+since = "0.1.0"
+
+risk = """
+Adding an account to Domain Admins or another privileged group is the most common way
+to keep access after a compromise, and the most common quiet mistake ("temporarily" made
+admin for a migration). Generic checks report large or non-empty groups, but only the team
+knows that tier 0 should be exactly *these* people. Declaring it turns every unreviewed
+change into a finding on the next scan, and in CI into a failed job.
+"""
+
+detection = """
+Runs only with `--invariants FILE`, for each group under `[groups]`:
+
+```toml
+[groups]
+"Domain Admins" = ["Administrator", "adm_alice"]
+"Schema Admins" = []
+```
+
+- The group is found by name, ignoring case. For the privileged groups ad-doctor already
+  collects (Domain, Enterprise and Schema Admins, Administrators and the four operator
+  groups) it uses their transitive membership from that collection, which also includes
+  accounts made members through `primaryGroupID`. For any other group it expands nested
+  groups from the snapshot (cycles are cut).
+- Members are compared by `sAMAccountName`, ignoring case. Only user and computer accounts
+  count; nested groups are expanded, not compared.
+- Each difference is one object: `Domain Admins: unexpected svc_sql` or
+  `Domain Admins: missing adm_alice`.
+
+A declared group that does not exist in the snapshot reports every declared member as
+missing.
+"""
+
+false_positives = """
+- **Members from another domain or forest** (foreign security principals) are not
+  resolved to accounts and are left out of the comparison.
+- **Membership through `primaryGroupID`** is counted only for the privileged groups above;
+  for other declared groups it is missed. See [AD-PRIV-007](AD-PRIV-007.md).
+"""
+
+remediation = """
+1. **Find out who made the change and when** before reverting it. On a DC, group changes
+   are logged as events 4728/4732/4756 (member added) when auditing of security group
+   management is on:
+
+    ```powershell
+    Get-ADReplicationAttributeMetadata 'CN=Domain Admins,CN=Users,DC=corp,DC=example' `
+        -Server dc01 -ShowAllLinkedValues | Where-Object AttributeName -eq member |
+        Sort-Object LastOriginatingChangeTime -Descending |
+        Select-Object -First 10 AttributeValue, LastOriginatingChangeTime, IsLinkValue
+    ```
+
+2. **If the change was not intended, revert it** and treat the account as compromised
+   until you know otherwise:
+
+    ```powershell
+    Remove-ADGroupMember 'Domain Admins' -Members svc_sql -WhatIf
+    ```
+
+3. **If it was intended, change the invariants file** in a reviewed pull request, so the
+   decision is recorded.
+
+4. **Run the check in CI** so the next drift fails the build; see
+   [Invariants](../invariants.md) and [CI integration](../ci.md).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --invariants invariants.toml --only AD-INV-001"
+
+[[references]]
+title = "Appendix B: Privileged accounts and groups in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-b--privileged-accounts-and-groups-in-active-directory"
+kind = "vendor"
+
+[[references]]
+title = "Monitoring Active Directory for signs of compromise"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/monitoring-active-directory-for-signs-of-compromise"
+kind = "vendor"

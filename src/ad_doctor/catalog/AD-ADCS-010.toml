@@ -1,0 +1,107 @@
+id = "AD-ADCS-010"
+aliases = ["esc8"]
+summary = "AD CS web enrollment (/certsrv/) accepts NTLM or Negotiate over plain HTTP, so relayed NTLM authentication from a DC yields a certificate for that DC."
+severities = ["high"]
+severity_logic = """
+Always **high**: with any coercion primitive the endpoint turns a domain user into a DC.
+When the Print Spooler also runs on a DC, the pair is reported by
+[AD-CHAIN-003](AD-CHAIN-003.md).
+"""
+mitre = ["T1649", "T1557.001"]
+data_sources = ["probe-http", "ldap"]
+attributes = [
+    "dNSHostName (on pKIEnrollmentService)",
+    "HTTP GET /certsrv/: status and WWW-Authenticate",
+]
+related = ["AD-CHAIN-003", "AD-INF-009", "AD-ADCS-014", "AD-CHAIN-001"]
+since = "0.1.0"
+
+risk = """
+The *Certification Authority Web Enrollment* role serves `/certsrv/` from IIS. Over plain
+HTTP, NTLM authentication has no channel to bind to, so an attacker can relay it:
+
+1. Coerce a domain controller into authenticating to the attacker's host, for example
+   with the Print Spooler (PrinterBug) or EFSRPC (PetitPotam).
+2. Relay the DC's NTLM authentication to `http://<ca>/certsrv/` and request a certificate
+   from the *DomainController* (or *Machine*) template as the DC's computer account.
+3. Use the certificate for PKINIT, obtain the DC's TGT and NT hash, and run DCSync.
+
+Any domain user can do this, and with some coercion methods no account at all. Requiring
+HTTPS with Extended Protection for Authentication (EPA) binds the authentication to the
+TLS channel and breaks the relay.
+"""
+
+detection = """
+For each enterprise CA found in LDAP (`dNSHostName` of each `pKIEnrollmentService`),
+ad-doctor sends an unauthenticated `GET /certsrv/` over plain HTTP to the port given by
+`--http-port` (default 80). The CA is reported when the server answers **401** and the
+`WWW-Authenticate` headers offer `NTLM` or `Negotiate` (which falls back to NTLM). A
+refused connection means no web enrollment; any other error is noted in the report as
+not probed rather than clean.
+
+The probe sends no credentials and does not request a certificate. Each object is the
+endpoint URL, for example `http://ca01.corp.example/certsrv/`. It runs unless
+`--no-probes` is given or `--http-port 0` is set.
+"""
+
+false_positives = """
+- **Not covered**: HTTPS endpoints without EPA, which are also relayable, and the
+  Certificate Enrollment Web Service (`/<CA>_CES_Kerberos/service.svc` and its
+  siblings). ad-doctor probes only `/certsrv/` over HTTP.
+- **Negotiate restricted to Kerberos.** If IIS offers `Negotiate` but NTLM is disabled
+  for the site, the relay fails; ad-doctor cannot tell from the header alone. Confirm
+  with the read-only commands below.
+"""
+
+remediation = """
+Follow KB5005413; apply **at least one** of these, in order of preference:
+
+1. **Remove web enrollment** if nobody uses it (run on the CA):
+
+    ```powershell
+    Uninstall-WindowsFeature ADCS-Web-Enrollment -WhatIf
+    ```
+
+2. **Require HTTPS and Extended Protection** on the CertSrv application. Read the current
+   settings first:
+
+    ```powershell
+    Import-Module WebAdministration
+    Get-WebConfigurationProperty -PSPath 'IIS:\\' -Location 'Default Web Site/CertSrv' `
+        -Filter 'system.webServer/security/access' -Name sslFlags
+    Get-WebConfigurationProperty -PSPath 'IIS:\\' -Location 'Default Web Site/CertSrv' `
+        -Filter 'system.webServer/security/authentication/windowsAuthentication/extendedProtection' `
+        -Name tokenChecking
+    ```
+
+    Then, after review, set `sslFlags` to `Ssl` and `tokenChecking` to `Require`, remove
+    the HTTP binding if nothing else needs it, and restart IIS.
+
+3. **Disable NTLM** for the site (Windows Authentication providers: Negotiate:Kerberos
+   only), or block incoming NTLM on the CA server by policy.
+
+4. **Reduce coercion**: disable the Print Spooler on DCs ([AD-INF-009](AD-INF-009.md)).
+   This narrows, but does not close, the relay path.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-010"
+
+[[references]]
+title = "KB5005413: Mitigating NTLM relay attacks on Active Directory Certificate Services (AD CS)"
+url = "https://support.microsoft.com/en-us/servicing/os/windows-server/2021/07/kb5005413-mitigating-ntlm-relay-attacks-on-active-directory-certificate-services-ad-cs"
+kind = "vendor"
+
+[[references]]
+title = "Certified Pre-Owned: Abusing Active Directory Certificate Services (whitepaper, ESC8)"
+url = "https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf"
+kind = "research"
+
+[[references]]
+title = "Defender for Identity: Edit insecure ADCS certificate enrollment IIS endpoints (ESC8)"
+url = "https://learn.microsoft.com/en-us/defender-for-identity/security-posture-assessments/certificates"
+kind = "vendor"
+
+[[references]]
+title = "Certipy wiki: Privilege escalation (ESC8)"
+url = "https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation"
+kind = "tool"

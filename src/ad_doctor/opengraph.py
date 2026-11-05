@@ -37,12 +37,27 @@ EDGE_KINDS = {
     "enroll (ESC1-3)": "EnrollExploitableTemplate",
     "write template (ESC4)": "WriteTemplate",
     "read gMSA password": "ReadGMSAPassword",
+    "ManageCA (ESC7)": "ManageCA",
+    "ManageCertificates (ESC7)": "ManageCertificates",
+    "admin to": "AdminTo",
+    "backup operator on": "LocalBackupOperator",
+    "Hyper-V admin on": "HyperVAdmin",
+    "hosts sync account": "HostsSyncAccount",
+    "can RDP": "CanRDP",
+    "can PSRemote": "CanPSRemote",
+    "DCOM": "ExecuteDCOM",
 }
 INHERITED = " (inherited)"
+VIA_GPO = " via GPO "
 
 
 def edge_kinds(label: str) -> list[tuple[str, bool]]:
     """(edge kind, inherited) for each right in a path label such as 'a, b (inherited)'."""
+    if VIA_GPO in label:
+        # the GPO's name goes into the edge properties, never into the kind
+        right = label.split(VIA_GPO, 1)[0]
+        kind = "MemberOfViaGPO" if right == "member of" else EDGE_KINDS.get(right, "Controls")
+        return [(PREFIX + kind, False)]
     inherited = label.endswith(INHERITED)
     label = label.removesuffix(INHERITED)
     if label.startswith("linked to "):
@@ -91,20 +106,24 @@ def export(snap: Snapshot, paths_only: bool = False, g: Graph | None = None) -> 
             nodes[nid] = {"id": nid, "kinds": [PREFIX + kind], "properties": props}
         return nid
 
-    for src in sorted(g.edges):
-        for dst, label in g.edges[src]:
-            if keep is not None and (src not in keep or dst not in keep):
-                continue
-            start, end = add_node(src), add_node(dst)
-            for kind, inherited in edge_kinds(label):
-                edges.append(
-                    {
-                        "kind": kind,
-                        "start": {"value": start, "match_by": "id"},
-                        "end": {"value": end, "match_by": "id"},
-                        "properties": {"label": label, "inherited": inherited},
-                    }
-                )
+    for traversable, graph_edges in ((True, g.edges), (False, g.logon_edges)):
+        for src in sorted(graph_edges):
+            for dst, label in graph_edges[src]:
+                # a logon edge is kept when it ends on a kept node
+                if keep is not None and (dst not in keep or (traversable and src not in keep)):
+                    continue
+                start, end = add_node(src), add_node(dst)
+                extra = g.edge_props.get((src, dst, label), {})
+                for kind, inherited in edge_kinds(label):
+                    props = {"label": label, "inherited": inherited, "traversable": traversable}
+                    edges.append(
+                        {
+                            "kind": kind,
+                            "start": {"value": start, "match_by": "id"},
+                            "end": {"value": end, "match_by": "id"},
+                            "properties": {**props, **extra},
+                        }
+                    )
     for node in g.tier0:  # tier-0 nodes appear even when nothing points at them
         add_node(node)
     return {

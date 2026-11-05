@@ -1,0 +1,98 @@
+id = "AD-PRIV-003"
+summary = "Schema Admins or Enterprise Admins have standing members, although both groups should stay empty except while a forest-level change is being made."
+severities = ["low"]
+severity_logic = """
+Always **low**. The members are already tier 0 through other groups in most domains;
+the finding is about standing forest-wide rights that nobody needs day to day.
+"""
+mitre = ["T1078.002"]
+data_sources = ["ldap"]
+attributes = [
+    "memberOf (transitive) of Schema Admins (RID 518) and Enterprise Admins (RID 519)",
+    "primaryGroupID",
+]
+related = ["AD-PRIV-001", "AD-PRIV-007", "AD-PRIV-010"]
+since = "0.1.0"
+
+risk = """
+**Enterprise Admins** are administrators of every domain in the forest and of the
+configuration partition, which holds the PKI, sites and the forest-wide settings.
+**Schema Admins** can change the schema, which is replicated to every domain controller
+and cannot be undone. A compromised member of either group is a forest compromise, not
+only a domain compromise: the attacker can reach child domains that the domain admins
+of those domains believed were separate.
+
+Both groups are needed only for rare, planned operations (adding a domain, extending
+the schema for a product). Membership that stays in place between those operations
+only adds exposure.
+"""
+
+detection = """
+ad-doctor resolves both groups by SID (`<domain SID>-518` and `-519`) and collects
+their **transitive** user and computer members, plus accounts whose `primaryGroupID`
+is 518 or 519. Each member is reported as `group: account`, for example
+`Enterprise Admins: Administrator` and `Schema Admins: Administrator`.
+
+Both groups exist only in the forest root domain. When ad-doctor scans a child domain
+the groups are not found there and the check stays silent; scan the forest root to
+cover them.
+"""
+
+false_positives = """
+- **The built-in Administrator of the forest root** is a member of both groups by
+  default, so a new forest is reported. Microsoft's guidance allows it to stay in
+  Enterprise Admins only when it is secured as described in Appendix D (long random
+  password, sensitive and cannot be delegated, logon restrictions). If you keep it,
+  accept that single finding object in an [accepted-risk file](../ci.md#accepted-risks)
+  with an owner and an expiry date.
+- **A change in progress**: membership during a planned schema update or domain
+  promotion is expected. Remove it when the change is done.
+"""
+
+remediation = """
+1. **See who is in the groups.**
+
+    ```powershell
+    Get-ADGroupMember 'Enterprise Admins' -Recursive | Select-Object SamAccountName, objectClass
+    Get-ADGroupMember 'Schema Admins' -Recursive | Select-Object SamAccountName, objectClass
+    ```
+
+2. **Remove the standing members.**
+
+    ```powershell
+    Remove-ADGroupMember 'Schema Admins' -Members Administrator -WhatIf
+    Remove-ADGroupMember 'Enterprise Admins' -Members adm_alice -WhatIf
+    ```
+
+3. **Add members only for the change, with an expiry.** With the Privileged Access
+   Management optional feature (forest functional level Windows Server 2016 or later),
+   a membership can carry a time to live and disappears on its own. Enabling the
+   feature cannot be undone, so review it first:
+
+    ```powershell
+    Enable-ADOptionalFeature 'Privileged Access Management Feature' `
+        -Scope ForestOrConfigurationSet -Target corp.example -WhatIf
+    Add-ADGroupMember 'Schema Admins' -Members adm_alice `
+        -MemberTimeToLive (New-TimeSpan -Hours 2) -WhatIf
+    ```
+
+4. **Alert on changes**: both are universal groups, so an addition raises event 4756 on
+   the domain controller that made it (with *Audit Security Group Management* enabled).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-003"
+
+[[references]]
+title = "Appendix E: Securing Enterprise Admins groups in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-e--securing-enterprise-admins-groups-in-active-directory"
+kind = "vendor"
+
+[[references]]
+title = "Appendix B: Privileged accounts and groups in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-b--privileged-accounts-and-groups-in-active-directory"
+kind = "vendor"
+
+[[references]]
+title = "Appendix D: Securing built-in Administrator accounts in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-d--securing-built-in-administrator-accounts-in-active-directory"
+kind = "vendor"

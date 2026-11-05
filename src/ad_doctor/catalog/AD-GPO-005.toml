@@ -1,0 +1,91 @@
+id = "AD-GPO-005"
+aliases = []
+summary = "Group Policy makes a broad group (Domain Users, Authenticated Users, and the like) a local administrator of the computers a GPO reaches."
+severities = ["high"]
+severity_logic = """
+Always **high**: one phished member of a broad group becomes administrator of every computer
+the GPO applies to. When any of those computers is a tier-0 server, the finding names them, and
+[AD-GPO-006](AD-GPO-006.md) covers the same grant from the tier-0 angle.
+"""
+mitre = ["T1078.002", "T1021.002"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "GptTmpl.inf [Group Membership] (Restricted Groups)",
+    "Machine\\Preferences\\Groups\\Groups.xml (GPP Local Users and Groups)",
+    "gPLink, gPOptions, GPO flags, versionNumber, gPCMachineExtensionNames",
+    "nTSecurityDescriptor of each GPO (security filtering)",
+]
+related = ["AD-GPO-006", "AD-GPO-007", "AD-PATH-001", "AD-SEC-001"]
+since = "unreleased"
+
+risk = """
+Group Policy can set local group membership two ways: **Restricted Groups** (a security
+template in `GptTmpl.inf`) and **Group Policy Preferences > Local Users and Groups**. When
+either adds a broad group such as Domain Users, Authenticated Users, Everyone or Domain
+Computers to the local **Administrators** group (or Backup Operators or Hyper-V Administrators,
+which are administrator-equivalent), every account in that broad group gains local admin on all
+the computers the GPO reaches.
+
+That turns any single compromised user into an administrator of a whole swathe of machines,
+from which they can dump credentials, move laterally and escalate. It is one of the most common
+ways a flat local-admin footprint is created by accident.
+"""
+
+detection = """
+ad-doctor parses Restricted Groups and GPP Local Groups from SYSVOL, resolves the member and
+group names to SIDs, and works out which computers each entry reaches with a pure scope engine:
+it follows the GPO links on the domain, OUs and sites, honours Block Inheritance, Enforced and
+disabled links, skips GPOs Windows would not apply (computer side disabled, computer version 0,
+or the required client-side extension missing), and applies security filtering (Read plus the
+Apply Group Policy right for any SID in the computer's token). It then reports entries whose
+*member* is a broad group and whose *group* is an administrator-equivalent local group.
+
+Each object is one GPO, member and group, with up to five of the computers reached and any
+caveats, for example `LabLocalAdmins: Domain Users -> Administrators on WS01$, WS02$`. A GPP
+item with item-level targeting is listed for every computer the GPO reaches, with the caveat
+`item-level targeting not evaluated`. NT AUTHORITY\\INTERACTIVE counts as a broad group here:
+in a local group it covers everyone who logs on at the console or over RDP.
+"""
+
+false_positives = """
+- **Over-reporting by design.** The offline scope engine assumes WMI filters match, treats items
+  with item-level targeting as applying (with a caveat), ignores Deny ACEs on GPO permissions, and, with more
+  than one site, assumes every site's links apply. It can therefore name a computer a GPO does
+  not actually reach. Confirm with `gpresult` on a sample host.
+- **Intended broad local admin** (a lab or a kiosk fleet) is still worth flagging; accept it
+  with an owner and expiry if it is deliberate.
+"""
+
+remediation = """
+1. **Find the entry** named in the finding: in GPMC, edit the GPO and look under
+   *Computer Configuration > Policies > Windows Settings > Security Settings > Restricted Groups*
+   and *Preferences > Control Panel Settings > Local Users and Groups*.
+
+2. **Remove the broad group** from the administrator-equivalent local group, or unlink the GPO
+   from the OU if the whole policy is wrong (`Remove-GPLink`).
+
+3. **Grant local admin per tier** through a dedicated, scoped group, and manage the built-in
+   local administrator password with Windows LAPS instead of a shared membership.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-005"
+
+[[references]]
+title = "Implementing Least-Privilege Administrative Models"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/implementing-least-privilege-administrative-models"
+kind = "vendor"
+
+[[references]]
+title = "Windows LAPS overview"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/laps/laps-overview"
+kind = "vendor"
+
+[[references]]
+title = "Group Policy Preferences (Local Users and Groups)"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2012-r2-and-2012/dn581922(v=ws.11)"
+kind = "vendor"
+
+[[references]]
+title = "BloodHound: AdminTo edge"
+url = "https://bloodhound.specterops.io/resources/edges/admin-to"
+kind = "tool"

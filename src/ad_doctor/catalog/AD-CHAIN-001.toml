@@ -1,0 +1,114 @@
+id = "AD-CHAIN-001"
+aliases = ["relay-rbcd"]
+summary = "DCs accept relayed NTLM on LDAP or LDAPS and any user can create computer accounts, so coerced server authentication becomes admin on that server through RBCD."
+severities = ["high"]
+severity_logic = """
+Always **high**: both halves are present, and public tools chain them in a few commands.
+Each half on its own is reported by its own check at a lower severity.
+"""
+mitre = ["T1557", "T1187", "T1134"]
+data_sources = ["derived"]
+attributes = [
+    "ms-DS-MachineAccountQuota",
+    "probe: unsigned NTLM bind on plain LDAP",
+    "probe: NTLM bind on LDAPS without channel binding",
+]
+related = ["AD-POL-002", "AD-INF-005", "AD-INF-010", "AD-DEL-003", "AD-INF-009"]
+since = "0.1.0"
+
+risk = """
+This is the relay-to-RBCD attack, and it needs nothing more than a domain user:
+
+1. The attacker makes a server authenticate to a host they control, with PetitPotam,
+   PrinterBug or a WebDAV path (coercion; usually over HTTP, since SMB-originated NTLM
+   asks for signing that LDAP would then enforce).
+2. They relay that NTLM authentication to LDAP on a DC that does not require signing
+   ([AD-INF-005](AD-INF-005.md)), or to LDAPS on a DC that does not enforce channel
+   binding ([AD-INF-010](AD-INF-010.md)).
+3. Acting as the server's computer account, they create a computer account of their own
+   (allowed by the quota, [AD-POL-002](AD-POL-002.md)) and write it into the server's
+   `msDS-AllowedToActOnBehalfOfOtherIdentity`, which a computer may set on itself.
+4. With S4U2Self and S4U2Proxy they get a service ticket to the server as any user, a
+   domain admin included, and are administrator on that server.
+
+Every server that can be coerced is a target; one that holds tier-0 credentials, or is a
+CA or an Entra Connect server, turns this into domain compromise.
+"""
+
+detection = """
+A compound finding, derived from results other checks already have. It fires when **both**
+hold:
+
+- `ms-DS-MachineAccountQuota` on the domain head is above 0, and
+- at least one DC failed a relay probe: it accepted an unsigned NTLM bind on plain LDAP
+  (*LDAP signing not required*), or accepted an NTLM bind on LDAPS without channel binding
+  (*LDAPS channel binding not enforced*). One weak DC is enough.
+
+Both probes need a `DOMAIN\\user` account with a password (NTLM). The signing probe uses
+`--signing-probe-port` (0 skips it) and the channel binding probe is skipped with
+`--no-probes`; with neither result this check cannot fire. The object is the domain, and the
+detail names which relay target is open, for example `LDAP signing not required and LDAPS
+channel binding not enforced, and any user can create computer accounts` with object
+`corp.example`.
+
+ad-doctor does not try a relay and does not check whether coercion works; any server
+running the Print Spooler or EFSRPC, or the WebClient service, is usually coercible.
+"""
+
+false_positives = """
+- **The quota is in effect 0** because nobody holds *Add workstations to domain*. The
+  relay half is still exploitable with an account that already has an SPN, so fix the
+  relay side rather than accepting this.
+"""
+
+remediation = """
+Fixing **either** side breaks this chain; fix both:
+
+1. **Require LDAP signing** on every DC: in the Default Domain Controllers Policy set
+   *Domain controller: LDAP server signing requirements* to *Require signing*. Check first
+   which clients still bind unsigned (Directory Service event 2889 after raising the
+   diagnostic level), as [AD-INF-005](AD-INF-005.md) describes.
+
+2. **Enforce LDAPS channel binding** on every DC (`LdapEnforceChannelBinding = 2`, or the
+   *Domain controller: LDAP server channel binding token requirements* policy set to
+   *Always*). Read the current value first:
+
+    ```powershell
+    Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NTDS\\Parameters' -Name LdapEnforceChannelBinding
+    ```
+
+3. **Set the machine account quota to 0** and give domain join to a dedicated group:
+
+    ```powershell
+    Set-ADDomain -Identity corp.example -Replace @{'ms-DS-MachineAccountQuota' = 0} -WhatIf
+    ```
+
+4. **Reduce coercion**: disable the Print Spooler on servers that do not print and the
+   WebClient service where WebDAV is not needed, and patch for PetitPotam.
+
+5. **Look for earlier abuse**: computers with `msDS-AllowedToActOnBehalfOfOtherIdentity`
+   set ([AD-DEL-003](AD-DEL-003.md)) and computers created by ordinary users
+   (`ms-DS-CreatorSID`).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-CHAIN-001"
+
+[[references]]
+title = "Wagging the Dog: Abusing resource-based constrained delegation (Elad Shamir)"
+url = "https://shenaniganslabs.io/2019/01/28/Wagging-the-Dog.html"
+kind = "research"
+
+[[references]]
+title = "The worst of both worlds: combining NTLM relaying and Kerberos delegation (Dirk-jan Mollema)"
+url = "https://dirkjanm.io/worst-of-both-worlds-ntlm-relaying-and-kerberos-delegation/"
+kind = "research"
+
+[[references]]
+title = "How to enable LDAP signing in Windows Server"
+url = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/enable-ldap-signing-in-windows-server"
+kind = "vendor"
+
+[[references]]
+title = "KB4520412: LDAP channel binding and LDAP signing requirements for Windows"
+url = "https://support.microsoft.com/en-us/servicing/os/windows/2020/02/2020-2023-and-2024-ldap-channel-binding-and-ldap-signing-requirements-for-windows-kb4520412"
+kind = "vendor"

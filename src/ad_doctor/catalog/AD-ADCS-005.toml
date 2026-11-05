@@ -1,0 +1,99 @@
+id = "AD-ADCS-005"
+aliases = ["esc5"]
+summary = "Principals outside tier 0 control a PKI object in the configuration partition (NTAuthCertificates, a template or CA container, or a CA object)."
+severities = ["high"]
+severity_logic = "Always **high**: control over these objects lets the holder add a trusted CA or a vulnerable template."
+mitre = ["T1649"]
+data_sources = ["ldap"]
+attributes = [
+    "nTSecurityDescriptor of CN=NTAuthCertificates",
+    "nTSecurityDescriptor of CN=Certificate Templates",
+    "nTSecurityDescriptor of CN=Enrollment Services",
+    "nTSecurityDescriptor of each pKIEnrollmentService (CA) object",
+]
+related = ["AD-ADCS-004", "AD-ADCS-013", "AD-PRIV-009", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+Active Directory's PKI configuration lives under
+`CN=Public Key Services,CN=Services,CN=Configuration`, and these objects decide which
+certificates the forest trusts for logon:
+
+- **NTAuthCertificates** lists the CAs whose certificates domain controllers accept for
+  Kerberos (PKINIT) and smart card logon. Whoever can write it can add a CA they run
+  themselves and then mint a logon certificate for any account.
+- **Certificate Templates** container: control over it lets the holder create a new
+  template, or take over existing ones through inheritance, and build an ESC1 template.
+- **Enrollment Services** container and each **CA object** (`pKIEnrollmentService`):
+  writing a CA object's `certificateTemplates` publishes any template on that CA, and the
+  container controls which CAs exist.
+
+Because these objects sit in the configuration partition, they are forest-wide and are
+often missed by audits that only look at the domain partition.
+"""
+
+detection = """
+ad-doctor reads the DACL of `CN=NTAuthCertificates`, `CN=Certificate Templates`,
+`CN=Enrollment Services` and every `pKIEnrollmentService` object over LDAP, and reports
+each principal that holds `GenericAll`, `GenericWrite`, `WriteDacl`, `WriteOwner`, or
+`WriteProperty` on all attributes, unless it is:
+
+- tier 0 (Domain Admins, Enterprise Admins, Administrators, SYSTEM, domain controllers
+  and the other built-in tier-0 principals), or
+- **Cert Publishers**, which CA servers are members of and which manages these objects by
+  design, or
+- on a CA object, that CA server's own computer account.
+
+Each object names the PKI object and the principals, for example
+`NTAuthCertificates (helpdesk)` or `CA adlab-CA (svc_pki)`.
+"""
+
+false_positives = """
+- **Not covered**: the `CN=Public Key Services` container itself, the AIA, CDP and OID
+  containers, the CA server's computer object and the CA's local administrators. Control
+  of the CA host is ESC7-equivalent; see [AD-ADCS-013](AD-ADCS-013.md).
+- **Cert Publishers members** are trusted here; unexpected members of that group are
+  reported by [AD-PRIV-009](AD-PRIV-009.md).
+- **A dedicated PKI admin group** may hold these rights on purpose. Treat it as tier 0
+  rather than accepting the finding repeatedly.
+"""
+
+remediation = """
+1. **List the grants** on the reported object (read-only):
+
+    ```powershell
+    $cfg = (Get-ADRootDSE).configurationNamingContext
+    $dn  = "CN=NTAuthCertificates,CN=Public Key Services,CN=Services,$cfg"
+    (Get-Acl "AD:$dn").Access |
+        Where-Object ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner|WriteProperty' |
+        Select-Object IdentityReference, ActiveDirectoryRights, IsInherited
+    ```
+
+2. **Remove the write rights** for the reported principals. `dsacls` has no dry run, so
+   review the output of step 1 first:
+
+    ```console
+    dsacls "CN=NTAuthCertificates,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=example" /R "CORP\\helpdesk"
+    ```
+
+3. **Check what the principal may already have done**: compare the CA certificates in
+   NTAuth with the CAs you run (`certutil -viewstore -enterprise NTAuth`), and look for
+   templates or published templates you did not create.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-005"
+
+[[references]]
+title = "Certified Pre-Owned: Abusing Active Directory Certificate Services (whitepaper, ESC5)"
+url = "https://specterops.io/wp-content/uploads/sites/3/2022/06/Certified_Pre-Owned.pdf"
+kind = "research"
+
+[[references]]
+title = "certutil"
+url = "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/certutil"
+kind = "vendor"
+
+[[references]]
+title = "Locksmith: find and fix AD CS misconfigurations"
+url = "https://github.com/jakehildreth/Locksmith"
+kind = "tool"

@@ -1,0 +1,88 @@
+id = "AD-PRIV-005"
+summary = "Anonymous Logon or Everyone is a member of Pre-Windows 2000 Compatible Access, which lets unauthenticated sessions read users and groups."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. Nothing is taken over directly, but anonymous enumeration hands an
+outsider the user list for password spraying and the group structure for planning.
+"""
+mitre = ["T1087.002"]
+data_sources = ["ldap"]
+attributes = ["member of Pre-Windows 2000 Compatible Access (S-1-5-32-554)"]
+related = ["AD-INF-004", "AD-POL-001", "AD-ACC-004"]
+since = "0.1.0"
+
+risk = """
+*Pre-Windows 2000 Compatible Access* exists for Windows NT 4.0 era systems. Its members
+have read access to all users and groups in the domain, and the DC uses the group when
+deciding what an unauthenticated (null) session over SAMR and LSA may enumerate.
+
+When **Anonymous Logon** is a member, anyone who can reach a domain controller on the
+network, without any account, can list users, groups and memberships and read details
+such as the password policy. That user list is the input for password spraying
+against the lockout policy ([AD-POL-001](AD-POL-001.md)).
+
+**Everyone** includes anonymous sessions only when the policy *Network access: Let
+Everyone permissions apply to anonymous users* is enabled, but a domain promoted with
+pre-Windows 2000 compatible permissions usually has both.
+"""
+
+detection = """
+ad-doctor reads the `member` attribute of the builtin group with SID `S-1-5-32-554` and
+looks for the foreign security principals `CN=S-1-5-7` (Anonymous Logon) and
+`CN=S-1-1-0` (Everyone). Only direct membership is checked. The objects are
+`Anonymous Logon` and/or `Everyone`.
+
+*Authenticated Users* (`S-1-5-11`), the default member in a domain created with
+Windows 2000-and-later permissions, is not reported.
+"""
+
+false_positives = """
+- **Genuine NT 4.0-era dependencies** (very old appliances or applications that query
+  the domain anonymously) are the only reason to keep the membership. Replace or
+  reconfigure them to authenticate; until then, accept the finding in an
+  [accepted-risk file](../ci.md#accepted-risks) with an expiry date.
+"""
+
+remediation = """
+1. **See the current members.**
+
+    ```powershell
+    (Get-ADGroup 'Pre-Windows 2000 Compatible Access' -Properties member).member
+    ```
+
+2. **Remove Anonymous Logon and Everyone.** They are foreign security principals, so
+   remove them by DN:
+
+    ```powershell
+    $fsp = "CN=ForeignSecurityPrincipals,$((Get-ADDomain).DistinguishedName)"
+    Set-ADGroup 'Pre-Windows 2000 Compatible Access' `
+        -Remove @{member = "CN=S-1-5-7,$fsp", "CN=S-1-1-0,$fsp"} -WhatIf
+    ```
+
+3. **Keep Authenticated Users** in the group unless you have tested its removal: some
+   applications read group membership of other users through it.
+
+4. **Check the related anonymous-access settings**: *Network access: Let Everyone
+   permissions apply to anonymous users* should be disabled, and anonymous LDAP
+   operations should stay blocked through `dSHeuristics` ([AD-INF-004](AD-INF-004.md)).
+
+5. **Test** from a machine outside the domain that a null session can no longer list
+   users (for example with `rpcclient -U '' -N dc01.corp.example -c enumdomusers`).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-005"
+
+[[references]]
+title = "Active Directory security groups: Pre-Windows 2000 Compatible Access"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-security-groups#prewindows-2000-compatible-access"
+kind = "vendor"
+
+[[references]]
+title = "Network access: Let Everyone permissions apply to anonymous users"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/network-access-let-everyone-permissions-apply-to-anonymous-users"
+kind = "vendor"
+
+[[references]]
+title = "ANSSI Active Directory checklist (vuln_compatible_2000_anonymous)"
+url = "https://cert.cyber.gouv.fr/uploads/ad_checklist.html"
+kind = "vendor"

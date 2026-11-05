@@ -1,0 +1,109 @@
+id = "AD-INF-006"
+aliases = ["sid-filtering"]
+summary = "A trust to another domain or forest lets SID history through or allows TGT delegation, so a compromise of the other side can be carried into this domain."
+severities = ["high"]
+severity_logic = """
+Always **high**: each reported trust turns a compromise of the other domain or forest
+into a compromise of this one.
+"""
+mitre = ["T1134.005", "T1482"]
+data_sources = ["ldap"]
+attributes = ["trustPartner", "trustDirection", "trustType", "trustAttributes"]
+related = ["AD-ACC-007", "AD-INF-009", "AD-DEL-001"]
+since = "0.1.0"
+
+risk = """
+A trust is only as safe as the domain on the other side. Two settings decide whether an
+attacker who controls that domain can step into this one:
+
+- **SID filtering.** When this domain trusts another one, the domain controllers filter
+  the SIDs in tickets coming from it. With filtering off on an external trust, or with
+  SID history enabled on a forest trust, an attacker who owns the trusted domain forges
+  a ticket whose SID history contains the SID of a privileged group in this domain and
+  is treated as a member of it. Forest trusts with SID history still drop RIDs below
+  1000, so the targets there are custom admin groups and accounts with rights over
+  tier 0.
+- **TGT delegation across a forest trust.** With delegation enabled, users of one forest
+  who authenticate to a host with unconstrained delegation in the other forest leave
+  their TGT there. An attacker who owns such a host in the trusted forest, and coerces a
+  domain controller of this forest to authenticate to it (PrinterBug, PetitPotam), gets
+  the DC's TGT and can DCSync this domain. This is why Microsoft disabled TGT
+  delegation across forest trusts by default in 2019.
+"""
+
+detection = """
+ad-doctor reads the `trustedDomain` objects under `CN=System` and evaluates
+`trustAttributes` and `trustDirection` for every trust that leaves the forest (trusts
+with `TRUST_ATTRIBUTE_WITHIN_FOREST`, 0x20, are skipped):
+
+| Trust | Reported when |
+| --- | --- |
+| External, outbound or two-way | `TRUST_ATTRIBUTE_QUARANTINED_DOMAIN` (0x4) **not** set: SID filtering disabled |
+| Forest, outbound or two-way | `TRUST_ATTRIBUTE_TREAT_AS_EXTERNAL` (0x40) set: SID history enabled |
+| Forest, inbound or two-way | `TRUST_ATTRIBUTE_CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION` (0x800) set |
+
+Each object is the partner name with the reason, for example
+`partner.example (external, SID filtering disabled)`.
+"""
+
+false_positives = """
+- **Migrations in progress.** SID history is sometimes enabled on purpose while users
+  are moved from one forest to another. Accept the finding with the planned end of the
+  migration as the expiry ([accepted risks](../ci.md#accepted-risks)), and disable it
+  when the migration is over.
+- **Both sides under the same administrators.** If the other domain is run by the same
+  tier-0 team with the same controls, the trust adds less risk; it is still a path an
+  auditor will want documented.
+"""
+
+remediation = """
+1. **Review every trust that leaves the forest.**
+
+    ```powershell
+    Get-ADTrust -Filter * | Select-Object Name, Direction, ForestTransitive,
+        SIDFilteringQuarantined, SIDFilteringForestAware, TGTDelegation
+    ```
+
+2. **Remove trusts nothing uses any more.** That is the strongest fix.
+3. **Re-enable SID filtering.** `netdom trust` has no dry-run mode; run each option
+   without a value first, which only displays the current state:
+
+    ```
+    netdom trust corp.example /domain:partner.example /quarantine
+    netdom trust corp.example /domain:partner.example /quarantine:yes
+    netdom trust corp.example /domain:partner.example /enablesidhistory:no
+    ```
+
+   Use `/quarantine` on external trusts and `/enablesidhistory:no` on forest trusts.
+4. **Disable TGT delegation across forest trusts**:
+
+    ```
+    netdom trust corp.example /domain:partner.example /enabletgtdelegation:no
+    ```
+
+5. Remove unconstrained delegation on both sides of the trust
+   ([AD-DEL-001](AD-DEL-001.md)) and stop the spooler on DCs
+   ([AD-INF-009](AD-INF-009.md)), which removes the coercion half of the TGT attack.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-006"
+
+[[references]]
+title = "[MS-ADTS]: trustAttributes"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/e9a2d23c-c31e-4a6f-88a0-6646fdb51a3c"
+kind = "spec"
+
+[[references]]
+title = "Netdom trust"
+url = "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/netdom-trust"
+kind = "vendor"
+
+[[references]]
+title = "Active Directory forest trusts part 1: how does SID filtering work? (Dirk-jan Mollema)"
+url = "https://dirkjanm.io/active-directory-forest-trusts-part-one-how-does-sid-filtering-work/"
+kind = "research"
+
+[[references]]
+title = "Not a Security Boundary: Breaking Forest Trusts (SpecterOps)"
+url = "https://specterops.io/blog/2018/11/28/not-a-security-boundary-breaking-forest-trusts/"
+kind = "research"

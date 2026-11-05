@@ -1,0 +1,85 @@
+id = "AD-INV-004"
+summary = "A principal outside tier 0 and outside the declared list holds both replication rights on the domain, so it can DCSync every password hash."
+severities = ["high"]
+severity_logic = """
+Always **high**: DCSync rights are the domain's password database.
+"""
+mitre = []
+data_sources = ["ldap"]
+attributes = [
+    "nTSecurityDescriptor of the domain head",
+    "DS-Replication-Get-Changes",
+    "DS-Replication-Get-Changes-All",
+]
+related = ["AD-ACL-001", "AD-PRIV-011", "AD-ACL-008", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+Whoever holds *Replicating Directory Changes* and *Replicating Directory Changes All* on
+the domain can ask a DC to replicate secrets, and gets the NT hash of every account,
+`krbtgt` included (DCSync). Some products need it, such as the Entra Connect sync account,
+so [AD-ACL-001](AD-ACL-001.md) cannot know which holders are expected. The invariants file
+lists them, so any new holder, typically an attacker's persistence ACE, fails the scan.
+"""
+
+detection = """
+Runs only with `--invariants FILE` that has a `[dcsync]` section:
+
+```toml
+[dcsync]
+allowed = ["MSOL_0123456789ab"]
+```
+
+ad-doctor reads the DACL of the domain head and takes every SID that holds **both**
+`DS-Replication-Get-Changes` (`1131f6aa-...`) and `DS-Replication-Get-Changes-All`
+(`1131f6ad-...`). Tier-0 SIDs (domain controllers, Enterprise Domain Controllers,
+Administrators, Domain and Enterprise Admins and the other built-in tier-0 principals) are
+dropped; the rest are resolved to names and compared, ignoring case, with `allowed`.
+
+Each undeclared holder is one object, for example `svc_sync`.
+"""
+
+false_positives = """
+- **A new sync or backup product** that needs replication rights: add its account to
+  `allowed` through review, and treat its server as tier 0 ([AD-PRIV-011](AD-PRIV-011.md)).
+- **Holders through a group** are reported under the group's name; declare the group, not
+  its members.
+"""
+
+remediation = """
+1. **List who holds the rights** on the domain:
+
+    ```powershell
+    $domain = (Get-ADDomain).DistinguishedName
+    (Get-Acl "AD:$domain").Access |
+        Where-Object { $_.ObjectType -in '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2',
+                                          '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' } |
+        Format-Table IdentityReference, ObjectType, AccessControlType, IsInherited -AutoSize
+    ```
+
+2. **If a holder is not expected, treat it as a compromise**: an attacker who could add the
+   ACE had high privileges. Remove the ACE after review, then reset the `krbtgt` password
+   twice and the passwords of the other privileged accounts:
+
+    ```powershell
+    # dsacls "DC=corp,DC=example" /R "CORP\\svc_sync"
+    ```
+
+3. **If it is expected, add it to `allowed`** in a reviewed change to the invariants file;
+   see [Invariants](../invariants.md).
+
+4. **Alert on DCSync** from anything that is not a DC: event 4662 on DCs with the
+   replication GUIDs above.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --invariants invariants.toml --only AD-INV-004"
+
+[[references]]
+title = "DS-Replication-Get-Changes-All extended right"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/r-ds-replication-get-changes-all"
+kind = "spec"
+
+[[references]]
+title = "Event 4662: An operation was performed on an object"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4662"
+kind = "vendor"

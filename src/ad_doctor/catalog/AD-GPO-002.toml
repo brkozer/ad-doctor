@@ -1,0 +1,92 @@
+id = "AD-GPO-002"
+aliases = ["gplink"]
+summary = "A principal outside tier 0 can write gPLink on the domain or the Domain Controllers OU, so it can link a GPO it controls to every domain controller."
+severities = ["high"]
+severity_logic = """
+Always **high**: linking a GPO the attacker can edit to the domain head or the Domain
+Controllers OU runs their code as SYSTEM on the DCs.
+"""
+mitre = ["T1484.001"]
+data_sources = ["ldap"]
+attributes = [
+    "nTSecurityDescriptor of the domain head and OU=Domain Controllers (effective ACEs)",
+    "gPLink (f30e3bbe-9ff0-11d1-b603-0000f80367c1)",
+]
+related = ["AD-GPO-001", "AD-GPO-004", "AD-ACL-003", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+Which GPOs apply to a container is decided by its `gPLink` attribute. Whoever can write it
+does not need edit rights on an existing DC policy:
+
+1. They create a GPO (members of Group Policy Creator Owners can) or reuse one they can
+   already edit ([AD-GPO-004](AD-GPO-004.md)), and put an immediate scheduled task in it.
+2. They add that GPO to `gPLink` on the Domain Controllers OU or the domain head.
+3. At the next refresh every DC runs the task as SYSTEM.
+
+Synacktiv's OUned research goes further: with write access to `gPLink` alone, an attacker
+can point clients at a GPO hosted on a machine they control, without creating or editing
+any GPO in the domain. Delegating "Manage Group Policy links" on the domain or the DC OU is
+therefore as dangerous as granting edit rights on the DC policies.
+"""
+
+detection = """
+ad-doctor reads the effective ACEs of the domain head and of `OU=Domain Controllers` and
+reports every principal outside tier 0 that can write `gPLink`: WriteProperty on the
+`gPLink` attribute or on all attributes, GenericWrite, GenericAll, WriteDacl or WriteOwner.
+
+Tier 0 here includes the operator groups (Account, Server, Print and Backup Operators) as
+well as Administrators, Domain Admins, Enterprise Admins, Schema Admins, the DC groups, the
+built-in Administrator and SYSTEM. Each object names the container and the principal, for
+example `Domain Controllers OU: gpo_linker` or `domain: helpdesk`. A principal with full
+control of the domain object also appears in [AD-ACL-003](AD-ACL-003.md). The owner of the
+container is not evaluated here.
+"""
+
+false_positives = """
+- **A GPO admin group managed as tier 0** but not nested in a built-in tier-0 group. Accept
+  with an owner if deliberate (../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **List who can write gPLink** on the Domain Controllers OU (read-only; repeat for the
+   domain head):
+
+    ```powershell
+    $ou = "OU=Domain Controllers,$((Get-ADDomain).DistinguishedName)"
+    $gplink = [guid]'f30e3bbe-9ff0-11d1-b603-0000f80367c1'
+    (Get-Acl "AD:$ou").Access |
+        Where-Object { $_.AccessControlType -eq 'Allow' -and
+                       ($_.ObjectType -eq $gplink -or
+                        $_.ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner') } |
+        Format-Table IdentityReference, ActiveDirectoryRights, ObjectType, IsInherited -AutoSize
+    ```
+
+2. **Remove the delegation.** If it was granted with the Delegation of Control wizard or
+   GPMC's *Delegation* tab on the OU, remove it there; otherwise remove the ACE (review
+   first; `/R` removes every ACE for the trustee on that container):
+
+    ```powershell
+    # dsacls "OU=Domain Controllers,DC=corp,DC=example" /R "CORP\\gpo_linker"
+    ```
+
+3. **Review the current links** on both containers for GPOs you do not recognise:
+   `(Get-GPInheritance -Target $ou).GpoLinks`.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-002"
+
+[[references]]
+title = "BloodHound: WriteGPLink edge"
+url = "https://bloodhound.specterops.io/resources/edges/write-gp-link"
+kind = "tool"
+
+[[references]]
+title = "OUned.py: exploiting hidden Organizational Units ACL attack vectors in Active Directory (Synacktiv)"
+url = "https://www.synacktiv.com/publications/ounedpy-exploiting-hidden-organizational-units-acl-attack-vectors-in-active-directory"
+kind = "research"
+
+[[references]]
+title = "A Red Teamer's Guide to GPOs and OUs (Andy Robbins)"
+url = "https://wald0.com/?p=179"
+kind = "research"

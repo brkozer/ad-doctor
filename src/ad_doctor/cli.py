@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import __version__, accept, invariants, opengraph, paths, redact
+from . import __version__, accept, catalog, explain, invariants, opengraph, paths, redact
 from .checks import MITRE, REGISTRY, run_all
 from .collect import CollectError, Target, collect
 from .fixes import render_fixes
@@ -53,7 +53,23 @@ def _target(args: argparse.Namespace) -> Target:
         probes=not args.no_probes,
         kerberos=args.kerberos,
         all_dcs=not args.single_dc,
+        ca_registry=not args.no_ca_registry,
     )
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write a file only its owner can read: snapshots, reports and fix scripts describe
+    how to attack the domain they came from."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)  # the mode above applies only to a new file
+        out = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+    with out:
+        out.write(text)
 
 
 def _use_color(stream: Any) -> bool:
@@ -164,7 +180,7 @@ def cmd_blast_radius(args: argparse.Namespace) -> int:
 def cmd_export_graph(args: argparse.Namespace) -> int:
     snap = Snapshot.from_json(_load_json(args.snapshot))
     payload = opengraph.export(snap, paths_only=args.paths_only)
-    args.output.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    _write_private(args.output, json.dumps(payload, indent=1))
     graph = payload["graph"]
     print(f"wrote {args.output} ({len(graph['nodes'])} nodes, {len(graph['edges'])} edges)")
     return 0
@@ -179,8 +195,26 @@ def cmd_redact(args: argparse.Namespace) -> int:
         )
         return 1
     data = redact.redact(_load_json(args.snapshot), key.encode())
-    args.output.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _write_private(args.output, json.dumps(data, indent=2))
     print(f"wrote {args.output}")
+    return 0
+
+
+def _explain(query: str, fmt: str, web: bool) -> int:
+    entry = catalog.find(query)
+    if entry is None:
+        known = query.strip().upper() in explain.titles()
+        why = "has no catalog entry yet" if known else "is not a check ID or alias"
+        print(f"ad-doctor: {query!r} {why} (ad-doctor checks lists them)", file=sys.stderr)
+        return 1
+    if web:
+        import webbrowser
+
+        webbrowser.open(entry.url)
+        return 0
+    render = {"text": explain.render_text, "markdown": explain.render_markdown,
+              "json": explain.render_json}[fmt]  # fmt: skip
+    print(render(entry))
     return 0
 
 
@@ -207,7 +241,16 @@ def main(argv: list[str] | None = None) -> int:
             "--http-port", type=int, default=80, help="CA web enrollment port for ESC8 (0 to skip)"
         )
         p.add_argument(
-            "--no-probes", action="store_true", help="skip the SMB, channel binding and ESC8 probes"
+            "--no-probes",
+            action="store_true",
+            help="skip every probe: SMB, channel binding, ESC8 and the CA registry",
+        )
+        p.add_argument(
+            "--no-ca-registry",
+            action="store_true",
+            help="do not read CA settings (ESC6/7/11/16) over the winreg pipe; opening it "
+            "starts RemoteRegistry on the CA if it is stopped, and EDR or Defender for "
+            "Identity may alert on remote registry access",
         )
         p.add_argument(
             "--single-dc",
@@ -294,12 +337,26 @@ def main(argv: list[str] | None = None) -> int:
     p_checks = sub.add_parser("checks", help="list available checks")
     p_checks.add_argument("-f", "--format", choices=["text", "json"], default="text")
 
+    p_explain = sub.add_parser("explain", help="what a check looks for and how to fix it (offline)")
+    p_explain.add_argument("check", help="check ID or alias (AD-ADCS-001, esc1, kerberoasting)")
+    p_explain.add_argument("-f", "--format", choices=["text", "markdown", "json"], default="text")
+    p_explain.add_argument(
+        "--web", action="store_true", help="open the online page in a browser instead"
+    )
+
     args = parser.parse_args(argv)
 
+    if args.cmd == "explain":
+        return _explain(args.check, args.format, args.web)
+
     if args.cmd == "checks":
-        rows = [
-            {"id": c.id, "title": c.title, "mitre": list(MITRE.get(c.id, ()))} for c in REGISTRY
-        ]
+        rows: list[dict[str, Any]] = []
+        for c in REGISTRY:
+            row: dict[str, Any] = {"id": c.id, "title": c.title}
+            row["mitre"] = list(MITRE.get(c.id, ()))
+            if (e := catalog.get(c.id)) is not None:
+                row |= {"summary": e.summary, "url": e.url}
+            rows.append(row)
         if args.format == "json":
             print(json.dumps(rows, indent=2))
         else:
@@ -321,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             snap = collect(_target(args))
         if args.cmd == "collect":
-            args.output.write_text(json.dumps(snap.to_json(), indent=2), encoding="utf-8")
+            _write_private(args.output, json.dumps(snap.to_json(), indent=2))
             print(f"wrote {args.output} ({len(snap.accounts)} accounts)")
             return 0
 
@@ -338,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
                 c.id for c in REGISTRY if not args.only or c.id in {i.upper() for i in args.only}
             }
             if spec is not None:
-                ran |= {f"AD-INV-00{i}" for i in range(1, 6)}
+                ran |= set(invariants.IDS)
             report.findings, report.accepted, notes = accept.apply(findings, entries, today, ran)
             snap.notes.extend(notes)
         if args.baseline:
@@ -356,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.fixes:
-        args.fixes.write_text(render_fixes(report.findings, snap), encoding="utf-8")
+        _write_private(args.fixes, render_fixes(report.findings, snap))
     if args.format == "text":
         text = render_text(report, color=not args.output and _use_color(sys.stdout))
     elif args.format == "junit":
@@ -365,7 +422,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         text = RENDERERS[args.format](report)
     if args.output:
-        args.output.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+        _write_private(args.output, text if text.endswith("\n") else text + "\n")
     else:
         print(text)
 

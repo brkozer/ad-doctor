@@ -8,3 +8,6 @@ snapshot*.json
 AGENTS.md
 CLAUDE.md
 dist/
+docs/checks/
+docs/changelog.md
+site/

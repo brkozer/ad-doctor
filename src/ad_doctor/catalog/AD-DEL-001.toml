@@ -1,0 +1,103 @@
+id = "AD-DEL-001"
+aliases = ["unconstrained-delegation"]
+summary = "Enabled accounts other than domain controllers are trusted for unconstrained delegation, so they keep the TGT of everyone who authenticates to them."
+severities = ["high"]
+severity_logic = """
+Always **high**: one such host is enough. Coercing a domain controller to authenticate
+to it gives the attacker the DC's TGT, and with it the domain.
+"""
+mitre = ["T1558", "T1187"]
+data_sources = ["ldap"]
+attributes = ["userAccountControl"]
+related = [
+    "AD-CHAIN-002",
+    "AD-INF-009",
+    "AD-PRIV-002",
+    "AD-PRIV-010",
+    "AD-DEL-002",
+    "AD-DEL-003",
+]
+since = "0.1.0"
+
+risk = """
+An account with **Trust this computer for delegation to any service (Kerberos only)**
+receives a copy of the forwardable TGT of every user who authenticates to one of its
+services. The TGT sits in memory (LSASS) on that host, and whoever has local admin
+there can extract it and act as that user anywhere in the domain.
+
+The attacker does not have to wait for an admin to log on:
+
+1. They take over the delegating host (or, for a user account, its password).
+2. They force a domain controller to authenticate to it, for example through the Print
+   Spooler ([AD-INF-009](AD-INF-009.md)) or another RPC coercion method.
+3. The DC's own TGT arrives on the host; with it the attacker runs DCSync and has every
+   hash in the domain.
+
+[AD-CHAIN-002](AD-CHAIN-002.md) reports this combination when the scan also finds the
+Print Spooler running on a DC.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled** account (computer, user or managed service
+account) with the `TRUSTED_FOR_DELEGATION` bit (`0x80000`) in `userAccountControl`,
+except domain controllers and RODCs (accounts with `SERVER_TRUST_ACCOUNT`, `0x2000`, or
+`PARTIAL_SECRETS_ACCOUNT`, `0x4000000`), which need the flag. One finding lists the
+accounts by `sAMAccountName`, for example `APP01$`.
+"""
+
+false_positives = """
+- **None in the usual sense.** Some old applications were set up this way because it was
+  the easiest option. They almost always work with constrained or resource-based
+  delegation instead. If one truly cannot, isolate the host as tier 0 and record it in
+  an [accepted-risk file](../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **List the accounts** (read-only):
+
+    ```powershell
+    $f = '(&(userAccountControl:1.2.840.113556.1.4.803:=524288)' +
+         '(!(userAccountControl:1.2.840.113556.1.4.803:=8192))' +
+         '(!(userAccountControl:1.2.840.113556.1.4.803:=67108864)))'
+    Get-ADObject -LDAPFilter $f -Properties sAMAccountName |
+        Select-Object sAMAccountName, DistinguishedName
+    ```
+
+2. **Find out what the delegation is for.** Usually it is a web front end that passes
+   users through to a database or file share.
+
+3. **Replace it** with constrained delegation to the specific SPNs the service needs,
+   or with resource-based delegation configured on the back end, then remove the flag:
+
+    ```powershell
+    Set-ADAccountControl 'APP01$' -TrustedForDelegation $false -WhatIf
+    ```
+
+4. **Protect privileged accounts** so their TGTs are never delegated: set *Account is
+   sensitive and cannot be delegated* ([AD-PRIV-002](AD-PRIV-002.md)) or put them in
+   Protected Users ([AD-PRIV-010](AD-PRIV-010.md)).
+
+5. **Reduce coercion**: disable the Print Spooler on DCs ([AD-INF-009](AD-INF-009.md)).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-DEL-001"
+
+[[references]]
+title = "Kerberos constrained delegation overview"
+url = "https://learn.microsoft.com/en-us/windows-server/security/kerberos/kerberos-constrained-delegation-overview"
+kind = "vendor"
+
+[[references]]
+title = "Active Directory Security Risk #101: Kerberos Unconstrained Delegation (Sean Metcalf)"
+url = "https://adsecurity.org/?p=1667"
+kind = "research"
+
+[[references]]
+title = "Hunting in Active Directory: Unconstrained Delegation & Forests Trusts (SpecterOps)"
+url = "https://specterops.io/blog/2018/11/28/hunting-in-active-directory-unconstrained-delegation-forests-trusts/"
+kind = "research"
+
+[[references]]
+title = "The Hacker Recipes: Unconstrained delegation"
+url = "https://www.thehacker.recipes/ad/movement/kerberos/delegations/unconstrained"
+kind = "research"

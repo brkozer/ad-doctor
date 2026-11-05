@@ -1,0 +1,103 @@
+id = "AD-KRB-001"
+aliases = ["golden-ticket"]
+summary = "The krbtgt password is older than 180 days, so a stolen krbtgt key keeps forging valid Kerberos tickets (golden tickets) for that long."
+severities = ["high"]
+severity_logic = """
+Always **high**: the check fires only when the `krbtgt` password is more than 180 days
+old, and every forged ticket made with a key stolen in that window still works.
+"""
+mitre = ["T1558.001"]
+data_sources = ["ldap"]
+attributes = ["sAMAccountName", "pwdLastSet"]
+related = ["AD-ACL-001", "AD-ACC-011"]
+since = "0.1.0"
+
+risk = """
+Every Kerberos ticket-granting ticket (TGT) in the domain is encrypted and signed with
+a key derived from the `krbtgt` account's password. Anyone who has that key can create
+a TGT for any user, with any group memberships and any lifetime, without talking to a
+domain controller first: a **golden ticket**.
+
+The key leaks whenever the domain is compromised once: DCSync rights
+([AD-ACL-001](AD-ACL-001.md)), a copy of `ntds.dit` from a backup or a DC disk, or code
+execution on a DC. Resetting admin passwords afterwards does not help, because the
+forged tickets do not depend on them. Only changing the `krbtgt` password, **twice**,
+invalidates them, since the account keeps the previous password in its history and DCs
+still accept tickets made with it.
+
+A `krbtgt` password that has not changed for years means that any compromise in all
+those years may still be live.
+"""
+
+detection = """
+From the LDAP snapshot: the account whose `sAMAccountName` is `krbtgt`, and its
+`pwdLastSet`. ad-doctor compares that timestamp with the time the snapshot was taken
+and reports the account when the difference is more than **180 days**. The finding
+gives the age in days, for example:
+
+```text
+krbtgt password is 612 days old; forged tickets stay valid until it changes.
+```
+
+The object is always `krbtgt`. The per-RODC accounts (`krbtgt_12345`) are not
+examined. If `pwdLastSet` is not readable, the check stays silent.
+"""
+
+false_positives = """
+- **A reset that happened very recently** is not a false positive of the scan, but a
+  snapshot taken on another DC before replication finished can still show the old date.
+  Re-run the scan after replication.
+- A single reset clears the finding while the previous key is still in the account's
+  history. The check cannot tell whether you reset once or twice; follow the
+  remediation fully.
+"""
+
+remediation = """
+1. **Check the current age** (read-only):
+
+    ```powershell
+    Get-ADUser krbtgt -Properties PasswordLastSet | Select-Object Name, PasswordLastSet
+    ```
+
+2. **Reset the password once.** The value you type does not matter: the DC generates a
+   strong random password for `krbtgt` itself. Microsoft's `New-KrbtgtKeys.ps1` script
+   (see references) runs the same reset with replication checks and has a simulation
+   mode. With the AD module:
+
+    ```powershell
+    Set-ADAccountPassword krbtgt -Reset `
+        -NewPassword (Read-Host -AsSecureString 'any value') -WhatIf
+    ```
+
+3. **Wait** until the change has replicated to every DC and at least the maximum
+   ticket lifetime has passed (10 hours by default), so that no valid ticket still
+   depends on the old key.
+
+4. **Reset it a second time.** This pushes the compromised key out of the password
+   history, so tickets forged with it stop working.
+
+5. **Schedule it.** Rotate the `krbtgt` password at least every 180 days, and
+   immediately (twice, with the wait) after any suspected domain compromise.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-KRB-001"
+
+[[references]]
+title = "AD Forest Recovery: Reset the krbtgt password"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/forest-recovery-guide/ad-forest-recovery-reset-the-krbtgt-password"
+kind = "vendor"
+
+[[references]]
+title = "New-KrbtgtKeys.ps1 (Microsoft, archived)"
+url = "https://github.com/microsoftarchive/New-KrbtgtKeys.ps1"
+kind = "tool"
+
+[[references]]
+title = "Kerberos & KRBTGT: Active Directory's Domain Kerberos Service Account (Sean Metcalf)"
+url = "https://adsecurity.org/?p=483"
+kind = "research"
+
+[[references]]
+title = "Kerberos Golden Tickets are Now More Golden (Sean Metcalf)"
+url = "https://adsecurity.org/?p=1640"
+kind = "research"

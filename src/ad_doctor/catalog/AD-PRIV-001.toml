@@ -1,0 +1,108 @@
+id = "AD-PRIV-001"
+summary = "Tier-0 groups with more than five transitive members: every extra member is another account whose compromise means domain compromise."
+severities = ["low"]
+severity_logic = """
+Always **low**. A large tier-0 group is not exploitable by itself; it widens the set of
+accounts an attacker can aim at, and the other PRIV and ACC checks report what is wrong
+with those accounts.
+"""
+mitre = ["T1078.002"]
+data_sources = ["ldap"]
+attributes = [
+    "memberOf (transitive, LDAP_MATCHING_RULE_IN_CHAIN) of the tier-0 groups",
+    "objectSid",
+    "primaryGroupID",
+]
+related = ["AD-PRIV-002", "AD-PRIV-003", "AD-PRIV-006", "AD-PRIV-008", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+Every member of Domain Admins, Enterprise Admins, Schema Admins, Administrators or the
+operator groups can take over the whole domain, directly or in a few steps. Each one is
+a password that can be phished or sprayed, a session that leaves credentials in memory
+on the machines it logs on to, and a mailbox that receives targeted attacks. The more
+accounts hold these rights, the more workstations and servers carry tier-0 credentials,
+and the shorter the path from an ordinary compromised laptop to the domain.
+
+Large tier-0 groups are usually a sign that rights were granted for convenience
+(help desk staff, service accounts, application installers) instead of delegated for a
+specific task.
+"""
+
+detection = """
+For each tier-0 group ad-doctor collects the **transitive** members: user and computer
+objects whose `memberOf` reaches the group through any nesting (an LDAP search with the
+`LDAP_MATCHING_RULE_IN_CHAIN` rule). Nested groups are expanded, not counted. Accounts
+whose `primaryGroupID` points at Domain Admins, Schema Admins or Enterprise Admins are
+added back, because that membership never shows in `member`
+([AD-PRIV-007](AD-PRIV-007.md)).
+
+The groups are Domain Admins, Schema Admins, Enterprise Admins, Administrators, Account
+Operators, Server Operators, Print Operators and Backup Operators (and Domain
+Controllers, but only when a user account poses as a DC through its primary group). A
+group is reported when it has **more than five** members; the limit is fixed in the
+code. Administrators contains Domain Admins and Enterprise Admins, so it is usually the
+largest.
+
+The finding lists each group with its count, for example
+`Groups with more than 5 transitive members: Administrators (9), Domain Admins (7)`,
+and the objects are the group names (`Administrators`, `Domain Admins`).
+"""
+
+false_positives = """
+- **Large organisations** with several domains or many dedicated admin teams can need
+  more than five tier-0 accounts. If every member is a named, separate admin account
+  that is used only from privileged access workstations, record the decision in an
+  [accepted-risk file](../ci.md#accepted-risks) with an owner and an expiry date.
+- **Computer accounts** in a tier-0 group count towards the limit; they are reported
+  separately by [AD-PRIV-006](AD-PRIV-006.md).
+"""
+
+remediation = """
+1. **List who is in each group and how they got there.**
+
+    ```powershell
+    foreach ($g in 'Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Administrators') {
+        Get-ADGroupMember $g -Recursive -ErrorAction SilentlyContinue |
+            Select-Object @{n = 'Group'; e = { $g }}, SamAccountName, objectClass
+    }
+    ```
+
+2. **Find the nesting** that brings in unexpected members (a nested help desk group is
+   a common cause):
+
+    ```powershell
+    Get-ADGroupMember 'Domain Admins' | Where-Object objectClass -eq 'group'
+    ```
+
+3. **Remove members who do not administer the domain itself.** Delegate their tasks
+   (password resets, joining computers, OU management) on the OUs they need instead:
+
+    ```powershell
+    Remove-ADGroupMember 'Domain Admins' -Members helpdesk_lead -WhatIf
+    ```
+
+4. **Keep the remaining tier-0 accounts separate** from everyday accounts, add them to
+   Protected Users ([AD-PRIV-010](AD-PRIV-010.md)) and use them only from privileged
+   access workstations.
+
+5. **Declare the expected membership** in an [invariants file](../invariants.md)
+   (`[groups]` and `limits.tier0_users`) so that CI fails when it grows again.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-001"
+
+[[references]]
+title = "Appendix B: Privileged accounts and groups in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-b--privileged-accounts-and-groups-in-active-directory"
+kind = "vendor"
+
+[[references]]
+title = "Implementing least-privilege administrative models"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/implementing-least-privilege-administrative-models"
+kind = "vendor"
+
+[[references]]
+title = "Enterprise access model"
+url = "https://learn.microsoft.com/en-us/security/privileged-access-workstations/privileged-access-access-model"
+kind = "vendor"

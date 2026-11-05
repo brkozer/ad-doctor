@@ -1,0 +1,95 @@
+id = "AD-ACC-005"
+aliases = ["stale-users"]
+summary = "Enabled user accounts that have not logged on for 90 days or more: unwatched credentials that still work."
+severities = ["low"]
+severity_logic = """
+Always **low**. A dormant account is not an attack path by itself; it is a credential
+nobody would miss and nobody watches. Dormant admins are also reported by
+[AD-ACC-011](AD-ACC-011.md) when their password is old.
+"""
+mitre = ["T1078.002"]
+data_sources = ["ldap"]
+attributes = ["lastLogonTimestamp", "pwdLastSet", "userAccountControl", "objectClass"]
+related = ["AD-ACC-011", "AD-ACC-003", "AD-INF-002"]
+since = "0.1.0"
+
+risk = """
+Accounts of people who left, test accounts and one-off service accounts tend to stay
+enabled. Their passwords are old and often weak, their owners will not notice a logon,
+and no one reads their alerts. Password spraying finds them, and a logon with a dormant
+account looks like any other user's.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled user** (computers and managed service accounts
+excluded, `krbtgt` and `Guest` skipped) whose last activity is more than **90 days**
+before the scan time. Last activity is `lastLogonTimestamp`; when that is empty,
+`pwdLastSet` is used instead. Accounts with neither (never logged on and never given a
+password) are not reported.
+
+`lastLogonTimestamp` is replicated, so one DC is enough, but it is only updated when
+the previous value is older than about 9 to 14 days. Treat the 90 days as approximate.
+
+The finding says how many users matched; each object is a `sAMAccountName`, for example
+`old_contractor`.
+"""
+
+false_positives = """
+- **Cloud-only sign-ins.** Users who only sign in to Microsoft 365 or other services
+  through password hash sync never authenticate to a domain controller, so
+  `lastLogonTimestamp` does not move.
+- **Break-glass and disaster-recovery accounts** are unused on purpose. Accept them in an
+  [accepted-risk file](../ci.md#accepted-risks) with an owner and an expiry date.
+"""
+
+remediation = """
+1. **List inactive users** (read-only):
+
+    ```powershell
+    Search-ADAccount -AccountInactive -UsersOnly -TimeSpan 90.00:00:00 |
+        Where-Object Enabled |
+        Select-Object SamAccountName, LastLogonDate, DistinguishedName
+    ```
+
+2. **Confirm with the owner** (HR, the application owner) that each account is not
+   needed.
+
+3. **Disable** the account and move it to a quarantine OU. This is what `ad-doctor fix`
+   generates:
+
+    ```powershell
+    Disable-ADAccount old_contractor -WhatIf
+    ```
+
+4. **Delete** after a grace period, with the AD Recycle Bin enabled
+   ([AD-INF-002](AD-INF-002.md)) so a mistake can be undone:
+
+    ```powershell
+    Remove-ADUser old_contractor -WhatIf
+    ```
+
+5. **Automate it**: run the query in step 1 on a schedule and feed it into the leaver
+   process.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-005"
+
+[[references]]
+title = "Regularly check for and remove inactive user accounts in Active Directory"
+url = "https://learn.microsoft.com/en-us/services-hub/microsoft-engage-center/health/remediation-steps-ad/regularly-check-for-and-remove-inactive-user-accounts-in-active-directory"
+kind = "vendor"
+
+[[references]]
+title = "The LastLogonTimeStamp attribute: what it was designed for and how it works"
+url = "https://techcommunity.microsoft.com/blog/askds/the-lastlogontimestamp-attribute---what-it-was-designed-for-and-how-it-works/396204"
+kind = "vendor"
+
+[[references]]
+title = "Search-ADAccount"
+url = "https://learn.microsoft.com/en-us/powershell/module/activedirectory/search-adaccount?view=windowsserver2025-ps"
+kind = "vendor"
+
+[[references]]
+title = "ANSSI Active Directory checklist (vuln_user_accounts_dormant)"
+url = "https://cert.cyber.gouv.fr/uploads/ad_checklist.html"
+kind = "vendor"

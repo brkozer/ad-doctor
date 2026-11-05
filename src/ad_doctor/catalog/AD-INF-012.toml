@@ -1,0 +1,88 @@
+id = "AD-INF-012"
+aliases = ["rodc-prp"]
+summary = "A read-only domain controller's password replication policy lets it cache the credentials of privileged or broad groups, or omits the Denied RODC Password Replication Group."
+severities = ["medium"]
+severity_logic = """
+Always **medium**: the exposure only materialises when an RODC is stolen or compromised,
+but then it hands over the credentials of every cached account.
+"""
+mitre = ["T1003"]
+data_sources = ["ldap"]
+attributes = ["msDS-RevealOnDemandGroup", "msDS-NeverRevealGroup", "userAccountControl"]
+related = ["AD-PRIV-001", "AD-PRIV-006"]
+since = "0.1.0"
+
+risk = """
+A read-only domain controller is meant for places that cannot be physically secured,
+such as branch offices. It stores no passwords except those its password replication
+policy (PRP) allows it to cache: accounts in its *allowed* list (`msDS-RevealOnDemandGroup`)
+that are not in its *denied* list (`msDS-NeverRevealGroup`), once they have logged on
+through it.
+
+Anyone who steals the RODC's disk, or gains admin on it, can extract every cached
+password hash. If the allowed list contains a tier-0 group, a broad group like Domain
+Users, or if the built-in **Denied RODC Password Replication Group** was taken out of the
+denied list, those hashes can include administrators, and the stolen branch server
+becomes a domain compromise.
+"""
+
+detection = """
+For every account with `PARTIAL_SECRETS_ACCOUNT` in `userAccountControl` (an RODC),
+ad-doctor reads the two PRP attributes and reports:
+
+- each group in `msDS-RevealOnDemandGroup` that is a tier-0 or operator group, or a
+  broad group (Domain Users, Domain Computers, Domain Guests, Everyone, Authenticated
+  Users, Users and similar), as `RODC01$: allowed Domain Admins`;
+- an `msDS-NeverRevealGroup` that does not contain the Denied RODC Password Replication
+  Group (RID 572), as `RODC01$: Denied RODC Password Replication Group not in
+  never-reveal`.
+
+Only groups listed directly are compared; a privileged group nested inside an allowed
+group is not resolved, and the list of credentials already cached on the RODC
+(`msDS-RevealedList`) is not read.
+"""
+
+false_positives = """
+None expected. An RODC whose allowed list holds a broad group by design should be
+treated as a writable DC in terms of physical and administrative protection.
+"""
+
+remediation = """
+1. **Review the policy and what is already cached.**
+
+    ```powershell
+    Get-ADDomainControllerPasswordReplicationPolicy -Identity RODC01 -Allowed
+    Get-ADDomainControllerPasswordReplicationPolicy -Identity RODC01 -Denied
+    Get-ADDomainControllerPasswordReplicationPolicyUsage -Identity RODC01 -RevealedAccounts
+    ```
+
+2. **Remove privileged and broad groups from the allowed list**; allow only the users
+   and computers of the branch the RODC serves:
+
+    ```powershell
+    Remove-ADDomainControllerPasswordReplicationPolicy -Identity RODC01 `
+        -AllowedList 'Domain Users' -WhatIf
+    ```
+
+3. **Put the Denied RODC Password Replication Group back in the denied list**:
+
+    ```powershell
+    Add-ADDomainControllerPasswordReplicationPolicy -Identity RODC01 `
+        -DeniedList 'Denied RODC Password Replication Group' -WhatIf
+    ```
+
+4. **Reset the passwords of privileged accounts** that the usage report shows as
+   revealed, since their hashes are already on the RODC.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-012"
+
+[[references]]
+title = "Password Replication Policy"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2008-R2-and-2008/cc730883(v=ws.10)"
+kind = "vendor"
+
+[[references]]
+title = "Attacking Read-Only Domain Controllers (RODCs) to Own Active Directory (Sean Metcalf)"
+url = "https://adsecurity.org/?p=3592"
+kind = "research"

@@ -1,0 +1,121 @@
+id = "AD-DEL-004"
+summary = "Enabled accounts may delegate to a domain controller service or to krbtgt, or a DC carries RBCD, so their owners can impersonate any admin to a DC."
+severities = ["high"]
+severity_logic = """
+Always **high**: impersonating a domain admin to LDAP, CIFS or HOST on a domain
+controller is domain compromise.
+"""
+mitre = ["T1558", "T1134"]
+data_sources = ["ldap"]
+attributes = [
+    "msDS-AllowedToDelegateTo",
+    "msDS-AllowedToActOnBehalfOfOtherIdentity",
+    "userAccountControl",
+    "dNSHostName",
+    "sAMAccountName",
+]
+related = ["AD-DEL-002", "AD-DEL-003", "AD-DEL-001", "AD-PRIV-002", "AD-PRIV-010"]
+since = "0.1.0"
+
+risk = """
+Constrained delegation lets an account obtain service tickets *as other users* to the
+SPNs listed in its `msDS-AllowedToDelegateTo` (S4U2Proxy). When one of those SPNs is a
+domain controller service, whoever controls the delegating account can get a ticket as
+a domain admin to, for example, `ldap/dc01` and run DCSync, or to `cifs/dc01` and own
+the DC's file system. The service name in the ticket is not protected, so any service
+on the same DC host is reachable once one is.
+
+- With protocol transition ([AD-DEL-002](AD-DEL-002.md)) this needs nothing but the
+  account's password or key.
+- Without it, the attacker needs a forwardable ticket from the victim, but Elad Shamir
+  showed how RBCD can supply one (see *Wagging the Dog*), so plain Kerberos-only
+  delegation to a DC is not a safe variant.
+- Delegation to `krbtgt` lets the account obtain TGTs on behalf of users, which is as
+  good as the users' credentials anywhere in the domain.
+
+RBCD **on** a DC object (`msDS-AllowedToActOnBehalfOfOtherIdentity` set on the DC's
+computer account) lets the listed accounts do the same directly, and is a common
+persistence trick after a compromise.
+"""
+
+detection = """
+From the LDAP snapshot, for every **enabled** account:
+
+| Reported when | Example object |
+|---|---|
+| an SPN in `msDS-AllowedToDelegateTo` has service `ldap`, `cifs`, `host`, `http`, `gc`, `rpcss`, `wsman` or `dns`, and its host is a DC (matched on the DC's `sAMAccountName` without `$` or its `dNSHostName`, ignoring case and port) | `svc_dc -> ldap/DC01.adlab.test` |
+| an SPN in `msDS-AllowedToDelegateTo` has service `krbtgt` | `svc_x -> krbtgt/ADLAB.TEST` |
+| the account is a DC or RODC and its `msDS-AllowedToActOnBehalfOfOtherIdentity` is set | `DC01$ (resource-based delegation configured on it)` |
+
+Delegation is reported whether or not protocol transition is enabled.
+
+Limits:
+
+- SPNs that point at a DC through a DNS alias (CNAME) or another name not stored on the
+  DC's account are not matched.
+- Disabled accounts are skipped, and `krbtgt` is always disabled, so RBCD written on the
+  `krbtgt` object itself is not reported here; [AD-DEL-003](AD-DEL-003.md) still lists
+  it.
+"""
+
+false_positives = """
+- **None expected.** If a product really requires delegation to a DC service, the
+  delegating account is effectively tier 0: protect it as such and record the decision
+  in an [accepted-risk file](../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **Find the delegation** (read-only):
+
+    ```powershell
+    Get-ADObject -LDAPFilter '(msDS-AllowedToDelegateTo=*)' `
+        -Properties sAMAccountName, 'msDS-AllowedToDelegateTo' |
+        Select-Object sAMAccountName,
+            @{n = 'Targets'; e = { $_.'msDS-AllowedToDelegateTo' -join ', ' }}
+    Get-ADComputer -Filter 'PrimaryGroupID -eq 516 -or PrimaryGroupID -eq 521' `
+        -Properties PrincipalsAllowedToDelegateToAccount |
+        Select-Object Name, PrincipalsAllowedToDelegateToAccount
+    ```
+
+2. **Remove the DC and `krbtgt` SPNs** from each delegating account (or clear the list):
+
+    ```powershell
+    Set-ADUser svc_dc -WhatIf `
+        -Remove @{'msDS-AllowedToDelegateTo' = 'ldap/DC01.adlab.test'}
+    ```
+
+3. **Clear RBCD on DCs**:
+
+    ```powershell
+    Set-ADComputer DC01 -PrincipalsAllowedToDelegateToAccount $null -WhatIf
+    ```
+
+4. **Treat it as a possible compromise.** Nobody should have configured this; find out
+   who did (event 5136 on the DCs) and whether the account was used.
+
+5. **Protect admin accounts** from impersonation: *Account is sensitive and cannot be
+   delegated* ([AD-PRIV-002](AD-PRIV-002.md)) or Protected Users
+   ([AD-PRIV-010](AD-PRIV-010.md)).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-DEL-004"
+
+[[references]]
+title = "Kerberos constrained delegation overview"
+url = "https://learn.microsoft.com/en-us/windows-server/security/kerberos/kerberos-constrained-delegation-overview"
+kind = "vendor"
+
+[[references]]
+title = "Wagging the Dog: Abusing Resource-Based Constrained Delegation (Elad Shamir)"
+url = "https://shenaniganslabs.io/2019/01/28/Wagging-the-Dog.html"
+kind = "research"
+
+[[references]]
+title = "Another Word on Delegation (Will Schroeder)"
+url = "https://blog.harmj0y.net/redteaming/another-word-on-delegation/"
+kind = "research"
+
+[[references]]
+title = "The Hacker Recipes: Constrained delegation"
+url = "https://www.thehacker.recipes/ad/movement/kerberos/delegations/constrained"
+kind = "research"

@@ -7,19 +7,22 @@ stays one line per problem rather than one line per account.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-from . import sd
+from . import catalog, gpo_scope, sd
+from .gpo_scope import LOCAL_GROUPS, Grant
 from .model import (
     EXCHANGE_GROUPS,
     UAC,
     Account,
+    CaConfig,
     CertTemplate,
     Finding,
     Severity,
     Snapshot,
+    exchange_members,
 )
 
 CheckFn = Callable[[Snapshot], Finding | None]
@@ -77,86 +80,30 @@ def _finding(
     )
 
 
-# MITRE ATT&CK techniques each finding enables
-MITRE: dict[str, tuple[str, ...]] = {
-    "AD-KRB-001": ("T1558.001",),
-    "AD-KRB-002": ("T1558.004",),
-    "AD-KRB-003": ("T1558.003",),
-    "AD-KRB-004": ("T1558",),
-    "AD-DEL-001": ("T1558", "T1187"),
-    "AD-DEL-002": ("T1558", "T1134"),
-    "AD-DEL-003": ("T1558", "T1134"),
-    "AD-ACC-001": ("T1078.002",),
-    "AD-ACC-002": ("T1003",),
-    "AD-ACC-003": ("T1078.002",),
-    "AD-ACC-004": ("T1078.001",),
-    "AD-ACC-005": ("T1078.002",),
-    "AD-ACC-006": ("T1078.002",),
-    "AD-ACC-007": ("T1134.005",),
-    "AD-PRIV-001": ("T1078.002",),
-    "AD-PRIV-002": ("T1558",),
-    "AD-PRIV-003": ("T1078.002",),
-    "AD-PRIV-004": ("T1574.002",),
-    "AD-PRIV-005": ("T1087.002",),
-    "AD-POL-001": ("T1110",),
-    "AD-POL-002": ("T1136.002",),
-    "AD-SEC-001": ("T1550.002",),
-    "AD-INF-001": ("T1210",),
-    "AD-INF-002": ("T1485",),
-    "AD-INF-004": ("T1087.002", "T1098"),
-    "AD-INF-005": ("T1557",),
-    "AD-INF-006": ("T1134.005", "T1482"),
-    "AD-ADCS-001": ("T1649",),
-    "AD-ADCS-002": ("T1649",),
-    "AD-ADCS-003": ("T1649",),
-    "AD-ADCS-004": ("T1649",),
-    "AD-ADCS-005": ("T1649",),
-    "AD-ADCS-006": ("T1649",),
-    "AD-ADCS-007": ("T1649",),
-    "AD-ADCS-008": ("T1649",),
-    "AD-ACL-001": ("T1003.006",),
-    "AD-ACL-002": ("T1098",),
-    "AD-ACL-003": ("T1098", "T1222"),
-    "AD-GPO-001": ("T1484.001",),
-    "AD-GPO-002": ("T1484.001",),
-    "AD-GPO-003": ("T1557", "T1003"),
-    "AD-GPO-004": ("T1484.001",),
-    "AD-GPP-002": ("T1552.001",),
-    "AD-ADCS-009": ("T1649",),
-    "AD-ADCS-010": ("T1649", "T1557.001"),
-    "AD-ADCS-011": ("T1649",),
-    "AD-KRB-005": ("T1558.003",),
-    "AD-KRB-006": ("T1558.002",),
-    "AD-DEL-004": ("T1558", "T1134"),
-    "AD-ACL-004": ("T1098", "T1556"),
-    "AD-ACL-005": ("T1098",),
-    "AD-ACL-006": ("T1555",),
-    "AD-ACC-008": ("T1552",),
-    "AD-ACC-009": ("T1552",),
-    "AD-ACC-010": ("T1078.002",),
-    "AD-ACC-011": ("T1078.002",),
-    "AD-PRIV-006": ("T1078.002",),
-    "AD-PRIV-007": ("T1078.002", "T1564"),
-    "AD-PRIV-008": ("T1078.002",),
-    "AD-PRIV-009": ("T1649",),
-    "AD-PRIV-010": ("T1558",),
-    "AD-SEC-002": ("T1555",),
-    "AD-INF-007": ("T1098", "T1136.002"),
-    "AD-INF-008": ("T1557",),
-    "AD-INF-009": ("T1187",),
-    "AD-INF-010": ("T1557",),
-    "AD-INF-011": ("T1490",),
-    "AD-INF-012": ("T1003",),
-    "AD-PATH-001": ("T1098", "T1484"),
-    "AD-CHAIN-001": ("T1557", "T1187", "T1134"),
-    "AD-CHAIN-002": ("T1187", "T1558"),
-    "AD-CHAIN-003": ("T1187", "T1557.001", "T1649"),
-    "AD-GPP-001": ("T1552.006",),
-    "AD-INF-013": ("T1557",),
-    "AD-ACL-007": ("T1098", "T1557.001", "T1003.006"),
-    "AD-PRIV-011": ("T1003.006", "T1078.002"),
-    "AD-ACL-008": ("T1098", "T1003.006"),
-}
+class _Mitre(Mapping[str, tuple[str, ...]]):
+    """Check ID -> MITRE ATT&CK techniques, from the catalog entries; checks without a
+    technique (hygiene, invariants) are absent. Read on first use, so importing this
+    module does not parse the catalog."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, tuple[str, ...]] | None = None
+
+    def _load(self) -> dict[str, tuple[str, ...]]:
+        if self._data is None:
+            self._data = {cid: e.mitre for cid, e in catalog.load().items() if e.mitre}
+        return self._data
+
+    def __getitem__(self, check_id: str) -> tuple[str, ...]:
+        return self._load()[check_id]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._load())
+
+    def __len__(self) -> int:
+        return len(self._load())
+
+
+MITRE: Mapping[str, tuple[str, ...]] = _Mitre()
 
 
 KRBTGT_MAX_AGE = timedelta(days=180)
@@ -647,7 +594,8 @@ def esc5(snap: Snapshot) -> Finding | None:
             continue
         who = {snap.name_of(a.sid) for a in aces if a.takeover and a.sid not in expected}
         if key.startswith("PKI:CA "):
-            who = {w for w in who if w.upper() not in snap.ca_hosts}
+            ca_hosts = {h.upper() for h in snap.ca_hosts}
+            who = {w for w in who if w.upper() not in ca_hosts}
         if who:
             hits.append(f"{key.removeprefix('PKI:')} ({', '.join(sorted(who))})")
     if not hits:
@@ -670,8 +618,8 @@ def esc9(snap: Snapshot) -> Finding | None:
         "Certificates from these templates carry no SID. On DCs without full certificate "
         "binding enforcement (the default only since the 2025 updates), anyone who can change "
         "a victim's UPN can then authenticate as that victim.",
-        "Clear CT_FLAG_NO_SECURITY_EXTENSION and keep StrongCertificateBindingEnforcement=2 "
-        "on every domain controller.",
+        "Clear CT_FLAG_NO_SECURITY_EXTENSION and keep every domain controller on current "
+        "updates (full enforcement, the only mode after the September 2025 updates).",
         lambda t: t.no_security_extension and _authenticates(t),
         Severity.MEDIUM,
     )
@@ -1280,20 +1228,19 @@ def gmsa_readers(snap: Snapshot) -> Finding | None:
     tier0 = _tier0_group_sids(snap)
     broad = snap.broad_sids()
     privileged = snap.privileged_dns()
-    hits, severity = [], Severity.MEDIUM
+    hits = []
     for g in snap.gmsas:
         is_priv = g.dn.lower() in privileged
+        # a broad reader, or any non-tier-0 reader of a privileged gMSA: both are HIGH
         risky = [s for s in g.readers if s in broad or (is_priv and s not in tier0)]
         if risky:
             who = ", ".join(sorted(snap.name_of(s) for s in risky))
             hits.append(f"{g.name} (readable by {who})")
-            if any(s in broad for s in risky) or g.dn.lower() in privileged:
-                severity = Severity.HIGH
     if not hits:
         return None
     return _finding(
         "AD-ACL-006",
-        severity,
+        Severity.HIGH,
         "Anyone in these groups can retrieve the managed password and act as the service account.",
         "Limit PrincipalsAllowedToRetrieveManagedPassword to the hosts that run the service.",
         sorted(hits),
@@ -1597,7 +1544,9 @@ def gpo_security(snap: Snapshot) -> Finding | None:
     hits, severity = [], Severity.MEDIUM
     for g in snap.gpos:
         s = snap.gpo_settings.get(g.guid)
-        if s is None or not g.linked_to:
+        # same rule as the local group checks: an empty computer side or a GPO without the
+        # security extension is never applied, whatever its GptTmpl.inf says
+        if s is None or not g.linked_to or not gpo_scope.computer_side_applies(g, "restricted"):
             continue
         if s.lm_compatibility is not None and s.lm_compatibility < 3:
             hits.append(f"{g.name}: LmCompatibilityLevel {s.lm_compatibility} (LM/NTLMv1 allowed)")
@@ -2022,6 +1971,460 @@ def entra_connect_control(snap: Snapshot) -> Finding | None:
         "Remove the rights and ownership; keep the sync account and server under tier-0 "
         "control only.",
         sorted(hits),
+    )
+
+
+# --- Round 5: the CA's own configuration (registry, over MS-RRP) -----------------------
+
+PENDING_NOTE = (
+    " {cas} hold every request for a CA manager (RequestDisposition has REQDISP_PENDING), "
+    "which slows this down but does not stop a manager approving a forged request."
+)
+# KB5014754 strong certificate mapping, as the detail texts describe it
+STRONG_MAPPING = "StrongCertificateBindingEnforcement"
+
+
+def _pending(c: CaConfig) -> bool:
+    return c.request_disposition is not None and bool(c.request_disposition & sd.REQDISP_PENDING)
+
+
+def _ca_finding(
+    snap: Snapshot,
+    check_id: str,
+    match: Callable[[CaConfig], bool],
+    severity: Severity,
+    detail: str,
+    remediation: str,
+) -> Finding | None:
+    """One finding over every CA that matches, a level lower when each of them holds
+    every request for approval."""
+    hits = sorted((c for c in snap.probes.ca_configs if match(c)), key=lambda c: c.name.lower())
+    if not hits:
+        return None
+    pending = [c.name for c in hits if _pending(c)]
+    if pending:
+        detail += PENDING_NOTE.format(cas=", ".join(pending))
+    if len(pending) == len(hits):
+        severity = Severity(max(severity - 1, Severity.LOW))
+    return _finding(check_id, severity, detail, remediation, [c.name for c in hits])
+
+
+def _esc6(c: CaConfig) -> bool:
+    return c.edit_flags is not None and bool(c.edit_flags & sd.EDITF_ATTRIBUTESUBJECTALTNAME2)
+
+
+def _esc16(c: CaConfig) -> bool:
+    return c.disabled_extensions is not None and sd.SZOID_NTDS_CA_SECURITY_EXT in {
+        e.strip() for e in c.disabled_extensions
+    }
+
+
+CA_RIGHTS = ((sd.CA_MANAGE, "ManageCA"), (sd.CA_OFFICER, "ManageCertificates"))
+
+
+FOREST_ADMIN_RIDS = ("500", "512", "518", "519")
+
+
+def _ca_admins(snap: Snapshot) -> set[str]:
+    """SIDs expected to manage a CA: tier 0, the CA servers themselves, and the admins of
+    every domain in the forest (the default CA descriptor grants the CA's own domain's
+    Domain Admins, and the CA can sit in another domain of the forest)."""
+    tier0_dns = snap.tier0_dns()
+    ca_hosts = {h.upper() for h in snap.ca_hosts}
+    expected = _tier0_group_sids(snap)
+    forest = {t.sid for t in snap.trusts if t.within_forest and t.sid}
+    expected |= {f"{sid}-{rid}" for sid in forest for rid in FOREST_ADMIN_RIDS}
+    expected |= {
+        a.sid
+        for a in snap.accounts
+        if a.sid and (a.dn.lower() in tier0_dns or a.sam.upper() in ca_hosts)
+    }
+    expected |= {o.sid for o in snap.objects if o.sid and o.dn.lower() in tier0_dns}
+    return expected
+
+
+def _other_domain_admins(snap: Snapshot, sid: str) -> bool:
+    """Administrator or Domain Admins of a domain other than the scanned one: what the
+    default descriptor of a CA in another domain of the forest holds, when no trust
+    object gives that domain's SID (a sibling or grandchild domain)."""
+    prefix, _, rid = sid.rpartition("-")
+    return (
+        rid in ("500", "512")
+        and prefix.startswith("S-1-5-21-")
+        and prefix not in (snap.domain_sid, snap.root_sid)
+    )
+
+
+def ca_control(snap: Snapshot) -> list[tuple[CaConfig, str, str]]:
+    """(CA, SID, right) for each non-tier-0 holder of ManageCA or ManageCertificates.
+
+    The owner of the CA security descriptor can rewrite it, so it counts as ManageCA.
+    """
+    expected = _ca_admins(snap)
+    out: set[tuple[str, str, str]] = set()
+    configs = {c.name: c for c in snap.probes.ca_configs}
+    for c in snap.probes.ca_configs:
+        own_domain = c.host.lower().partition(".")[2] == snap.domain.lower()
+        if c.owner and c.owner not in expected:
+            out.add((c.name, c.owner, "ManageCA"))
+        for ace in c.aces:
+            if ace.sid in expected or (not own_domain and _other_domain_admins(snap, ace.sid)):
+                continue
+            out |= {(c.name, ace.sid, right) for bit, right in CA_RIGHTS if ace.mask & bit}
+    return [(configs[ca], sid, right) for ca, sid, right in sorted(out)]
+
+
+def officer_templates(snap: Snapshot) -> list[str]:
+    """Published templates that turn ManageCertificates alone into a certificate for any
+    user: the requester supplies the subject of an authentication certificate, and a
+    certificate manager can approve the request or issue it after it was refused."""
+    return sorted(
+        t.name
+        for t in snap.templates
+        if t.published and t.enrollee_supplies_subject and _authenticates(t)
+    )
+
+
+@check("AD-ADCS-012", "ESC6: CA accepts a subject alternative name from request attributes")
+def esc6(snap: Snapshot) -> Finding | None:
+    return _ca_finding(
+        snap,
+        "AD-ADCS-012",
+        _esc6,
+        Severity.MEDIUM,
+        "EDITF_ATTRIBUTESUBJECTALTNAME2 is set, so any enrollee can name another user in the "
+        "SAN of any certificate the CA issues. The CA still embeds the requester's own SID, and "
+        "DCs with the KB5014754 updates (May 2022 on) refuse a certificate whose SID does not "
+        "match for Kerberos logon; the April 2023 updates removed the setting that turned this "
+        "off. On its own this works against DCs without those updates and against services "
+        "that map certificates by name alone. With ESC16 on the same CA it works everywhere "
+        "(AD-CHAIN-004).",
+        "certutil -config <host>\\<CA> -setreg policy\\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2, "
+        "then restart certsvc; keep every DC on current updates (full enforcement).",
+    )
+
+
+@check("AD-ADCS-013", "ESC7: non-tier-0 principals manage the CA")
+def esc7(snap: Snapshot) -> Finding | None:
+    hits = ca_control(snap)
+    if not hits:
+        return None
+    manage = any(right == "ManageCA" for _, _, right in hits)
+    templates = officer_templates(snap)
+    detail = (
+        "ManageCA lets its holder reconfigure the CA: turn on ESC6, publish any template "
+        "(SubCA included) and grant itself ManageCertificates, which ends in a certificate for "
+        "any user. "
+        if manage
+        else ""
+    )
+    detail += "ManageCertificates lets its holder approve pending requests and issue refused ones."
+    if templates:
+        detail += (
+            f" Published templates whose requester supplies the subject ({', '.join(templates)}) "
+            "make that a certificate for any user: request one for a domain admin, then issue it."
+        )
+    else:
+        detail += (
+            " No published authentication template lets the requester supply the subject, so "
+            "ManageCertificates alone does not yet give a certificate for another user."
+        )
+    return _finding(
+        "AD-ADCS-013",
+        Severity.HIGH if manage or templates else Severity.MEDIUM,
+        detail,
+        "Remove ManageCA and ManageCertificates from these principals in the CA's security "
+        "settings (certsrv.msc > Properties > Security), or treat them as tier 0.",
+        sorted(f"{c.name}: {snap.name_of(sid)} ({right})" for c, sid, right in hits),
+    )
+
+
+@check("AD-ADCS-014", "ESC11: CA does not require encryption for ICPR requests")
+def esc11(snap: Snapshot) -> Finding | None:
+    return _ca_finding(
+        snap,
+        "AD-ADCS-014",
+        lambda c: (
+            c.interface_flags is not None
+            and not c.interface_flags & sd.IF_ENFORCEENCRYPTICERTREQUEST
+        ),
+        Severity.HIGH,
+        "IF_ENFORCEENCRYPTICERTREQUEST is off, so the CA accepts certificate requests over RPC "
+        "(ICPR) without packet privacy. Authentication coerced from a DC can be relayed to the "
+        "CA for a certificate as that DC, which is valid under strong mapping and leads to "
+        "DCSync.",
+        "certutil -config <host>\\<CA> -setreg CA\\InterfaceFlags +IF_ENFORCEENCRYPTICERTREQUEST, "
+        "then restart certsvc.",
+    )
+
+
+@check("AD-ADCS-015", "ESC16: CA leaves the SID security extension out of certificates")
+def esc16(snap: Snapshot) -> Finding | None:
+    return _ca_finding(
+        snap,
+        "AD-ADCS-015",
+        _esc16,
+        Severity.MEDIUM,
+        f"{sd.SZOID_NTDS_CA_SECURITY_EXT} is in DisableExtensionList, so no certificate from "
+        "this CA carries the requester's SID: every authentication template behaves like ESC9, "
+        "and whoever can change a victim's userPrincipalName can get a certificate that maps "
+        "to the victim. DCs in full enforcement refuse such weakly mapped certificates: the "
+        "default since the February 2025 updates, and the only mode after the September 2025 "
+        f"updates, which no longer read {STRONG_MAPPING}. DCs without the September 2025 "
+        "updates that were set back to compatibility mode accept them. With ESC6 on the same "
+        "CA it works under full enforcement too (AD-CHAIN-004).",
+        f"certutil -config <host>\\<CA> -setreg policy\\DisableExtensionList "
+        f"-{sd.SZOID_NTDS_CA_SECURITY_EXT}, then restart certsvc; keep every DC on current "
+        "updates (full enforcement).",
+    )
+
+
+@check("AD-ADCS-016", "CA configuration could not be read")
+def unread_ca_config(snap: Snapshot) -> Finding | None:
+    hits = []
+    for c in snap.probes.ca_configs:
+        if c.error:
+            hits.append(f"{c.host}: {c.error}")
+            continue
+        if c.third_party_policy:
+            hits.append(
+                f"{c.host}: policy module {c.policy_module} is not Microsoft's; "
+                "ESC6 and ESC16 not judged"
+            )
+        absent = [
+            (name, esc)
+            for name, esc, missing in (
+                ("InterfaceFlags", "ESC11", c.interface_flags is None),
+                # a real CA descriptor always has an owner: neither means it was not read
+                ("security descriptor", "ESC7", c.owner is None and not c.aces),
+                ("EditFlags", "ESC6", c.edit_flags is None and not c.third_party_policy),
+                (
+                    "DisableExtensionList",
+                    "ESC16",
+                    c.disabled_extensions is None and not c.third_party_policy,
+                ),
+            )
+            if missing
+        ]
+        if absent:
+            hits.append(
+                f"{c.host}: {', '.join(n for n, _ in absent)} absent or empty; "
+                f"{', '.join(e for _, e in absent)} not judged"
+            )
+    if not hits:
+        return None
+    return _finding(
+        "AD-ADCS-016",
+        Severity.LOW,
+        "ESC6, ESC7, ESC11 and ESC16 depend on CA settings that LDAP cannot show. On these CAs "
+        "some of them could not be read or judged (a read error affects all four; otherwise "
+        "each line names the checks affected), so those checks say nothing about them.",
+        "Run the scan from a host that reaches TCP 445 on each CA. RemoteRegistry must not be "
+        "disabled, and SYSTEM\\CurrentControlSet\\Services\\CertSvc must stay in the winreg "
+        "AllowedPaths list (a GPO that sets 'Network access: Remotely accessible registry "
+        "paths and subpaths' replaces the whole list).",
+        hits,
+    )
+
+
+@check("AD-CHAIN-004", "ESC6 plus ESC16 on the same CA")
+def chain_esc6_esc16(snap: Snapshot) -> Finding | None:
+    return _ca_finding(
+        snap,
+        "AD-CHAIN-004",
+        lambda c: _esc6(c) and _esc16(c),
+        Severity.HIGH,
+        "The CA takes the SAN from request attributes and leaves out the SID extension, so a "
+        "requester can put any user's SID in a SAN URL (tag:microsoft.com,2022-09-14:sid:...), "
+        "which DCs accept as a strong mapping: any enrollee can authenticate as any user, a "
+        "domain admin included, even against DCs in full enforcement.",
+        "Fix either side: clear EDITF_ATTRIBUTESUBJECTALTNAME2, or remove "
+        f"{sd.SZOID_NTDS_CA_SECURITY_EXT} from DisableExtensionList.",
+    )
+
+
+# --- Round 5: local group membership set by Group Policy -----------------------------
+
+ADMIN_GROUPS = {sid for sid, g in LOCAL_GROUPS.items() if g.admin}
+LOGON_GROUPS = {sid for sid, g in LOCAL_GROUPS.items() if not g.admin}
+SHOWN_HOSTS = 5
+
+
+def tier0_hosts(snap: Snapshot) -> dict[str, str]:
+    """Lower-cased DN -> role of every computer whose administrators control the domain."""
+    roles: dict[str, str] = {}
+    computers = [a for a in snap.accounts if a.is_computer]
+    ca_hosts = {h.upper() for h in snap.ca_hosts}
+    exchange = exchange_members(snap.objects)
+    privileged = snap.privileged_dns()
+    dcsync = _dcsync_sids(snap)
+    sync_servers = {s.dn.lower() for a in _sync_accounts(snap) for s in _sync_servers(snap, a)}
+    for role, holds in (
+        ("domain controller", lambda a: a.is_dc),
+        ("CA server", lambda a: a.sam.upper() in ca_hosts),
+        ("Entra Connect server", lambda a: a.dn.lower() in sync_servers),
+        ("Exchange server", lambda a: a.dn.lower() in exchange),
+        ("tier-0 member", lambda a: a.dn.lower() in privileged or a.sid in dcsync),
+    ):
+        for a in computers:
+            if holds(a):
+                roles.setdefault(a.dn.lower(), role)
+    return roles
+
+
+def _local_broad(snap: Snapshot) -> set[str]:
+    """Broad groups, plus INTERACTIVE: in a local group it covers everyone who logs on
+    at the console or over RDP, and Domain Users may log on locally to workstations."""
+    return snap.broad_sids() | {gpo_scope.INTERACTIVE}
+
+
+def _group_label(snap: Snapshot, grant: Grant) -> str:
+    sid = grant.item.group_sid
+    if not grant.domain_group:
+        return LOCAL_GROUPS[sid].name
+    prefix = "BUILTIN\\" if sid.startswith("S-1-5-32-") else ""
+    return f"{prefix}{snap.name_of(sid)} (domain, via DCs)"
+
+
+def _grant_objects(snap: Snapshot, hits: list[tuple[Grant, str | None]]) -> list[str]:
+    """One object per GPO, member and group, listing the hosts (first five) and caveats."""
+    grouped: dict[tuple[str, str, str], tuple[set[str], set[str]]] = {}
+    for grant, host in hits:
+        key = (grant.gpo.name, snap.name_of(grant.item.member_sid), _group_label(snap, grant))
+        hosts, caveats = grouped.setdefault(key, (set(), set()))
+        if host:
+            hosts.add(host)
+        caveats.update(grant.caveats)
+    out = []
+    for (gpo, member, group), (hosts, caveats) in grouped.items():
+        text = f"{gpo}: {member} -> {group}"
+        if hosts:
+            names = sorted(hosts, key=str.lower)
+            more = len(names) - SHOWN_HOSTS
+            text += (
+                " on " + ", ".join(names[:SHOWN_HOSTS]) + (f" (+{more} more)" if more > 0 else "")
+            )
+        if caveats:
+            text += f" [{', '.join(sorted(caveats))}]"
+        out.append(text)
+    return sorted(out)
+
+
+def _host(grant: Grant, roles: dict[str, str]) -> str:
+    assert grant.computer is not None
+    role = roles.get(grant.computer.dn.lower())
+    return f"{grant.computer.sam} ({role})" if role else grant.computer.sam
+
+
+def _filtered_note(hits: list[tuple[Grant, str | None]]) -> str:
+    if not any(gpo_scope.ILT_CAVEAT in g.caveats for g, _ in hits):
+        return ""
+    return (
+        f" Entries marked '{gpo_scope.ILT_CAVEAT}' apply only where their targeting matches;"
+        " they are listed for every computer the GPO reaches."
+    )
+
+
+@check("AD-GPO-005", "GPOs make broad groups local administrators")
+def gpo_broad_admins(snap: Snapshot) -> Finding | None:
+    scope = gpo_scope.resolve(snap)
+    if not scope.grants:
+        return None
+    broad, tier0 = _local_broad(snap), _tier0_group_sids(snap)
+    roles = tier0_hosts(snap)
+    hits: list[tuple[Grant, str | None]] = []
+    reached = set()
+    for g in scope.grants:
+        if g.item.member_sid not in broad:
+            continue
+        if g.domain_group and g.item.group_sid in tier0:
+            hits.append((g, None))
+        elif g.computer is not None and g.item.group_sid in ADMIN_GROUPS:
+            hits.append((g, g.computer.sam))
+            if g.computer.dn.lower() in roles:
+                reached.add(_host(g, roles))
+    if not hits:
+        return None
+    detail = (
+        "Every account in these groups becomes an administrator (or the equivalent) of the "
+        "computers the GPO reaches, so one phished user owns all of them."
+    )
+    if reached:
+        detail += f" Including tier-0 servers: {', '.join(sorted(reached, key=str.lower))}."
+    return _finding(
+        "AD-GPO-005",
+        Severity.HIGH,
+        detail + _filtered_note(hits),
+        "Remove the entry from the GPO (Restricted Groups or Preferences > Local Users and "
+        "Groups) and grant local admin per tier through a dedicated group or LAPS.",
+        _grant_objects(snap, hits),
+    )
+
+
+@check("AD-GPO-006", "GPOs grant admin rights on tier-0 servers outside tier 0")
+def gpo_tier0_admins(snap: Snapshot) -> Finding | None:
+    scope = gpo_scope.resolve(snap)
+    if not scope.grants:
+        return None
+    broad, tier0 = _local_broad(snap), _tier0_group_sids(snap)
+    roles = tier0_hosts(snap)
+    hits: list[tuple[Grant, str | None]] = []
+    for g in scope.grants:
+        member = g.item.member_sid
+        if member in tier0 or member in broad:  # broad groups are AD-GPO-005
+            continue
+        if g.domain_group and g.item.group_sid in tier0:
+            hits.append((g, None))
+        elif (
+            g.computer is not None
+            and g.item.group_sid in ADMIN_GROUPS
+            and g.computer.dn.lower() in roles
+        ):
+            hits.append((g, _host(g, roles)))
+    if not hits:
+        return None
+    return _finding(
+        "AD-GPO-006",
+        Severity.HIGH,
+        "Group Policy makes these non-tier-0 principals administrators of servers that "
+        "control the domain (or puts them in a tier-0 group through the DCs): whoever "
+        "controls them controls the domain." + _filtered_note(hits),
+        "Remove the entry, or move these servers to an OU that only tier-0 GPOs reach.",
+        _grant_objects(snap, hits),
+    )
+
+
+@check("AD-GPO-007", "GPOs grant remote logon to broad groups or on tier-0 servers")
+def gpo_remote_logon(snap: Snapshot) -> Finding | None:
+    scope = gpo_scope.resolve(snap)
+    if not scope.grants:
+        return None
+    broad, tier0 = _local_broad(snap), _tier0_group_sids(snap)
+    roles = tier0_hosts(snap)
+    hits: list[tuple[Grant, str | None]] = []
+    severity = Severity.MEDIUM
+    for g in scope.grants:
+        member = g.item.member_sid
+        if g.item.group_sid not in LOGON_GROUPS or not g.effective or member in tier0:
+            continue
+        on_tier0 = g.domain_group or (g.computer is not None and g.computer.dn.lower() in roles)
+        if not on_tier0 and member not in broad:
+            continue
+        hits.append((g, None if g.computer is None else _host(g, roles)))
+        if on_tier0:
+            severity = Severity.HIGH
+    if not hits:
+        return None
+    return _finding(
+        "AD-GPO-007",
+        severity,
+        "Group Policy lets these principals log on remotely (RDP, WinRM or DCOM): broad groups "
+        "anywhere, or non-tier-0 principals on servers that control the domain, where their "
+        "logon leaves credentials to steal and a local exploit away from SYSTEM. Remote "
+        "Desktop Users only counts where the remote logon right includes it (by default not "
+        "on DCs)." + _filtered_note(hits),
+        "Remove the entry, or limit it to the tier the servers belong to.",
+        _grant_objects(snap, hits),
     )
 
 

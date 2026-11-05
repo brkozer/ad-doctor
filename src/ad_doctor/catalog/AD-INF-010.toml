@@ -1,0 +1,77 @@
+id = "AD-INF-010"
+aliases = ["ldaps-channel-binding"]
+summary = "A domain controller accepts an LDAPS bind without a channel binding token, so NTLM authentication relayed from another connection can log on to LDAPS."
+severities = ["medium"]
+severity_logic = """
+Always **medium** on its own. Combined with a machine account quota above 0 it is part
+of the relay-to-RBCD chain reported as **high** by [AD-CHAIN-001](AD-CHAIN-001.md).
+"""
+mitre = ["T1557"]
+data_sources = ["probe-ldaps"]
+attributes = ["LDAPS NTLM bind without channel binding (SEC_E_BAD_BINDINGS)"]
+related = ["AD-INF-005", "AD-CHAIN-001", "AD-INF-013", "AD-POL-002"]
+since = "0.1.0"
+
+risk = """
+LDAP signing ([AD-INF-005](AD-INF-005.md)) protects plain LDAP only: over LDAPS the TLS
+session already provides integrity, so a DC that requires signing still accepts an NTLM
+bind over TLS. What stops a relayed NTLM authentication there is **channel binding**:
+the client includes a hash of the server's TLS certificate (the channel binding token)
+in its NTLM response, and an attacker relaying from another connection cannot produce
+the right one.
+
+Without enforcement, an attacker relays a coerced or captured authentication to
+LDAPS and uses it to modify the directory: resource-based delegation on a computer
+account, shadow credentials, or group membership if the victim is an administrator.
+Relayed sessions over LDAPS can also do what plain LDAP refuses, such as setting a
+password on a newly created computer account.
+"""
+
+detection = """
+ad-doctor opens an LDAPS connection to each DC and performs an NTLM bind **without** a
+channel binding token. A DC that enforces channel binding refuses it with
+`SEC_E_BAD_BINDINGS` (80090346); a successful bind means it does not, and the DC is
+reported. Any other failure is inconclusive and not reported.
+
+The setting *When supported* (`LdapEnforceChannelBinding` = 1) still accepts clients that
+send no token, so only *Always* (2) passes. The probe needs `--ldaps` and a
+`DOMAIN\\user` account with a password (NTLM), and is skipped with `--no-probes`. Each
+object is a DC host name, for example `DC01.adlab.test`.
+"""
+
+false_positives = """
+None expected: the probe observes the DC's actual behaviour. A DC that could not be
+reached is not reported here; see [AD-INF-013](AD-INF-013.md).
+"""
+
+remediation = '''
+1. **Find clients that do not send a token** before enforcing: with `16 LDAP Interface
+   Events` = 2, DCs log events 3039 to 3041 in the Directory Service log for binds
+   without a valid channel binding token (see KB4520412).
+2. **Enforce channel binding on every DC** through the Default Domain Controllers Policy:
+   *Computer Configuration > Policies > Windows Settings > Security Settings > Local
+   Policies > Security Options > Domain controller: LDAP server channel binding token
+   requirements* = **Always**. Read the result in the registry:
+
+    ```powershell
+    Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters' -Name LdapEnforceChannelBinding
+    # 2 = always; set it through the GPO rather than by hand:
+    Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters' `
+        -Name LdapEnforceChannelBinding -Value 2 -WhatIf
+    ```
+
+3. **Require LDAP signing as well** ([AD-INF-005](AD-INF-005.md)), so that neither port
+   accepts a relayed bind.
+'''
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-010"
+
+[[references]]
+title = "2020, 2023, and 2024 LDAP channel binding and LDAP signing requirements for Windows (KB4520412)"
+url = "https://support.microsoft.com/en-us/servicing/os/windows/2020/02/2020-2023-and-2024-ldap-channel-binding-and-ldap-signing-requirements-for-windows-kb4520412"
+kind = "vendor"
+
+[[references]]
+title = "The Hacker Recipes: NTLM relay"
+url = "https://www.thehacker.recipes/ad/movement/ntlm/relay"
+kind = "research"

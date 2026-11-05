@@ -1,0 +1,97 @@
+id = "AD-ACC-002"
+aliases = ["reversible-encryption"]
+summary = "Enabled accounts are set to store their password with reversible encryption, so a DCSync or a DC backup yields the clear-text password."
+severities = ["high"]
+severity_logic = """
+Always **high**: anyone who can read the domain's secrets gets these passwords in clear
+text, and clear-text passwords are reused on other systems.
+"""
+mitre = ["T1003"]
+data_sources = ["ldap"]
+attributes = ["userAccountControl"]
+related = ["AD-ACL-001", "AD-POL-001", "AD-INF-011"]
+since = "0.1.0"
+
+risk = """
+With `ENCRYPTED_TEXT_PWD_ALLOWED` (`userAccountControl` bit `0x80`) set, the next time
+the password is set the domain controller stores, next to the usual hashes, a copy that
+it can decrypt back to the original text (the `Primary:CLEARTEXT` package in
+`supplementalCredentials`). It exists for old protocols such as CHAP and HTTP Digest
+authentication.
+
+The key that protects that copy is on every domain controller. Whoever can DCSync (see
+[AD-ACL-001](AD-ACL-001.md)), or gets a copy of `ntds.dit` and the SYSTEM hive from a DC
+or a backup, reads the password itself, not just a hash: it can be typed into a VPN
+portal, a web application or another forest where the same person reused it.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled** account (users and computers) whose
+`userAccountControl` has `ENCRYPTED_TEXT_PWD_ALLOWED` (`0x80`) set.
+
+The check reads the per-account flag only. The domain-wide setting *Store passwords
+using reversible encryption* (in the Default Domain Policy) and fine-grained password
+policies with `msDS-PasswordReversibleEncryptionEnabled` are **not** examined, so look at
+them yourself (step 4 below).
+
+Each object is the account's `sAMAccountName`, for example `old_vpn`.
+"""
+
+false_positives = """
+- **A legacy dependency that cannot be removed yet** (for example a RADIUS server that
+  still uses CHAP). The risk is real; record it in an
+  [accepted-risk file](../ci.md#accepted-risks) with an owner and an expiry date.
+- **The flag set but the password not changed since.** Nothing reversible is stored
+  until the next password change, but the next reset will store it, so clear the flag
+  anyway.
+"""
+
+remediation = """
+1. **List the accounts.**
+
+    ```powershell
+    Get-ADUser -LDAPFilter '(userAccountControl:1.2.840.113556.1.4.803:=128)' `
+        -Properties PasswordLastSet, Description |
+        Select-Object SamAccountName, Enabled, PasswordLastSet, Description
+    ```
+
+2. **Find out why** each account has it (CHAP, Digest authentication, an old appliance)
+   and move that dependency to something that does not need the clear text.
+
+3. **Clear the flag, then reset the password.** The reversible copy stays in the
+   directory until the password changes again.
+
+    ```powershell
+    Set-ADAccountControl old_vpn -AllowReversiblePasswordEncryption $false -WhatIf
+    Set-ADAccountPassword old_vpn -Reset -NewPassword (Read-Host -AsSecureString 'New password') -WhatIf
+    ```
+
+4. **Check the policies ad-doctor does not read** (both commands are read-only):
+
+    ```powershell
+    Get-ADDefaultDomainPasswordPolicy | Select-Object ReversibleEncryptionEnabled
+    Get-ADFineGrainedPasswordPolicy -Filter * | Select-Object Name, ReversibleEncryptionEnabled
+    ```
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-002"
+
+[[references]]
+title = "Store passwords using reversible encryption"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/store-passwords-using-reversible-encryption"
+kind = "vendor"
+
+[[references]]
+title = "UserAccountControl property flags"
+url = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/useraccountcontrol-manipulate-account-properties"
+kind = "vendor"
+
+[[references]]
+title = "ANSSI Active Directory checklist (vuln_reversible_password_priv_uac)"
+url = "https://cert.cyber.gouv.fr/uploads/ad_checklist.html"
+kind = "vendor"
+
+[[references]]
+title = "The Hacker Recipes: DCSync"
+url = "https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync"
+kind = "research"

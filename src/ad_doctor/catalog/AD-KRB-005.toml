@@ -1,0 +1,88 @@
+id = "AD-KRB-005"
+aliases = ["rc4-only"]
+summary = "Enabled user accounts with an SPN whose msDS-SupportedEncryptionTypes excludes AES, so their service tickets use RC4, the fastest kind to crack."
+severities = ["medium"]
+severity_logic = """
+Always **medium**. The account is already Kerberoastable ([AD-KRB-003](AD-KRB-003.md),
+which carries the privilege-based severity); this check reports the setting that makes
+cracking its tickets much faster.
+"""
+mitre = ["T1558.003"]
+data_sources = ["ldap"]
+attributes = ["msDS-SupportedEncryptionTypes", "servicePrincipalName", "userAccountControl", "objectClass"]
+related = ["AD-KRB-003", "AD-KRB-004"]
+since = "0.1.0"
+
+risk = """
+When any domain user requests a service ticket for an SPN (Kerberoasting), the KDC
+encrypts it with the strongest type the service account says it supports, taken from
+`msDS-SupportedEncryptionTypes`. If that value has no AES bit, the ticket is encrypted
+with **RC4-HMAC** (etype 23), whose key is just the NT hash of the password. Offline
+guessing against RC4 tickets is far faster than against AES ones, which go through
+thousands of PBKDF2 iterations per guess.
+
+So the same weak service account password falls in much less time. The cracked password
+then gives the attacker the service account and whatever it can reach.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled** user account with at least one
+`servicePrincipalName`, whose `msDS-SupportedEncryptionTypes` **is set** and has
+neither AES bit (`0x8` AES128, `0x10` AES256; the check tests `value & 0x18 == 0`).
+Computer accounts, gMSA/sMSA/dMSA and `krbtgt*` accounts are skipped. One finding lists
+the accounts by `sAMAccountName`, for example `svc_web`.
+
+Accounts where the attribute is **not set** are not reported: the KDC then falls back to
+its `DefaultDomainSupportedEncTypes` value, which ad-doctor cannot read over LDAP. Those
+accounts may also receive RC4 tickets; Microsoft's RC4 guide below shows how to find
+them from the DC event logs.
+"""
+
+false_positives = """
+- **A service that genuinely cannot use AES.** Then move it behind a gMSA or upgrade it;
+  until then record it in an [accepted-risk file](../ci.md#accepted-risks) and make the
+  password 25+ random characters, so RC4 cracking stays impractical.
+"""
+
+remediation = """
+1. **See the current value** (read-only):
+
+    ```powershell
+    Get-ADUser -LDAPFilter '(servicePrincipalName=*)' `
+        -Properties 'msDS-SupportedEncryptionTypes', PasswordLastSet |
+        Select-Object SamAccountName, 'msDS-SupportedEncryptionTypes', PasswordLastSet
+    ```
+
+2. **Allow AES** on each account (this sets `0x18`):
+
+    ```powershell
+    Set-ADUser svc_web -KerberosEncryptionType AES128, AES256 -WhatIf
+    ```
+
+3. **Reset the password.** Accounts whose password predates the domain's support for
+   AES have no AES keys until the next reset, and tickets would keep failing or falling
+   back. Use a long random password.
+
+4. **Test the service**, then watch event 4769 on the DCs: the *Ticket Encryption Type*
+   for this account should be `0x12` (AES256), not `0x17` (RC4).
+
+5. **Better: replace the account with a gMSA**, as described in
+   [AD-KRB-003](AD-KRB-003.md).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-KRB-005"
+
+[[references]]
+title = "Detect and remediate RC4 usage in Kerberos"
+url = "https://learn.microsoft.com/en-us/windows-server/security/kerberos/detect-remediate-rc4-kerberos"
+kind = "vendor"
+
+[[references]]
+title = "[MS-KILE]: Supported Encryption Types Bit Flags"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-kile/6cfc7b50-11ed-4b4d-846d-6f08f0812919"
+kind = "spec"
+
+[[references]]
+title = "Microsoft's guidance to help mitigate Kerberoasting"
+url = "https://www.microsoft.com/en-us/security/blog/2024/10/11/microsofts-guidance-to-help-mitigate-kerberoasting/"
+kind = "vendor"

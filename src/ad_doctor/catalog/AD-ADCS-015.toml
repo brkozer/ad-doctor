@@ -1,0 +1,91 @@
+id = "AD-ADCS-015"
+aliases = ["esc16"]
+summary = "A CA leaves the SID security extension out of every certificate (OID in DisableExtensionList), so weak certificate mappings are not caught by strong-mapping enforcement."
+severities = ["low", "medium"]
+severity_logic = """
+**Medium** on its own. With the SID extension suppressed, every authentication template on
+the CA behaves like ESC9: whoever can change a victim's `userPrincipalName` can get a
+certificate that maps to the victim. DCs in full enforcement (the default since the February
+2025 updates, and the only mode after the September 2025 updates) still refuse such weakly
+mapped certificates; DCs without the September 2025 updates that were set back to
+compatibility mode accept them. Drops to **low** when
+the CA holds requests for a manager. Paired with ESC6 on the same CA it bypasses full
+enforcement and is reported **high** by [AD-CHAIN-004](AD-CHAIN-004.md).
+"""
+mitre = ["T1649"]
+data_sources = ["probe-winreg"]
+attributes = ["policy\\DisableExtensionList", "PolicyModules\\Active"]
+related = ["AD-ADCS-006", "AD-ADCS-012", "AD-CHAIN-004", "AD-ADCS-016"]
+since = "unreleased"
+
+risk = """
+Since KB5014754 the CA stamps each certificate with the requester's SID in the
+`szOID_NTDS_CA_SECURITY_EXT` (1.3.6.1.4.1.311.25.2) extension, and a DC in strong-mapping
+mode uses that SID to bind the certificate to an account securely. A CA administrator can
+switch the extension off globally by adding its OID to the `DisableExtensionList` registry
+value.
+
+With the extension gone, certificates fall back to being mapped by their SAN, which is the
+pre-2022 behaviour. Every authentication template on the CA is then effectively ESC9: an
+attacker who can set a victim's `userPrincipalName` (or otherwise influence the SAN) obtains
+a certificate that authenticates as the victim. On its own this needs a DC without the
+September 2025 updates that was set back to compatibility mode; combined with ESC6 ([AD-ADCS-012](AD-ADCS-012.md)) on the same CA it works
+even under full enforcement, because the SID can then be supplied in a SAN URL.
+"""
+
+detection = """
+ad-doctor reads `policy\\DisableExtensionList` from the CA registry over `\\pipe\\winreg` and
+reports the CA when it contains the SID extension OID `1.3.6.1.4.1.311.25.2`. When
+`PolicyModules\\Active` names a non-Microsoft module the value is treated as unknown and
+reported by [AD-ADCS-016](AD-ADCS-016.md), not as clean. A CA that holds requests for a
+manager is noted and the severity drops.
+"""
+
+false_positives = """
+- **Full enforcement and no ESC6.** With every DC in full enforcement and no
+  `EDITF_ATTRIBUTESUBJECTALTNAME2` on the CA, the SID can no longer be forged into the SAN,
+  so ESC16 alone is latent. ad-doctor still reports it medium, because it re-enables a whole
+  class of weak-mapping attacks and turns critical the moment a DC falls back or ESC6 appears.
+"""
+
+remediation = """
+1. **Re-enable the SID extension on the CA** and restart the service:
+
+    ```console
+    certutil -config "<host>\\<CA name>" -setreg policy\\DisableExtensionList -1.3.6.1.4.1.311.25.2
+    net stop certsvc & net start certsvc
+    ```
+
+2. **Reissue or re-enrol** certificates that were issued while the extension was off, so they
+   carry the SID binding.
+
+3. **Keep every DC on current updates** (full enforcement, the only mode after the
+   September 2025 updates) and fix any ESC9-style templates ([AD-ADCS-006](AD-ADCS-006.md)).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-015"
+
+[[references]]
+title = "ESC16 Strips the SID Extension Strong Mapping Depends On (Trackr.Live)"
+url = "https://www.trackr.live/2026/07/01/esc16-adcs-strong-mapping-sid-extension/"
+kind = "research"
+
+[[references]]
+title = "ADCS ESC16 - Security Extension Disabled on CA Globally (Hacking Articles)"
+url = "https://www.hackingarticles.in/adcs-esc16-security-extension-disabled-on-ca-globally/"
+kind = "research"
+
+[[references]]
+title = "KB5014754: Certificate-based authentication changes on Windows domain controllers"
+url = "https://support.microsoft.com/en-us/topic/kb5014754-certificate-based-authentication-changes-on-windows-domain-controllers-ad2c23b0-15d8-4340-a468-4d4f3b188f16"
+kind = "vendor"
+
+[[references]]
+title = "certutil"
+url = "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/certutil"
+kind = "vendor"
+
+[[references]]
+title = "Certipy wiki: ESC16"
+url = "https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation"
+kind = "tool"

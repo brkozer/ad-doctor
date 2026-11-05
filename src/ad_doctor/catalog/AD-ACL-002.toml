@@ -1,0 +1,92 @@
+id = "AD-ACL-002"
+aliases = ["adminsdholder"]
+summary = "A principal outside tier 0 can rewrite the AdminSDHolder object, whose DACL SDProp copies onto every protected admin account and group every hour."
+severities = ["high"]
+severity_logic = """
+Always **high**: control of AdminSDHolder becomes control of Domain Admins, Enterprise
+Admins, Administrators and every other protected group and member within an hour.
+"""
+mitre = ["T1098"]
+data_sources = ["ldap"]
+attributes = ["nTSecurityDescriptor of CN=AdminSDHolder,CN=System (effective ACEs)"]
+related = ["AD-ACL-004", "AD-ACL-005", "AD-ACC-006", "AD-PATH-001"]
+since = "0.1.0"
+
+risk = """
+`CN=AdminSDHolder,CN=System` is a template. Every 60 minutes the Security Descriptor
+Propagator (SDProp) on the PDC emulator overwrites the security descriptor of every
+protected account and group (members of Domain Admins, Enterprise Admins, Administrators,
+the operator groups, krbtgt and so on) with the AdminSDHolder one.
+
+1. An attacker who can write the AdminSDHolder DACL adds an ACE giving their account
+   full control.
+2. Within an hour SDProp stamps that ACE onto every protected object.
+3. They reset a domain admin's password or add themselves to Domain Admins.
+
+It is also a classic persistence trick: an administrator who removes the attacker's ACE
+from Domain Admins sees it come back at the next SDProp run.
+"""
+
+detection = """
+ad-doctor reads the DACL of `CN=AdminSDHolder,CN=System,<domain>` (the effective ACEs,
+including those it inherits when inheritance is on, see [AD-ACL-005](AD-ACL-005.md)) and
+reports every principal outside the default tier-0 set that holds a **takeover** right:
+
+- GenericAll or full control,
+- GenericWrite,
+- WriteDacl or WriteOwner,
+- WriteProperty on all attributes (an ACE with no object type).
+
+Default tier 0 here is Administrators, Domain Admins, Enterprise Admins, Schema Admins,
+Domain Controllers, Enterprise Domain Controllers, the read-only DC groups, the built-in
+Administrator and SYSTEM. Each object is the principal's name, for example `helpdesk`.
+Ownership of AdminSDHolder is not evaluated.
+"""
+
+false_positives = """
+- **Delegated tier-0 tooling**, such as a privileged access management product that
+  manages protected accounts through AdminSDHolder. Treat its service account as tier 0
+  and accept the finding with an owner (../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **Review the AdminSDHolder DACL** (read-only):
+
+    ```powershell
+    $holder = "CN=AdminSDHolder,CN=System,$((Get-ADDomain).DistinguishedName)"
+    (Get-Acl "AD:$holder").Access |
+        Where-Object { $_.ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner|WriteProperty' } |
+        Format-Table IdentityReference, ActiveDirectoryRights, ObjectType, IsInherited -AutoSize
+    ```
+
+2. **Remove the ACEs for the reported principals.** `dsacls /R` removes every ACE for the
+   trustee, so check step 1 first:
+
+    ```powershell
+    # dsacls "CN=AdminSDHolder,CN=System,DC=corp,DC=example" /R "CORP\\helpdesk"
+    ```
+
+3. **Wait for SDProp (60 minutes) or run it now**, then confirm the ACE is gone from a
+   protected group such as Domain Admins as well.
+
+4. **If the grant was not intended, investigate**: who added it and when (directory
+   service change auditing, event 5136 on the DCs), and what the principal did with
+   protected accounts since.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-002"
+
+[[references]]
+title = "Appendix C: Protected accounts and groups in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-c--protected-accounts-and-groups-in-active-directory"
+kind = "vendor"
+
+[[references]]
+title = "Sneaky Active Directory Persistence #15: Leverage AdminSDHolder & SDProp (Sean Metcalf)"
+url = "https://adsecurity.org/?p=1906"
+kind = "research"
+
+[[references]]
+title = "An ACE Up the Sleeve: Designing Active Directory DACL Backdoors (SpecterOps)"
+url = "https://specterops.io/wp-content/uploads/sites/3/2022/06/an_ace_up_the_sleeve.pdf"
+kind = "research"
