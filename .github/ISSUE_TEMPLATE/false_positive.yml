@@ -1,0 +1,35 @@
+name: False positive or missed finding
+description: A check reported something that is not a problem, or missed one that is
+labels: [accuracy]
+body:
+  - type: input
+    id: check
+    attributes:
+      label: Check ID
+      placeholder: AD-ACL-004
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - False positive (reported, but not a problem)
+        - Missed finding (a problem, not reported)
+        - Wrong severity
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it is wrong
+      description: The object and the setting involved, and why the result is wrong
+    validations:
+      required: true
+  - type: textarea
+    id: snapshot
+    attributes:
+      label: Redacted snapshot (optional, very helpful)
+      description: >
+        `AD_DOCTOR_REDACT_KEY=... ad-doctor redact snap.json -o redacted.json`, then attach
+        the file. Read it before attaching.

@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import __version__, accept, invariants, paths, redact
+from . import __version__, accept, invariants, opengraph, paths, redact
 from .checks import MITRE, REGISTRY, run_all
 from .collect import CollectError, Target, collect
 from .fixes import render_fixes
@@ -52,6 +52,7 @@ def _target(args: argparse.Namespace) -> Target:
         http_port=args.http_port,
         probes=not args.no_probes,
         kerberos=args.kerberos,
+        all_dcs=not args.single_dc,
     )
 
 
@@ -160,6 +161,15 @@ def cmd_blast_radius(args: argparse.Namespace) -> int:
     return 2 if tier0 else 0
 
 
+def cmd_export_graph(args: argparse.Namespace) -> int:
+    snap = Snapshot.from_json(_load_json(args.snapshot))
+    payload = opengraph.export(snap, paths_only=args.paths_only)
+    args.output.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    graph = payload["graph"]
+    print(f"wrote {args.output} ({len(graph['nodes'])} nodes, {len(graph['edges'])} edges)")
+    return 0
+
+
 def cmd_redact(args: argparse.Namespace) -> int:
     key = os.environ.get("AD_DOCTOR_REDACT_KEY")
     if not key:
@@ -198,6 +208,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         p.add_argument(
             "--no-probes", action="store_true", help="skip the SMB, channel binding and ESC8 probes"
+        )
+        p.add_argument(
+            "--single-dc",
+            action="store_true",
+            help="probe only the DC being scanned, not every DC in the domain",
         )
         p.add_argument(
             "-k",
@@ -267,6 +282,15 @@ def main(argv: list[str] | None = None) -> int:
     p_redact.add_argument("snapshot", type=Path)
     p_redact.add_argument("-o", "--output", type=Path, required=True)
 
+    p_graph = sub.add_parser(
+        "export-graph", help="write the control graph as BloodHound OpenGraph JSON"
+    )
+    p_graph.add_argument("snapshot", type=Path)
+    p_graph.add_argument("-o", "--output", type=Path, required=True)
+    p_graph.add_argument(
+        "--paths-only", action="store_true", help="only nodes and edges on paths to tier 0"
+    )
+
     p_checks = sub.add_parser("checks", help="list available checks")
     p_checks.add_argument("-f", "--format", choices=["text", "json"], default="text")
 
@@ -290,6 +314,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_blast_radius(args)
         if args.cmd == "redact":
             return cmd_redact(args)
+        if args.cmd == "export-graph":
+            return cmd_export_graph(args)
         if args.cmd == "analyze":
             snap = Snapshot.from_json(_load_json(args.snapshot))
         else:

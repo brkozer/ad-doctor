@@ -1,0 +1,38 @@
+name: Bug report
+description: ad-doctor crashed, failed to collect, or produced broken output
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `ad-doctor --version`
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: The command you ran, with host names and accounts replaced
+      placeholder: ad-doctor scan dc01.corp.example -u 'CORP\auditor' --ldaps
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The error or the wrong output, and what you expected instead
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and Python version, DC Windows Server version, domain functional level
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Before posting
+      options:
+        - label: I removed domain names, account names, addresses and SIDs, or used `ad-doctor redact`
+          required: true

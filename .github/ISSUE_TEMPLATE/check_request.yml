@@ -1,0 +1,21 @@
+name: Check request
+description: Propose a new check or a new data source
+labels: [check-request]
+body:
+  - type: textarea
+    id: misconfiguration
+    attributes:
+      label: Misconfiguration
+      description: What is wrong in the directory, and what an attacker can do with it
+    validations:
+      required: true
+  - type: textarea
+    id: detection
+    attributes:
+      label: How to detect it
+      description: The LDAP attributes, ACEs, SYSVOL files or probes that show it, if you know
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      description: Write-ups, CVEs, MITRE ATT&CK techniques, other tools that check it

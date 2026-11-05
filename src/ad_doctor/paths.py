@@ -9,6 +9,7 @@ tier-0 node finds the shortest path from any other principal.
 
 from __future__ import annotations
 
+import re
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -26,9 +27,10 @@ from .checks import (
     _tier0_group_sids,
     check,
 )
-from .model import Finding, Severity, Snapshot
+from .model import Account, Finding, Severity, Snapshot
 
 Edge = tuple[str, str]  # (target node, label)
+UNESCAPED_COMMA = re.compile(r"(?<!\\),")
 
 
 @dataclass
@@ -155,14 +157,22 @@ def build(snap: Snapshot) -> Graph:
         if a.sid
     ]
     children += [(o.dn, node_of(o.dn), o.kind) for o in snap.objects if o.kind in ("group", "ou")]
-    for parent in snap.objects:
-        if parent.kind not in ("ou", "container"):
+    # index children under every OU/container above them (a DN suffix lookup per comma
+    # instead of comparing every child with every container)
+    parents = [p for p in snap.objects if p.kind in ("ou", "container")]
+    parent_index = {p.dn.lower(): i for i, p in enumerate(parents)}
+    below: list[list[tuple[str, str]]] = [[] for _ in parents]
+    for dn, node, kind in children:
+        key = dn.lower()
+        if key in protected:
             continue
-        suffix = "," + parent.dn.lower()
+        for comma in UNESCAPED_COMMA.finditer(key):
+            i = parent_index.get(key[comma.end() :])
+            if i is not None:
+                below[i].append((node, kind))
+    for parent, kids in zip(parents, below, strict=True):
         parent_node = node_of(parent.dn)
-        for dn, node, kind in children:
-            if not dn.lower().endswith(suffix) or dn.lower() in protected:
-                continue
+        for node, kind in kids:
             add(parent_node, node, "contains")
             for ace in parent.inheritable:
                 applies = ace.inherited_object_type in (None, CLASS_OF_KIND.get(kind))
@@ -289,8 +299,10 @@ def identity_nodes(snap: Snapshot, sam_or_sid: str) -> list[str]:
     """The account's own node plus the groups it is in without a member link."""
     key = sam_or_sid.lower()
     account = next((a for a in snap.accounts if a.sam.lower() == key or a.sid.lower() == key), None)
-    if account is None:
-        return []
+    return [] if account is None else _identity(snap, account)
+
+
+def _identity(snap: Snapshot, account: Account) -> list[str]:
     machine = account.is_computer or account.managed
     primary = account.primary_group or (515 if machine else 513)
     nodes = [_sid_node(account.sid), _sid_node("S-1-1-0"), _sid_node("S-1-5-11")]
@@ -313,7 +325,7 @@ def exposure(snap: Snapshot, g: Graph, found: dict[str, Path]) -> tuple[int, int
     exposed = sum(
         1
         for a in users
-        if any(n in found or n in g.tier0 for n in identity_nodes(snap, a.sid)[1:])
+        if any(n in found or n in g.tier0 for n in _identity(snap, a)[1:])
         or _sid_node(a.sid) in found
     )
     return exposed, len(users)

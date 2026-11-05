@@ -316,6 +316,35 @@ try {
         -Filter system.webServer/security/access -Name sslFlags -Value 'None'
 } catch { "web enrollment not installed: $($_.Exception.Message)" }
 
+# --- Round 4 ---
+# Exchange: the groups Exchange setup creates, with the pre-2019 WriteDacl on the domain head
+# (PrivExchange, AD-ACL-007). No Exchange install: only the directory side matters here.
+$exName = 'Microsoft Exchange Security Groups'
+if (-not (Get-ADOrganizationalUnit -Filter "Name -eq '$exName'")) {
+    New-ADOrganizationalUnit -Name $exName -Path $dn -ProtectedFromAccidentalDeletion $false
+}
+foreach ($g in 'Exchange Windows Permissions', 'Exchange Trusted Subsystem') {
+    if (-not (Get-ADGroup -Filter "Name -eq '$g'")) {
+        New-ADGroup -Name $g -SamAccountName $g -GroupScope Universal -GroupCategory Security `
+            -Path "OU=$exName,$dn"
+    }
+}
+Ensure-Computer EXCH01
+Add-ADGroupMember 'Exchange Trusted Subsystem' -Members (Get-ADComputer EXCH01)
+Add-ADGroupMember 'Exchange Windows Permissions' -Members 'Exchange Trusted Subsystem'
+Grant-Ad $dn (Get-ADGroup 'Exchange Windows Permissions').SID WriteDacl
+
+# Entra Connect: a sync account with DCSync whose server is not tier 0 (AD-PRIV-011) and
+# whose password helpdesk can reset (AD-ACL-008). The description is the one setup writes.
+Ensure-Computer ENTRA01
+Ensure-User MSOL_0a1b2c3d4e5f @{Description = 'Account created by Microsoft Azure Active ' +
+    'Directory Connect with installation identifier 0a1b2c3d4e5f running on computer ENTRA01 ' +
+    'configured to synchronize to tenant adlab.onmicrosoft.com.'}
+$msol = Get-ADUser MSOL_0a1b2c3d4e5f
+Grant-Ad $dn $msol.SID ExtendedRight '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2'
+Grant-Ad $dn $msol.SID ExtendedRight '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2'
+Grant-Ad $msol.DistinguishedName $helpdesk ExtendedRight '00299570-246d-11d0-a768-00aa006e0529'
+
 # SDProp copies the AdminSDHolder ACL onto protected objects now instead of within the hour
 $rootDse = [ADSI]'LDAP://RootDSE'
 $rootDse.Put('runProtectAdminGroupsTask', 1)

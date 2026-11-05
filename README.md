@@ -6,12 +6,13 @@
 Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
-(plus SYSVOL and a few cheap probes over SMB and HTTP) and runs 74 checks for what
-attackers look for first: roastable accounts, risky delegation, exploitable certificate
-templates (ESC1–5, 8, 9, 13–15), DCSync and other takeover rights, shadow credentials,
-BadSuccessor, editable GPOs on domain controllers, passwords in Group Policy and scripts,
-relay-friendly settings, weak trusts and legacy configuration. It then finds every
-control path from a non-admin to tier 0. It writes nothing to the directory.
+(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 78
+checks for what attackers look for first: roastable accounts, risky delegation,
+exploitable certificate templates (ESC1–5, 8, 9, 13–15), DCSync and other takeover rights,
+shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync accounts,
+editable GPOs on domain controllers, passwords in Group Policy and scripts, relay-friendly
+DCs, weak trusts and legacy configuration. It then finds every control path from a
+non-admin to tier 0. It writes nothing to the directory.
 
 <p align="center"><img src="docs/demo.svg" alt="ad-doctor scanning the lab domain: ESC8 web enrollment, a relay-to-RBCD chain, a password in a logon script, BadSuccessor rights and the control paths to tier 0" width="100%"></p>
 
@@ -25,6 +26,16 @@ DC seeded with one instance of every misconfiguration that a single domain can h
   gMSA readers) from the snapshot and reports the shortest path from every non-tier-0
   principal to tier 0, plus the share of users that have one. `ad-doctor blast-radius`
   answers "what does this account control if it is phished?".
+- **Plays well with BloodHound.** `ad-doctor export-graph` writes the same graph as a
+  BloodHound OpenGraph payload. Principals keep their SIDs, so the edges attach to an
+  existing SharpHound graph of the domain instead of building a second one.
+- **Every DC, not just one.** LDAP signing, SMB signing, the spooler and channel binding
+  are probed on each domain controller, and findings name the ones that drift from the
+  rest; DCs that cannot be reached are reported rather than assumed fine.
+- **Fast on large domains.** 100,000 users, 33,000 computers and 127,000 ACEs load in
+  about 3 s and go through every check, attack paths included, in about 6 s on one 2017
+  Xeon core
+  ([benchmark](#performance)).
 - **Compound findings.** `AD-CHAIN-*` raise the alarm when individually medium findings
   add up to a known one-step compromise (relay to RBCD, coercion plus unconstrained
   delegation, coercion plus ESC8).
@@ -88,6 +99,7 @@ against a live DC.
 | | AD-PRIV-008 | Operator groups not empty | medium |
 | | AD-PRIV-009 | Cert Publishers members that are not CA servers | medium |
 | | AD-PRIV-010 | Protected Users not used for administrators | info |
+| | AD-PRIV-011 | Entra Connect sync account can DCSync and its server is not protected as tier 0 | medium |
 | Policy | AD-POL-001 | Weak default password policy | medium |
 | | AD-POL-002 | `ms-DS-MachineAccountQuota` above 0 | medium |
 | Hardening | AD-SEC-001 | Windows computers without LAPS | medium |
@@ -96,14 +108,15 @@ against a live DC.
 | | AD-INF-002 | AD Recycle Bin disabled | low |
 | | AD-INF-003 | Domain functional level below Windows Server 2016 | low |
 | | AD-INF-004 | Unsafe `dsHeuristics` (anonymous LDAP, AdminSDHolder exclusions) | medium/high |
-| | AD-INF-005 | LDAP signing not required (probe) | medium |
+| | AD-INF-005 | LDAP signing not required (probe, every DC) | medium |
 | | AD-INF-006 | Trusts without SID filtering or with TGT delegation | high |
 | | AD-INF-007 | BadSuccessor: dMSA creation rights outside tier 0 (2025 domains) | high |
-| | AD-INF-008 | SMB signing not required on the DC (probe) | high |
-| | AD-INF-009 | Print Spooler running on the DC (probe); high with unconstrained delegation | medium/high |
-| | AD-INF-010 | LDAPS channel binding not enforced (probe) | medium |
+| | AD-INF-008 | SMB signing not required (probe, every DC) | high |
+| | AD-INF-009 | Print Spooler running (probe, every DC); high with unconstrained delegation | medium/high |
+| | AD-INF-010 | LDAPS channel binding not enforced (probe, every DC) | medium |
 | | AD-INF-011 | No backup of the domain partition in 7 days | medium |
 | | AD-INF-012 | RODCs that may cache privileged credentials | medium |
+| | AD-INF-013 | Domain controllers the probes could not reach | low |
 | Certificate services | AD-ADCS-001 | ESC1: enrollee-supplied subject on an authentication template | high |
 | | AD-ADCS-002 | ESC2: any-purpose or no-EKU template | high |
 | | AD-ADCS-003 | ESC3: enrollment agent template open to broad groups | high |
@@ -121,6 +134,8 @@ against a live DC.
 | | AD-ACL-004 | Takeover rights or ownership on tier-0 accounts, groups and DCs (shadow credentials, RBCD, members, password reset, SPN) | high |
 | | AD-ACL-005 | AdminSDHolder inherits permissions | high |
 | | AD-ACL-006 | gMSA passwords readable outside tier 0 | medium/high |
+| | AD-ACL-007 | Exchange groups with WriteDacl over the domain (PrivExchange); medium when only inherited | medium/high |
+| | AD-ACL-008 | Entra Connect sync account or server controllable outside tier 0 | high |
 | Group Policy | AD-GPO-001 | GPOs linked to the domain or DC OU editable outside tier 0 | high |
 | | AD-GPO-002 | Non-tier-0 principals can link GPOs to the domain or DCs | high |
 | | AD-GPO-003 | NTLMv1/LM, LM hashes, reversible encryption or dangerous privileges in those GPOs | medium/high |
@@ -164,6 +179,9 @@ ad-doctor analyze 2026-11.json -f markdown -o report.md --invariants invariants.
 ad-doctor diff 2026-10.json 2026-11.json
 ad-doctor blast-radius 2026-11.json helpdesk_jane
 AD_DOCTOR_REDACT_KEY=... ad-doctor redact 2026-11.json -o shareable.json
+
+# the control graph for BloodHound CE (File Ingest accepts OpenGraph JSON)
+ad-doctor export-graph 2026-11.json -o graph.json --paths-only
 ```
 
 | Option | |
@@ -178,6 +196,7 @@ AD_DOCTOR_REDACT_KEY=... ad-doctor redact 2026-11.json -o shareable.json
 | `-k`, `--kerberos` | bind with Kerberos instead of a password |
 | `--no-sysvol`, `--smb-port` | skip or redirect the SMB part |
 | `--no-probes`, `--http-port` | skip the SMB, channel binding and ESC8 probes, or move the web enrollment port |
+| `--single-dc` | probe only the DC being scanned instead of every DC in the domain |
 | `--signing-probe-port PORT` | plain LDAP port for the signing probe; `0` skips it |
 
 Parts that cannot run (no AD CS, SYSVOL unreachable, Kerberos without an NTLM account for
@@ -206,17 +225,23 @@ by a small built-in parser (`sd.py`). From SYSVOL it reads Group Policy Preferen
 `GptTmpl.inf` security templates and scripts, and keeps only paths, line numbers, account
 names and setting values, never a secret.
 
-Active probes, each one connection: an unsigned NTLM bind on 389 (LDAP signing), an NTLM
-bind on LDAPS without a channel binding token, an SMB negotiate plus an attempt to open
-the `spoolss` pipe, and an unauthenticated `GET /certsrv/` on each CA. `--no-probes` and
-`--signing-probe-port 0` turn them off.
+Active probes, each one connection per DC: an unsigned NTLM bind on 389 (LDAP signing),
+an NTLM bind on LDAPS without a channel binding token, an SMB negotiate plus an attempt
+to open the `spoolss` pipe, and an unauthenticated `GET /certsrv/` on each CA. The DC
+being scanned is reached through the address and ports given on the command line, the
+others by their DNS names on the standard ports. `--single-dc`, `--no-probes` and
+`--signing-probe-port 0` narrow or turn them off; [SECURITY.md](SECURITY.md) lists every
+probe.
 
 ## Limits
 
 - One domain per run; trusts are inspected from this side only.
 - CA-side settings that LDAP cannot see (ESC6, ESC7, ESC11, ESC16, EPA on HTTPS
-  enrollment) are out of scope, and so are per-host settings beyond the DC that is
-  scanned.
+  enrollment) are out of scope, and so are host settings beyond what the DC probes see
+  (local admins on Exchange or Entra Connect servers, for instance).
+- Exchange and Entra Connect are recognised from their directory footprint (the groups
+  Exchange setup creates, `MSOL_` sync accounts); the lab seeds that footprint without
+  installing either product.
 - Deny ACEs are ignored, which can only over-report, never hide a finding.
 - An ordinary user cannot read fine-grained password policies; the report says so
   instead of assuming the default policy applies to admins.
@@ -237,15 +262,37 @@ flowchart LR
     P --> S
     S -- "collect -o / redact" --> F[(snapshot.json)]
     F --> A
-    S --> A[checks.py + paths.py<br/>74 pure functions]
+    S --> A[checks.py + paths.py<br/>78 pure functions]
     A --> I[invariants.py<br/>accept.py]
     I --> R[report.py<br/>text, JSON, Markdown,<br/>HTML, SARIF, JUnit]
     I --> X[fixes.py<br/>remediation script]
+    A --> O[opengraph.py<br/>BloodHound OpenGraph]
 ```
 
 Checks never touch the network, which keeps them fast and lets the unit tests run
 without a domain controller; the collector itself is tested against a fake LDAP
 connection and, through `tests/test_lab.py`, against the live lab DC.
+
+## Performance
+
+`scripts/bench.py` builds a synthetic enterprise domain (an OU tree of 8 regions, 80
+sites and 480 departments, nested groups, delegated OU permissions that inherit, default
+DACLs on every object, GPOs and templates) and times each stage. On one core of an Intel
+Xeon Gold 6138 (2017), Python 3.12:
+
+| Domain | Snapshot | Load | All checks + paths | OpenGraph export | Peak memory |
+|---|---|---|---|---|---|
+| 10,000 users, 3,300 computers, 19,000 ACEs | 12 MB | 0.4 s | 0.6 s | 0.7 s | 0.2 GB |
+| 100,000 users, 33,000 computers, 127,000 ACEs | 111 MB | 3.3 s | 5.7 s | 6.3 s | 1.4 GB |
+| 250,000 users, 83,000 computers, 308,000 ACEs | 277 MB | 8.1 s | 15.1 s | 16.8 s | 3.5 GB |
+
+Analysis grows linearly with the size of the domain. Collection time is set by the DC:
+the snapshot comes from a few paged LDAP searches, so it scales with the number of objects
+and the network round trip, not with the number of checks.
+
+```bash
+uv run python scripts/bench.py --users 100000
+```
 
 ## Development
 
@@ -253,6 +300,9 @@ connection and, through `tests/test_lab.py`, against the live lab DC.
 uv sync
 uv run ruff check . && uv run mypy && uv run pytest
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for adding a check and [SECURITY.md](SECURITY.md)
+for reporting vulnerabilities. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 [`lab/`](lab) builds a disposable Windows Server 2025 evaluation DC under KVM and seeds
 it; see [lab/README.md](lab/README.md). With the lab running:

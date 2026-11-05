@@ -9,8 +9,10 @@ import os
 
 import pytest
 
+from ad_doctor import opengraph
 from ad_doctor.checks import run_all
 from ad_doctor.collect import Target, collect
+from ad_doctor.model import Snapshot
 
 pytestmark = pytest.mark.lab
 
@@ -38,9 +40,9 @@ EXPECTED = {
     "AD-ADCS-002": {"LabESC2 (enroll: Domain Users)"},
     "AD-ADCS-003": {"LabESC3 (enroll: Domain Users)"},
     "AD-ADCS-004": {"LabESC4 (Authenticated Users)"},
-    "AD-ACL-001": {"svc_sync"},
+    "AD-ACL-001": {"svc_sync", "MSOL_0a1b2c3d4e5f"},
     "AD-ACL-002": {"helpdesk"},
-    "AD-ACL-003": {"helpdesk"},
+    "AD-ACL-003": {"helpdesk", "Exchange Windows Permissions"},
     "AD-ADCS-005": {"NTAuthCertificates (helpdesk)"},
     "AD-ADCS-006": {"LabESC9 (enroll: Domain Users)"},
     "AD-ADCS-007": {"LabESC13 (enroll: Domain Users)"},
@@ -53,7 +55,7 @@ EXPECTED = {
     "AD-INF-001": {"OLD2008$ (Windows Server 2008 R2 Standard)"},
     "AD-INF-002": {"adlab.test"},
     "AD-INF-004": {"0000002"},
-    "AD-INF-005": {"adlab.test"},
+    "AD-INF-005": {"DC01.adlab.test"},
     "AD-ACC-008": {"notes_user"},
     "AD-ACC-010": {"PRE2K$"},
     "AD-KRB-005": {"svc_web"},
@@ -75,7 +77,7 @@ EXPECTED = {
     "AD-GPO-004": {"LabUserPolicy (helpdesk)"},
     "AD-GPP-002": {r"scripts\map.bat:1 (net use with a password)"},
     "AD-INF-007": {"Lab: ou_admin"},
-    "AD-INF-010": {"adlab.test"},
+    "AD-INF-010": {"DC01.adlab.test"},
     "AD-PRIV-006": {"Domain Admins: old_admin (disabled)"},
     "AD-PRIV-007": {"hidden_admin (primary group Domain Admins)"},
     "AD-PRIV-008": {"Backup Operators: op_user"},
@@ -87,6 +89,9 @@ EXPECTED = {
         "gpo_linker -[link GPOs]-> Domain Controllers",
         "kc_writer -[write msDS-KeyCredentialLink]-> DC01$",
     },
+    "AD-ACL-007": {"Exchange Windows Permissions: WriteDacl on the domain object"},
+    "AD-PRIV-011": {"MSOL_0a1b2c3d4e5f on ENTRA01: not in a tier-0 group, no LAPS"},
+    "AD-ACL-008": {"MSOL_0a1b2c3d4e5f (sync account): helpdesk (reset password)"},
     "AD-GPP-001": {
         r"Policies\{4B1D7A55-0C1E-4A3B-9D2F-7E6A5C3B2A10}\Machine\Preferences\Groups\Groups.xml"
         " (localadmin)"
@@ -95,7 +100,7 @@ EXPECTED = {
 
 
 @pytest.fixture(scope="module")
-def findings() -> dict[str, set[str]]:
+def snap() -> Snapshot:
     host = os.environ.get("AD_DOCTOR_LAB_HOST")
     if not host:
         pytest.skip("AD_DOCTOR_LAB_HOST not set")
@@ -113,7 +118,25 @@ def findings() -> dict[str, set[str]]:
     assert snap.domain == "adlab.test"
     # an ordinary user cannot see fine-grained password policies; nothing else may fail
     assert [n for n in snap.notes if "fine-grained" not in n] == []
+    return snap
+
+
+@pytest.fixture(scope="module")
+def findings(snap: Snapshot) -> dict[str, set[str]]:
     return {f.check_id: set(f.objects) for f in run_all(snap)}
+
+
+def test_every_dc_probed(snap: Snapshot) -> None:
+    assert [d.name.lower() for d in snap.probes.dcs] == ["dc01.adlab.test"]
+    assert snap.probes.dcs[0].error is None
+
+
+def test_opengraph_export_of_the_lab(snap: Snapshot) -> None:
+    payload = opengraph.export(snap)
+    msol = next(a.sid for a in snap.accounts if a.sam == "MSOL_0a1b2c3d4e5f")
+    kinds = {(e["start"]["value"], e["kind"]) for e in payload["graph"]["edges"]}
+    assert (msol, "ADD_DCSync") in kinds
+    assert all(":" not in n["id"] for n in payload["graph"]["nodes"])
 
 
 @pytest.mark.parametrize("check_id", sorted(EXPECTED))
@@ -143,6 +166,8 @@ def test_clean_and_default_objects_not_flagged(findings: dict[str, set[str]]) ->
         "AD-ACL-002",
         "AD-ACL-003",
         "AD-ACL-006",
+        "AD-ACL-007",
+        "AD-ACL-008",
         "AD-DEL-001",
         "AD-DEL-004",
         "AD-GPP-002",

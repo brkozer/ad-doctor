@@ -46,6 +46,7 @@ KEEP = {
     "rasandiasserver", "smartcardlogon", "smartcarduser", "userSignature".lower(),
     "machineenrollmentagent", "offlinerouter", "rootcertificationauthority",
 }  # fmt: skip
+UNKNOWN_SYNC_HOST = "unknown server"
 SID_PREFIX = re.compile(r"S-1-5-21-\d+-\d+-\d+")
 IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 GUID_LIKE = re.compile(r"^\{?[0-9a-fA-F-]{36}\}?$")
@@ -53,8 +54,9 @@ GUID_LIKE = re.compile(r"^\{?[0-9a-fA-F-]{36}\}?$")
 FIXED_KEYS = {
     f.name
     for cls in (model.Snapshot, model.Account, model.DomainPolicy, model.CertTemplate,
-                model.DirObject, model.GpoSettings, model.Probes, model.Gmsa, model.Rodc,
-                model.Trust, model.Gpo, model.GppPassword, model.ScriptSecret)
+                model.DirObject, model.GpoSettings, model.Probes, model.DcProbe,
+                model.Gmsa, model.Rodc, model.Trust, model.Gpo, model.GppPassword,
+                model.ScriptSecret)
     for f in dataclasses.fields(cls)
 } | {"domain", "AdminSDHolder", "sid", "mask", "object_type", "inherited_object_type"}  # fmt: skip
 
@@ -88,6 +90,10 @@ class Redactor:
             words.update(_dn_values(a["dn"]))
             if a.get("dns_host"):
                 words.update([a["dns_host"], *a["dns_host"].split(".")])
+            if a.get("sync_host") and a["sync_host"] != UNKNOWN_SYNC_HOST:
+                words.add(a["sync_host"])
+        for d in data.get("probes", {}).get("dcs", []):
+            words.update([d["name"], *d["name"].split(".")])
         for o in data.get("objects", []):
             words.add(o["name"])
             words.update(_dn_values(o["dn"]))

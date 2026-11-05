@@ -91,4 +91,10 @@ uv run ad-doctor scan dc01.adlab.test --ldaps --port 10636 --smb-port 10445 --ht
   so AD-INF-009 and AD-CHAIN-002/003 are covered by unit tests only.
 - Seeding restarts NTDS once and asks SDProp to run immediately, so the AdminSDHolder ACL
   is copied onto protected objects before the tests.
+- Exchange and Entra Connect are seeded by their directory footprint only: the Exchange
+  security groups with the pre-2019 WriteDacl on the domain head and a member server
+  account, and an `MSOL_` sync account with DCSync and the description setup writes. Neither
+  product is installed.
+- With one DC, the every-DC probes cover the scanned DC only; the multi-DC paths are
+  unit-tested.
 - The evaluation licence runs for 180 days. Rebuild from scratch rather than extend it.

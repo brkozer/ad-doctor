@@ -17,8 +17,10 @@ from ldap3.protocol.microsoft import security_descriptor_control
 
 from . import probes, sd, sysvol
 from .model import (
+    EXCHANGE_GROUPS,
     Account,
     CertTemplate,
+    DcProbe,
     DirObject,
     DomainPolicy,
     Gmsa,
@@ -59,6 +61,10 @@ SECRET_TEXT = re.compile(
     r"\s*[:=]\s*\S{3,}",
     re.IGNORECASE,
 )
+# Entra Connect (Azure AD Connect) names its sync account MSOL_<hex> and writes the server
+# into the description; older DirSync/express installs use Sync_<server>_<hex>
+SYNC_DESCRIPTION = re.compile(r"running on computer ([A-Za-z0-9._-]+)", re.IGNORECASE)
+SYNC_SAM = re.compile(r"^(?:MSOL_[0-9a-f]{12}|Sync_(?P<host>.+)_[0-9a-f]{12})$", re.IGNORECASE)
 PASSWORD_ATTRIBUTES = ("userPassword", "unixUserPassword", "msSFU30Password", "orclCommonAttribute")
 LAPS_PASSWORD_ATTRIBUTES = ("ms-Mcs-AdmPwd", "msLAPS-Password", "msLAPS-EncryptedPassword")
 MANAGED_CLASSES = {
@@ -119,6 +125,8 @@ class Target:
     # SMB posture and channel binding probes
     probes: bool = True
     kerberos: bool = False
+    # probe every DC found in the directory, not only the one being scanned
+    all_dcs: bool = True
 
 
 def sid_to_str(raw: bytes) -> str:
@@ -155,6 +163,7 @@ class Collector:
         self.ca_dns_hosts: list[str] = []
         self.rodc_policies: list[tuple[Account, list[str], list[str]]] = []
         self.domain_dn = ""
+        self.scanned_ldap_signing: bool | None = None
 
     def search(
         self,
@@ -299,6 +308,11 @@ class Collector:
                 acls[key] = aces
 
         priv_dns = {dn.lower() for members in privileged.values() if members for dn in members}
+        # accounts that hold DCSync are tier 0 in practice (Entra Connect, backup tools)
+        domain_aces = acls["domain"]
+        get = {a.sid for a in domain_aces if a.extended_right(sd.DS_REPL_GET_CHANGES)}
+        get_all = {a.sid for a in domain_aces if a.extended_right(sd.DS_REPL_GET_CHANGES_ALL)}
+        priv_dns |= {a.dn.lower() for a in accounts if a.sid and a.sid in get & get_all}
         objects = self._objects(domain_dn, accounts, priv_dns)
         gpos = self._gpos(domain_dn, _first(h, "gPLink"), objects)
 
@@ -312,7 +326,7 @@ class Collector:
         sysvol_result = self._sysvol(domain, [g.guid for g in gpos])
         # one value per attribute; dSASignature changes on every backup
         metadata = "".join(_str(h.get("msds-replattributemetadata", [])))
-        return Snapshot(
+        snap = Snapshot(
             domain=domain,
             domain_dn=domain_dn,
             domain_sid=domain_sid,
@@ -334,8 +348,8 @@ class Collector:
             pre2k_members=_str(pre2k[0].get("member", [])) if pre2k else [],
             ds_heuristics=self._ds_heuristics(config_dn),
             recycle_bin=self._recycle_bin(config_dn),
-            ldap_signing_required=self._probe_signing(),
-            probes=self._probes(dc_dns_host),
+            ldap_signing_required=None,  # set from the scanned DC's probe below
+            probes=self._probes(dc_dns_host, accounts),
             objects=objects,
             gpo_settings=sysvol_result.gpo_settings,
             script_secrets=sysvol_result.script_secrets,
@@ -346,6 +360,8 @@ class Collector:
             psos_visible=self._psos_visible(domain_dn),
             notes=self.notes,
         )
+        snap.ldap_signing_required = self.scanned_ldap_signing
+        return snap
 
     # --- DACLs and objects -----------------------------------------------------------
 
@@ -398,10 +414,20 @@ class Collector:
         holder = f"CN=AdminSDHolder,CN=System,{domain_dn}"
         for dn, kind in [(domain_dn, "domain"), (holder, "container")]:
             objects += [self._object(e, kind) for e in self._base(dn, attrs)]
+        # Entra Connect sync accounts and their servers, and Exchange servers: whoever
+        # controls them controls what they hold over the domain
+        sync_hosts = {a.sync_host.lower() for a in accounts if a.sync_host}
+        exchange = _exchange_members(objects)
         sensitive = [
             a
             for a in accounts
-            if a.dn.lower() in priv_dns or a.is_dc or a.sam.lower() == "krbtgt" or a.rid == 500
+            if a.dn.lower() in priv_dns
+            or a.is_dc
+            or a.sam.lower() == "krbtgt"
+            or a.rid == 500
+            or a.sync_host
+            or (a.is_computer and a.sam.lower().rstrip("$") in sync_hosts)
+            or a.dn.lower() in exchange
         ]
         for a in sensitive:
             kind = "computer" if a.is_computer else "user"
@@ -640,48 +666,95 @@ class Collector:
             self.notes.append(f"SYSVOL not checked: {exc}")
             return sysvol.SysvolResult()
 
-    def _probe_signing(self) -> bool | None:
-        """Try an unsigned NTLM bind on plain LDAP; a DC that requires signing refuses it."""
+    def _probe_signing(self, host: str, port: int) -> tuple[bool | None, str | None]:
+        """Try an unsigned NTLM bind on plain LDAP; a DC that requires signing refuses it.
+
+        Returns the result and, when there is none, why.
+        """
         t = self.target
-        if t is None or not t.plain_port:
-            return None
-        if not t.user or "\\" not in t.user:
+        assert t is not None
+        server = ldap3.Server(host, port=port, connect_timeout=10)
+        conn = ldap3.Connection(server, user=t.user, password=t.password, authentication=ldap3.NTLM)
+        try:
+            if conn.bind():
+                return False, None
+            if conn.result.get("result") == 8:  # strongerAuthRequired
+                return True, None
+            return None, f"LDAP signing probe inconclusive: {conn.result.get('description')}"
+        except LDAPException as exc:
+            return None, f"LDAP signing probe failed: {exc}"
+        finally:
+            conn.unbind()
+
+    def _dc_targets(self, dc_dns_host: str, accounts: list[Account]) -> list[tuple[str, bool]]:
+        """(DC host name, is the scanned DC) for every DC to probe, the scanned one first."""
+        t = self.target
+        assert t is not None
+        scanned = dc_dns_host or t.host
+        out = [(scanned, True)]
+        if not t.all_dcs:
+            return out
+        others = {
+            a.dns_host.lower(): a.dns_host
+            for a in accounts
+            if a.is_dc and a.enabled and a.dns_host and a.dns_host.lower() != scanned.lower()
+        }
+        return out + [(others[k], False) for k in sorted(others)]
+
+    def _probe_dc(self, name: str, scanned: bool) -> DcProbe:
+        """Every probe against one DC; the scanned DC is reached through the given ports."""
+        t = self.target
+        assert t is not None
+        host = t.host if scanned else name
+        result = DcProbe(name)
+        ntlm = bool(t.user and "\\" in t.user and not t.kerberos)
+        plain_port = t.plain_port if scanned else (389 if t.plain_port else 0)
+        if plain_port and ntlm:
+            result.ldap_signing_required, note = self._probe_signing(host, plain_port)
+            if note:
+                self.notes.append(f"{name}: {note}")
+        if not t.probes:
+            return result
+        if t.kerberos or (t.user and t.password is not None):
+            smb_port = t.smb_port if scanned else 445
+            result.smb_signing_required, result.spooler = probes.smb_posture(
+                host, smb_port, t.user, t.password, t.kerberos
+            )
+            if result.smb_signing_required is None:
+                result.error = "no SMB connection"
+        if t.use_ssl and ntlm:
+            result.ldaps_channel_binding_required = probes.ldaps_channel_binding_required(
+                host, t.port if scanned else 636, t.user or "", t.password or ""
+            )
+        return result
+
+    def _probes(self, dc_dns_host: str, accounts: list[Account]) -> Probes:
+        t = self.target
+        result = Probes()
+        if t is None:
+            return result
+        if t.plain_port and not (t.user and "\\" in t.user and not t.kerberos):
             self.notes.append(
                 "LDAP signing and channel binding not probed: they need a DOMAIN\\user account "
                 "with a password (NTLM)"
             )
-            return None
-        server = ldap3.Server(t.host, port=t.plain_port, connect_timeout=10)
-        conn = ldap3.Connection(server, user=t.user, password=t.password, authentication=ldap3.NTLM)
-        try:
-            if conn.bind():
-                return False
-            if conn.result.get("result") == 8:  # strongerAuthRequired
-                return True
-            self.notes.append(f"LDAP signing probe inconclusive: {conn.result.get('description')}")
-            return None
-        except LDAPException as exc:
-            self.notes.append(f"LDAP signing probe failed: {exc}")
-            return None
-        finally:
-            conn.unbind()
-
-    def _probes(self, dc_dns_host: str) -> Probes:
-        t = self.target
-        result = Probes()
-        if t is None or not t.probes:
+        if not t.probes and not t.plain_port:
             return result
-        if t.kerberos or (t.user and t.password is not None):
-            result.smb_signing_required, result.spooler_on_dc = probes.smb_posture(
-                t.host, t.smb_port, t.user, t.password, t.kerberos
-            )
-            if result.smb_signing_required is None:
-                self.notes.append("SMB probes did not run: no SMB connection to the DC")
-        if t.use_ssl and t.user and "\\" in t.user and not t.kerberos:
-            result.ldaps_channel_binding_required = probes.ldaps_channel_binding_required(
-                t.host, t.port, t.user, t.password or ""
-            )
-        if t.http_port:
+        for name, scanned in self._dc_targets(dc_dns_host, accounts):
+            if not scanned and not t.probes:
+                break
+            dc = self._probe_dc(name, scanned)
+            result.dcs.append(dc)
+            if scanned:
+                self.scanned_ldap_signing = dc.ldap_signing_required
+                result.smb_signing_required = dc.smb_signing_required
+                result.spooler_on_dc = dc.spooler
+                result.ldaps_channel_binding_required = dc.ldaps_channel_binding_required
+                if dc.error and t.probes:
+                    self.notes.append("SMB probes did not run: no SMB connection to the DC")
+            elif dc.error:
+                self.notes.append(f"{name}: not probed ({dc.error})")
+        if t.probes and t.http_port:
             for ca_host in self.ca_dns_hosts:
                 # a CA on the DC being scanned is reached through the address given for it
                 same = ca_host.lower() == dc_dns_host.lower()
@@ -732,6 +805,7 @@ class Collector:
             laps_password_readable=any(e.get(a.lower()) for a in LAPS_PASSWORD_ATTRIBUTES),
             preceded_by=_first(e, "msDS-ManagedAccountPrecededByLink") or None,
             managed=bool(classes & MANAGED_CLASSES),
+            sync_host=_sync_host(_first(e, "sAMAccountName"), text),
         )
         if account.is_rodc:
             self.rodc_policies.append(
@@ -742,6 +816,32 @@ class Collector:
                 )
             )
         return account
+
+
+def _exchange_members(objects: list[DirObject]) -> set[str]:
+    """Lower-cased DNs of every transitive member of the Exchange groups."""
+    groups = {o.dn.lower(): o for o in objects if o.kind == "group"}
+    todo = [o.dn.lower() for o in groups.values() if o.name.lower() in EXCHANGE_GROUPS]
+    seen: set[str] = set()
+    while todo:
+        dn = todo.pop()
+        for m in groups[dn].members if dn in groups else []:
+            key = m.lower()
+            if key not in seen:
+                seen.add(key)
+                todo.append(key)
+    return seen - {dn for dn in groups if groups[dn].name.lower() in EXCHANGE_GROUPS}
+
+
+def _sync_host(sam: str, description: str) -> str | None:
+    """Server an Entra Connect sync account belongs to; None for any other account."""
+    m = SYNC_SAM.match(sam)
+    if not m:
+        return None
+    if m.group("host"):
+        return m.group("host").upper()
+    found = SYNC_DESCRIPTION.search(description)
+    return found.group(1).split(".")[0].upper() if found else "unknown server"
 
 
 META_BLOCK = re.compile(r"<DS_REPL_ATTR_META_DATA>(.*?)</DS_REPL_ATTR_META_DATA>", re.S)

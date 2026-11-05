@@ -71,6 +71,8 @@ class Account:
     preceded_by: str | None = None
     # gMSA, sMSA or dMSA (computer-like, but not a computer)
     managed: bool = False
+    # for an Entra Connect sync account: the server it runs on, from its description/name
+    sync_host: str | None = None
 
     def has(self, flag: UAC) -> bool:
         return bool(self.uac & flag)
@@ -195,6 +197,19 @@ class Rodc:
 
 
 @dataclass
+class DcProbe:
+    """Probe results for one domain controller; None means not run or inconclusive."""
+
+    name: str
+    ldap_signing_required: bool | None = None
+    smb_signing_required: bool | None = None
+    spooler: bool | None = None
+    ldaps_channel_binding_required: bool | None = None
+    # why the DC could not be probed (unreachable, no credentials, ...)
+    error: str | None = None
+
+
+@dataclass
 class Probes:
     """Results of the active network checks; None means not run or inconclusive."""
 
@@ -203,6 +218,22 @@ class Probes:
     ldaps_channel_binding_required: bool | None = None
     # web enrollment URLs that answered with NTLM over plain HTTP (ESC8)
     web_enrollment_ntlm: list[str] = field(default_factory=list)
+    # every DC that was probed, the scanned one included (empty in older snapshots)
+    dcs: list[DcProbe] = field(default_factory=list)
+
+    def per_dc(self, attr: str, fallback: bool | None, scanned: str) -> dict[str, bool | None]:
+        """DC name -> result of one probe; older snapshots only hold the scanned DC."""
+        if self.dcs:
+            return {d.name: getattr(d, attr) for d in self.dcs}
+        return {scanned: fallback}
+
+    def overall(self, attr: str, fallback: bool | None) -> bool | None:
+        """False if any probed DC failed, True if every probed DC passed, else None."""
+        values = [getattr(d, attr) for d in self.dcs] if self.dcs else [fallback]
+        if False in values:
+            return False
+        known = [v for v in values if v is not None]
+        return True if known and len(known) == len(values) else None
 
 
 @dataclass
@@ -328,7 +359,7 @@ class Snapshot:
             oid_group_links=data.get("oid_group_links", {}),
             ca_hosts=data.get("ca_hosts", []),
             root_sid=data.get("root_sid", ""),
-            probes=Probes(**data.get("probes", {})),
+            probes=_probes(data.get("probes", {})),
             objects=[
                 DirObject(
                     **{
@@ -385,6 +416,12 @@ WELL_KNOWN_RIDS = {
 # Pre-Windows 2000 Compatible Access holds Authenticated Users on a default domain
 BROAD_SIDS = {"S-1-1-0", "S-1-5-7", "S-1-5-11", "S-1-5-32-545", "S-1-5-32-554"}
 BROAD_RIDS = {"513", "514", "515"}
+# groups Exchange setup creates; their rights over the domain are the PrivExchange problem
+EXCHANGE_GROUPS = {
+    "exchange windows permissions",
+    "exchange trusted subsystem",
+    "organization management",
+}
 TIER0_SIDS = {"S-1-5-9", "S-1-5-18", "S-1-5-32-544"}
 TIER0_RIDS = {"498", "500", "512", "516", "518", "519", "521"}
 FOREST_ROOT_RIDS = {"498", "500", "512", "518", "519"}
@@ -392,6 +429,10 @@ FOREST_ROOT_RIDS = {"498", "500", "512", "518", "519"}
 
 def _aces(items: list[dict[str, Any]]) -> list[Ace]:
     return [Ace(**a) for a in items]
+
+
+def _probes(data: dict[str, Any]) -> Probes:
+    return Probes(**{**data, "dcs": [DcProbe(**d) for d in data.get("dcs", [])]})
 
 
 def _encode(value: Any) -> Any:

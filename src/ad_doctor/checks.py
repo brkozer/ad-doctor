@@ -12,7 +12,15 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 
 from . import sd
-from .model import UAC, Account, CertTemplate, Finding, Severity, Snapshot
+from .model import (
+    EXCHANGE_GROUPS,
+    UAC,
+    Account,
+    CertTemplate,
+    Finding,
+    Severity,
+    Snapshot,
+)
 
 CheckFn = Callable[[Snapshot], Finding | None]
 
@@ -144,6 +152,10 @@ MITRE: dict[str, tuple[str, ...]] = {
     "AD-CHAIN-002": ("T1187", "T1558"),
     "AD-CHAIN-003": ("T1187", "T1557.001", "T1649"),
     "AD-GPP-001": ("T1552.006",),
+    "AD-INF-013": ("T1557",),
+    "AD-ACL-007": ("T1098", "T1557.001", "T1003.006"),
+    "AD-PRIV-011": ("T1003.006", "T1078.002"),
+    "AD-ACL-008": ("T1098", "T1003.006"),
 }
 
 
@@ -945,18 +957,32 @@ def ds_heuristics(snap: Snapshot) -> Finding | None:
     )
 
 
+def _weak_dcs(snap: Snapshot, attr: str, fallback: bool | None, bad: bool) -> list[str]:
+    """DCs whose probe for `attr` returned `bad`."""
+    results = snap.probes.per_dc(attr, fallback, snap.domain)
+    return sorted(name for name, value in results.items() if value is bad)
+
+
+def _of_probed(snap: Snapshot, weak: list[str], attr: str) -> str:
+    probed = [d for d in snap.probes.dcs if getattr(d, attr) is not None]
+    return f" ({len(weak)} of {len(probed)} probed DCs)" if len(probed) > 1 else ""
+
+
 @check("AD-INF-005", "LDAP signing not required")
 def ldap_signing(snap: Snapshot) -> Finding | None:
-    if snap.ldap_signing_required is not False:
+    weak = _weak_dcs(snap, "ldap_signing_required", snap.ldap_signing_required, False)
+    if not weak:
         return None
     return _finding(
         "AD-INF-005",
         Severity.MEDIUM,
-        "The DC accepted an unsigned NTLM bind on plain LDAP, so relayed authentication "
-        "(for example from coerced machine accounts) can be used to modify the directory.",
-        "Set 'Domain controller: LDAP server signing requirements' to Require signing and "
-        "enable LDAP channel binding.",
-        [snap.domain],
+        "These DCs accepted an unsigned NTLM bind on plain LDAP"
+        + _of_probed(snap, weak, "ldap_signing_required")
+        + ", so relayed authentication (for example from coerced machine accounts) can be "
+        "used to modify the directory. One weak DC is enough for an attacker.",
+        "Set 'Domain controller: LDAP server signing requirements' to Require signing on every "
+        "DC (through the Default Domain Controllers Policy) and enable LDAP channel binding.",
+        weak,
     )
 
 
@@ -1195,10 +1221,20 @@ def _risky_rights(ace: sd.Ace, kind: str) -> list[str]:
     return rights
 
 
+def _control_rights(snap: Snapshot, ace: sd.Ace, kind: str) -> list[str]:
+    """_risky_rights minus the KeyCredentialLink write Key Admins hold by default."""
+    rights = _risky_rights(ace, kind)
+    key_admins = {f"{snap.domain_sid}-526", f"{snap.domain_sid}-527"}
+    if snap.root_sid:
+        key_admins.add(f"{snap.root_sid}-527")
+    if ace.sid in key_admins:
+        rights = [r for r in rights if r != "write msDS-KeyCredentialLink"]
+    return rights
+
+
 @check("AD-ACL-004", "Non-tier-0 control over tier-0 accounts, groups or DCs")
 def tier0_object_control(snap: Snapshot) -> Finding | None:
     tier0 = _tier0_group_sids(snap)
-    key_admins = {f"{snap.domain_sid}-526", f"{snap.domain_sid}-527"}
     targets = snap.tier0_dns() | {o.dn.lower() for o in snap.objects if o.sid in tier0}
     hits = set()
     for o in snap.objects:
@@ -1209,9 +1245,7 @@ def tier0_object_control(snap: Snapshot) -> Finding | None:
         for ace in o.aces:
             if ace.sid in tier0 or ace.sid in (PRINCIPAL_SELF, CREATOR_OWNER):
                 continue
-            rights = _risky_rights(ace, o.kind)
-            if ace.sid in key_admins:
-                rights = [r for r in rights if r != "write msDS-KeyCredentialLink"]
+            rights = _control_rights(snap, ace, o.kind)
             if rights:
                 hits.add(f"{o.name}: {snap.name_of(ace.sid)} ({', '.join(rights)})")
     if not hits:
@@ -1630,22 +1664,30 @@ def script_secrets(snap: Snapshot) -> Finding | None:
     )
 
 
-@check("AD-INF-008", "SMB signing not required on the domain controller")
+@check("AD-INF-008", "SMB signing not required on domain controllers")
 def smb_signing(snap: Snapshot) -> Finding | None:
-    if snap.probes.smb_signing_required is not False:
+    weak = _weak_dcs(snap, "smb_signing_required", snap.probes.smb_signing_required, False)
+    if not weak:
         return None
     return _finding(
         "AD-INF-008",
         Severity.HIGH,
-        "Relayed NTLM authentication can be used against the DC over SMB.",
+        "Relayed NTLM authentication can be used against these DCs over SMB"
+        + _of_probed(snap, weak, "smb_signing_required")
+        + ".",
         "Enable 'Microsoft network server: Digitally sign communications (always)' on DCs.",
-        [snap.domain],
+        weak,
     )
 
 
-@check("AD-INF-009", "Print Spooler running on the domain controller")
+def _spooler_dcs(snap: Snapshot) -> list[str]:
+    return _weak_dcs(snap, "spooler", snap.probes.spooler_on_dc, True)
+
+
+@check("AD-INF-009", "Print Spooler running on domain controllers")
 def spooler(snap: Snapshot) -> Finding | None:
-    if snap.probes.spooler_on_dc is not True:
+    running = _spooler_dcs(snap)
+    if not running:
         return None
     unconstrained = unconstrained_delegation(snap)
     detail = (
@@ -1659,21 +1701,28 @@ def spooler(snap: Snapshot) -> Finding | None:
         Severity.HIGH if unconstrained else Severity.MEDIUM,
         detail,
         "Stop and disable the Print Spooler service on domain controllers.",
-        [snap.domain],
+        running,
     )
 
 
 @check("AD-INF-010", "LDAPS channel binding not enforced")
 def channel_binding(snap: Snapshot) -> Finding | None:
-    if snap.probes.ldaps_channel_binding_required is not False:
+    weak = _weak_dcs(
+        snap,
+        "ldaps_channel_binding_required",
+        snap.probes.ldaps_channel_binding_required,
+        False,
+    )
+    if not weak:
         return None
     return _finding(
         "AD-INF-010",
         Severity.MEDIUM,
-        "The DC accepted an LDAPS bind without a channel binding token, so NTLM relayed from "
-        "another connection can authenticate to LDAPS.",
+        "These DCs accepted an LDAPS bind without a channel binding token"
+        + _of_probed(snap, weak, "ldaps_channel_binding_required")
+        + ", so NTLM relayed from another connection can authenticate to LDAPS.",
         "Set 'Domain controller: LDAP server channel binding token requirements' to Always.",
-        [snap.domain],
+        weak,
     )
 
 
@@ -1739,10 +1788,16 @@ def chain_relay_rbcd(snap: Snapshot) -> Finding | None:
     relayable = [
         name
         for name, weak in (
-            ("LDAP signing not required", snap.ldap_signing_required is False),
+            (
+                "LDAP signing not required",
+                snap.probes.overall("ldap_signing_required", snap.ldap_signing_required) is False,
+            ),
             (
                 "LDAPS channel binding not enforced",
-                snap.probes.ldaps_channel_binding_required is False,
+                snap.probes.overall(
+                    "ldaps_channel_binding_required", snap.probes.ldaps_channel_binding_required
+                )
+                is False,
             ),
         )
         if weak
@@ -1763,7 +1818,7 @@ def chain_relay_rbcd(snap: Snapshot) -> Finding | None:
 @check("AD-CHAIN-002", "Coercion plus unconstrained delegation")
 def chain_coerce_unconstrained(snap: Snapshot) -> Finding | None:
     delegated = unconstrained_delegation(snap)
-    if snap.probes.spooler_on_dc is not True or delegated is None:
+    if not _spooler_dcs(snap) or delegated is None:
         return None
     return _finding(
         "AD-CHAIN-002",
@@ -1777,7 +1832,7 @@ def chain_coerce_unconstrained(snap: Snapshot) -> Finding | None:
 
 @check("AD-CHAIN-003", "Coercion plus web enrollment relay (ESC8)")
 def chain_esc8(snap: Snapshot) -> Finding | None:
-    if not snap.probes.web_enrollment_ntlm or snap.probes.spooler_on_dc is not True:
+    if not snap.probes.web_enrollment_ntlm or not _spooler_dcs(snap):
         return None
     return _finding(
         "AD-CHAIN-003",
@@ -1786,6 +1841,187 @@ def chain_esc8(snap: Snapshot) -> Finding | None:
         "enrollment for a DC certificate: domain compromise in two commands.",
         "Fix either side: disable the spooler on DCs, or HTTP/NTLM on web enrollment.",
         sorted(snap.probes.web_enrollment_ntlm),
+    )
+
+
+# --- Round 4: every DC, Exchange, Entra Connect ---------------------------------------
+
+
+@check("AD-INF-013", "Domain controllers that could not be probed")
+def unprobed_dcs(snap: Snapshot) -> Finding | None:
+    hits = sorted(f"{d.name}: {d.error}" for d in snap.probes.dcs if d.error)
+    if not hits:
+        return None
+    return _finding(
+        "AD-INF-013",
+        Severity.LOW,
+        "The SMB, signing and channel binding checks could not reach these DCs, so their "
+        "results say nothing about them. Settings often drift between DCs.",
+        "Run the scan from a host that reaches every DC (TCP 389, 445 and 636), or scan each "
+        "DC separately.",
+        hits,
+    )
+
+
+def _exchange_sids(snap: Snapshot) -> dict[str, str]:
+    """SID -> name of the Exchange-created groups in the snapshot."""
+    return {
+        o.sid: o.name
+        for o in snap.objects
+        if o.kind == "group" and o.sid and o.name.lower() in EXCHANGE_GROUPS
+    }
+
+
+def _exchange_rights(ace: sd.Ace) -> list[str]:
+    rights = []
+    if ace.mask & sd.GENERIC_ALL:
+        rights.append("full control")
+    else:
+        if ace.mask & sd.WRITE_DAC:
+            rights.append("WriteDacl")
+        if ace.mask & sd.WRITE_OWNER:
+            rights.append("WriteOwner")
+    return rights
+
+
+@check("AD-ACL-007", "Exchange groups with rights over the domain (PrivExchange)")
+def exchange_rights(snap: Snapshot) -> Finding | None:
+    groups = _exchange_sids(snap)
+    if not groups:
+        return None
+    hits = []
+    direct = False
+    for ace in snap.acls.get("domain", []):
+        if ace.sid in groups:
+            rights = _exchange_rights(ace)
+            if ace.extended_right(sd.DS_REPL_GET_CHANGES_ALL):
+                rights.append("replicate secrets")
+            if rights:
+                direct = True
+                hits.append(f"{groups[ace.sid]}: {', '.join(rights)} on the domain object")
+    head = next((o for o in snap.objects if o.kind == "domain"), None)
+    for ace in head.inheritable if head else []:
+        applies = ace.inherited_object_type in (None, sd.USER_CLASS, sd.GROUP_CLASS)
+        rights = _exchange_rights(ace)
+        if ace.sid in groups and applies and rights:
+            hits.append(f"{groups[ace.sid]}: {', '.join(rights)} inherited by users and groups")
+    if not hits:
+        return None
+    by_dn = snap.object_by_dn()
+    servers = set()
+    for o in snap.objects:
+        if o.sid in groups:
+            for m in o.members:
+                member = by_dn.get(m.lower())
+                if member is None or member.kind != "group":
+                    servers.add(_account_names(snap, [m])[0])
+    detail = (
+        "Exchange setup gave its groups WriteDacl over the domain. Anyone who controls an "
+        "Exchange server, or can make one authenticate and relay it to LDAP, can grant "
+        "themselves DCSync."
+        if direct
+        else "Exchange groups hold WriteDacl on every user and group through inheritance, so "
+        "whoever controls an Exchange server can take over any non-protected account."
+    )
+    if servers:
+        detail += f" Members: {', '.join(sorted(servers, key=str.lower))}."
+    return _finding(
+        "AD-ACL-007",
+        Severity.HIGH if direct else Severity.MEDIUM,
+        detail,
+        "Install a current Exchange cumulative update and run Setup /PrepareAD, which makes "
+        "these ACEs inherit-only, or move to Active Directory split permissions. Treat "
+        "Exchange servers as tier 0 until then.",
+        sorted(hits),
+    )
+
+
+def _sync_accounts(snap: Snapshot) -> list[Account]:
+    return [a for a in snap.accounts if a.sync_host and a.enabled]
+
+
+def _dcsync_sids(snap: Snapshot) -> set[str]:
+    aces = snap.acls.get("domain", [])
+    get = {a.sid for a in aces if a.extended_right(sd.DS_REPL_GET_CHANGES)}
+    get_all = {a.sid for a in aces if a.extended_right(sd.DS_REPL_GET_CHANGES_ALL)}
+    return get & get_all
+
+
+def _sync_servers(snap: Snapshot, account: Account) -> list[Account]:
+    host = (account.sync_host or "").lower()
+    return [a for a in snap.accounts if a.is_computer and a.sam.lower().rstrip("$") == host]
+
+
+@check("AD-PRIV-011", "Entra Connect servers hold DCSync but are not tier 0")
+def entra_connect_tier0(snap: Snapshot) -> Finding | None:
+    dcsync = _dcsync_sids(snap)
+    tier0 = snap.tier0_dns()
+    hits = []
+    for a in _sync_accounts(snap):
+        if a.sid not in dcsync:
+            continue
+        servers = _sync_servers(snap, a)
+        if not servers:
+            hits.append(f"{a.sam} (server {a.sync_host}, not found in the domain)")
+            continue
+        for s in servers:
+            notes = []
+            if s.dn.lower() not in tier0:
+                notes.append("not in a tier-0 group")
+            if s.has(UAC.TRUSTED_FOR_DELEGATION):
+                notes.append("unconstrained delegation")
+            if not s.laps:
+                notes.append("no LAPS")
+            if notes:
+                hits.append(f"{a.sam} on {s.sam.rstrip('$')}: {', '.join(notes)}")
+    if not hits:
+        return None
+    return _finding(
+        "AD-PRIV-011",
+        Severity.MEDIUM,
+        "The Entra Connect sync account can DCSync for password hash sync, and its password "
+        "sits on the sync server: a local admin on that server can replicate every hash in "
+        "the domain, krbtgt's included.",
+        "Treat the Entra Connect server as a domain controller: tier-0 admins only, no "
+        "interactive logon for others, LAPS, no delegation. Drop the replication rights if "
+        "password hash sync is not used.",
+        sorted(hits),
+    )
+
+
+@check("AD-ACL-008", "Entra Connect sync account or server controllable outside tier 0")
+def entra_connect_control(snap: Snapshot) -> Finding | None:
+    dcsync = _dcsync_sids(snap)
+    tier0 = _tier0_group_sids(snap)
+    targets: dict[str, str] = {}  # DN -> why it matters
+    for a in _sync_accounts(snap):
+        if a.sid in dcsync:
+            targets[a.dn.lower()] = "sync account"
+            for s in _sync_servers(snap, a):
+                targets[s.dn.lower()] = "sync server"
+    hits = set()
+    for o in snap.objects:
+        role = targets.get(o.dn.lower())
+        if role is None:
+            continue
+        if o.owner and o.owner not in tier0:
+            hits.add(f"{o.name} ({role}): owned by {snap.name_of(o.owner)}")
+        for ace in o.aces:
+            if ace.sid in tier0 or ace.sid in (PRINCIPAL_SELF, CREATOR_OWNER):
+                continue
+            rights = _control_rights(snap, ace, o.kind)
+            if rights:
+                hits.add(f"{o.name} ({role}): {snap.name_of(ace.sid)} ({', '.join(rights)})")
+    if not hits:
+        return None
+    return _finding(
+        "AD-ACL-008",
+        Severity.HIGH,
+        "These principals can take over the Entra Connect sync account or its server, which "
+        "can DCSync: a path to every password hash in the domain, and to the cloud tenant.",
+        "Remove the rights and ownership; keep the sync account and server under tier-0 "
+        "control only.",
+        sorted(hits),
     )
 
 

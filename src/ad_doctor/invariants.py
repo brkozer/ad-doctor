@@ -42,7 +42,9 @@ SETTINGS = {
     "pwd_complexity": lambda s: s.policy.pwd_complexity,
     "functional_level": lambda s: s.policy.functional_level,
     "recycle_bin": lambda s: s.recycle_bin,
-    "ldap_signing_required": lambda s: s.ldap_signing_required,
+    "ldap_signing_required": lambda s: s.probes.overall(
+        "ldap_signing_required", s.ldap_signing_required
+    ),
 }
 
 
