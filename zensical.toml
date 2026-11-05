@@ -16,6 +16,7 @@ nav = [
     { "Network probes" = "probes.md" },
   ] },
   { "Using ad-doctor" = [
+    { "HTML viewer" = "viewer.md" },
     { "CI integration" = "ci.md" },
     { "Snapshots and redaction" = "snapshots.md" },
     { "Invariants (policy as code)" = "invariants.md" },

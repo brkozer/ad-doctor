@@ -1,4 +1,4 @@
-"""Risk score and report renderers (text, JSON, Markdown, HTML, SARIF)."""
+"""Risk score and report renderers (text, JSON, Markdown, SARIF, JUnit; HTML is viewer.py)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import json
 import re
 import textwrap
 from dataclasses import dataclass, field
-from html import escape
 from typing import Any
 from xml.sax.saxutils import escape as xml_escape
 from xml.sax.saxutils import quoteattr
@@ -19,6 +18,8 @@ from .model import CATEGORIES, Finding, Severity, Snapshot
 
 WEIGHT = {Severity.HIGH: 15, Severity.MEDIUM: 6, Severity.LOW: 2, Severity.INFO: 0}
 GRADES = [(10, "A"), (25, "B"), (45, "C"), (70, "D"), (100, "F")]
+# version of the JSON report's layout: 2 added `schema` and `checks` (the check IDs that ran)
+REPORT_SCHEMA = 2
 
 
 @dataclass
@@ -36,15 +37,17 @@ class Report:
     accepted: list[Accepted] = field(default_factory=list)
     # (check_id, object) pairs not present in the baseline; None when no baseline was given
     new: set[tuple[str, str]] | None = None
+    # check IDs that ran, when known (a trend marks the scans where the set changed)
+    ran: list[str] | None = None
 
     @property
     def score(self) -> int:
         """0 (nothing found) to 100; each finding adds its severity weight."""
-        return min(100, sum(WEIGHT[f.severity] for f in self.findings))
+        return score_of(self.findings)
 
     @property
     def grade(self) -> str:
-        return next(g for limit, g in GRADES if self.score <= limit)
+        return grade_of(self.score)
 
     def category_scores(self) -> dict[str, int]:
         scores = {c: 0 for c in dict.fromkeys(CATEGORIES.values())}
@@ -56,16 +59,33 @@ class Report:
         return {s: sum(f.severity == s for f in self.findings) for s in Severity}
 
     def is_new(self, f: Finding) -> bool:
-        return self.new is not None and any((f.check_id, o) in self.new for o in f.objects)
+        return self.new is not None and any((f.check_id, f.key(o)) in self.new for o in f.objects)
+
+
+def score_of(findings: list[Finding]) -> int:
+    return min(100, sum(WEIGHT[f.severity] for f in findings))
+
+
+def grade_of(score: int) -> str:
+    return next(g for limit, g in GRADES if score <= limit)
 
 
 def fingerprint(check_id: str, obj: str) -> str:
-    """Stable ID of one finding on one object, for ticket systems and SARIF."""
+    """Stable ID of one finding on one object, for ticket systems and SARIF. `obj` is the
+    object's identity (`Finding.key`), so a path that changes shape keeps its fingerprint."""
     return hashlib.sha256(f"{check_id}|{obj}".encode()).hexdigest()[:16]
 
 
 def finding_keys(findings: list[Finding]) -> set[tuple[str, str]]:
-    return {(f.check_id, o) for f in findings for o in f.objects}
+    return {(f.check_id, f.key(o)) for f in findings for o in f.objects}
+
+
+def legacy_keys(check_id: str, objects: list[str]) -> dict[str, str]:
+    """Identities for a JSON report written before reports carried `keys`: an AD-PATH-001
+    object is a rendered path, and its identity is the principal it starts from."""
+    if check_id != "AD-PATH-001":
+        return {}
+    return {o: PATH_STEP.split(o, 1)[0] for o in objects}
 
 
 # --- text ----------------------------------------------------------------------------
@@ -132,6 +152,7 @@ def render_text(r: Report, color: bool = False) -> str:
 def report_dict(r: Report) -> dict[str, Any]:
     return {
         "tool": "ad-doctor",
+        "schema": REPORT_SCHEMA,
         "version": __version__,
         "domain": r.snap.domain,
         "collected_at": r.snap.collected_at.isoformat(),
@@ -147,15 +168,32 @@ def report_dict(r: Report) -> dict[str, Any]:
                 "detail": f.detail,
                 "remediation": f.remediation,
                 "objects": f.objects,
-                "fingerprints": {o: fingerprint(f.check_id, o) for o in f.objects},
+                "fingerprints": {o: fingerprint(f.check_id, f.key(o)) for o in f.objects},
                 "mitre": f.mitre,
                 **({"new": r.is_new(f)} if r.new is not None else {}),
+                **_extra(f),
             }
             for f in r.findings
         ],
         "accepted": [a.__dict__ for a in r.accepted],
         "notes": r.snap.notes,
+        **({"checks": sorted(r.ran)} if r.ran is not None else {}),
     }
+
+
+def _extra(f: Finding) -> dict[str, Any]:
+    """keys and data, limited to the objects still in the finding (acceptances remove some)."""
+    out: dict[str, Any] = {}
+    keys = {o: f.keys[o] for o in f.objects if o in f.keys}
+    if keys:
+        out["keys"] = keys
+    if f.data:
+        data = dict(f.data)
+        if isinstance(data.get("paths"), list):
+            kept = set(f.objects)
+            data["paths"] = [p for p in data["paths"] if p.get("object") in kept]
+        out["data"] = data
+    return out
 
 
 def render_json(r: Report) -> str:
@@ -266,118 +304,6 @@ def mermaid_paths(paths: list[str], limit: int = 15) -> list[str]:
     return lines
 
 
-# --- HTML ----------------------------------------------------------------------------
-
-HTML_STYLE = """
-:root{--bg:#f7f7f5;--card:#fff;--fg:#1d1d1f;--muted:#6b6b70;--line:#e3e3e0;
---high:#c2261d;--medium:#b86e00;--low:#2a6fb0;--info:#7a7a7f;--ok:#1f8a4c}
-@media (prefers-color-scheme:dark){:root{--bg:#141416;--card:#1d1d20;--fg:#ececee;
---muted:#9a9aa0;--line:#2e2e33;--high:#ff6b5e;--medium:#f0a63a;--low:#6aa8ff;--info:#9a9aa0;
---ok:#4cc27f}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
-font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
-main{max-width:1040px;margin:0 auto;padding:32px 16px 64px}
-h1{font-size:26px;margin:0 0 4px}h2{font-size:18px;margin:32px 0 12px}
-.muted{color:var(--muted)}.grid{display:grid;gap:16px;
-grid-template-columns:repeat(auto-fit,minmax(220px,1fr));align-items:start;margin-top:24px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
-.score{font-size:44px;font-weight:700;line-height:1}.grade{font-size:15px;color:var(--muted)}
-.bar{height:8px;border-radius:4px;background:var(--line);overflow:hidden;margin-top:6px}
-.bar>span{display:block;height:100%}
-.cat{display:flex;justify-content:space-between;font-size:14px;margin-top:10px}
-.sev{display:inline-block;min-width:64px;text-align:center;font-size:12px;font-weight:600;
-text-transform:uppercase;border-radius:4px;padding:2px 6px;color:#fff}
-.sev.high{background:var(--high)}.sev.medium{background:var(--medium)}
-.sev.low{background:var(--low)}.sev.info{background:var(--info)}
-details{background:var(--card);border:1px solid var(--line);border-radius:10px;
-margin:10px 0;padding:0 16px}summary{cursor:pointer;padding:14px 0;display:flex;gap:12px;
-align-items:center;list-style:none}summary::-webkit-details-marker{display:none}
-summary code{color:var(--muted);font-size:13px}.body{padding:0 0 16px}
-.objs{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
-.objs code{background:var(--bg);border:1px solid var(--line);border-radius:4px;
-padding:1px 6px;font-size:13px;overflow-wrap:anywhere}
-.tag{font-size:12px;color:var(--muted);margin-left:auto;white-space:nowrap}
-.new{color:var(--high);font-weight:700;font-size:12px}
-a{color:var(--low)}ul{padding-left:20px}
-"""
-
-
-def _color(score: int) -> str:
-    if score == 0:
-        return "var(--ok)"
-    return "var(--high)" if score > 45 else "var(--medium)" if score > 10 else "var(--low)"
-
-
-def _doc_link(check_id: str) -> str:
-    code = f"<code>{escape(check_id)}</code>"
-    e = docs.get(check_id)
-    return f'<a href="{escape(e.url)}">{code}</a>' if e else code
-
-
-def render_html(r: Report) -> str:
-    snap = r.snap
-    counts = r.counts()
-    cats = "".join(
-        f'<div class="cat"><span>{escape(c)}</span><span>{s}</span></div>'
-        f'<div class="bar"><span style="width:{max(s, 2)}%;background:{_color(s)}"></span></div>'
-        for c, s in r.category_scores().items()
-    )
-    sev_rows = "".join(
-        f'<div class="cat"><span><span class="sev {s}">{s}</span></span>'
-        f"<span>{counts[s]}</span></div>"
-        for s in reversed(Severity)
-    )
-    items = []
-    for f in r.findings:
-        mitre = ", ".join(
-            f'<a href="https://attack.mitre.org/techniques/{escape(t.replace(".", "/"))}/">'
-            f"{escape(t)}</a>"
-            for t in f.mitre
-        )
-        objs = "".join(f"<code>{escape(o)}</code>" for o in f.objects)
-        new = '<span class="new">NEW</span>' if r.is_new(f) else ""
-        items.append(
-            f"<details{' open' if f.severity is Severity.HIGH else ''}><summary>"
-            f'<span class="sev {f.severity}">{f.severity}</span>'
-            f"<strong>{escape(f.title)}</strong>{new}"
-            f'<span class="tag">{escape(f.category)} · {_doc_link(f.check_id)}</span>'
-            f'</summary><div class="body"><p>{escape(f.detail)}</p>'
-            f'<div class="objs">{objs}</div>'
-            f"<p><strong>Fix:</strong> {escape(f.remediation)}</p>"
-            + (f'<p class="muted">MITRE ATT&amp;CK: {mitre}</p>' if mitre else "")
-            + "</div></details>"
-        )
-    accepted = "".join(
-        f"<li><code>{a.check_id}</code> ({escape(', '.join(a.objects) or 'all objects')}) "
-        f"until {escape(a.expires)}: {escape(a.reason)}</li>"
-        for a in r.accepted
-    )
-    notes = "".join(f"<li>{escape(n)}</li>" for n in snap.notes)
-    return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ad-doctor: {escape(snap.domain)}</title><style>{HTML_STYLE}</style></head>
-<body><main>
-<h1>Active Directory report: {escape(snap.domain)}</h1>
-<div class="muted">Collected {snap.collected_at:%Y-%m-%d %H:%M} UTC · ad-doctor {__version__} ·
-{len(snap.accounts)} accounts · {len(snap.templates)} certificate templates</div>
-<div class="grid">
-<div class="card"><div class="muted">Risk score</div>
-<div class="score" style="color:{_color(r.score)}">{r.score}<span class="grade">/100</span></div>
-<div class="grade">Grade {r.grade} · lower is better</div>
-<div class="bar"><span style="width:{max(r.score, 2)}%;background:{_color(r.score)}"></span></div>
-</div>
-<div class="card"><div class="muted">Findings by severity</div>{sev_rows}</div>
-<div class="card"><div class="muted">Risk by category</div>{cats}</div>
-</div>
-<h2>Findings ({len(r.findings)})</h2>
-{"".join(items) or "<p>No findings.</p>"}
-{f"<h2>Accepted risks</h2><ul>{accepted}</ul>" if accepted else ""}
-{f"<h2>Notes</h2><ul>{notes}</ul>" if notes else ""}
-</main></body></html>
-"""
-
-
 # --- SARIF ---------------------------------------------------------------------------
 
 SARIF_LEVEL = {
@@ -444,7 +370,7 @@ def render_sarif(r: Report) -> str:
             "ruleId": f.check_id,
             "level": SARIF_LEVEL[f.severity],
             "message": {"text": f"{f.detail} Object: {o}"},
-            "partialFingerprints": {"adDoctor/v1": fingerprint(f.check_id, o)},
+            "partialFingerprints": {"adDoctor/v1": fingerprint(f.check_id, f.key(o))},
             "locations": [
                 {
                     "physicalLocation": {"artifactLocation": {"uri": f"ad/{r.snap.domain}"}},

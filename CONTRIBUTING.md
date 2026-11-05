@@ -27,6 +27,30 @@ uv run mypy src
 
 CI runs the same four commands on Python 3.12 and 3.13.
 
+The HTML viewer (`src/ad_doctor/viewer.py`, with its script and style in
+`src/ad_doctor/viewer_assets/`) also has browser tests and Node tests. They need Node 20
+or later and run in their own CI job:
+
+```bash
+cd tests/browser
+npm ci && npx playwright install chromium
+npm run fixtures       # builds xss.html, full.html, sealed.html with ad-doctor view
+npx playwright test
+node screenshots.mjs ../../report.html shots    # every screen, desktop and phone, light and dark
+
+cd ../..
+uv run python -m tests.viewer_fixtures parity tests/js/build   # Python's blast radius
+node --test tests/js/*.test.mjs   # the page's graph search, TOML drafts and diff against it
+```
+
+`core.js` holds the parts of the page that compute (the blast-radius search, acceptance
+drafts, the ad-hoc diff); it has no DOM access, and the Node tests load the same file.
+`uv run pytest` also runs `node` for the acceptance-draft round trip when Node is installed.
+
+The viewer's script must only ever write text: no `innerHTML` or other HTML sink, no
+storage, no network (`tests/test_viewer.py` greps for them), and every attribute goes
+through the allowlist in `h()`.
+
 The unit tests build snapshots in memory and need no domain. `tests/test_lab.py` runs
 against the seeded lab DC in [`lab/`](lab/README.md) and is skipped unless the
 `AD_DOCTOR_LAB_*` variables are set.

@@ -12,7 +12,8 @@ Each SARIF rule carries the check's summary as `fullDescription`, its remediatio
 references as `help.markdown`, and a `helpUri` to its [catalog page](checks/index.md), so
 GitHub code-scanning alerts show the full explanation even for rules that did not fire. The
 JUnit format writes one test case per check (failed when it found something, skipped when
-accepted) and the Markdown and HTML reports link each finding to its docs page.
+accepted) and the Markdown report links each finding to its docs page; the HTML viewer
+links nowhere and shows the URL as text to copy.
 
 ## Exit codes and `--fail-on`
 

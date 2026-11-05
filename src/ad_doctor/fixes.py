@@ -33,8 +33,19 @@ def _is_computer(obj: str) -> bool:
     return _name(obj).endswith("$")
 
 
+# PowerShell closes a single-quoted string on any of these, not only on the ASCII one.
+_PS_QUOTES = re.compile("(['\u2018\u2019\u201a\u201b])")
+
+
 def _q(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
+    """A PowerShell verbatim string: every single-quote character doubled, so a directory
+    name (attacker controlled) can never end the literal; $ and ` are inert inside it."""
+    return "'" + _PS_QUOTES.sub(r"\1\1", value) + "'"
+
+
+def _ldap(value: str) -> str:
+    """An RFC 4515 assertion value."""
+    return "".join(f"\\{ord(c):02x}" if c in "\\*()\x00" else c for c in value)
 
 
 def _per_object(template: str) -> Fix:
@@ -134,7 +145,9 @@ FIXES: dict[str, Fix] = {
     ),
     "AD-ACC-010": _per_object("Set-ADAccountControl {o} -PasswordNotRequired $false -WhatIf"),
     "AD-PRIV-007": lambda f, snap: [
-        f'Set-ADObject (Get-ADObject -Filter "sAMAccountName -eq {_q(_name(o))}") '
+        # -LDAPFilter in a verbatim string: the name never lands in a "..." (expandable)
+        # string, where $(...) and backticks would run while the argument is built
+        f"Set-ADObject (Get-ADObject -LDAPFilter {_q(f'(sAMAccountName={_ldap(_name(o))})')}) "
         f"-Replace @{{primaryGroupID={515 if _is_computer(o) else 513}}} -WhatIf"
         for o in f.objects
     ],
@@ -157,6 +170,11 @@ FIXES: dict[str, Fix] = {
     "AD-GPO-006": _gpo_entries,
     "AD-GPO-007": _gpo_entries,
 }
+
+
+def snippet(f: Finding, snap: Snapshot) -> list[str]:
+    """The script lines for one finding (guarded like the whole script)."""
+    return [one_line(line) for line in FIXES.get(f.check_id, _manual)(f, snap)]
 
 
 def render_fixes(findings: list[Finding], snap: Snapshot) -> str:

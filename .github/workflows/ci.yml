@@ -23,6 +23,31 @@ jobs:
       - run: uv run pytest
       - run: uv build
 
+  # the HTML viewer in a real browser: every screen, XSS fixture, no requests
+  browser:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/browser
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tests/browser/package-lock.json
+      - run: uv sync --locked
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run fixtures
+      - run: npx playwright test
+      # the page's JavaScript against Python: blast radius parity, TOML drafts, diff
+      - run: uv run python -m tests.viewer_fixtures parity tests/js/build
+        working-directory: .
+      - run: node --test tests/js/*.test.mjs
+        working-directory: .
+
   docs:
     runs-on: ubuntu-latest
     steps:

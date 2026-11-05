@@ -76,6 +76,8 @@ def apply(
 
     `ran` is the set of check IDs that ran; acceptances for other checks are left alone
     (neither applied nor reported as stale). Names compare case-insensitively, like AD.
+    An object matches by its full text, its leading name or its identity (`Finding.key`:
+    the start principal of an AD-PATH-001 path, so "Domain Users" accepts that path).
     """
     accepted: list[Accepted] = []
     notes: list[str] = []
@@ -95,7 +97,9 @@ def apply(
             hit = (
                 remaining
                 if not e.objects
-                else [o for o in remaining if o.lower() in wanted or _base(o).lower() in wanted]
+                else [
+                    o for o in remaining if wanted & {o.lower(), _base(o).lower(), f.key(o).lower()}
+                ]
             )
             if hit:
                 e.used = True
@@ -111,6 +115,18 @@ def apply(
         elif e.expires - today <= EXPIRY_WARNING:
             notes.append(f"acceptance of {e.check} expires on {e.expires}{_who(e)}")
     return kept, accepted, notes
+
+
+def status(e: Entry, today: date, ran: set[str] | None = None) -> str:
+    """expired, stale, expiring, active, or skipped (its check did not run). Call it after
+    apply(), which records whether the entry matched anything."""
+    if e.expires < today:
+        return "expired"
+    if ran is not None and e.check not in ran:
+        return "skipped"
+    if not e.used:
+        return "stale"
+    return "expiring" if e.expires - today <= EXPIRY_WARNING else "active"
 
 
 def _who(e: Entry) -> str:

@@ -1,0 +1,14 @@
+{
+  "name": "ad-doctor-browser-tests",
+  "private": true,
+  "description": "Browser tests for the ad-doctor HTML viewer (dev and CI only; nothing here ships)",
+  "type": "module",
+  "scripts": {
+    "fixtures": "cd ../.. && uv run python -m tests.viewer_fixtures tests/browser/build",
+    "test": "playwright test",
+    "screenshots": "node screenshots.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1"
+  }
+}

@@ -15,6 +15,8 @@ Things that count as a vulnerability here:
 - `redact` leaving a name, SID, host name or address readable
 - a crafted directory object or SYSVOL file that makes the scanner run code, hang or
   crash
+- a viewer file that runs a directory name as markup or code, makes a network request,
+  stores data in the browser, or reveals encrypted content without the passphrase
 
 A check that misses a misconfiguration, or reports one that is not there, is a bug, not a
 vulnerability: please open a regular issue (there is a template for false positives).
@@ -56,3 +58,65 @@ the credentials of the scanning account:
 
 ad-doctor never stores password values: it records only that a password-bearing attribute
 or a credential-looking line exists, and where.
+
+## The HTML viewer file
+
+`ad-doctor view` (and `-f html`) writes one HTML file that is meant to be opened on
+another machine and sometimes sent to someone. What it holds and how it is protected:
+
+**What is in it.** The report (findings, objects, fingerprints, remediation), the control
+paths to tier 0 and their chokepoints, and whatever the command line added: the baseline
+diff, the acceptance and invariant state, earlier reports for the trend (`--history`), the
+fix-script lines (`--fixes`) and the control graph (`--graph`). With `--graph full` that is
+every principal and object with an edge, every control edge and every account's name and
+SID: a map of who can take over what. `--graph paths` holds only the blast radius of the
+principals on control paths and of the accounts named with `--blast-radius-for`. The raw
+snapshot is never embedded, there is no option for it, and a redacted snapshot yields a
+file with its pseudonyms only.
+
+**Encryption.** A file that embeds graph data is encrypted by default; `--no-encrypt`
+writes it in the clear and must be given explicitly. `scan -f html` and `analyze -f html`
+embed no graph and are not encrypted. The payload is gzip-compressed, then encrypted with
+AES-256-GCM (pycryptodome) under a key derived with PBKDF2-HMAC-SHA256, 600,000
+iterations, a random 16-byte salt and a random 12-byte nonce; the page decrypts it with
+WebCrypto. The passphrase comes from `AD_DOCTOR_VIEW_PASSPHRASE` or a prompt (entered
+twice), must be at least 14 characters with at least 6 different ones, and is never
+written to the file, the command line shown in it, or any log. The prompt offers a random
+seven-word passphrase (63 bits, from a 512-word list and Python's `secrets`). `view`
+removes `AD_DOCTOR_VIEW_PASSPHRASE` from its own environment once read, so a browser it
+starts with `--open` does not inherit it. Readable before unlock: the ad-doctor version,
+the build time, the KDF and cipher parameters, and the SHA-256 of the ciphertext. The
+version, build time and parameters are the GCM additional data, so editing them makes
+decryption fail. The SHA-256 is not (it is the hash of the ciphertext itself): the page
+computes it from the data in the file, shows that, and refuses to unlock when it differs
+from the recorded one; the size it shows is measured too. The GCM tag authenticates the
+whole ciphertext. The domain name and every directory name are inside it.
+
+**In the browser.** A meta Content-Security-Policy allows only the file's own inlined
+script and style (by SHA-256), `connect-src 'none'`, no forms, frames or plugins, and
+Trusted Types. The script never parses markup: directory names, which any user can choose
+for a computer account, are written as text, and a Playwright test renders a domain whose
+names are XSS payloads. Nothing is stored (no localStorage, IndexedDB, cookies or service
+worker). In an encrypted file no directory name goes into the address bar: the blast
+radius screen puts an index in the URL (`#blast?a=@3`), not the account, and the findings
+search is not written to the URL, so the browser's history holds no names. **Lock** drops
+the page's references to the decrypted data and reloads it. A dropped report for the
+ad-hoc diff is read in the tab and kept in memory only; an acceptance draft is only
+downloaded.
+
+**Residual risks.** Once unlocked, the data is in the browser's memory like any page:
+
+- browser extensions with access to file URLs can read the page, so open it in a clean
+  browser profile without extensions, on a trusted workstation;
+- the operating system can write that memory to swap or a hibernation file, and a crash
+  dump can contain it; Lock and closing the tab end its use but JavaScript cannot wipe
+  memory, so the decrypted data lingers until the browser reuses it;
+- the passphrase protects the file against someone who copies it, not against a
+  compromised machine that opens it; anyone with the passphrase and the file has the
+  whole map;
+- the file is a view, not evidence: anyone can edit HTML; the SHA-256 shows that the
+  payload is the one written at build time, not who wrote it;
+- in a file written with `--no-encrypt`, account names picked by hand in a link
+  (`#blast?a=NAME`) or typed into the findings search do reach the URL and the history.
+
+The CLI writes the file with mode 0600 on POSIX.

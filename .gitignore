@@ -11,3 +11,8 @@ dist/
 docs/checks/
 docs/changelog.md
 site/
+tests/browser/node_modules/
+tests/browser/build/
+tests/browser/test-results/
+tests/browser/playwright-report/
+tests/js/build/

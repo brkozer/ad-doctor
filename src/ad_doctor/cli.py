@@ -7,18 +7,34 @@ import getpass
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import __version__, accept, catalog, explain, invariants, opengraph, paths, redact
+from . import (
+    __version__,
+    accept,
+    catalog,
+    explain,
+    invariants,
+    opengraph,
+    paths,
+    redact,
+    seal,
+    trend,
+    viewer,
+    viewer_graph,
+)
 from .checks import MITRE, REGISTRY, run_all
 from .collect import CollectError, Target, collect
 from .fixes import render_fixes
-from .model import Finding, Severity, Snapshot
+from .model import DomainPolicy, Finding, Severity, Snapshot
 from .report import (
+    Accepted,
     Report,
     finding_keys,
-    render_html,
+    legacy_keys,
+    mermaid_paths,
     render_json,
     render_junit,
     render_markdown,
@@ -29,10 +45,10 @@ from .report import (
 RENDERERS = {
     "json": render_json,
     "markdown": render_markdown,
-    "html": render_html,
     "sarif": render_sarif,
     "junit": render_junit,
 }
+FORMATS = ["text", "json", "markdown", "html", "sarif", "junit"]
 
 
 def _target(args: argparse.Namespace) -> Target:
@@ -85,6 +101,23 @@ def _load_json(path: Path) -> dict[str, Any]:
     return data
 
 
+def _report_findings(data: dict[str, Any]) -> list[Finding]:
+    return [
+        Finding(
+            f["id"],
+            f["title"],
+            Severity[f["severity"].upper()],
+            f["detail"],
+            f["remediation"],
+            f["objects"],
+            f.get("mitre", []),
+            f.get("keys") or legacy_keys(f["id"], f["objects"]),
+            f.get("data", {}),
+        )
+        for f in data["findings"]
+    ]
+
+
 def _findings_from(
     path: Path, only: list[str] | None = None, spec: dict[str, Any] | None = None
 ) -> tuple[str, list[Finding]]:
@@ -92,18 +125,7 @@ def _findings_from(
     JSON report."""
     data = _load_json(path)
     if data.get("tool") == "ad-doctor":
-        return data["domain"], [
-            Finding(
-                f["id"],
-                f["title"],
-                Severity[f["severity"].upper()],
-                f["detail"],
-                f["remediation"],
-                f["objects"],
-                f.get("mitre", []),
-            )
-            for f in data["findings"]
-        ]
+        return data["domain"], _report_findings(data)
     snap = Snapshot.from_json(data)
     findings = run_all(snap, only)
     if spec is not None:
@@ -123,13 +145,17 @@ def cmd_diff(args: argparse.Namespace) -> int:
     removed = sorted(before - after)
     sev = {f.check_id: f.severity for f in [*old, *new]}
     title = {f.check_id: f.title for f in [*old, *new]}
+    # keys are identities; show the object text (a path's identity is only its start)
+    shown = {(f.check_id, f.key(o)): o for f in [*old, *new] for o in f.objects}
     if args.format == "json":
         print(
             json.dumps(
                 {
                     "domain": domain,
-                    "new": [{"id": c, "object": o, "severity": str(sev[c])} for c, o in added],
-                    "resolved": [{"id": c, "object": o} for c, o in removed],
+                    "new": [
+                        {"id": c, "object": shown[c, o], "severity": str(sev[c])} for c, o in added
+                    ],
+                    "resolved": [{"id": c, "object": shown[c, o]} for c, o in removed],
                 },
                 indent=2,
             )
@@ -137,11 +163,65 @@ def cmd_diff(args: argparse.Namespace) -> int:
     else:
         print(f"{domain}: {len(added)} new, {len(removed)} resolved")
         for c, o in added:
-            print(f"+ [{str(sev[c]).upper():6}] {c}  {o}  ({title[c]})")
+            print(f"+ [{str(sev[c]).upper():6}] {c}  {shown[c, o]}  ({title[c]})")
         for c, o in removed:
-            print(f"- [{str(sev[c]).upper():6}] {c}  {o}  ({title[c]})")
-    new_findings = [f for f in new for o in f.objects if (f.check_id, o) in set(added)]
+            print(f"- [{str(sev[c]).upper():6}] {c}  {shown[c, o]}  ({title[c]})")
+    fresh = set(added)
+    new_findings = [f for f in new for o in f.objects if (f.check_id, f.key(o)) in fresh]
     return 2 if _fails(new_findings, args.fail_on) else 0
+
+
+def cmd_paths(args: argparse.Namespace) -> int:
+    snap = Snapshot.from_json(_load_json(args.snapshot))
+    a = paths.analyze(snap)
+    g = a.graph
+    if args.chokepoints:
+        points = paths.chokepoints(a.paths, args.minimum)
+        if args.format == "json":
+            rows = [
+                {
+                    "count": c.count,
+                    "kind": "edge" if c.is_edge else "node",
+                    **({"from": g.name(c.source), "how": c.how} if c.source is not None else {}),
+                    "node": g.name(c.target),
+                }
+                for c in points
+            ]
+            print(json.dumps({"paths": len(a.paths), "chokepoints": rows}, indent=2))
+            return 0
+        print(f"{snap.domain}: {len(a.paths)} paths to tier 0; shared by {args.minimum} or more:")
+        for c in points:
+            where = (
+                f"edge  {g.name(c.source)} -[{c.how}]-> {g.name(c.target)}"
+                if c.source is not None
+                else f"node  {g.name(c.target)}"
+            )
+            print(f"  {c.count:>4}/{len(a.paths)}  {where}")
+        if not points:
+            print("  none: every path takes its own route")
+        return 0
+    if args.format == "json":
+        print(
+            json.dumps(
+                {
+                    "domain": snap.domain,
+                    "exposed_users": a.exposed,
+                    "enabled_users": a.users,
+                    "paths": [p.record(g) for p in a.paths],
+                },
+                indent=2,
+            )
+        )
+    elif args.format == "mermaid":
+        print("\n".join(mermaid_paths([p.render(g) for p in a.paths], limit=len(a.paths))))
+    else:
+        print(
+            f"{snap.domain}: {len(a.paths)} principals reach tier 0; {a.exposed} of {a.users} "
+            f"enabled users ({a.percent}%) have a path"
+        )
+        for p in a.paths:
+            print(f"  {len(p.steps)} hop{'s' if len(p.steps) != 1 else ' '}  {p.render(g)}")
+    return 0
 
 
 def cmd_blast_radius(args: argparse.Namespace) -> int:
@@ -151,13 +231,7 @@ def cmd_blast_radius(args: argparse.Namespace) -> int:
         print(f"ad-doctor: no account {args.account!r} in the snapshot", file=sys.stderr)
         return 1
     g = paths.build(snap)
-    controlled = paths.reachable(g, starts)
-    tier0 = sorted((p for n, p in controlled.items() if n in g.tier0), key=lambda p: len(p.steps))
-    if starts[0] in g.tier0:  # the account itself (or its primary group) is tier 0
-        tier0.insert(0, paths.Path(starts[0], []))
-    elif any(s in g.tier0 for s in starts[1:]):
-        start = next(s for s in starts[1:] if s in g.tier0)
-        tier0.insert(0, paths.Path(starts[0], [(start, "primary group")]))
+    controlled, tier0 = paths.blast_radius(g, starts)
     if args.format == "json":
         rows = [
             {"object": g.name(n), "tier0": n in g.tier0, "path": p.render(g)}
@@ -198,6 +272,183 @@ def cmd_redact(args: argparse.Namespace) -> int:
     _write_private(args.output, json.dumps(data, indent=2))
     print(f"wrote {args.output}")
     return 0
+
+
+ERRORS = (
+    CollectError,
+    seal.PassphraseError,
+    accept.AcceptError,
+    invariants.InvariantError,
+    OSError,
+    ValueError,
+    KeyError,
+)
+
+
+def _analyze(
+    args: argparse.Namespace, snap: Snapshot, findings: list[Finding], from_report: bool = False
+) -> tuple[Report, viewer.Options]:
+    """Invariants, acceptances and the baseline on top of the findings: the part of a run
+    that scan, analyze and view share. Returns the report and what the viewer needs."""
+    only = getattr(args, "only", None)
+    spec = invariants.load(args.invariants) if args.invariants else None
+    if spec is not None:
+        if from_report:
+            raise ValueError("--invariants needs a snapshot, not a JSON report")
+        findings += invariants.evaluate(snap, spec)
+        findings.sort(key=lambda f: (-f.severity, f.check_id))
+    report = Report(snap, findings)
+    if not from_report:
+        wanted = {i.upper() for i in only or []}
+        report.ran = [c.id for c in REGISTRY if not wanted or c.id in wanted]
+        report.ran += list(invariants.IDS) if spec is not None else []
+    opts = viewer.Options(spec=spec)
+    if args.accept:
+        entries = accept.load(args.accept)
+        today = snap.collected_at.date()
+        if from_report:
+            ran = {f.check_id for f in findings} | {a.check_id for a in report.accepted}
+            ran |= {c.id for c in REGISTRY}
+        else:
+            ran = {c.id for c in REGISTRY if not only or c.id in {i.upper() for i in only}}
+        if spec is not None:
+            ran |= set(invariants.IDS)
+        kept, accepted, notes = accept.apply(findings, entries, today, ran)
+        report.findings = kept
+        report.accepted += accepted
+        snap.notes.extend(notes)
+        opts.entries, opts.ran = entries, ran
+    if args.baseline:
+        _, old = _findings_from(args.baseline, only, spec)
+        report.new = finding_keys(report.findings) - finding_keys(old)
+        stamp = _load_json(args.baseline).get("collected_at")
+        opts.baseline = viewer.Baseline(old, stamp, args.baseline.name)
+    return report, opts
+
+
+def _command(args: argparse.Namespace) -> str:
+    """How a page was built, for its About screen: file names only, never a host, user
+    or secret."""
+    parts = ["ad-doctor", args.cmd]
+    if args.cmd in ("analyze", "view"):
+        parts.append(getattr(args, "snapshot", None) or args.input)
+    for flag in ("baseline", "accept", "invariants"):
+        if getattr(args, flag, None):
+            parts += [f"--{flag}", getattr(args, flag)]
+    if args.cmd == "view":
+        parts += ["--fixes"] if args.fixes else []
+        parts += ["--history", Path(args.history)] if args.history else []
+        parts += ["--graph", args.graph] if args.graph != "auto" else []
+        for account in args.blast_radius_for or []:
+            parts += ["--blast-radius-for", account]
+        parts += {True: ["--encrypt"], False: ["--no-encrypt"], None: []}[args.encrypt]
+    else:
+        parts += ["-f", "html"]
+    return " ".join(str(Path(p).name) if isinstance(p, Path) else p for p in parts)
+
+
+def _snapshot_of_report(data: dict[str, Any]) -> Snapshot:
+    """A JSON report has no snapshot: an empty one carries its domain, time and notes."""
+    return Snapshot(
+        domain=data["domain"],
+        domain_dn="",
+        domain_sid="",
+        collected_at=datetime.fromisoformat(data["collected_at"]),
+        policy=DomainPolicy(0, False, 0, None, 0, 0),
+        accounts=[],
+        privileged={},
+        protected_users=[],
+        notes=list(data.get("notes", [])),
+    )
+
+
+def _passphrase(graph: str, explicit: bool) -> str:
+    """The viewer passphrase: AD_DOCTOR_VIEW_PASSPHRASE, else a prompt (twice) on a
+    terminal. Never echoed, never written into the file. The variable is removed from
+    this process's environment once read, so a browser started by --open does not
+    inherit it."""
+    why = (
+        "--encrypt was given"
+        if explicit
+        else {"full": "it embeds the control graph", "paths": "it embeds blast-radius data"}[graph]
+    )
+    text = os.environ.pop(seal.ENV, None)
+    if text is None:
+        if not sys.stdin.isatty():
+            hint = "" if explicit else " (or --graph none to leave the graph out)"
+            raise seal.PassphraseError(
+                f"the file is encrypted because {why}: set {seal.ENV}, or pass --no-encrypt "
+                f"to write it in the clear{hint}"
+            )
+        print(
+            f"The file is encrypted because {why}. Use at least {seal.MIN_LENGTH} characters, "
+            f"for example this random one ({seal.suggestion_bits()} bits): {seal.suggest()}",
+            file=sys.stderr,
+        )
+        text = getpass.getpass("Passphrase for the viewer file: ")
+        if seal.problem(text) is None and getpass.getpass("Again: ") != text:
+            raise seal.PassphraseError("the two passphrases differ")
+    why_not = seal.problem(text)
+    if why_not is not None:
+        raise seal.PassphraseError(
+            f"the passphrase {why_not}; for example: {seal.suggest()} "
+            f"({seal.suggestion_bits()} bits)"
+        )
+    return text
+
+
+def cmd_view(args: argparse.Namespace) -> int:
+    out = args.output or args.input.with_suffix(".html")
+    if out.resolve() == args.input.resolve():
+        print("ad-doctor: the output would overwrite the input; pass -o", file=sys.stderr)
+        return 1
+    try:
+        data = _load_json(args.input)
+        if data.get("tool") == "ad-doctor":
+            snap = _snapshot_of_report(data)
+            findings = _report_findings(data)
+            if args.fixes:
+                raise ValueError("--fixes needs a snapshot, not a JSON report")
+            if args.graph not in ("auto", "none") or args.blast_radius_for:
+                raise ValueError("--graph and --blast-radius-for need a snapshot, not a report")
+            report, opts = _analyze(args, snap, findings, from_report=True)
+            report.accepted = [Accepted(**a) for a in data.get("accepted", [])] + report.accepted
+            checks = data.get("checks")
+            report.ran = list(checks) if isinstance(checks, list) else None
+            opts.source, source = "report", None
+        else:
+            source = Snapshot.from_json(data)
+            report, opts = _analyze(args, source, run_all(source))
+            opts.graph = viewer_graph.choose(args.graph, source)
+            if args.blast_radius_for and opts.graph != "paths":
+                raise ValueError("--blast-radius-for goes with --graph paths (full has them all)")
+        if args.history:
+            opts.history = trend.load(args.history, report.snap.domain)
+        opts.encrypted = args.encrypt if args.encrypt is not None else opts.graph != "none"
+        passphrase = _passphrase(opts.graph, args.encrypt is True) if opts.encrypted else None
+        opts.redacted = bool(data.get("redacted"))
+        opts.fixes = args.fixes
+        opts.blast_for = args.blast_radius_for
+        opts.command = _command(args)
+        page = viewer.render(viewer.viewmodel(report, source, opts), passphrase)
+        _write_private(out, page)
+    except ERRORS as exc:
+        print(f"ad-doctor: {exc}", file=sys.stderr)
+        return 1
+    extras = [plural_findings(len(report.findings)), f"graph {opts.graph}"]
+    if opts.history is not None:
+        extras.append(f"{len(opts.history)} earlier reports")
+    extras.append("encrypted" if opts.encrypted else "not encrypted")
+    print(f"wrote {out} ({len(page.encode()) // 1024} KB, {', '.join(extras)})")
+    if args.open:
+        import webbrowser
+
+        webbrowser.open(out.resolve().as_uri())
+    return 0
+
+
+def plural_findings(n: int) -> str:
+    return f"{n} finding{'' if n == 1 else 's'}"
 
 
 def _explain(query: str, fmt: str, web: bool) -> int:
@@ -272,9 +523,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     def out_args(p: argparse.ArgumentParser) -> None:
-        p.add_argument(
-            "-f", "--format", choices=["text", *RENDERERS], default="text", help="report format"
-        )
+        p.add_argument("-f", "--format", choices=FORMATS, default="text", help="report format")
         p.add_argument("-o", "--output", type=Path, help="write the report to a file")
         p.add_argument("--only", nargs="+", metavar="ID", help="run only these check IDs")
         p.add_argument(
@@ -320,6 +569,64 @@ def main(argv: list[str] | None = None) -> int:
     p_blast.add_argument("snapshot", type=Path)
     p_blast.add_argument("account", help="sAMAccountName or SID")
     p_blast.add_argument("-f", "--format", choices=["text", "json"], default="text")
+
+    p_paths = sub.add_parser("paths", help="control paths to tier 0, or where to break them")
+    p_paths.add_argument("snapshot", type=Path)
+    p_paths.add_argument(
+        "--chokepoints",
+        action="store_true",
+        help="rank the edges and nodes that the most paths share (break those first)",
+    )
+    p_paths.add_argument(
+        "--minimum", type=int, default=2, metavar="N", help="with --chokepoints: shared by N+"
+    )
+    p_paths.add_argument("-f", "--format", choices=["text", "json", "mermaid"], default="text")
+
+    p_view = sub.add_parser(
+        "view", help="write the interactive report: one offline HTML file, no server"
+    )
+    p_view.add_argument("input", type=Path, metavar="SNAPSHOT|REPORT")
+    p_view.add_argument(
+        "--baseline", type=Path, metavar="JSON", help="earlier report or snapshot to compare"
+    )
+    p_view.add_argument("--accept", type=Path, metavar="TOML", help="accepted-risk file")
+    p_view.add_argument(
+        "--invariants", type=Path, metavar="TOML", help="declared state (needs a snapshot)"
+    )
+    p_view.add_argument(
+        "--fixes", action="store_true", help="include each finding's fix script lines"
+    )
+    p_view.add_argument(
+        "-o", "--output", type=Path, metavar="HTML", help="default: the input name with .html"
+    )
+    p_view.add_argument(
+        "--history",
+        type=Path,
+        metavar="DIR",
+        help="earlier JSON reports of this domain (-f json output) for the Trend screen",
+    )
+    p_view.add_argument(
+        "--graph",
+        choices=["auto", "none", "paths", "full"],
+        default="auto",
+        help="control graph for the Blast radius screen: full (every account, searched in "
+        "the page), paths (precomputed for path holders), none; auto: full up to "
+        f"{viewer_graph.FULL_GRAPH_OBJECTS:,} directory objects, else paths",
+    )
+    p_view.add_argument(
+        "--blast-radius-for",
+        action="append",
+        metavar="ACCOUNT",
+        help="with --graph paths: also precompute this account's blast radius (repeatable)",
+    )
+    p_view.add_argument(
+        "--encrypt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=f"encrypt the file with a passphrase ({seal.ENV} or a prompt); the default "
+        "when a graph is embedded",
+    )
+    p_view.add_argument("--open", action="store_true", help="open it in the default browser")
 
     p_redact = sub.add_parser("redact", help="pseudonymize a snapshot for sharing")
     p_redact.add_argument("snapshot", type=Path)
@@ -373,6 +680,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_redact(args)
         if args.cmd == "export-graph":
             return cmd_export_graph(args)
+        if args.cmd == "paths":
+            return cmd_paths(args)
+        if args.cmd == "view":
+            return cmd_view(args)
         if args.cmd == "analyze":
             snap = Snapshot.from_json(_load_json(args.snapshot))
         else:
@@ -382,33 +693,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"wrote {args.output} ({len(snap.accounts)} accounts)")
             return 0
 
-        findings = run_all(snap, args.only)
-        spec = invariants.load(args.invariants) if args.invariants else None
-        if spec is not None:
-            findings += invariants.evaluate(snap, spec)
-            findings.sort(key=lambda f: (-f.severity, f.check_id))
-        report = Report(snap, findings)
-        if args.accept:
-            entries = accept.load(args.accept)
-            today = snap.collected_at.date()
-            ran = {
-                c.id for c in REGISTRY if not args.only or c.id in {i.upper() for i in args.only}
-            }
-            if spec is not None:
-                ran |= set(invariants.IDS)
-            report.findings, report.accepted, notes = accept.apply(findings, entries, today, ran)
-            snap.notes.extend(notes)
-        if args.baseline:
-            _, old = _findings_from(args.baseline, args.only, spec)
-            report.new = finding_keys(report.findings) - finding_keys(old)
-    except (
-        CollectError,
-        accept.AcceptError,
-        invariants.InvariantError,
-        OSError,
-        ValueError,
-        KeyError,
-    ) as exc:
+        report, opts = _analyze(args, snap, run_all(snap, args.only))
+    except ERRORS as exc:
         print(f"ad-doctor: {exc}", file=sys.stderr)
         return 1
 
@@ -419,6 +705,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.format == "junit":
         only = {i.upper() for i in args.only or []}
         text = render_junit(report, [c.id for c in REGISTRY if not only or c.id in only])
+    elif args.format == "html":
+        # the same page as `ad-doctor view`, with the defaults: no fix lines, nothing extra
+        opts.command = _command(args)
+        text = viewer.render(viewer.viewmodel(report, snap, opts))
     else:
         text = RENDERERS[args.format](report)
     if args.output:

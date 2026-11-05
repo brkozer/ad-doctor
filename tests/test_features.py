@@ -8,14 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from ad_doctor import accept, sd
+from ad_doctor import accept, sd, viewer
 from ad_doctor.checks import REGISTRY, run_all
 from ad_doctor.cli import main
 from ad_doctor.fixes import render_fixes
 from ad_doctor.model import Severity, Trust
 from ad_doctor.report import (
     Report,
-    render_html,
     render_markdown,
     render_sarif,
     render_text,
@@ -24,6 +23,7 @@ from ad_doctor.sd import Ace
 
 from .test_acl_adcs import DOMAIN_SID, template
 from .test_checks import NORMAL, NOW, computer, only, snapshot, user
+from .viewer_fixtures import decode_payload
 
 HELPDESK = f"{DOMAIN_SID}-1105"
 
@@ -178,9 +178,11 @@ def test_renderers() -> None:
     r = dirty()
     text = render_text(r)
     assert "risk score 57/100 (grade D)" in text
-    html = render_html(r)
-    assert "Bad&lt;t&gt;" in html and "Bad<t>" not in html
-    assert "attack.mitre.org/techniques/T1558/004/" in html
+    html = viewer.render(viewer.viewmodel(r, r.snap, viewer.Options()))
+    assert "Bad<t>" not in html  # names only travel inside the escaped, packed payload
+    data = decode_payload(html)
+    assert r"Bad\u003ct\u003e" in data and "Bad<t>" not in data
+    assert "T1558.004" in data  # MITRE IDs are text: the page links nowhere outside itself
     md = render_markdown(r)
     assert "| high | AD-ADCS-001 |" in md
     sarif = json.loads(render_sarif(r))
@@ -220,6 +222,62 @@ def test_fix_script_is_guarded() -> None:
     for line in script.splitlines():
         if line and not line.startswith("#"):
             assert line.endswith("-WhatIf"), line
+
+
+_PS_QUOTE = "'‘’‚‛"
+
+
+def _outside_literals(line: str) -> str:
+    """The parts of a PowerShell line outside single-quoted (verbatim) strings, by
+    PowerShell's rules: any of the five quote characters opens or closes one, and two in a
+    row inside it stand for one quote."""
+    out, i, n = [], 0, len(line)
+    while i < n:
+        if line[i] in _PS_QUOTE:
+            i += 1
+            while i < n:
+                if line[i] in _PS_QUOTE:
+                    if i + 1 < n and line[i + 1] in _PS_QUOTE:
+                        i += 2
+                        continue
+                    break
+                i += 1
+            else:
+                raise AssertionError(f"unterminated literal: {line}")
+            i += 1
+        else:
+            out.append(line[i])
+            i += 1
+    return "".join(out)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "x’+$(calc.exe)+’u",
+        "x‘;calc.exe;‘",
+        "x‚$(calc.exe)‛",
+        "y$(calc.exe)`\"z'",
+        "a'';calc.exe;''$",
+        "p*)(calc=1",
+    ],
+)
+def test_fix_lines_keep_hostile_names_inside_literals(name: str) -> None:
+    from ad_doctor.fixes import FIXES, snippet
+    from ad_doctor.model import Finding
+
+    snap = dirty().snap
+    for check_id in FIXES:
+        objects = [name, f"{name} -> ctx (more)", f"Group: {name}"]
+        f = Finding(check_id, "t", Severity.HIGH, "d", "r", objects=objects)
+        for line in snippet(f, snap):
+            if line.startswith("#"):
+                continue
+            rest = _outside_literals(line)
+            assert "calc" not in rest, (check_id, line)
+            assert '"' not in rest and "`" not in rest, (check_id, line)
+    priv7 = snippet(Finding("AD-PRIV-007", "t", Severity.HIGH, "d", "r", objects=["p*)(x$"]), snap)
+    assert "-LDAPFilter '(sAMAccountName=p\\2a\\29\\28x$)'" in priv7[0]
 
 
 def write_snapshot(path: Path, *accounts: object) -> None:

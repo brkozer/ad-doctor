@@ -626,10 +626,19 @@ class Finding:
     remediation: str
     objects: list[str] = field(default_factory=list)
     mitre: list[str] = field(default_factory=list)
+    # object -> stable identity, for objects whose text carries context that changes
+    # between runs (AD-PATH-001 shows a whole path; its identity is the start principal).
+    # Fingerprints, baselines and diffs use the identity; objects without one use the text.
+    keys: dict[str, str] = field(default_factory=dict)
+    # structured data for viewers, e.g. AD-PATH-001's paths step by step (JSON types only)
+    data: dict[str, Any] = field(default_factory=dict)
 
     @property
     def category(self) -> str:
         return CATEGORIES[self.check_id.split("-")[1]]
+
+    def key(self, obj: str) -> str:
+        return self.keys.get(obj, obj)
 
 
 CATEGORIES = {

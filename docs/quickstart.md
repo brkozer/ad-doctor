@@ -16,8 +16,11 @@ ad-doctor scan dc01.corp.example --ldaps -u 'CORP\auditor' -f html -o report.htm
 ```
 
 `-f` chooses the format (`text`, `json`, `markdown`, `html`, `sarif`, `junit`) and `-o`
-the file. Every finding in the HTML report links to its page in the
-[check catalog](checks/index.md); the fix script runs every change with `-WhatIf`. The same
+the file. The HTML report is the [offline viewer](viewer.md): one file with no network
+access that names each finding's page in the [check catalog](checks/index.md);
+`ad-doctor view` builds it with a baseline, a trend, acceptances, fix lines and the
+control graph for blast radius (encrypted with a passphrase by default). The fix script runs
+every change with `-WhatIf`. The same
 explanation is available offline for any check:
 
 ```bash

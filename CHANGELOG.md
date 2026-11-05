@@ -9,13 +9,64 @@ logic or severity between versions, but an ID is never reused for something else
 
 ### Added
 
+- **`ad-doctor view`: the report as one offline HTML file.** It takes a snapshot or a
+  JSON report (plus `--baseline`, `--accept`, `--invariants`, `--fixes`, `-o`, `--open`)
+  and writes a single page with screens for the overview (tier-0 exposure first, score
+  and grade, categories, compound findings, top actions, acceptance and invariant tiles),
+  the findings (filters and search kept in the URL, objects with fingerprints, the
+  catalog's explanation, fix-script lines, CSV and JSON export), the control paths (each
+  drawn as a chain, a node inspector, the shared steps to break first, copy as Mermaid),
+  the changes since a baseline, the acceptance and invariant state, and the file itself
+  (contents, payload hash, the CSP and a self-check, a print view). Python computes
+  everything; the vanilla JavaScript and CSS ship as package data and are inlined, the
+  data is embedded escaped, gzip-compressed and base64-encoded, and a meta CSP allows only
+  the inlined script and style by hash, with `connect-src 'none'` and Trusted Types. No
+  runtime dependency was added. Browser tests (Playwright, `tests/browser/`, their own CI
+  job) open every screen of a fixture whose directory names are XSS payloads and fail on
+  any executed payload, any request or any console error; pytest greps the script for HTML
+  sinks, storage and network APIs.
+- **Viewer: trend, encryption, blast radius, drafts.** `ad-doctor view` gained:
+  - `--history DIR` and a Trend screen: severity counts and tier-0 exposure per scan as
+    inline SVG lines, category scores as a heat map, and markers where the ad-doctor
+    version or the set of checks changed, from earlier JSON reports of the same domain.
+  - Encryption: a file that embeds graph data is encrypted by default (AES-256-GCM, key
+    from PBKDF2-HMAC-SHA256 with 600,000 iterations; pycryptodome writes it, WebCrypto
+    reads it). The passphrase comes from `AD_DOCTOR_VIEW_PASSPHRASE` or a prompt, needs 14
+    characters, is never written to the file, and the prompt offers a random seven-word
+    passphrase. `--no-encrypt` must be explicit. An Unlock screen shows only the version,
+    build time and encryption parameters (GCM additional data) and the ciphertext's size
+    and SHA-256 (measured by the page, which refuses to unlock an edited file); no account
+    name goes into the URL; Lock drops the decrypted data and reloads.
+  - `--graph none|paths|full` (default `auto`: `full` up to 50,000 directory objects) and a
+    Blast radius screen: account typeahead, verdict, tier-0 paths, everything else the
+    account controls grouped by kind with the step that reaches it, and two accounts side
+    by side. `full` embeds the control graph as a node table and integer edge arrays and
+    searches it in the page with a JavaScript port of `paths.reachable`, checked against
+    Python by Node tests (`tests/js/`), in CI on the fixtures and a 3,000-user bench
+    domain, and locally also on the lab snapshot. `paths` (large domains) embeds the blast
+    radius of the first 25 path holders (an account searched with its implicit groups, as
+    `ad-doctor blast-radius` does) and of each `--blast-radius-for ACCOUNT`, computed at
+    build time.
+  - An acceptance draft builder (*Add to acceptance draft* on a finding, edited on the
+    Policy screen) that downloads `accept-draft.toml` in the format `--accept` reads; a
+    test parses the page's output with `accept.py`.
+  - A drag-and-drop (or file picker) diff against any JSON report on the Changes screen.
+  - Edge-kind filters on the Control paths screen.
+- `paths.blast_radius()`: the account search behind `ad-doctor blast-radius`, shared with
+  the viewer.
+- The JSON report carries `"schema": 2` and `checks`, the IDs of the checks that ran.
+- **`ad-doctor paths`** lists the control paths to tier 0 (`-f text|json|mermaid`), and
+  `--chokepoints` ranks the edges and nodes that the most paths share (`paths.chokepoints`).
+- AD-PATH-001 findings carry the paths as data (start principal and each step, with kind,
+  its node ID (the SID where it has one) and whether it is tier 0) in a new `data` field of the JSON report, and
+  each object's identity in `keys`.
 - **Per-check documentation and `ad-doctor explain`.** Each check now has a catalog entry
   (`src/ad_doctor/catalog/<ID>.toml`, shipped in the wheel and read lazily through
   importlib.resources) holding its risk, detection, severity logic, remediation, MITRE
   techniques and references. `ad-doctor explain <ID|alias>` prints it offline as text,
   Markdown or JSON (`--web` opens the online page). SARIF rules gained `fullDescription`,
-  `help.markdown` and a `helpUri`; HTML, Markdown and JUnit reports and the fix script link
-  each finding to its page. `checks.MITRE` is now derived from the catalog alone (every check and
+  `help.markdown` and a `helpUri`; Markdown and JUnit reports and the fix script link each
+  finding to its page, and the HTML viewer shows the URL as text to copy. `checks.MITRE` is now derived from the catalog alone (every check and
   invariant has an entry, and a test fails when one is missing). A documentation site
   (Zensical) is generated by `scripts/gen_docs.py` and built with `zensical build --strict`;
   `ad-doctor checks -f json` adds each check's summary and docs URL.
@@ -80,6 +131,22 @@ logic or severity between versions, but an ID is never reused for something else
 
 ### Changed
 
+- **`-f html` on `scan` and `analyze` now writes the viewer page** (the same builder as
+  `ad-doctor view`, without fix lines), so there is one HTML code path. The previous
+  static report is gone. Its escaping was audited before removal: every directory string
+  went through `html.escape`, but the check ID of an accepted risk (read from the accept
+  file) was inserted unescaped, and finding links pointed at external sites from a page
+  without a CSP. The viewer has neither problem: it never parses markup and links nowhere.
+- Well-known principals the snapshot holds no object for (Authenticated Users,
+  Everyone, ...) are shown by name in paths and blast radius output instead of as a bare
+  SID; AD-PATH-001 keys and fingerprints are unchanged.
+- **AD-PATH-001 fingerprints are keyed by the path's start principal**, not by the whole
+  rendered path. A path that gets longer or takes another route keeps its fingerprint, is
+  not reported as new by `diff` or `--baseline`, and keeps its SARIF `partialFingerprints`.
+  Every existing AD-PATH-001 fingerprint changes once with this release; other checks are
+  unaffected. Baselines written by older versions still compare correctly: the start
+  principal is read from the rendered path. An acceptance can name the start principal
+  (`objects = ["Domain Users"]`) to accept that path.
 - AD-INF-005, 008, 009 and 010 report DC names instead of the domain name.
 - The control-path engine no longer compares every object with every OU: building the
   graph for 100,000 users went from minutes to about two seconds.
@@ -101,6 +168,11 @@ logic or severity between versions, but an ID is never reused for something else
   GPO or CA name taken from the directory cannot end a comment and start a command. The
   Markdown report keeps finding objects inside code spans and flattens line breaks in
   directory-sourced text.
+- Fix script lines quote directory names for PowerShell with every single-quote
+  character it accepts (U+2018 to U+201B as well as `'`), so a name like `x’+$(calc)+’`
+  can no longer close the string; AD-PRIV-007 looks the account up with `-LDAPFilter` in a
+  verbatim string instead of putting the name in a double-quoted `-Filter`, where `$()`
+  would run. A test feeds hostile names through every fix template.
 
 ## [0.1.0] - unreleased
 

@@ -14,7 +14,7 @@ are exported, but logon is not control, so the path search does not follow them.
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -36,7 +36,7 @@ from .checks import (
     check,
     officer_templates,
 )
-from .model import Account, Finding, Severity, Snapshot
+from .model import WELL_KNOWN_SIDS, Account, Finding, Severity, Snapshot
 
 Edge = tuple[str, str]  # (target node, label)
 UNESCAPED_COMMA = gpo_scope.RDN_SEPARATOR
@@ -51,9 +51,57 @@ class Graph:
     logon_edges: dict[str, list[Edge]] = field(default_factory=dict)
     # (source, target, label) -> extra edge properties: the GPO and its caveats
     edge_props: dict[tuple[str, str, str], dict[str, Any]] = field(default_factory=dict)
+    # node -> object class where the snapshot says it (user, computer, group, ou, ...)
+    kinds: dict[str, str] = field(default_factory=dict)
 
     def name(self, node: str) -> str:
+        """The node's directory name; a well-known SID the snapshot holds no object for
+        (Authenticated Users, Everyone, ...) by its standard name, else the bare ID."""
+        if node in self.names:
+            return self.names[node]
+        bare = node.split(":", 1)[-1]
+        return WELL_KNOWN_SIDS.get(bare, bare) if node.startswith("sid:") else bare
+
+    def ident(self, node: str) -> str:
+        """The name a path's start is keyed by in baselines and acceptance files: the
+        directory name, else the bare SID (unchanged when well-known SIDs got names)."""
         return self.names.get(node, node.split(":", 1)[-1])
+
+    def kind(self, node: str) -> str:
+        """user, computer, gmsa, group, ou, container, gpo, domain, template, pki, ca or
+        principal (a SID the snapshot holds no object for)."""
+        if node in self.kinds:
+            return self.kinds[node]
+        for prefix, kind in NODE_PREFIX_KINDS:
+            if node.startswith(prefix):
+                return kind
+        sid = node.removeprefix("sid:")
+        rid = sid.rsplit("-", 1)[-1]
+        if sid in WELL_KNOWN_GROUPS or sid.startswith("S-1-5-32-") or rid in DOMAIN_GROUP_RIDS:
+            return "group"
+        return "principal"
+
+    def record(self, node: str) -> dict[str, Any]:
+        """A node as JSON for reports and the viewer."""
+        return {
+            "id": node,
+            "name": self.name(node),
+            "kind": self.kind(node),
+            "tier0": node in self.tier0,
+        }
+
+
+NODE_PREFIX_KINDS = (
+    ("tier0:template:", "template"),
+    ("tier0:PKI:", "pki"),
+    ("tier0:ca:", "ca"),
+    ("tier0:dc-ou", "ou"),
+)
+# Everyone, Anonymous Logon, Authenticated Users, Enterprise Domain Controllers
+WELL_KNOWN_GROUPS = {"S-1-1-0", "S-1-5-7", "S-1-5-11", "S-1-5-9"}
+# Domain Admins .. Enterprise Key Admins, RAS and IAS Servers, (Denied) RODC Password
+# Replication Group: groups whose snapshot object may be missing
+DOMAIN_GROUP_RIDS = {*map(str, range(512, 528)), "553", "571", "572"}
 
 
 @dataclass
@@ -66,6 +114,19 @@ class Path:
         for node, how in self.steps:
             out += f" -[{how}]-> {g.name(node)}"
         return out
+
+    def record(self, g: Graph) -> dict[str, Any]:
+        """The path as JSON: the start principal and each step, with names, kinds and
+        whether the node is tier 0."""
+        return {
+            "object": self.render(g),
+            "start": g.record(self.start),
+            "steps": [{"how": how, **g.record(node)} for node, how in self.steps],
+        }
+
+    @classmethod
+    def from_record(cls, data: dict[str, Any]) -> Path:
+        return cls(data["start"]["id"], [(s["id"], s["how"]) for s in data["steps"]])
 
 
 def _sid_node(sid: str) -> str:
@@ -87,6 +148,7 @@ CLASS_OF_KIND = {
 def build(snap: Snapshot) -> Graph:
     edges: dict[str, list[Edge]] = {}
     names: dict[str, str] = {}
+    kinds: dict[str, str] = {}
 
     def add(src: str, dst: str, how: str) -> None:
         if src != dst:
@@ -100,10 +162,13 @@ def build(snap: Snapshot) -> Graph:
         if a.sid:
             dn_to_node[a.dn.lower()] = _sid_node(a.sid)
             names[_sid_node(a.sid)] = a.sam
+            kind = "gmsa" if a.managed else "computer" if a.is_computer else "user"
+            kinds[_sid_node(a.sid)] = kind
     for o in snap.objects:
         node = _sid_node(o.sid) if o.sid and o.kind != "domain" else _dn_node(o.dn)
         dn_to_node[o.dn.lower()] = node
         names.setdefault(node, o.name)
+        kinds.setdefault(node, o.kind)
     for sid, name in snap.principals.items():
         names.setdefault(_sid_node(sid), name)
 
@@ -199,6 +264,7 @@ def build(snap: Snapshot) -> Graph:
     for g in snap.gpos:
         gpo_node = node_of(f"CN={g.guid},CN=Policies,CN=System,{snap.domain_dn}")
         names.setdefault(gpo_node, f"GPO {g.name}")
+        kinds[gpo_node] = "gpo"
         for where in g.linked_to:
             add(gpo_node, domain_node if where == "domain" else "tier0:dc-ou", f"linked to {where}")
 
@@ -272,12 +338,14 @@ def build(snap: Snapshot) -> Graph:
         ca_node = hosts.get(c.host.lower(), f"tier0:ca:{c.name}")
         ca_nodes.add(ca_node)
         names.setdefault(ca_node, f"CA {c.name}")
+        kinds.setdefault(ca_node, "ca")
         add(principal(sid), ca_node, f"{right} (ESC7)")
 
     # gMSA password readers become the gMSA
     for gm in snap.gmsas:
         target = node_of(gm.dn)
         names.setdefault(target, gm.name)
+        kinds.setdefault(target, "gmsa")
         for sid in gm.readers:
             add(principal(sid), target, "read gMSA password")
 
@@ -292,11 +360,12 @@ def build(snap: Snapshot) -> Graph:
             tier0.add(node_of(o.dn))
     names["tier0:dc-ou"] = "Domain Controllers OU"
     names[domain_node] = snap.domain
+    kinds[domain_node] = "domain"
     for ca in snap.ca_hosts:  # CA servers sign logons for anyone: tier 0
         for a in snap.accounts:
             if a.sam.upper() == ca.upper() and a.sid:
                 tier0.add(_sid_node(a.sid))
-    return Graph(edges, names, tier0, logon_edges, edge_props)
+    return Graph(edges, names, tier0, logon_edges, edge_props, kinds)
 
 
 def paths_to_tier0(g: Graph) -> dict[str, Path]:
@@ -348,6 +417,20 @@ def reachable(g: Graph, starts: Iterable[str]) -> dict[str, Path]:
             node = parent
         out[end] = Path(node, list(reversed(steps)))
     return out
+
+
+def blast_radius(g: Graph, starts: list[str]) -> tuple[dict[str, Path], list[Path]]:
+    """What the identity `starts` (identity_nodes) controls, and its paths into tier 0:
+    the tier-0 objects it reaches, shortest first, led by the account itself when it (or
+    one of its implicit groups) is tier 0 already. The viewer's JavaScript ports this."""
+    controlled = reachable(g, starts)
+    tier0 = sorted((p for n, p in controlled.items() if n in g.tier0), key=lambda p: len(p.steps))
+    if starts and starts[0] in g.tier0:  # the account itself is tier 0
+        tier0.insert(0, Path(starts[0], []))
+    elif any(s in g.tier0 for s in starts[1:]):
+        start = next(s for s in starts[1:] if s in g.tier0)
+        tier0.insert(0, Path(starts[0], [(start, "primary group")]))
+    return controlled, tier0
 
 
 def identity_nodes(snap: Snapshot, sam_or_sid: str) -> list[str]:
@@ -421,33 +504,103 @@ BROAD_FIRST = (
 )
 
 
-@check("AD-PATH-001", "Control paths from non-tier-0 principals to tier 0")
-def tier0_paths(snap: Snapshot) -> Finding | None:
+@dataclass
+class Analysis:
+    """What AD-PATH-001, `ad-doctor paths` and the viewer report."""
+
+    graph: Graph
+    # principals that hold a right themselves, each with its shortest path, in report
+    # order: broad groups first, then by length, then by name
+    paths: list[Path]
+    exposed: int  # enabled non-tier-0 users with a path
+    users: int  # enabled non-tier-0 users
+
+    @property
+    def broad(self) -> list[Path]:
+        return [p for p in self.paths if self.graph.name(p.start) in BROAD_FIRST]
+
+    @property
+    def percent(self) -> int:
+        return (100 * self.exposed // self.users) if self.users else 0
+
+
+def analyze(snap: Snapshot) -> Analysis:
     g = build(snap)
     found = paths_to_tier0(g)
     # principals that hold a right themselves; members who only inherit it through a group
     # are counted in the exposure figure instead of being listed one by one
     starts = direct_holders(g, found)
-    if not starts:
-        return None
     exposed, total = exposure(snap, g, found)
     ordered = sorted(
         starts.values(),
         key=lambda p: (g.name(p.start) not in BROAD_FIRST, len(p.steps), g.name(p.start).lower()),
     )
-    broad = [p for p in ordered if g.name(p.start) in BROAD_FIRST]
+    return Analysis(g, ordered, exposed, total)
+
+
+@dataclass(frozen=True)
+class Chokepoint:
+    """An edge (`source` set) or a node (`source` None) that `count` paths go through."""
+
+    target: str
+    count: int
+    source: str | None = None
+    how: str = ""
+
+    @property
+    def is_edge(self) -> bool:
+        return self.source is not None
+
+
+def chokepoints(paths: Iterable[Path], minimum: int = 2) -> list[Chokepoint]:
+    """The edges and nodes that at least `minimum` paths share, most shared first: the
+    places where one change breaks the most paths. A node counts for every path that
+    starts at it or passes through it; the tier-0 object a path ends at is not counted,
+    because that is not where a path can be broken."""
+    edges: Counter[tuple[str, str, str]] = Counter()
+    nodes: Counter[str] = Counter()
+    for p in paths:
+        hops: set[tuple[str, str, str]] = set()
+        prev = p.start
+        for node, how in p.steps:
+            hops.add((prev, node, how))
+            prev = node
+        edges.update(hops)
+        nodes.update({p.start, *(node for node, _ in p.steps[:-1])})
+    out = [Chokepoint(t, n, s, h) for (s, t, h), n in edges.items() if n >= minimum]
+    out += [Chokepoint(node, n) for node, n in nodes.items() if n >= minimum]
+    out.sort(key=lambda c: (-c.count, not c.is_edge, c.source or "", c.target, c.how))
+    return out
+
+
+@check("AD-PATH-001", "Control paths from non-tier-0 principals to tier 0")
+def tier0_paths(snap: Snapshot) -> Finding | None:
+    a = analyze(snap)
+    if not a.paths:
+        return None
+    g = a.graph
     detail = (
-        f"{len(starts)} principals outside tier 0 can reach it; {exposed} of {total} enabled "
-        f"users ({(100 * exposed // total) if total else 0}%) have a path through their "
-        "accounts or groups. Each object shows the shortest path."
+        f"{len(a.paths)} principals outside tier 0 can reach it; {a.exposed} of {a.users} "
+        f"enabled users ({a.percent}%) have a path through their accounts or groups. "
+        "Each object shows the shortest path."
     )
-    if broad:
+    if a.broad:
         detail += " Broad groups have a path, so every user is effectively tier 0."
-    return _finding(
+    f = _finding(
         "AD-PATH-001",
         Severity.HIGH,
         detail,
         "Break each path at its first step, starting with the ones shared by most paths "
-        "(see `ad-doctor blast-radius` for one account).",
-        [p.render(g) for p in ordered],
+        "(`ad-doctor paths --chokepoints` ranks them; `ad-doctor blast-radius` shows one "
+        "account).",
+        [p.render(g) for p in a.paths],
     )
+    # a path's identity is the principal it starts from: when the path gets longer or takes
+    # another route it keeps its fingerprint and is not new in a diff
+    f.keys = {p.render(g): g.ident(p.start) for p in a.paths}
+    f.data = {
+        "exposed": a.exposed,
+        "users": a.users,
+        "paths": [p.record(g) for p in a.paths],
+    }
+    return f

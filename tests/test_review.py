@@ -301,8 +301,8 @@ def test_fix_script_targets_and_ids() -> None:
         Finding("AD-ACL-001", "t", Severity.HIGH, "d", "r", ["Exchange Windows Permissions"]),
     ]
     script = render_fixes(fs, snap)
-    assert "sAMAccountName -eq 'PC01$'\") -Replace @{primaryGroupID=515}" in script
-    assert "sAMAccountName -eq 'bob'\") -Replace @{primaryGroupID=513}" in script
+    assert "-LDAPFilter '(sAMAccountName=PC01$)') -Replace @{primaryGroupID=515}" in script
+    assert "-LDAPFilter '(sAMAccountName=bob)') -Replace @{primaryGroupID=513}" in script
     assert "-Members 'PKI Admins'" in script
     assert "Set-ADComputer 'FS01' -PrincipalsAllowedToDelegateToAccount" in script
     assert "Set-ADUser 'krbtgt' -PrincipalsAllowedToDelegateToAccount" in script

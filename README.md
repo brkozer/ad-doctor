@@ -43,6 +43,14 @@ DC seeded with one instance of every misconfiguration that a single domain can h
 - **Compound findings.** `AD-CHAIN-*` raise the alarm when individually medium findings
   add up to a known one-step compromise (relay to RBCD, coercion plus unconstrained
   delegation, coercion plus ESC8).
+- **A report you can hand over, as one offline file.** `ad-doctor view` writes a single
+  HTML file with the findings, the control paths drawn step by step, the places where one
+  change breaks the most paths, any account's blast radius, the changes since a baseline,
+  the trend across earlier scans, and accepted risks and invariants, with a builder for
+  new acceptances. It has no server, loads nothing and cannot make a request: a
+  Content-Security-Policy allows only its own inlined script and style. With the control
+  graph inside, it is encrypted with a passphrase by default (AES-256-GCM, opened with
+  WebCrypto) ([details](#the-html-viewer)).
 - **Built for CI and change management.** SARIF 2.1.0 (validated against the schema),
   JUnit, JSON with stable per-finding fingerprints, exit codes with `--fail-on`, and
   `--baseline` / `diff` so a scheduled job fails only on *new* findings.
@@ -66,7 +74,7 @@ Tools like PingCastle and Purple Knight cover more ground overall and Locksmith 
 deeper into AD CS; ad-doctor is the scriptable option, and the one that tests itself
 against a live DC.
 
-<p align="center"><img src="docs/report.png" alt="HTML report: risk score, findings by severity and category, expandable findings with remediation and MITRE ATT&CK links" width="85%"></p>
+<p align="center"><img src="docs/viewer.png" alt="ad-doctor view on the lab domain: tier-0 exposure of 95%, risk score, findings by severity and category, top actions" width="85%"></p>
 
 ## Checks
 
@@ -186,8 +194,9 @@ ad-doctor explain esc1             # or by alias
 ad-doctor explain AD-KRB-003 -f markdown
 ```
 
-Every finding in a report links to its catalog page, and SARIF rules carry the
-explanation and a `helpUri` so code-scanning alerts show it too.
+Every finding in a Markdown, JUnit or SARIF report and in the fix script links to its
+catalog page (the HTML viewer, which links nowhere, shows the URL as text to copy), and
+SARIF rules carry the explanation and a `helpUri` so code-scanning alerts show it too.
 
 ## Usage
 
@@ -208,6 +217,8 @@ ad-doctor collect dc01.corp.example --ldaps -u 'CORP\auditor' -o 2026-11.json
 ad-doctor analyze 2026-11.json -f markdown -o report.md --invariants invariants.toml
 ad-doctor diff 2026-10.json 2026-11.json
 ad-doctor blast-radius 2026-11.json helpdesk_jane
+ad-doctor paths 2026-11.json --chokepoints        # where one change breaks the most paths
+ad-doctor view 2026-11.json --baseline 2026-10.json --accept accept.toml --fixes --open
 AD_DOCTOR_REDACT_KEY=... ad-doctor redact 2026-11.json -o shareable.json
 
 # the control graph for BloodHound CE (File Ingest accepts OpenGraph JSON)
@@ -223,6 +234,8 @@ ad-doctor export-graph 2026-11.json -o graph.json --paths-only
 | `--invariants FILE` | declared state to enforce (see [`examples/invariants.toml`](examples/invariants.toml)) |
 | `--fixes FILE` | write the PowerShell remediation script |
 | `--only ID ...` | run a subset of checks (`ad-doctor checks` lists them) |
+| `view FILE`, `--open` | write the offline HTML viewer from a snapshot or a JSON report (`--baseline`, `--accept`, `--invariants`, `--fixes` as above; `--history DIR` for the trend, `--graph auto\|full\|paths\|none` for blast radius, `--encrypt`/`--no-encrypt`) |
+| `paths FILE --chokepoints` | list the control paths to tier 0, or rank the steps they share (`-f text\|json\|mermaid`) |
 | `explain ID\|alias` | print a check's full explanation and fix offline (`-f text\|markdown\|json`, `--web`) |
 | `-k`, `--kerberos` | bind with Kerberos instead of a password |
 | `--no-sysvol`, `--smb-port` | skip or redirect the SMB part |
@@ -344,7 +357,8 @@ flowchart LR
     F --> A
     S --> A[checks.py + paths.py<br/>87 pure functions]
     A --> I[invariants.py<br/>accept.py]
-    I --> R[report.py<br/>text, JSON, Markdown,<br/>HTML, SARIF, JUnit]
+    I --> R[report.py<br/>text, JSON, Markdown,<br/>SARIF, JUnit]
+    I --> W[viewer.py<br/>offline HTML viewer]
     I --> X[fixes.py<br/>remediation script]
     A --> O[opengraph.py<br/>BloodHound OpenGraph]
 ```
@@ -352,6 +366,92 @@ flowchart LR
 Checks never touch the network, which keeps them fast and lets the unit tests run
 without a domain controller; the collector itself is tested against a fake LDAP
 connection and, through `tests/test_lab.py`, against the live lab DC.
+
+## The HTML viewer
+
+`ad-doctor view` (and `-f html` on `scan` and `analyze`, which use the same builder) writes
+one self-contained HTML file. Python computes everything (findings, paths, chokepoints,
+the baseline diff, acceptances, invariants, the trend); the page renders, filters and
+navigates it, and walks the embedded control graph for blast radius. It works from a USB
+stick or an air-gapped laptop. The [viewer page](docs/viewer.md) has the details.
+
+```bash
+export AD_DOCTOR_VIEW_PASSPHRASE='...'     # or answer the prompt; the file embeds the graph
+ad-doctor view 2026-11.json --baseline 2026-10.json --history reports/ \
+  --accept accept.toml --invariants invariants.toml --fixes -o 2026-11.html --open
+```
+
+<p align="center"><img src="docs/viewer-blast.png" alt="Blast radius screen on the lab: two accounts side by side, both reaching tier 0, with their paths into tier 0 and the objects each controls, grouped by kind" width="85%"></p>
+
+| Screen | What it shows |
+|---|---|
+| Overview | tier-0 exposure, score and grade (and the baseline's), severity and category, compound findings, top actions, acceptance and invariant tiles, what was not checked |
+| Findings | filters and search kept in the URL; the evidence, objects with fingerprints, the catalog's explanation, the remediation and, with `--fixes`, the fix-script lines; CSV and JSON export |
+| Control paths | each path drawn as a chain, filters by edge kind, a node inspector, the steps the most paths share ("break here first"), copy as Mermaid |
+| Blast radius | any account: whether it reaches tier 0, how, and everything else it controls grouped by kind; two accounts side by side |
+| Changes | against `--baseline` or a JSON report dropped on the screen: new, resolved and changed objects, score and exposure |
+| Trend | with `--history`: severity counts and exposure per scan, category heat map, markers where the ad-doctor version or the check set changed |
+| Policy | a draft builder that downloads `accept-draft.toml`; acceptance and invariant state |
+| About | contents, payload SHA-256, the CSP and a self-check that requests are blocked, a print view |
+
+<p align="center"><img src="docs/viewer-paths.png" alt="Control paths screen: edge filters, the path list, one path drawn as a chain from LabServerAdmins through ENTRA01$ and the sync account to the domain" width="85%"></p>
+
+`--graph` decides what the Blast radius screen can answer: `full` embeds the whole control
+graph (nodes plus integer edge arrays) and searches it in the page with a JavaScript port
+of `paths.reachable` that Node tests hold to Python's results; `paths`, the default above
+50,000 directory objects, embeds the blast radius of the first 25 principals on control
+paths and
+of the accounts named with `--blast-radius-for`, computed at build time; `none` leaves it
+out.
+
+The security model:
+
+- **Directory names are hostile input.** Any user can create a computer account while
+  MachineAccountQuota is above 0, so names reach the page only as text: the script never
+  parses markup, and a test fails the build if it uses `innerHTML` or any other HTML sink.
+  The data is JSON with `<`, `>`, `&`, U+2028 and U+2029 escaped, gzip-compressed and
+  base64-encoded. Playwright renders a domain whose names are XSS payloads, every screen
+  and every suggested account's blast radius, and fails on any executed payload, request
+  or console error.
+- **No egress.** The CSP is `default-src 'none'`, with the inlined script and style
+  allowed by SHA-256, `connect-src 'none'`, no forms, frames or plugins, and Trusted Types.
+  The page links nowhere. Nothing is stored in the browser.
+- **Encrypted when it maps the domain.** A file with graph data is encrypted by default:
+  AES-256-GCM with a key from PBKDF2-HMAC-SHA256 (600,000 iterations, random salt and
+  nonce), written by pycryptodome and opened with WebCrypto. The passphrase (14
+  characters or more; the prompt offers a random seven-word one) comes from
+  `AD_DOCTOR_VIEW_PASSPHRASE` or a prompt and is never written anywhere. Before unlock only
+  the version, build time, encryption parameters and the ciphertext's size and SHA-256 are
+  readable; the first three are GCM additional data, and the page measures the size and
+  hash itself and refuses an edited file. No account name goes into the URL or the
+  history. Lock drops the decrypted data. `--no-encrypt` must be explicit; `-f html` holds
+  no graph and is not encrypted.
+- **Minimum data, and its limits.** Never the raw snapshot; a redacted snapshot shows
+  pseudonyms only; mode 0600. Once unlocked, browser extensions and swap can see the data:
+  open it on a trusted workstation in a clean browser profile ([SECURITY.md](SECURITY.md)).
+
+Measured on `scripts/bench.py` domains and the lab, on one core of an Intel Xeon Gold 6138
+(2017), from the installed wheel, with the defaults: `--graph auto`, and so encrypted,
+since every one of these files embeds graph data. `ad-doctor view` includes loading the
+snapshot, running every check, building the graph data and encrypting; peak memory is the
+build's. First screen is from opening the same file built with `--no-encrypt` to the
+first screen in headless Chromium 156; unlock is from clicking Unlock to the first screen,
+most of it the 600,000 PBKDF2 rounds; both are the median of five runs, as is the
+JavaScript heap after unlocking and one blast-radius lookup.
+
+| Domain | Graph | HTML file | `ad-doctor view` | Build memory | First screen | Unlock | JS heap |
+|---|---|---|---|---|---|---|---|
+| lab (38 accounts) | full | 215 KB | 0.8 s | 54 MB | 98 ms | 0.82 s | 2.7 MB |
+| 10,000 users | full | 743 KB | 2.3 s | 124 MB | 152 ms | 0.82 s | 6.9 MB |
+| 100,000 users | paths | 1.5 MB | 23 s | 0.64 GB | 207 ms | 0.82 s | 7.9 MB |
+| 250,000 users | paths | 3.5 MB | 62 s | 1.55 GB | 335 ms | 0.82 s | 14.3 MB |
+
+An account's blast radius on the 10,000-user page, searched in the page and drawn, takes
+under 30 ms. Forcing `--graph full` on the 100,000-user domain gives a 5.9 MB file, a
+603 ms first screen, a 47 MB heap and 78 ms per account; `auto` switches to `paths` well
+before that. Encryption adds under half a second to the build (0.35 s on the lab, 0.3 s
+at 10,000 users). Object lists with
+thousands of rows are drawn as they scroll into view.
 
 ## Performance
 
