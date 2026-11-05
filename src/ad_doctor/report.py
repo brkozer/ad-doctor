@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import textwrap
 from dataclasses import dataclass, field
 from html import escape
 from typing import Any
+from xml.sax.saxutils import escape as xml_escape
+from xml.sax.saxutils import quoteattr
 
 from . import __version__
 from .checks import MITRE, REGISTRY
@@ -52,6 +56,11 @@ class Report:
 
     def is_new(self, f: Finding) -> bool:
         return self.new is not None and any((f.check_id, o) in self.new for o in f.objects)
+
+
+def fingerprint(check_id: str, obj: str) -> str:
+    """Stable ID of one finding on one object, for ticket systems and SARIF."""
+    return hashlib.sha256(f"{check_id}|{obj}".encode()).hexdigest()[:16]
 
 
 def finding_keys(findings: list[Finding]) -> set[tuple[str, str]]:
@@ -135,6 +144,7 @@ def report_dict(r: Report) -> dict[str, Any]:
                 "detail": f.detail,
                 "remediation": f.remediation,
                 "objects": f.objects,
+                "fingerprints": {o: fingerprint(f.check_id, o) for o in f.objects},
                 "mitre": f.mitre,
                 **({"new": r.is_new(f)} if r.new is not None else {}),
             }
@@ -189,6 +199,8 @@ def render_markdown(r: Report) -> str:
             "",
             *[f"- `{o}`" for o in f.objects],
         ]
+        if f.check_id == "AD-PATH-001":
+            out += ["", *mermaid_paths(f.objects)]
     if r.accepted:
         out += ["", "## Accepted risks", ""]
         for a in r.accepted:
@@ -197,6 +209,35 @@ def render_markdown(r: Report) -> str:
     if snap.notes:
         out += ["", "## Notes", "", *[f"- {n}" for n in snap.notes]]
     return "\n".join(out) + "\n"
+
+
+PATH_STEP = re.compile(r" -\[([^\]]+)\]-> ")
+
+
+def mermaid_paths(paths: list[str], limit: int = 15) -> list[str]:
+    """A Mermaid flowchart of rendered control paths (`a -[how]-> b -[how]-> c`)."""
+    ids: dict[str, str] = {}
+
+    def node(name: str) -> str:
+        if name not in ids:
+            ids[name] = f"n{len(ids)}"
+        label = name.replace('"', "'")
+        return f'{ids[name]}["{label}"]'
+
+    lines = ["```mermaid", "flowchart LR"]
+    edges = set()
+    for path in paths[:limit]:
+        parts = PATH_STEP.split(path)
+        for i in range(0, len(parts) - 2, 2):
+            src, how, dst = parts[i], parts[i + 1], parts[i + 2]
+            edge = f'    {node(src)} -- "{how}" --> {node(dst)}'
+            if edge not in edges:
+                edges.add(edge)
+                lines.append(edge)
+    if len(paths) > limit:
+        lines.append(f'    more["+{len(paths) - limit} more paths"]')
+    lines.append("```")
+    return lines
 
 
 # --- HTML ----------------------------------------------------------------------------
@@ -316,20 +357,32 @@ SARIF_LEVEL = {
 SECURITY_SEVERITY = {Severity.HIGH: "8.0", Severity.MEDIUM: "5.5", Severity.LOW: "3.0"}
 
 
+def catalog(r: Report) -> list[tuple[str, str]]:
+    """(id, title) of every registered check plus findings from elsewhere (invariants)."""
+    known = [(c.id, c.title) for c in REGISTRY]
+    ids = {c for c, _ in known}
+    extra = {f.check_id: f.title for f in r.findings if f.check_id not in ids}
+    return known + sorted(extra.items())
+
+
 def render_sarif(r: Report) -> str:
     by_id = {f.check_id: f for f in r.findings}
     rules: list[dict[str, Any]] = []
-    for c in REGISTRY:
+    for check_id, title in catalog(r):
         props: dict[str, Any] = {
-            "tags": ["security", "active-directory", *(f"mitre/{t}" for t in MITRE.get(c.id, ()))]
+            "tags": [
+                "security",
+                "active-directory",
+                *(f"mitre/{t}" for t in MITRE.get(check_id, ())),
+            ]
         }
         rule: dict[str, Any] = {
-            "id": c.id,
-            "name": c.fn.__name__,
-            "shortDescription": {"text": c.title},
+            "id": check_id,
+            "name": check_id.lower().replace("-", "_"),
+            "shortDescription": {"text": title},
             "properties": props,
         }
-        f = by_id.get(c.id)
+        f = by_id.get(check_id)
         if f is not None:
             rule["help"] = {"text": f.remediation}
             props["security-severity"] = SECURITY_SEVERITY.get(f.severity, "1.0")
@@ -339,7 +392,7 @@ def render_sarif(r: Report) -> str:
             "ruleId": f.check_id,
             "level": SARIF_LEVEL[f.severity],
             "message": {"text": f"{f.detail} Object: {o}"},
-            "partialFingerprints": {"adDoctor/v1": f"{f.check_id}:{o}"},
+            "partialFingerprints": {"adDoctor/v1": fingerprint(f.check_id, o)},
             "locations": [
                 {
                     "physicalLocation": {"artifactLocation": {"uri": f"ad/{r.snap.domain}"}},
@@ -368,3 +421,44 @@ def render_sarif(r: Report) -> str:
         ],
     }
     return json.dumps(sarif, indent=2)
+
+
+# --- JUnit ---------------------------------------------------------------------------
+
+
+def render_junit(r: Report, ran: list[str] | None = None) -> str:
+    """One test case per check: failed when it found something, skipped when accepted."""
+    by_id = {f.check_id: f for f in r.findings}
+    accepted = {a.check_id for a in r.accepted}
+    checks = catalog(r)
+    registered = {c.id for c in REGISTRY}
+    # checks that ran, plus findings that do not come from a registered check (invariants)
+    ids = set(ran if ran is not None else registered) | (by_id.keys() - registered)
+    cases = []
+    for check_id, title in checks:
+        if check_id not in ids:
+            continue
+        name = quoteattr(f"{check_id} {title}")
+        f = by_id.get(check_id)
+        if f is not None:
+            body = xml_escape("\n".join([f.detail, *f.objects, f"fix: {f.remediation}"]))
+            cases.append(
+                f'  <testcase classname="ad-doctor.{f.category}" name={name}>'
+                f"<failure type={quoteattr(str(f.severity))} message={quoteattr(f.title)}>"
+                f"{body}</failure></testcase>"
+            )
+        elif check_id in accepted:
+            cases.append(
+                f'  <testcase classname="ad-doctor" name={name}>'
+                '<skipped message="accepted risk"/></testcase>'
+            )
+        else:
+            cases.append(f'  <testcase classname="ad-doctor" name={name}/>')
+    failures = sum(1 for i in ids if i in by_id)
+    skipped = sum(1 for i in ids if i in accepted and i not in by_id)
+    suite = quoteattr(f"ad-doctor {r.snap.domain}")
+    header = (
+        f'<testsuite name={suite} tests="{len(cases)}" failures="{failures}" '
+        f'skipped="{skipped}" errors="0">'
+    )
+    return "\n".join(['<?xml version="1.0" encoding="UTF-8"?>', header, *cases, "</testsuite>"])

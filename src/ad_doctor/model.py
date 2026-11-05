@@ -23,6 +23,9 @@ class UAC(IntEnum):
     USE_DES_KEY_ONLY = 0x200000
     DONT_REQ_PREAUTH = 0x400000
     TRUSTED_TO_AUTH_FOR_DELEGATION = 0x1000000
+    WORKSTATION_TRUST_ACCOUNT = 0x1000
+    SMARTCARD_REQUIRED = 0x40000
+    PARTIAL_SECRETS_ACCOUNT = 0x4000000  # read-only DC
 
 
 _FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=UTC)
@@ -50,6 +53,24 @@ class Account:
     laps: bool = False
     os: str | None = None
     sid_history: list[str] = field(default_factory=list)
+    sid: str = ""
+    primary_group: int = 0
+    dns_host: str | None = None
+    # msDS-SupportedEncryptionTypes; None when the attribute is not set
+    enc_types: int | None = None
+    alt_security_identities: list[str] = field(default_factory=list)
+    logon_count: int | None = None
+    when_created: datetime | None = None
+    # names of password-bearing attributes that came back (values are never kept)
+    password_attributes: list[str] = field(default_factory=list)
+    # description/info looks like it holds a password (the text itself is not kept)
+    secret_in_description: bool = False
+    # a LAPS password attribute was readable by the scanning account
+    laps_password_readable: bool = False
+    # msDS-ManagedAccountPrecededByLink of a dMSA
+    preceded_by: str | None = None
+    # gMSA, sMSA or dMSA (computer-like, but not a computer)
+    managed: bool = False
 
     def has(self, flag: UAC) -> bool:
         return bool(self.uac & flag)
@@ -60,7 +81,15 @@ class Account:
 
     @property
     def is_dc(self) -> bool:
-        return self.has(UAC.SERVER_TRUST_ACCOUNT)
+        return self.has(UAC.SERVER_TRUST_ACCOUNT) or self.has(UAC.PARTIAL_SECRETS_ACCOUNT)
+
+    @property
+    def is_rodc(self) -> bool:
+        return self.has(UAC.PARTIAL_SECRETS_ACCOUNT)
+
+    @property
+    def rid(self) -> int:
+        return int(self.sid.rsplit("-", 1)[1]) if self.sid else 0
 
 
 @dataclass
@@ -86,6 +115,7 @@ class CertTemplate:
     schema_version: int = 2
     no_security_extension: bool = False
     issuance_policies: list[str] = field(default_factory=list)
+    min_key_size: int = 0
 
 
 @dataclass
@@ -112,6 +142,70 @@ class Gpo:
 
 
 @dataclass
+class DirObject:
+    """Any directory object whose permissions or members matter for control paths."""
+
+    dn: str
+    name: str
+    kind: str  # user, computer, group, gpo, ou, domain, container, gmsa
+    sid: str = ""
+    owner: str | None = None
+    aces: list[Ace] = field(default_factory=list)
+    dacl_protected: bool = False
+    # direct members (DNs) for groups
+    members: list[str] = field(default_factory=list)
+    # ACEs that child objects inherit (OUs, containers, the domain head)
+    inheritable: list[Ace] = field(default_factory=list)
+
+    def rid_is(self, snap: Snapshot, rid: int) -> bool:
+        return self.sid == f"{snap.domain_sid}-{rid}"
+
+
+@dataclass
+class GpoSettings:
+    """Security settings from a GPO's GptTmpl.inf that matter for the checks."""
+
+    lm_compatibility: int | None = None
+    no_lm_hash: int | None = None
+    clear_text_password: int | None = None
+    # privilege constant -> SIDs (or names) granted
+    privileges: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass
+class ScriptSecret:
+    path: str
+    line: int
+    kind: str
+
+
+@dataclass
+class Gmsa:
+    name: str
+    dn: str
+    # SIDs allowed to retrieve the password (msDS-GroupMSAMembership)
+    readers: list[str]
+
+
+@dataclass
+class Rodc:
+    name: str
+    reveal: list[str]  # msDS-RevealOnDemandGroup DNs
+    never_reveal: list[str]  # msDS-NeverRevealGroup DNs
+
+
+@dataclass
+class Probes:
+    """Results of the active network checks; None means not run or inconclusive."""
+
+    spooler_on_dc: bool | None = None
+    smb_signing_required: bool | None = None
+    ldaps_channel_binding_required: bool | None = None
+    # web enrollment URLs that answered with NTLM over plain HTTP (ESC8)
+    web_enrollment_ntlm: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Snapshot:
     domain: str
     domain_dn: str
@@ -134,6 +228,8 @@ class Snapshot:
     oid_group_links: dict[str, str] = field(default_factory=dict)
     # computer accounts (sAMAccountName) of the enterprise CA servers
     ca_hosts: list[str] = field(default_factory=list)
+    # SID of the forest root domain (differs from domain_sid in child domains)
+    root_sid: str = ""
     dns_admins: list[str] = field(default_factory=list)
     # direct members of Pre-Windows 2000 Compatible Access
     pre2k_members: list[str] = field(default_factory=list)
@@ -141,6 +237,19 @@ class Snapshot:
     recycle_bin: bool | None = None
     # None when the probe did not run
     ldap_signing_required: bool | None = None
+    probes: Probes = field(default_factory=Probes)
+    # groups, OUs, tier-0 objects, GPOs, the domain head: DACLs, owners, members
+    objects: list[DirObject] = field(default_factory=list)
+    gpo_settings: dict[str, GpoSettings] = field(default_factory=dict)
+    script_secrets: list[ScriptSecret] = field(default_factory=list)
+    gmsas: list[Gmsa] = field(default_factory=list)
+    rodcs: list[Rodc] = field(default_factory=list)
+    # when the domain partition was last backed up (dSASignature); None if never
+    last_backup: datetime | None = None
+    # whether the replication metadata holding the backup time could be read
+    backup_checked: bool = False
+    # whether any fine-grained password policy was readable
+    psos_visible: bool = False
     # parts of the collection that could not run (no AD CS, SYSVOL unreachable, ...)
     notes: list[str] = field(default_factory=list)
 
@@ -149,6 +258,17 @@ class Snapshot:
 
     def privileged_dns(self) -> set[str]:
         return {dn.lower() for members in self.privileged.values() for dn in members}
+
+    def object_by_dn(self) -> dict[str, DirObject]:
+        return {o.dn.lower(): o for o in self.objects}
+
+    def tier0_dns(self) -> set[str]:
+        """Lower-cased DNs of tier-0 accounts, groups and domain controllers."""
+        tier0 = self.tier0_sids()
+        dns = self.privileged_dns()
+        dns |= {a.dn.lower() for a in self.accounts if a.is_dc or a.sam.lower() == "krbtgt"}
+        dns |= {o.dn.lower() for o in self.objects if o.sid in tier0}
+        return dns
 
     def name_of(self, sid: str) -> str:
         if sid in self.principals:
@@ -161,8 +281,15 @@ class Snapshot:
         return BROAD_SIDS | {f"{self.domain_sid}-{rid}" for rid in BROAD_RIDS}
 
     def tier0_sids(self) -> set[str]:
-        """Principals that are expected to hold control over the domain."""
-        return TIER0_SIDS | {f"{self.domain_sid}-{rid}" for rid in TIER0_RIDS}
+        """Principals that are expected to hold control over the domain.
+
+        In a child domain the forest-wide groups (Enterprise/Schema Admins, Enterprise
+        RODCs) and the root domain's admins live under the forest root's SID.
+        """
+        sids = TIER0_SIDS | {f"{self.domain_sid}-{rid}" for rid in TIER0_RIDS}
+        if self.root_sid and self.root_sid != self.domain_sid:
+            sids |= {f"{self.root_sid}-{rid}" for rid in FOREST_ROOT_RIDS}
+        return sids
 
     def to_json(self) -> dict[str, Any]:
         return _encode(asdict(self))  # type: ignore[no-any-return]
@@ -183,6 +310,7 @@ class Snapshot:
                         **a,
                         "pwd_last_set": _dt(a["pwd_last_set"]),
                         "last_logon": _dt(a["last_logon"]),
+                        "when_created": _dt(a.get("when_created")),
                     }
                 )
                 for a in data["accounts"]
@@ -199,6 +327,25 @@ class Snapshot:
             gpos=[Gpo(**{**g, "aces": _aces(g["aces"])}) for g in data.get("gpos", [])],
             oid_group_links=data.get("oid_group_links", {}),
             ca_hosts=data.get("ca_hosts", []),
+            root_sid=data.get("root_sid", ""),
+            probes=Probes(**data.get("probes", {})),
+            objects=[
+                DirObject(
+                    **{
+                        **o,
+                        "aces": _aces(o["aces"]),
+                        "inheritable": _aces(o.get("inheritable", [])),
+                    }
+                )
+                for o in data.get("objects", [])
+            ],
+            gpo_settings={k: GpoSettings(**v) for k, v in data.get("gpo_settings", {}).items()},
+            script_secrets=[ScriptSecret(**x) for x in data.get("script_secrets", [])],
+            gmsas=[Gmsa(**x) for x in data.get("gmsas", [])],
+            rodcs=[Rodc(**x) for x in data.get("rodcs", [])],
+            last_backup=_dt(data.get("last_backup")),
+            backup_checked=data.get("backup_checked", False),
+            psos_visible=data.get("psos_visible", False),
             dns_admins=data.get("dns_admins", []),
             pre2k_members=data.get("pre2k_members", []),
             ds_heuristics=data.get("ds_heuristics", ""),
@@ -235,10 +382,12 @@ WELL_KNOWN_RIDS = {
     "526": "Key Admins",
     "527": "Enterprise Key Admins",
 }
-BROAD_SIDS = {"S-1-1-0", "S-1-5-7", "S-1-5-11", "S-1-5-32-545"}
+# Pre-Windows 2000 Compatible Access holds Authenticated Users on a default domain
+BROAD_SIDS = {"S-1-1-0", "S-1-5-7", "S-1-5-11", "S-1-5-32-545", "S-1-5-32-554"}
 BROAD_RIDS = {"513", "514", "515"}
 TIER0_SIDS = {"S-1-5-9", "S-1-5-18", "S-1-5-32-544"}
 TIER0_RIDS = {"498", "500", "512", "516", "518", "519", "521"}
+FOREST_ROOT_RIDS = {"498", "500", "512", "518", "519"}
 
 
 def _aces(items: list[dict[str, Any]]) -> list[Ace]:
@@ -296,4 +445,7 @@ CATEGORIES = {
     "ACL": "Permissions",
     "GPP": "Group Policy",
     "GPO": "Group Policy",
+    "PATH": "Attack paths",
+    "CHAIN": "Attack paths",
+    "INV": "Invariants",
 }

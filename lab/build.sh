@@ -41,13 +41,16 @@ python3 - <<'EOF'
 p = "dc01.xml"; s = open(p).read()
 fw = [("tcp", 12222, 22), ("tcp", 10389, 389), ("udp", 10389, 389), ("tcp", 10636, 636),
       ("tcp", 13268, 3268), ("tcp", 13269, 3269), ("tcp", 10088, 88), ("udp", 10088, 88),
-      ("tcp", 10445, 445), ("tcp", 10053, 53), ("udp", 10053, 53), ("tcp", 15985, 5985)]
+      ("tcp", 10445, 445), ("tcp", 10053, 53), ("udp", 10053, 53), ("tcp", 15985, 5985),
+      ("tcp", 10080, 80)]
 net = "user,id=adlab0,restrict=on," + ",".join(f"hostfwd={p}:127.0.0.1:{h}-:{g}" for p, h, g in fw)
 args = ["-netdev", net, "-device", "e1000e,netdev=adlab0,bus=pcie.0,addr=0x10"]
 cl = "".join(f'<qemu:arg value="{a}"/>' for a in args)
 s = s.replace("<domain type=\"kvm\">",
               '<domain type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">', 1)
 s = s.replace("</domain>", f"<qemu:commandline>{cl}</qemu:commandline></domain>", 1)
+# virt-install keeps a Windows guest's RTC in local time; Kerberos needs the clocks to agree
+s = s.replace("<clock offset=\"localtime\">", "<clock offset=\"utc\">")
 open(p, "w").write(s)
 EOF
 virsh -c qemu:///system define dc01.xml

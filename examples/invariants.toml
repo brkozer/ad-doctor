@@ -1,0 +1,27 @@
+# Declared state for `ad-doctor ... --invariants examples/invariants.toml`.
+# Every section is optional; anything that drifts from it becomes an AD-INV-* finding.
+
+[groups]
+# exact membership (sAMAccountName of the users, transitive)
+"Domain Admins" = ["Administrator", "adm_alice", "adm_bob"]
+"Schema Admins" = []
+"Enterprise Admins" = []
+
+[limits]
+# at most this many distinct accounts across all tier-0 groups
+tier0_users = 5
+
+[settings]
+machine_account_quota = 0
+min_pwd_length = 14        # at least
+lockout_threshold = 10     # at least
+recycle_bin = true
+ldap_signing_required = true
+
+[dcsync]
+# principals allowed to replicate secrets besides the domain controllers and tier 0
+allowed = ["MSOL_0123456789ab"]
+
+[templates]
+# the only certificate templates that may be published
+published = ["User", "Machine", "DomainController", "KerberosAuthentication", "WebServer", "SubCA"]

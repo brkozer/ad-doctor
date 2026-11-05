@@ -15,7 +15,12 @@ Fix = Callable[[Finding, Snapshot], list[str]]
 
 
 def _name(obj: str) -> str:
-    return obj.split(" ", 1)[0]
+    """The principal in a finding object, without the context ad-doctor appends."""
+    return obj.split(" -> ", 1)[0].split(" (", 1)[0]
+
+
+def _is_computer(obj: str) -> bool:
+    return _name(obj).endswith("$")
 
 
 def _q(value: str) -> str:
@@ -41,6 +46,11 @@ def _dsacls(target: str) -> Fix:
     return fix
 
 
+def _remove_member(obj: str) -> str:
+    group, _, member = obj.partition(": ")
+    return f"Remove-ADGroupMember {_q(group)} -Members {_q(member)} -WhatIf"
+
+
 def _manual(f: Finding, snap: Snapshot) -> list[str]:
     return [f"# manual: {f.remediation}"]
 
@@ -52,9 +62,15 @@ FIXES: dict[str, Fix] = {
     "AD-DEL-002": _per_object(
         "Set-ADAccountControl {o} -TrustedToAuthForDelegation $false -WhatIf"
     ),
-    "AD-DEL-003": _per_object(
-        "Set-ADComputer {c} -PrincipalsAllowedToDelegateToAccount $null -WhatIf"
-    ),
+    "AD-DEL-003": lambda f, snap: [
+        (
+            f"Set-ADComputer {_q(_name(o).rstrip('$'))}"
+            if _is_computer(o)
+            else f"Set-ADUser {_q(_name(o))}"
+        )
+        + " -PrincipalsAllowedToDelegateToAccount $null -WhatIf"
+        for o in f.objects
+    ],
     "AD-ACC-001": _per_object("Set-ADAccountControl {o} -PasswordNotRequired $false -WhatIf"),
     "AD-ACC-002": _per_object(
         "Set-ADAccountControl {o} -AllowReversiblePasswordEncryption $false -WhatIf"
@@ -77,6 +93,25 @@ FIXES: dict[str, Fix] = {
     "AD-INF-002": lambda f, snap: [
         "Enable-ADOptionalFeature 'Recycle Bin Feature' -Scope ForestOrConfigurationSet "
         f"-Target {_q(snap.domain)} -WhatIf"
+    ],
+    "AD-KRB-005": _per_object("Set-ADUser {o} -KerberosEncryptionType AES128,AES256 -WhatIf"),
+    "AD-ACC-009": _per_object(
+        "Set-ADUser {o} -Clear userPassword,unixUserPassword,msSFU30Password -WhatIf"
+    ),
+    "AD-ACC-010": _per_object("Set-ADAccountControl {o} -PasswordNotRequired $false -WhatIf"),
+    "AD-PRIV-007": lambda f, snap: [
+        f'Set-ADObject (Get-ADObject -Filter "sAMAccountName -eq {_q(_name(o))}") '
+        f"-Replace @{{primaryGroupID={515 if _is_computer(o) else 513}}} -WhatIf"
+        for o in f.objects
+    ],
+    "AD-PRIV-008": lambda f, snap: [_remove_member(o) for o in f.objects],
+    "AD-PRIV-009": _per_object("Remove-ADGroupMember 'Cert Publishers' -Members {o} -WhatIf"),
+    "AD-INF-009": lambda f, snap: [
+        "# on each DC: Stop-Service Spooler; Set-Service Spooler -StartupType Disabled"
+    ],
+    "AD-ACL-005": lambda f, snap: [
+        f"# $p = 'AD:CN=AdminSDHolder,CN=System,{snap.domain_dn}'; $a = Get-Acl $p; "
+        "$a.SetAccessRuleProtection($true, $false); Set-Acl $p $a"
     ],
     "AD-ACL-001": _dsacls("{domain}"),
     "AD-ACL-002": _dsacls("CN=AdminSDHolder,CN=System,{domain}"),

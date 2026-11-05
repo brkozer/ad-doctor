@@ -14,9 +14,11 @@ from ad_doctor.collect import Target, collect
 
 pytestmark = pytest.mark.lab
 
-# Every misconfiguration seed.ps1 plants. AD-KRB-001 and AD-ACC-005 need time to pass;
-# AD-ACC-007 (SID history) and AD-INF-006 (trusts) need a second domain, so they are
-# covered by the unit tests only.
+# Every misconfiguration seed.ps1 plants. Covered by the unit tests only: AD-KRB-001,
+# AD-ACC-005, AD-ACC-011 and AD-KRB-006 (need time to pass), AD-ACC-007 and AD-INF-006
+# (need a second domain), AD-INF-012 (needs an RODC), AD-ACC-009 (confidential on 2025),
+# AD-INF-008 (DCs require SMB signing), AD-INF-009, AD-CHAIN-002/003 (no spooler on
+# Server Core 2025) and AD-INF-011 (needs a week without backup).
 EXPECTED = {
     "AD-KRB-002": {"legacy_app"},
     "AD-KRB-003": {"svc_sql", "svc_web"},
@@ -31,7 +33,7 @@ EXPECTED = {
     "AD-PRIV-002": {"adm_bob", "svc_sql"},
     "AD-POL-001": {"adlab.test"},
     "AD-POL-002": {"adlab.test"},
-    "AD-SEC-001": {"APP01$", "FS01$", "WS01$"},
+    "AD-SEC-001": {"APP01$", "FS01$", "OLD2008$", "PRE2K$"},
     "AD-ADCS-001": {"LabESC1 (enroll: Domain Users)"},
     "AD-ADCS-002": {"LabESC2 (enroll: Domain Users)"},
     "AD-ADCS-003": {"LabESC3 (enroll: Domain Users)"},
@@ -52,6 +54,39 @@ EXPECTED = {
     "AD-INF-002": {"adlab.test"},
     "AD-INF-004": {"0000002"},
     "AD-INF-005": {"adlab.test"},
+    "AD-ACC-008": {"notes_user"},
+    "AD-ACC-010": {"PRE2K$"},
+    "AD-KRB-005": {"svc_web"},
+    "AD-DEL-004": {"svc_dc -> ldap/DC01.adlab.test"},
+    "AD-ACL-004": {
+        "DC01$: kc_writer (write msDS-KeyCredentialLink)",
+        "adm_bob: helpdesk (write/WriteDacl/WriteOwner)",
+    },
+    "AD-ACL-005": {"CN=AdminSDHolder,CN=System,DC=adlab,DC=test"},
+    "AD-ACL-006": {"gmsa_web$ (readable by Domain Users)"},
+    "AD-ADCS-009": {"map_user"},
+    "AD-ADCS-010": {"http://DC01.adlab.test/certsrv/"},
+    "AD-ADCS-011": {"LabWeakKey (1024 bits)"},
+    "AD-GPO-002": {"Domain Controllers OU: gpo_linker", "domain: helpdesk"},
+    "AD-GPO-003": {
+        "LabDCPolicy: LmCompatibilityLevel 1 (LM/NTLMv1 allowed)",
+        "LabDCPolicy: SeDebugPrivilege granted to Authenticated Users",
+    },
+    "AD-GPO-004": {"LabUserPolicy (helpdesk)"},
+    "AD-GPP-002": {r"scripts\map.bat:1 (net use with a password)"},
+    "AD-INF-007": {"Lab: ou_admin"},
+    "AD-INF-010": {"adlab.test"},
+    "AD-PRIV-006": {"Domain Admins: old_admin (disabled)"},
+    "AD-PRIV-007": {"hidden_admin (primary group Domain Admins)"},
+    "AD-PRIV-008": {"Backup Operators: op_user"},
+    "AD-PRIV-009": {"helpdesk"},
+    "AD-PRIV-010": {"adm_bob"},
+    "AD-SEC-002": {"WS01$"},
+    "AD-CHAIN-001": {"adlab.test"},
+    "AD-PATH-001": {
+        "gpo_linker -[link GPOs]-> Domain Controllers",
+        "kc_writer -[write msDS-KeyCredentialLink]-> DC01$",
+    },
     "AD-GPP-001": {
         r"Policies\{4B1D7A55-0C1E-4A3B-9D2F-7E6A5C3B2A10}\Machine\Preferences\Groups\Groups.xml"
         " (localadmin)"
@@ -72,10 +107,12 @@ def findings() -> dict[str, set[str]]:
         use_ssl=os.environ.get("AD_DOCTOR_LAB_SSL", "1") == "1",
         smb_port=int(os.environ.get("AD_DOCTOR_LAB_SMB_PORT", "445")),
         plain_port=int(os.environ.get("AD_DOCTOR_LAB_PLAIN_PORT", "389")),
+        http_port=int(os.environ.get("AD_DOCTOR_LAB_HTTP_PORT", "80")),
     )
     snap = collect(target)
     assert snap.domain == "adlab.test"
-    assert snap.notes == []
+    # an ordinary user cannot see fine-grained password policies; nothing else may fail
+    assert [n for n in snap.notes if "fine-grained" not in n] == []
     return {f.check_id: set(f.objects) for f in run_all(snap)}
 
 
@@ -92,6 +129,24 @@ def test_clean_and_default_objects_not_flagged(findings: dict[str, set[str]]) ->
             # only the seeded objects: the built-in templates, the CA object and its host
             # account are not exploitable by default
             assert objects == EXPECTED[check_id]
-    # nothing seeded in the GPO, delegation or ACL areas beyond what EXPECTED lists
-    for check_id in ("AD-GPO-001", "AD-ACL-001", "AD-ACL-002", "AD-ACL-003", "AD-DEL-001"):
+    # Domain Users reach tier 0 through the vulnerable templates
+    assert any(
+        p.startswith("Domain Users -[enroll (ESC1-3)]-> template Lab")
+        for p in findings["AD-PATH-001"]
+    )
+    # nothing beyond the seeded objects in these areas: defaults stay quiet
+    exact = (
+        "AD-GPO-001",
+        "AD-GPO-003",
+        "AD-GPO-004",
+        "AD-ACL-001",
+        "AD-ACL-002",
+        "AD-ACL-003",
+        "AD-ACL-006",
+        "AD-DEL-001",
+        "AD-DEL-004",
+        "AD-GPP-002",
+        "AD-PRIV-007",
+    )
+    for check_id in exact:
         assert findings[check_id] == EXPECTED[check_id]

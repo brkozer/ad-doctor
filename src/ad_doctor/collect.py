@@ -8,15 +8,23 @@ from datetime import UTC, datetime
 from typing import Any
 
 import ldap3
-from ldap3.core.exceptions import LDAPException, LDAPNoSuchObjectResult
+from ldap3.core.exceptions import (
+    LDAPException,
+    LDAPNoSuchObjectResult,
+    LDAPOperationResult,
+)
 from ldap3.protocol.microsoft import security_descriptor_control
 
-from . import sd, sysvol
+from . import probes, sd, sysvol
 from .model import (
     Account,
     CertTemplate,
+    DirObject,
     DomainPolicy,
+    Gmsa,
     Gpo,
+    Probes,
+    Rodc,
     Snapshot,
     Trust,
     filetime_to_datetime,
@@ -37,6 +45,7 @@ PRIVILEGED_BUILTIN = {
 PROTECTED_USERS_RID = 525
 PRE2K_SID = "S-1-5-32-554"
 DACL_ONLY = security_descriptor_control(sdflags=0x04)  # readable without admin rights
+OWNER_AND_DACL = security_descriptor_control(sdflags=0x05)
 
 # msPKI-Certificate-Name-Flag / msPKI-Enrollment-Flag bits
 CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT = 0x1
@@ -45,22 +54,48 @@ CT_FLAG_NO_SECURITY_EXTENSION = 0x80000
 
 GPLINK = re.compile(r"\[LDAP://([^;\]]+);(\d+)\]", re.IGNORECASE)
 GPLINK_DISABLED = 0x1
+SECRET_TEXT = re.compile(
+    r"\b(?:pass(?:word)?|passwd|pwd|parola|şifre|sifre|kennwort|contrase[ñn]a|mot de passe)"
+    r"\s*[:=]\s*\S{3,}",
+    re.IGNORECASE,
+)
+PASSWORD_ATTRIBUTES = ("userPassword", "unixUserPassword", "msSFU30Password", "orclCommonAttribute")
+LAPS_PASSWORD_ATTRIBUTES = ("ms-Mcs-AdmPwd", "msLAPS-Password", "msLAPS-EncryptedPassword")
+MANAGED_CLASSES = {
+    "msds-groupmanagedserviceaccount",
+    "msds-managedserviceaccount",
+    "msds-delegatedmanagedserviceaccount",
+}
 
 ACCOUNT_ATTRS = [
     "distinguishedName",
     "sAMAccountName",
     "objectClass",
+    "objectSid",
     "userAccountControl",
+    "primaryGroupID",
     "servicePrincipalName",
     "pwdLastSet",
     "lastLogonTimestamp",
+    "logonCount",
+    "whenCreated",
     "adminCount",
     "msDS-AllowedToActOnBehalfOfOtherIdentity",
     "msDS-AllowedToDelegateTo",
+    "msDS-SupportedEncryptionTypes",
+    "altSecurityIdentities",
     "ms-Mcs-AdmPwdExpirationTime",
     "msLAPS-PasswordExpirationTime",
     "operatingSystem",
+    "dNSHostName",
     "sIDHistory",
+    "description",
+    "info",
+    "msDS-ManagedAccountPrecededByLink",
+    "msDS-RevealOnDemandGroup",
+    "msDS-NeverRevealGroup",
+    *PASSWORD_ATTRIBUTES,
+    *LAPS_PASSWORD_ATTRIBUTES,
 ]
 
 
@@ -79,6 +114,11 @@ class Target:
     smb_port: int = 445
     # plain-LDAP port for the signing probe; 0 disables the probe
     plain_port: int = 389
+    # web enrollment port for the ESC8 probe; 0 disables it
+    http_port: int = 80
+    # SMB posture and channel binding probes
+    probes: bool = True
+    kerberos: bool = False
 
 
 def sid_to_str(raw: bytes) -> str:
@@ -86,7 +126,7 @@ def sid_to_str(raw: bytes) -> str:
 
 
 def _str(values: list[Any]) -> list[str]:
-    return [v.decode() if isinstance(v, bytes) else str(v) for v in values]
+    return [v.decode(errors="replace") if isinstance(v, bytes) else str(v) for v in values]
 
 
 def _int(entry: dict[str, list[Any]], attr: str, default: int = 0) -> int:
@@ -99,12 +139,22 @@ def _first(entry: dict[str, list[Any]], attr: str, default: str = "") -> str:
     return _str(values)[0] if values else default
 
 
+def _generalized_time(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(value[:14], "%Y%m%d%H%M%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
 class Collector:
     def __init__(self, conn: ldap3.Connection, target: Target | None = None) -> None:
         self.conn = conn
         self.target = target
         self.notes: list[str] = []
         self.ca_hosts: list[str] = []
+        self.ca_dns_hosts: list[str] = []
+        self.rodc_policies: list[tuple[Account, list[str], list[str]]] = []
+        self.domain_dn = ""
 
     def search(
         self,
@@ -128,16 +178,29 @@ class Collector:
         for e in entries:
             if e.get("type") != "searchResEntry":
                 continue
-            raw = {k.lower(): list(v) for k, v in e["raw_attributes"].items()}
+            raw: dict[str, list[Any]] = {}
+            for k, v in e["raw_attributes"].items():
+                key = k.lower()
+                if ";range=" in key:  # ranged retrieval of a large multi-valued attribute
+                    key = key.split(";", 1)[0]
+                    self.notes.append(f"{e['dn']}: {key} has more values than one LDAP page")
+                raw[key] = list(v)
             raw["distinguishedname"] = [e["dn"]]
             out.append(raw)
         return out
 
     def optional(self, base: str, flt: str, attrs: list[str], **kw: Any) -> list[dict[str, Any]]:
-        """A search whose base may not exist (no AD CS, no trusts container, ...)."""
+        """A search that may fail without failing the scan.
+
+        A missing base (no AD CS, no trusts) is normal; any other refusal (time or size
+        limit, access denied) is reported as a note and the part is skipped.
+        """
         try:
             return self.search(base, flt, attrs, **kw)
         except LDAPNoSuchObjectResult:
+            return []
+        except LDAPOperationResult as exc:
+            self.notes.append(f"search {flt} under {base} failed: {exc.description}")
             return []
 
     def snapshot(self) -> Snapshot:
@@ -145,7 +208,10 @@ class Collector:
         if root is None or not root.other.get("defaultNamingContext"):
             raise CollectError("rootDSE did not return defaultNamingContext")
         domain_dn = root.other["defaultNamingContext"][0]
+        self.domain_dn = domain_dn
         config_dn = root.other["configurationNamingContext"][0]
+        dc_dns_host = (root.other.get("dnsHostName") or [""])[0]
+        root_dn = (root.other.get("rootDomainNamingContext") or [""])[0]
         domain = ".".join(p.split("=", 1)[1] for p in domain_dn.split(","))
 
         head = self.search(
@@ -160,6 +226,7 @@ class Collector:
                 "ms-DS-MachineAccountQuota",
                 "msDS-Behavior-Version",
                 "gPLink",
+                "msDS-ReplAttributeMetaData",
             ],
             scope=ldap3.BASE,
         )
@@ -167,6 +234,13 @@ class Collector:
             raise CollectError(f"cannot read domain object {domain_dn}")
         h = head[0]
         domain_sid = sid_to_str(h["objectsid"][0])
+        root_sid = domain_sid
+        if root_dn and root_dn.lower() != domain_dn.lower():
+            forest_root = self.optional(root_dn, "(objectClass=*)", ["objectSid"], scope=ldap3.BASE)
+            if forest_root and forest_root[0].get("objectsid"):
+                root_sid = sid_to_str(forest_root[0]["objectsid"][0])
+            else:
+                self.notes.append("forest root SID not readable; root admins may be reported")
         max_age = _int(h, "maxPwdAge")
         policy = DomainPolicy(
             min_pwd_length=_int(h, "minPwdLength"),
@@ -191,6 +265,19 @@ class Collector:
             privileged[name] = self._members(domain_dn, f"(objectSid={domain_sid}-{rid})")
         for name, sid in PRIVILEGED_BUILTIN.items():
             privileged[name] = self._members(domain_dn, f"(objectSid={sid})")
+        # primaryGroupID membership never shows in member/memberOf; add it back so a
+        # hidden admin is treated as an admin everywhere (AD-PRIV-007 still reports it)
+        for name, rid in PRIVILEGED_RIDS.items():
+            hidden = {a.dn for a in accounts if not a.is_computer and a.primary_group == rid}
+            for group in (name, "Administrators"):  # these groups nest into Administrators
+                if hidden and privileged.get(group) is not None:
+                    privileged[group] = sorted(set(privileged[group] or []) | hidden)
+        # a user whose primary group is a DC group is a DC as far as rights go
+        fake_dcs = sorted(
+            a.dn for a in accounts if not a.is_computer and a.primary_group in (498, 516, 521)
+        )
+        if fake_dcs:
+            privileged["Domain Controllers"] = fake_dcs
         protected = self._members(domain_dn, f"(objectSid={domain_sid}-{PROTECTED_USERS_RID})")
         dns_admins = self._members(domain_dn, "(&(objectClass=group)(sAMAccountName=DnsAdmins))")
         pre2k = self.search(domain_dn, f"(objectSid={PRE2K_SID})", ["member"])
@@ -210,12 +297,21 @@ class Collector:
             aces = self._dacl(dn)
             if aces:
                 acls[key] = aces
-        gpos = self._gpos(domain_dn, _first(h, "gPLink"))
+
+        priv_dns = {dn.lower() for members in privileged.values() if members for dn in members}
+        objects = self._objects(domain_dn, accounts, priv_dns)
+        gpos = self._gpos(domain_dn, _first(h, "gPLink"), objects)
 
         trustees = {a.sid for aces in acls.values() for a in aces}
         trustees |= {a.sid for t in templates for a in t.aces}
         trustees |= {a.sid for g in gpos for a in g.aces}
+        trustees |= {a.sid for o in objects for a in o.aces} | {o.owner for o in objects if o.owner}
+        gmsas = self._gmsas(domain_dn)
+        trustees |= {s for g in gmsas for s in g.readers}
 
+        sysvol_result = self._sysvol(domain, [g.guid for g in gpos])
+        # one value per attribute; dSASignature changes on every backup
+        metadata = "".join(_str(h.get("msds-replattributemetadata", [])))
         return Snapshot(
             domain=domain,
             domain_dn=domain_dn,
@@ -227,19 +323,31 @@ class Collector:
             protected_users=protected or [],
             templates=templates,
             acls=acls,
-            principals=self._resolve(domain_dn, trustees),
-            gpp_passwords=self._sysvol(domain),
+            principals=self._resolve(domain_dn, trustees, objects),
+            gpp_passwords=sysvol_result.gpp_passwords,
             trusts=self._trusts(domain_dn),
             gpos=gpos,
             oid_group_links=self._oid_links(pks),
             ca_hosts=self.ca_hosts,
+            root_sid=root_sid,
             dns_admins=dns_admins or [],
             pre2k_members=_str(pre2k[0].get("member", [])) if pre2k else [],
             ds_heuristics=self._ds_heuristics(config_dn),
             recycle_bin=self._recycle_bin(config_dn),
             ldap_signing_required=self._probe_signing(),
+            probes=self._probes(dc_dns_host),
+            objects=objects,
+            gpo_settings=sysvol_result.gpo_settings,
+            script_secrets=sysvol_result.script_secrets,
+            gmsas=gmsas,
+            rodcs=[Rodc(a.sam, a_reveal, a_never) for a, a_reveal, a_never in self.rodc_policies],
+            last_backup=_last_backup(metadata),
+            backup_checked="dSASignature" in metadata,
+            psos_visible=self._psos_visible(domain_dn),
             notes=self.notes,
         )
+
+    # --- DACLs and objects -----------------------------------------------------------
 
     def _dacl(self, dn: str) -> list[sd.Ace]:
         entry = self.optional(
@@ -247,6 +355,111 @@ class Collector:
         )
         raw = entry[0].get("ntsecuritydescriptor") if entry else None
         return sd.parse_dacl(raw[0]) if raw else []
+
+    def _object(self, e: dict[str, Any], kind: str) -> DirObject:
+        raw_sd = e.get("ntsecuritydescriptor")
+        desc = sd.parse(raw_sd[0]) if raw_sd else sd.Descriptor(None, False, [])
+        sid = sid_to_str(e["objectsid"][0]) if e.get("objectsid") else ""
+        return DirObject(
+            dn=e["distinguishedname"][0],
+            name=_first(e, "sAMAccountName") or _first(e, "name") or e["distinguishedname"][0],
+            kind=kind,
+            sid=sid,
+            owner=desc.owner,
+            aces=desc.aces,
+            dacl_protected=desc.dacl_protected,
+            members=_str(e.get("member", [])),
+            inheritable=desc.inheritable if kind in ("ou", "container", "domain") else [],
+        )
+
+    def _objects(
+        self, domain_dn: str, accounts: list[Account], priv_dns: set[str]
+    ) -> list[DirObject]:
+        """Groups, OUs, the domain head and every tier-0 account, with owner and DACL."""
+        attrs = ["sAMAccountName", "name", "objectSid", "member", "nTSecurityDescriptor"]
+        objects = [
+            self._object(e, "group")
+            for e in self.search(domain_dn, "(objectClass=group)", attrs, controls=OWNER_AND_DACL)
+        ]
+        objects += [
+            self._object(e, "ou")
+            for e in self.search(
+                domain_dn, "(objectClass=organizationalUnit)", attrs, controls=OWNER_AND_DACL
+            )
+        ]
+        # top-level containers (CN=Users, CN=Computers, Managed Service Accounts, ...)
+        objects += [
+            self._object(e, "container")
+            for e in self.optional(
+                domain_dn, "(objectClass=container)", attrs, scope=ldap3.LEVEL,
+                controls=OWNER_AND_DACL,
+            )
+        ]  # fmt: skip
+        holder = f"CN=AdminSDHolder,CN=System,{domain_dn}"
+        for dn, kind in [(domain_dn, "domain"), (holder, "container")]:
+            objects += [self._object(e, kind) for e in self._base(dn, attrs)]
+        sensitive = [
+            a
+            for a in accounts
+            if a.dn.lower() in priv_dns or a.is_dc or a.sam.lower() == "krbtgt" or a.rid == 500
+        ]
+        for a in sensitive:
+            kind = "computer" if a.is_computer else "user"
+            objects += [self._object(e, kind) for e in self._base(a.dn, attrs)]
+        return objects
+
+    def _base(self, dn: str, attrs: list[str]) -> list[dict[str, Any]]:
+        """One object with its owner and DACL."""
+        return self.optional(
+            dn, "(objectClass=*)", attrs, scope=ldap3.BASE, controls=OWNER_AND_DACL
+        )
+
+    def _gpos(self, domain_dn: str, domain_gplink: str, objects: list[DirObject]) -> list[Gpo]:
+        dc_ou = self.optional(
+            f"OU=Domain Controllers,{domain_dn}", "(objectClass=*)", ["gPLink"], scope=ldap3.BASE
+        )
+        links: dict[str, list[str]] = {}
+        for where, gplink in [
+            ("domain", domain_gplink),
+            ("Domain Controllers OU", _first(dc_ou[0], "gPLink") if dc_ou else ""),
+        ]:
+            for dn, options in GPLINK.findall(gplink):
+                if not int(options) & GPLINK_DISABLED:
+                    links.setdefault(dn.lower(), []).append(where)
+        gpos = []
+        for e in self.optional(
+            f"CN=Policies,CN=System,{domain_dn}",
+            "(objectClass=groupPolicyContainer)",
+            ["displayName", "name", "nTSecurityDescriptor"],
+            scope=ldap3.LEVEL,
+            controls=OWNER_AND_DACL,
+        ):
+            dn = e["distinguishedname"][0]
+            raw_sd = e.get("ntsecuritydescriptor")
+            desc = sd.parse(raw_sd[0]) if raw_sd else sd.Descriptor(None, False, [])
+            gpo = Gpo(
+                name=_first(e, "displayName", dn),
+                guid=_first(e, "name"),
+                linked_to=links.get(dn.lower(), []),
+                aces=desc.aces,
+            )
+            gpos.append(gpo)
+            objects.append(DirObject(dn, gpo.name, "gpo", owner=desc.owner, aces=desc.aces))
+        return sorted(gpos, key=lambda g: g.name.lower())
+
+    def _gmsas(self, domain_dn: str) -> list[Gmsa]:
+        out = []
+        for e in self.search(
+            domain_dn,
+            "(objectClass=msDS-GroupManagedServiceAccount)",
+            ["sAMAccountName", "msDS-GroupMSAMembership"],
+        ):
+            raw = e.get("msds-groupmsamembership")
+            readers = sorted({a.sid for a in sd.parse_dacl(raw[0])}) if raw else []
+            out.append(Gmsa(_first(e, "sAMAccountName"), e["distinguishedname"][0], readers))
+        return out
+
+    # --- AD CS -----------------------------------------------------------------------
 
     def _templates(self, pks: str) -> tuple[list[CertTemplate], dict[str, str]]:
         services = self.optional(
@@ -264,6 +477,7 @@ class Collector:
                 "msPKI-RA-Signature",
                 "msPKI-Template-Schema-Version",
                 "msPKI-Certificate-Policy",
+                "msPKI-Minimal-Key-Size",
                 "pKIExtendedKeyUsage",
                 "msPKI-Certificate-Application-Policy",
                 "nTSecurityDescriptor",
@@ -276,12 +490,9 @@ class Collector:
         if not services:
             self.notes.append("no enterprise CA found, so no template is published")
         ca_dns = {_first(s, "name"): s["distinguishedname"][0] for s in services}
+        self.ca_dns_hosts = sorted({_first(s, "dNSHostName") for s in services} - {""})
         # the CA server's own computer account manages its enrollment service object
-        self.ca_hosts = sorted(
-            _first(s, "dNSHostName").split(".")[0].upper() + "$"
-            for s in services
-            if _first(s, "dNSHostName")
-        )
+        self.ca_hosts = sorted(self._computer_name(h) for h in self.ca_dns_hosts)
         published = {n for svc in services for n in _str(svc.get("certificatetemplates", []))}
         templates = []
         for e in entries:
@@ -304,9 +515,20 @@ class Collector:
                     schema_version=_int(e, "msPKI-Template-Schema-Version", 1),
                     no_security_extension=bool(enroll_flag & CT_FLAG_NO_SECURITY_EXTENSION),
                     issuance_policies=_str(e.get("mspki-certificate-policy", [])),
+                    min_key_size=_int(e, "msPKI-Minimal-Key-Size"),
                 )
             )
         return sorted(templates, key=lambda t: t.name), ca_dns
+
+    def _computer_name(self, dns_host: str) -> str:
+        """sAMAccountName of a host (NetBIOS names are cut at 15 characters)."""
+        hit = self.optional(
+            self.domain_dn,
+            f"(&(objectClass=computer)(dNSHostName={ldap3.utils.conv.escape_filter_chars(dns_host)}))",
+            ["sAMAccountName"],
+        )
+        found = _first(hit[0], "sAMAccountName") if hit else ""
+        return (found or dns_host.split(".")[0][:15] + "$").upper()
 
     def _oid_links(self, pks: str) -> dict[str, str]:
         entries = self.optional(
@@ -318,41 +540,7 @@ class Collector:
             _first(e, "msPKI-Cert-Template-OID"): _first(e, "msDS-OIDToGroupLink") for e in entries
         }
 
-    def _gpos(self, domain_dn: str, domain_gplink: str) -> list[Gpo]:
-        dc_ou = self.optional(
-            f"OU=Domain Controllers,{domain_dn}", "(objectClass=*)", ["gPLink"], scope=ldap3.BASE
-        )
-        # lower-cased DN -> (DN as written, places it is linked)
-        links: dict[str, tuple[str, list[str]]] = {}
-        for where, gplink in [
-            ("domain", domain_gplink),
-            ("Domain Controllers OU", _first(dc_ou[0], "gPLink") if dc_ou else ""),
-        ]:
-            for dn, options in GPLINK.findall(gplink):
-                if not int(options) & GPLINK_DISABLED:
-                    links.setdefault(dn.lower(), (dn, []))[1].append(where)
-        gpos = []
-        for dn, places in sorted(links.values()):
-            entry = self.optional(
-                dn,
-                "(objectClass=groupPolicyContainer)",
-                ["displayName", "name", "nTSecurityDescriptor"],
-                scope=ldap3.BASE,
-                controls=DACL_ONLY,
-            )
-            if not entry:
-                continue
-            e = entry[0]
-            raw_sd = e.get("ntsecuritydescriptor")
-            gpos.append(
-                Gpo(
-                    name=_first(e, "displayName", dn),
-                    guid=_first(e, "name"),
-                    linked_to=places,
-                    aces=sd.parse_dacl(raw_sd[0]) if raw_sd else [],
-                )
-            )
-        return gpos
+    # --- domain-wide settings --------------------------------------------------------
 
     def _trusts(self, domain_dn: str) -> list[Trust]:
         return [
@@ -390,43 +578,78 @@ class Collector:
         features = _str(entry[0].get("msds-enabledfeature", []))
         return any(f.lower().startswith("cn=recycle bin feature,") for f in features)
 
-    def _resolve(self, domain_dn: str, sids: set[str]) -> dict[str, str]:
+    def _psos_visible(self, domain_dn: str) -> bool:
+        psos = self.optional(
+            f"CN=Password Settings Container,CN=System,{domain_dn}",
+            "(objectClass=msDS-PasswordSettings)",
+            ["name"],
+        )
+        if not psos:
+            self.notes.append(
+                "no fine-grained password policy visible (none exist, or this account cannot "
+                "read them); AD-POL-001 judges the default domain policy only"
+            )
+        return bool(psos)
+
+    def _resolve(self, domain_dn: str, sids: set[str], objects: list[DirObject]) -> dict[str, str]:
+        known = {o.sid: o.name for o in objects if o.sid}
         names = {}
         for sid in sorted(sids):
             if not sid.startswith("S-1-5-21-"):
                 continue  # well-known SIDs are named in model.py
+            if sid in known:
+                names[sid] = known[sid]
+                continue
             hit = self.search(domain_dn, f"(objectSid={sid})", ["sAMAccountName"])
             if hit:
                 names[sid] = _first(hit[0], "sAMAccountName")
         return names
 
     def _members(self, domain_dn: str, group_filter: str) -> list[str] | None:
-        group = self.search(domain_dn, group_filter, ["distinguishedName"])
+        group = self.optional(domain_dn, group_filter, ["distinguishedName"])
         if not group:
             return None  # e.g. Enterprise Admins only exists in the forest root
         group_dn = ldap3.utils.conv.escape_filter_chars(group[0]["distinguishedname"][0])
-        members = self.search(
+        members = self.optional(
             domain_dn, f"(&(objectClass=user)(memberOf:{IN_CHAIN}:={group_dn}))", ["sAMAccountName"]
         )
         return sorted(m["distinguishedname"][0] for m in members)
 
-    def _sysvol(self, domain: str) -> list[Any]:
+    # --- SMB, probes -----------------------------------------------------------------
+
+    def _sysvol(self, domain: str, gpo_guids: list[str]) -> sysvol.SysvolResult:
         t = self.target
         if t is None or not t.sysvol:
-            return []
-        if not t.user:
+            return sysvol.SysvolResult()
+        if not t.user and not t.kerberos:
             self.notes.append("SYSVOL not checked: needs credentials")
-            return []
+            return sysvol.SysvolResult()
         try:
-            return sysvol.find_gpp_passwords(t.host, domain, t.user, t.password or "", t.smb_port)
+            result = sysvol.scan(
+                t.host, domain, t.user, t.password, gpo_guids, t.smb_port, t.kerberos
+            )
+            if result.unreadable:
+                shown = ", ".join(result.unreadable[:5])
+                more = len(result.unreadable) - 5
+                self.notes.append(
+                    f"SYSVOL files not readable by this account: {shown}"
+                    + (f" (+{more} more)" if more > 0 else "")
+                )
+            return result
         except sysvol.SysvolError as exc:
             self.notes.append(f"SYSVOL not checked: {exc}")
-            return []
+            return sysvol.SysvolResult()
 
     def _probe_signing(self) -> bool | None:
         """Try an unsigned NTLM bind on plain LDAP; a DC that requires signing refuses it."""
         t = self.target
-        if t is None or not t.plain_port or not t.user or "\\" not in t.user:
+        if t is None or not t.plain_port:
+            return None
+        if not t.user or "\\" not in t.user:
+            self.notes.append(
+                "LDAP signing and channel binding not probed: they need a DOMAIN\\user account "
+                "with a password (NTLM)"
+            )
             return None
         server = ldap3.Server(t.host, port=t.plain_port, connect_timeout=10)
         conn = ldap3.Connection(server, user=t.user, password=t.password, authentication=ldap3.NTLM)
@@ -443,14 +666,45 @@ class Collector:
         finally:
             conn.unbind()
 
-    @staticmethod
-    def _account(e: dict[str, list[Any]]) -> Account:
+    def _probes(self, dc_dns_host: str) -> Probes:
+        t = self.target
+        result = Probes()
+        if t is None or not t.probes:
+            return result
+        if t.kerberos or (t.user and t.password is not None):
+            result.smb_signing_required, result.spooler_on_dc = probes.smb_posture(
+                t.host, t.smb_port, t.user, t.password, t.kerberos
+            )
+            if result.smb_signing_required is None:
+                self.notes.append("SMB probes did not run: no SMB connection to the DC")
+        if t.use_ssl and t.user and "\\" in t.user and not t.kerberos:
+            result.ldaps_channel_binding_required = probes.ldaps_channel_binding_required(
+                t.host, t.port, t.user, t.password or ""
+            )
+        if t.http_port:
+            for ca_host in self.ca_dns_hosts:
+                # a CA on the DC being scanned is reached through the address given for it
+                same = ca_host.lower() == dc_dns_host.lower()
+                url, error = probes.web_enrollment_ntlm(
+                    t.host if same else ca_host, ca_host, t.http_port
+                )
+                if error:
+                    self.notes.append(f"web enrollment on {ca_host} not probed: {error}")
+                if url:
+                    result.web_enrollment_ntlm.append(url)
+        return result
+
+    # --- accounts --------------------------------------------------------------------
+
+    def _account(self, e: dict[str, list[Any]]) -> Account:
         classes = {c.lower() for c in _str(e.get("objectclass", []))}
-        return Account(
+        text = " ".join(_str(e.get("description", [])) + _str(e.get("info", [])))
+        uac = _int(e, "userAccountControl")
+        account = Account(
             dn=e["distinguishedname"][0],
             sam=_first(e, "sAMAccountName"),
-            uac=_int(e, "userAccountControl"),
-            is_computer="computer" in classes,
+            uac=uac,
+            is_computer="computer" in classes and not classes & MANAGED_CLASSES,
             spns=_str(e.get("serviceprincipalname", [])),
             pwd_last_set=filetime_to_datetime(_int(e, "pwdLastSet")),
             last_logon=filetime_to_datetime(_int(e, "lastLogonTimestamp")),
@@ -462,7 +716,46 @@ class Collector:
             ),
             os=_first(e, "operatingSystem") or None,
             sid_history=[sid_to_str(s) for s in e.get("sidhistory", [])],
+            sid=sid_to_str(e["objectsid"][0]) if e.get("objectsid") else "",
+            primary_group=_int(e, "primaryGroupID"),
+            dns_host=_first(e, "dNSHostName") or None,
+            enc_types=(
+                _int(e, "msDS-SupportedEncryptionTypes")
+                if e.get("msds-supportedencryptiontypes")
+                else None
+            ),
+            alt_security_identities=_str(e.get("altsecurityidentities", [])),
+            logon_count=_int(e, "logonCount") if e.get("logoncount") else None,
+            when_created=_generalized_time(_first(e, "whenCreated")),
+            password_attributes=[a for a in PASSWORD_ATTRIBUTES if e.get(a.lower())],
+            secret_in_description=bool(SECRET_TEXT.search(text)),
+            laps_password_readable=any(e.get(a.lower()) for a in LAPS_PASSWORD_ATTRIBUTES),
+            preceded_by=_first(e, "msDS-ManagedAccountPrecededByLink") or None,
+            managed=bool(classes & MANAGED_CLASSES),
         )
+        if account.is_rodc:
+            self.rodc_policies.append(
+                (
+                    account,
+                    _str(e.get("msds-revealondemandgroup", [])),
+                    _str(e.get("msds-neverrevealgroup", [])),
+                )
+            )
+        return account
+
+
+META_BLOCK = re.compile(r"<DS_REPL_ATTR_META_DATA>(.*?)</DS_REPL_ATTR_META_DATA>", re.S)
+LAST_CHANGE = re.compile(r"<ftimeLastOriginatingChange>([^<]+)</ftimeLastOriginatingChange>")
+
+
+def _last_backup(metadata_xml: str) -> datetime | None:
+    """dSASignature's last originating change in msDS-ReplAttributeMetaData = last backup."""
+    for block in META_BLOCK.findall(metadata_xml):
+        if "<pszAttributeName>dSASignature</pszAttributeName>" in block:
+            m = LAST_CHANGE.search(block)
+            if m and not m.group(1).startswith("1601"):
+                return datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+    return None
 
 
 def connect(target: Target) -> ldap3.Connection:
@@ -474,12 +767,33 @@ def connect(target: Target) -> ldap3.Connection:
         connect_timeout=10,
     )
     try:
-        if target.user:
+        if target.kerberos:
+            conn = ldap3.Connection(
+                server,
+                authentication=ldap3.SASL,
+                sasl_mechanism=ldap3.KERBEROS,
+                read_only=True,
+                raise_exceptions=True,
+            )
+            conn.bind()
+        elif target.user and "\\" in target.user:
             conn = ldap3.Connection(
                 server,
                 user=target.user,
                 password=target.password,
-                authentication=ldap3.NTLM if "\\" in target.user else ldap3.SIMPLE,
+                authentication=ldap3.NTLM,
+                read_only=True,
+                raise_exceptions=True,
+            )
+            conn.open()
+            # LDAPS binds carry a channel binding token so DCs that enforce it accept them
+            if not probes.ntlm_bind(conn, channel_binding=target.use_ssl):
+                raise CollectError(f"bind failed: {conn.result.get('message') or conn.result}")
+        elif target.user:
+            conn = ldap3.Connection(
+                server,
+                user=target.user,
+                password=target.password,
                 read_only=True,
                 auto_bind=True,
                 raise_exceptions=True,
@@ -495,5 +809,7 @@ def collect(target: Target) -> Snapshot:
     conn = connect(target)
     try:
         return Collector(conn, target).snapshot()
+    except LDAPException as exc:
+        raise CollectError(f"collection failed: {exc}") from exc
     finally:
         conn.unbind()

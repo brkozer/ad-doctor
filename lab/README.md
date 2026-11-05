@@ -1,8 +1,8 @@
 # Lab domain
 
 A disposable Windows Server 2025 domain controller for ad-doctor's live tests, seeded
-with one instance of every misconfiguration the tool checks for (except the few listed in
-the main README's "Limits").
+with one instance of every misconfiguration that a single domain can hold (the rest are
+listed in the main README's "Limits" and covered by unit tests).
 
 The DC runs under KVM with QEMU user networking (`restrict=on`): it cannot open
 connections anywhere, and its ports are forwarded to `127.0.0.1` on the host only.
@@ -13,7 +13,8 @@ connections anywhere, and its ports are forwarded to `127.0.0.1` on the host onl
 | 10389 / 10636 | 389 / 636 | LDAP / LDAPS |
 | 13268 / 13269 | 3268 / 3269 | Global catalog |
 | 10088 | 88 | Kerberos |
-| 10445 | 445 | SMB (SYSVOL) |
+| 10445 | 445 | SMB (SYSVOL, probes) |
+| 10080 | 80 | CA web enrollment (ESC8) |
 | 10053 | 53 | DNS |
 | 15985 | 5985 | WinRM |
 
@@ -44,20 +45,50 @@ Needs a Linux host with KVM, libvirt, `virt-install`, `qemu-img` and `xorriso`
      "powershell -ExecutionPolicy Bypass -File C:\seed.ps1 -UserPassword $USER_PASSWORD -ReaderPassword $READER_PASSWORD"
    ```
 
-   This installs an enterprise CA (which also gives the DC its LDAPS certificate) and
-   creates the vulnerable accounts, templates, ACLs, GPO and SYSVOL file. `alice` is the
-   clean control account; `adreader` is the unprivileged account the tests scan with.
+   This installs an enterprise CA (which also gives the DC its LDAPS certificate) and web
+   enrollment, then creates the vulnerable accounts, groups, templates, ACLs, GPOs, gMSA,
+   LAPS permissions and SYSVOL files. `alice` is the clean control account; `adreader` is
+   the unprivileged account the tests scan with.
 
 5. Run the live tests from the repository root as shown in the main README.
+
+## Kerberos
+
+To test `-k`, point MIT Kerberos at the forwarded KDC and resolve the DC's name to the
+forwarded ports:
+
+```ini
+# krb5.conf (use with KRB5_CONFIG=...)
+[libdefaults]
+    default_realm = ADLAB.TEST
+    dns_lookup_kdc = false
+    rdns = false
+    udp_preference_limit = 1
+[realms]
+    ADLAB.TEST = { kdc = 127.0.0.1:10088 }
+```
+
+```bash
+echo '127.0.0.1 dc01.adlab.test' | sudo tee -a /etc/hosts
+uv sync --extra kerberos            # needs libkrb5-dev and python3-dev to build gssapi
+kinit adreader@ADLAB.TEST
+uv run ad-doctor scan dc01.adlab.test --ldaps --port 10636 --smb-port 10445 --http-port 10080 -k
+```
 
 ## Notes
 
 - libvirt's native `passt` user networking would be the obvious choice, but Ubuntu
   24.04's AppArmor profile blocks QEMU from reaching the passt socket; `build.sh` passes
   the slirp network on the QEMU command line instead.
+- virt-install keeps a Windows guest's hardware clock in local time; `build.sh` switches
+  it to UTC, otherwise the guest runs hours off and Kerberos fails on clock skew.
 - The built-in OpenSSH firewall rule only covers the Private profile, and the lab NIC
   comes up as Public; `setup.ps1` widens it.
 - Windows Server 2025 enforces LDAP signing through `LDAPServerEnforceIntegrity` on top of
-  the classic `LDAPServerIntegrity`; `seed.ps1` relaxes both so the signing probe has
-  something to find.
+  the classic `LDAPServerIntegrity`, and requires SSL on the CertSrv site by default;
+  `seed.ps1` relaxes both so the probes have something to find.
+- Server Core 2025 has no Print Spooler and the Print-Server role fails to install on it,
+  so AD-INF-009 and AD-CHAIN-002/003 are covered by unit tests only.
+- Seeding restarts NTDS once and asks SDProp to run immediately, so the AdminSDHolder ACL
+  is copied onto protected objects before the tests.
 - The evaluation licence runs for 180 days. Rebuild from scratch rather than extend it.

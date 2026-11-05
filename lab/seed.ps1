@@ -203,5 +203,123 @@ New-Item -ItemType Directory -Force $dir | Out-Null
 </Groups>
 '@ | Set-Content -Encoding UTF8 "$dir\Groups.xml"                    # AD-GPP-001
 
+# --- Round 3 ---
+# A logon script with a literal password (AD-GPP-002)
+'net use z: \\fs01\share /user:ADLAB\svc_map S3cretPass!' |
+    Set-Content -Encoding ASCII C:\Windows\SYSVOL\domain\scripts\map.bat
+
+# Weak security settings in a GPO linked to the DCs (AD-GPO-003)
+$labGpo = Get-GPO -Name LabDCPolicy
+$secedit = "C:\Windows\SYSVOL\domain\Policies\{$($labGpo.Id.ToString().ToUpper())}\Machine\Microsoft\Windows NT\SecEdit"
+New-Item -ItemType Directory -Force $secedit | Out-Null
+@'
+[Unicode]
+Unicode=yes
+[Version]
+signature="$CHICAGO$"
+Revision=1
+[Registry Values]
+MACHINE\System\CurrentControlSet\Control\Lsa\LmCompatibilityLevel=4,1
+[Privilege Rights]
+SeDebugPrivilege = *S-1-5-32-544,*S-1-5-11
+'@ | Set-Content -Encoding Unicode "$secedit\GptTmpl.inf"
+
+# An unlinked GPO a non-admin can edit (AD-GPO-004)
+if (-not (Get-GPO -Name LabUserPolicy -ErrorAction SilentlyContinue)) { New-GPO -Name LabUserPolicy | Out-Null }
+Set-GPPermission -Name LabUserPolicy -TargetName helpdesk -TargetType User -PermissionLevel GpoEditDeleteModifySecurity | Out-Null
+
+# gPLink write on the Domain Controllers OU (AD-GPO-002)
+Ensure-User gpo_linker
+Grant-Ad "OU=Domain Controllers,$dn" (Get-ADUser gpo_linker).SID WriteProperty 'f30e3bbe-9ff0-11d1-b603-0000f80367c1'
+
+# Shadow credentials on the DC's computer object (AD-ACL-004)
+Ensure-User kc_writer
+Grant-Ad (Get-ADComputer DC01).DistinguishedName (Get-ADUser kc_writer).SID WriteProperty '5b47d60f-6090-40b2-9f37-2a4de88f3063'
+
+# AdminSDHolder inheriting from its parent (AD-ACL-005)
+$holderPath = "AD:\CN=AdminSDHolder,CN=System,$dn"
+$holderAcl = Get-Acl $holderPath
+if ($holderAcl.AreAccessRulesProtected) { $holderAcl.SetAccessRuleProtection($false, $true); Set-Acl $holderPath $holderAcl }
+
+# A gMSA whose password every user can read (AD-ACL-006)
+if (-not (Get-KdsRootKey)) { Add-KdsRootKey -EffectiveTime ((Get-Date).AddHours(-10)) | Out-Null }
+if (-not (Get-ADServiceAccount -Filter "Name -eq 'gmsa_web'")) {
+    New-ADServiceAccount gmsa_web -DNSHostName gmsa_web.adlab.test -PrincipalsAllowedToRetrieveManagedPassword 'Domain Users'
+}
+
+# Account hygiene (AD-ACC-008, -010) and Kerberos (AD-KRB-005, AD-DEL-004). AD-ACC-009 is
+# unit-tested only: unixUserPassword is confidential on Server 2025, so no reader sees it.
+Ensure-User notes_user
+Set-ADUser notes_user -Description 'temp pwd: Welcome2026'
+Ensure-Computer PRE2K
+Set-ADAccountControl 'PRE2K$' -PasswordNotRequired $true
+Set-ADUser svc_web -KerberosEncryptionType RC4
+Ensure-User svc_dc
+Set-ADUser svc_dc -Replace @{ 'msDS-AllowedToDelegateTo' = 'ldap/DC01.adlab.test' }
+
+# Group hygiene (AD-PRIV-006, -007, -008, -009)
+Ensure-User old_admin
+Add-ADGroupMember 'Domain Admins' old_admin
+Disable-ADAccount old_admin
+Ensure-User hidden_admin
+if ((Get-ADUser hidden_admin -Properties primaryGroupID).primaryGroupID -ne 512) {
+    Add-ADGroupMember 'Domain Admins' hidden_admin
+    Set-ADUser hidden_admin -Replace @{ primaryGroupID = 512 }
+}
+Ensure-User op_user
+Add-ADGroupMember 'Backup Operators' op_user
+Add-ADGroupMember 'Cert Publishers' helpdesk
+
+# An account mapped to a certificate by subject only (AD-ADCS-009)
+Ensure-User map_user
+Set-ADUser map_user -Replace @{ altSecurityIdentities = 'X509:<I>DC=test,DC=adlab,CN=adlab-CA<S>CN=map_user' }
+
+# A published template that allows 1024-bit keys (AD-ADCS-011)
+New-LabTemplate LabWeakKey @{ 'msPKI-Minimal-Key-Size' = 1024 }
+$ca = Get-ADObject -SearchBase "CN=Enrollment Services,$pks" -Filter "objectClass -eq 'pKIEnrollmentService'" -Properties certificateTemplates
+if ($ca.certificateTemplates -notcontains 'LabWeakKey') { Set-ADObject $ca -Add @{ certificateTemplates = 'LabWeakKey' } }
+
+# BadSuccessor: CreateChild on an OU for a non-admin (AD-INF-007)
+Ensure-User ou_admin
+Grant-Ad $ou (Get-ADUser ou_admin).SID CreateChild
+
+# Windows LAPS password readable by every user (AD-SEC-002)
+if (-not (Get-ADObject -SearchBase (Get-ADRootDSE).schemaNamingContext -Filter "name -eq 'ms-LAPS-Password'")) {
+    Update-LapsADSchema -Confirm:$false
+}
+Set-LapsADReadPasswordPermission -Identity $ou -AllowedPrincipals 'ADLAB\Domain Users' | Out-Null
+Set-ADComputer WS01 -Replace @{
+    'msLAPS-Password' = '{"n":"Administrator","t":"1dc0000000000000","p":"NotARealSecret1"}'
+    'msLAPS-PasswordExpirationTime' = (Get-Date).AddDays(30).ToFileTimeUtc()
+}
+
+# Print Spooler on the DC (AD-INF-009, AD-CHAIN-002). Server Core 2025 ships without the
+# service and the Print-Server role fails to install on it (0x80070bc9, rolled back at the
+# next boot), so on Core these checks are covered by the unit tests only.
+if (Get-Service Spooler -ErrorAction SilentlyContinue) {
+    Set-Service Spooler -StartupType Automatic
+    Start-Service Spooler
+} else {
+    'spooler: not present on this edition, AD-INF-009 is not seeded'
+}
+
+# Web enrollment over HTTP with NTLM (AD-ADCS-010, AD-CHAIN-003). Feature installation can
+# be blocked by a pending reboot; the unit tests cover these checks either way.
+try {
+    if (-not (Get-WindowsFeature ADCS-Web-Enrollment -ErrorAction Stop).Installed) {
+        Install-WindowsFeature ADCS-Web-Enrollment -ErrorAction Stop | Out-Null
+        Install-AdcsWebEnrollment -Force -ErrorAction Stop | Out-Null
+    }
+    # Server 2025 requires SSL on CertSrv out of the box; allow plain HTTP, the ESC8 setup
+    Import-Module WebAdministration
+    Set-WebConfigurationProperty -PSPath 'IIS:\' -Location 'Default Web Site/CertSrv' `
+        -Filter system.webServer/security/access -Name sslFlags -Value 'None'
+} catch { "web enrollment not installed: $($_.Exception.Message)" }
+
+# SDProp copies the AdminSDHolder ACL onto protected objects now instead of within the hour
+$rootDse = [ADSI]'LDAP://RootDSE'
+$rootDse.Put('runProtectAdminGroupsTask', 1)
+$rootDse.SetInfo()
+
 certutil -pulse | Out-Null
 'seeded'

@@ -102,7 +102,9 @@ def test_trusts() -> None:
             Trust("ext.test", 3, 2, 0),
             Trust("safe-ext.test", 3, 2, 0x4),
             Trust("inbound-only.test", 1, 2, 0),
-            Trust("forest.test", 2, 2, 0x8 | 0x40 | 0x800),
+            Trust("forest.test", 3, 2, 0x8 | 0x40 | 0x800),
+            # TGT delegation matters on the inbound side only
+            Trust("outbound-forest.test", 2, 2, 0x8 | 0x800),
             Trust("child.lab.test", 3, 2, 0x20),
         ]
     )
@@ -165,16 +167,17 @@ def test_score_and_grade() -> None:
     assert Report(snapshot(), []).score == 0
     assert Report(snapshot(), []).grade == "A"
     r = dirty()
-    # 2 high (15 each) + 2 medium (6 each)
-    assert r.score == 42
-    assert r.grade == "C"
+    # 3 high (ESC1, AS-REP, the Domain Users -> ESC1 path) x 15 + 2 medium x 6
+    assert r.score == 57
+    assert r.grade == "D"
     assert r.category_scores()["Certificate services"] == 15
+    assert r.category_scores()["Attack paths"] == 15
 
 
 def test_renderers() -> None:
     r = dirty()
     text = render_text(r)
-    assert "risk score 42/100 (grade C)" in text
+    assert "risk score 57/100 (grade D)" in text
     html = render_html(r)
     assert "Bad&lt;t&gt;" in html and "Bad<t>" not in html
     assert "attack.mitre.org/techniques/T1558/004/" in html
@@ -264,7 +267,7 @@ def test_cli_reports_bad_accept_file(tmp_path: Path, capsys: pytest.CaptureFixtu
 
 
 def test_expired_today_boundary() -> None:
-    entries = [("AD-SEC-001", set(), "r", NOW.date())]
+    entries = [accept.Entry("AD-SEC-001", set(), "r", NOW.date())]
     snap = snapshot(computer("WS9", laps=False))
     kept, accepted, _ = accept.apply(run_all(snap), entries, NOW.date())
     assert kept == [] and accepted

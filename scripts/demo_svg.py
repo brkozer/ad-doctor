@@ -16,7 +16,8 @@ from rich.text import Text
 SCAN = [
     "ad-doctor", "scan", "127.0.0.1", "--ldaps", "--port", "10636", "--smb-port", "10445",
     "--signing-probe-port", "10389", "-u", "ADLAB\\adreader",
-    "--only", "AD-ACL-001", "AD-ADCS-001", "AD-GPO-001", "AD-GPP-001", "AD-INF-005",
+    "--http-port", "10080", "--only", "AD-PATH-001", "AD-CHAIN-001", "AD-ADCS-010", "AD-INF-007",
+    "AD-GPP-002",
 ]  # fmt: skip
 
 

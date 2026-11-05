@@ -85,7 +85,7 @@ ROUTES: dict[tuple[str, str], list[dict[str, Any]]] = {
             trustAttributes=0,
         )
     ],
-    (GPO_DN, "(objectClass=groupPolicyContainer)"): [
+    (f"CN=Policies,CN=System,{DOMAIN}", "(objectClass=groupPolicyContainer)"): [
         entry(
             GPO_DN,
             displayName="Default Domain Policy",
