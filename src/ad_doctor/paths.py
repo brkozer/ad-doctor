@@ -18,6 +18,7 @@ Scope nodes are plumbing, so they count as neither controlled objects nor tier 0
 
 from __future__ import annotations
 
+import sys
 from collections import Counter, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -138,7 +139,7 @@ class Path:
 
 
 def _sid_node(sid: str) -> str:
-    return f"sid:{sid}"
+    return sys.intern(f"sid:{sid}")  # every edge of a node shares one string
 
 
 def _dn_node(dn: str) -> str:

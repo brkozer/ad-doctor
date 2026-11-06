@@ -41,7 +41,7 @@ DC seeded with one instance of every misconfiguration that a single domain can h
   are probed on each domain controller, and findings name the ones that drift from the
   rest; DCs that cannot be reached are reported rather than assumed fine.
 - **Fast on large domains.** 100,000 users, 33,000 computers and 127,000 ACEs load in
-  about 3 s and go through every check, attack paths included, in about 7 s on one 2017
+  about 4 s and go through every check, attack paths included, in about 10 s on one 2017
   Xeon core
   ([benchmark](#performance)).
 - **Compound findings.** `AD-CHAIN-*` raise the alarm when individually medium findings
@@ -491,15 +491,15 @@ JavaScript heap after unlocking and one blast-radius lookup.
 
 | Domain | Graph | HTML file | `ad-doctor view` | Build memory | First screen | Unlock | JS heap |
 |---|---|---|---|---|---|---|---|
-| lab (40 accounts) | full | 223 KB | 0.8 s | 56 MB | 101 ms | 0.82 s | 2.7 MB |
-| 10,000 users | full | 746 KB | 2.5 s | 145 MB | 148 ms | 0.82 s | 6.8 MB |
-| 100,000 users | paths | 1.5 MB | 25 s | 0.85 GB | 210 ms | 0.82 s | 7.9 MB |
-| 250,000 users | paths | 3.5 MB | 68 s | 2.08 GB | 337 ms | 0.82 s | 14.4 MB |
+| lab (49 accounts) | full | 228 KB | 0.8 s | 54 MB | 108 ms | 0.82 s | 3.0 MB |
+| 10,000 users | full | 798 KB | 3.1 s | 108 MB | 154 ms | 0.82 s | 7.6 MB |
+| 100,000 users | paths | 1.5 MB | 33 s | 0.60 GB | 198 ms | 0.82 s | 7.9 MB |
+| 250,000 users | paths | 3.5 MB | 90 s | 1.43 GB | 354 ms | 0.83 s | 14.4 MB |
 
 An account's blast radius on the 10,000-user page, searched in the page and drawn, takes
-under 30 ms. Forcing `--graph full` on the 100,000-user domain gives a 5.9 MB file, a
-593 ms first screen, a 47 MB heap and 74 ms per account; `auto` switches to `paths` well
-before that. Encryption adds under half a second to the build (0.32 s on the lab, 0.3 s
+under 20 ms. Forcing `--graph full` on the 100,000-user domain gives a 6.3 MB file, a
+657 ms first screen, a 49 MB heap and 77 ms per account; `auto` switches to `paths` well
+before that. Encryption adds under half a second to the build (0.36 s on the lab, 0.3 s
 at 10,000 users). Object lists with
 thousands of rows are drawn as they scroll into view.
 
@@ -512,9 +512,9 @@ Xeon Gold 6138 (2017), Python 3.12:
 
 | Domain | Snapshot | Load | All checks + paths | OpenGraph export | Peak memory |
 |---|---|---|---|---|---|
-| 10,000 users, 3,300 computers, 19,000 ACEs | 13 MB | 0.4 s | 1.1 s | 0.7 s | 0.2 GB |
-| 100,000 users, 33,000 computers, 127,000 ACEs | 123 MB | 3.6 s | 12.5 s | 7.8 s | 1.9 GB |
-| 250,000 users, 83,000 computers, 308,000 ACEs | 306 MB | 9.4 s | 32.9 s | 18.3 s | 4.8 GB |
+| 10,000 users, 3,300 computers, 19,000 ACEs | 13 MB | 0.4 s | 0.9 s | 0.7 s | 0.1 GB |
+| 100,000 users, 33,000 computers, 127,000 ACEs | 126 MB | 3.8 s | 9.9 s | 7.0 s | 0.8 GB |
+| 250,000 users, 83,000 computers, 308,000 ACEs | 314 MB | 9.6 s | 26.0 s | 18.1 s | 2.1 GB |
 
 Analysis grows linearly with the size of the domain. Collection time is set by the DC:
 the snapshot comes from a few paged LDAP searches, so it scales with the number of objects

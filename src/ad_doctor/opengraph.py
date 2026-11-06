@@ -92,6 +92,12 @@ def export(snap: Snapshot, paths_only: bool = False, g: Graph | None = None) -> 
         keep = set(g.tier0) | set(found)
     nodes: dict[str, dict[str, Any]] = {}
     edges = []
+    # the file holds millions of these dicts and most are repeats, so edges share them
+    ends: dict[str, dict[str, str]] = {}
+    plain_props: dict[tuple[str, bool, bool], dict[str, Any]] = {}
+
+    def end_of(nid: str) -> dict[str, str]:
+        return ends.setdefault(nid, {"value": nid, "match_by": "id"})
 
     def add_node(node: str) -> str:
         nid = node_id(snap, node)
@@ -119,12 +125,16 @@ def export(snap: Snapshot, paths_only: bool = False, g: Graph | None = None) -> 
                 extra = g.edge_props.get((src, dst, label), {})
                 for kind, inherited in edge_kinds(label):
                     props = {"label": label, "inherited": inherited, "traversable": traversable}
+                    if extra:
+                        props = {**props, **extra}
+                    else:
+                        props = plain_props.setdefault((label, inherited, traversable), props)
                     edges.append(
                         {
                             "kind": kind,
-                            "start": {"value": start, "match_by": "id"},
-                            "end": {"value": end, "match_by": "id"},
-                            "properties": {**props, **extra},
+                            "start": end_of(start),
+                            "end": end_of(end),
+                            "properties": props,
                         }
                     )
     for node in g.tier0:  # tier-0 nodes appear even when nothing points at them

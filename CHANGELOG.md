@@ -7,6 +7,18 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+### Changed
+
+- **Less memory.** Four new `Account` fields in 0.1.0 took it to 30 attributes, where
+  CPython stops sharing dict keys, so every account got a full dict of its own: 1.3 KB more
+  each on Python 3.12. `Account`, `DirObject` and `Ace` now use slots. `view` lets go of
+  the parsed file once the snapshot is built, loading shares equal ACEs and member DNs, the
+  control graph shares node strings, `to_json` no longer makes a deep copy first, OpenGraph
+  edges share repeated dicts, and `export-graph` writes the file in pieces. On the
+  250,000-user bench domain `view` peaks at 1.43 GB instead of 2.45 GB, `scripts/bench.py`
+  at 2.1 GB instead of 4.8 GB, and `export-graph` at 1.8 GB where it did not fit in 5 GB
+  before. Findings, fingerprints and every report and export are byte for byte the same.
+
 ## [0.1.4] - 2026-11-07
 
 ### Added

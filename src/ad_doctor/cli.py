@@ -7,6 +7,7 @@ import getpass
 import json
 import os
 import sys
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -74,7 +75,7 @@ def _target(args: argparse.Namespace) -> Target:
     )
 
 
-def _write_private(path: Path, text: str) -> None:
+def _write_private(path: Path, text: str | Iterable[str]) -> None:
     """Write a file only its owner can read: snapshots, reports and fix scripts describe
     how to attack the domain they came from."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -86,7 +87,7 @@ def _write_private(path: Path, text: str) -> None:
         os.close(fd)
         raise
     with out:
-        out.write(text)
+        out.writelines([text] if isinstance(text, str) else text)
 
 
 def _use_color(stream: Any) -> bool:
@@ -255,7 +256,8 @@ def cmd_blast_radius(args: argparse.Namespace) -> int:
 def cmd_export_graph(args: argparse.Namespace) -> int:
     snap = Snapshot.from_json(_load_json(args.snapshot))
     payload = opengraph.export(snap, paths_only=args.paths_only)
-    _write_private(args.output, json.dumps(payload, indent=1))
+    # in pieces: the whole text of a big graph takes more memory than the graph itself
+    _write_private(args.output, json.JSONEncoder(indent=1).iterencode(payload))
     graph = payload["graph"]
     print(f"wrote {args.output} ({len(graph['nodes'])} nodes, {len(graph['edges'])} edges)")
     return 0
@@ -405,6 +407,7 @@ def cmd_view(args: argparse.Namespace) -> int:
         return 1
     try:
         data = _load_json(args.input)
+        redacted = bool(data.get("redacted"))
         if data.get("tool") == "ad-doctor":
             snap = _snapshot_of_report(data)
             findings = _report_findings(data)
@@ -419,6 +422,7 @@ def cmd_view(args: argparse.Namespace) -> int:
             opts.source, source = "report", None
         else:
             source = Snapshot.from_json(data)
+            del data  # the parsed file is as big as the snapshot
             report, opts = _analyze(args, source, run_all(source))
             opts.graph = viewer_graph.choose(args.graph, source)
             if args.blast_radius_for and opts.graph != "paths":
@@ -427,7 +431,7 @@ def cmd_view(args: argparse.Namespace) -> int:
             opts.history = trend.load(args.history, report.snap.domain)
         opts.encrypted = args.encrypt if args.encrypt is not None else opts.graph != "none"
         passphrase = _passphrase(opts.graph, args.encrypt is True) if opts.encrypted else None
-        opts.redacted = bool(data.get("redacted"))
+        opts.redacted = redacted
         opts.fixes = args.fixes
         opts.blast_for = args.blast_radius_for
         opts.command = _command(args)

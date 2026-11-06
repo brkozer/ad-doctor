@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 from typing import Any
@@ -57,7 +57,9 @@ class KeyCredential:
     self_written: bool = False
 
 
-@dataclass
+# slots: a domain has hundreds of thousands of these, and from 30 attributes on, CPython
+# gives every plain instance a full dict of its own
+@dataclass(slots=True)
 class Account:
     dn: str
     sam: str
@@ -235,7 +237,7 @@ class GpoLocalGroup:
     filtered: bool = False  # GPP item-level targeting present
 
 
-@dataclass
+@dataclass(slots=True)
 class DirObject:
     """Any directory object whose permissions or members matter for control paths."""
 
@@ -509,12 +511,15 @@ class Snapshot:
         return sids
 
     def to_json(self) -> dict[str, Any]:
-        return _encode(asdict(self))  # type: ignore[no-any-return]
+        return _encode(self)  # type: ignore[no-any-return]
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> Snapshot:
         collected = _dt(data["collected_at"])
         assert collected is not None
+        # most DACLs repeat the same ACEs, and most member values repeat an account's DN
+        seen_aces: dict[Ace, Ace] = {}
+        dns = {a["dn"]: a["dn"] for a in data["accounts"]}
         return cls(
             domain=data["domain"],
             domain_dn=data["domain_dn"],
@@ -539,9 +544,10 @@ class Snapshot:
             privileged=data["privileged"],
             protected_users=data["protected_users"],
             templates=[
-                CertTemplate(**{**t, "aces": _aces(t["aces"])}) for t in data.get("templates", [])
+                CertTemplate(**{**t, "aces": _aces(t["aces"], seen_aces)})
+                for t in data.get("templates", [])
             ],
-            acls={k: _aces(v) for k, v in data.get("acls", {}).items()},
+            acls={k: _aces(v, seen_aces) for k, v in data.get("acls", {}).items()},
             principals=data.get("principals", {}),
             gpp_passwords=[GppPassword(**g) for g in data.get("gpp_passwords", [])],
             trusts=[
@@ -554,7 +560,7 @@ class Snapshot:
                 Gpo(
                     **{
                         **g,
-                        "aces": _aces(g["aces"]),
+                        "aces": _aces(g["aces"], seen_aces),
                         "links": [GpLink(**x) for x in g.get("links", [])],
                     }
                 )
@@ -563,13 +569,14 @@ class Snapshot:
             oid_group_links=data.get("oid_group_links", {}),
             ca_hosts=data.get("ca_hosts", []),
             root_sid=data.get("root_sid", ""),
-            probes=_probes(data.get("probes", {})),
+            probes=_probes(data.get("probes", {}), seen_aces),
             objects=[
                 DirObject(
                     **{
                         **o,
-                        "aces": _aces(o["aces"]),
-                        "inheritable": _aces(o.get("inheritable", [])),
+                        "aces": _aces(o["aces"], seen_aces),
+                        "inheritable": _aces(o.get("inheritable", []), seen_aces),
+                        "members": [dns.get(m, m) for m in o.get("members", [])],
                     }
                 )
                 for o in data.get("objects", [])
@@ -725,17 +732,21 @@ def _key_credential(data: dict[str, Any]) -> KeyCredential:
     return KeyCredential(**{**data, "created": _dt(data["created"]), "added": _dt(data["added"])})
 
 
-def _aces(items: list[dict[str, Any]]) -> list[Ace]:
-    return [Ace(**a) for a in items]
+def _aces(items: list[dict[str, Any]], seen: dict[Ace, Ace]) -> list[Ace]:
+    out = []
+    for item in items:
+        ace = Ace(**item)
+        out.append(seen.setdefault(ace, ace))
+    return out
 
 
-def _probes(data: dict[str, Any]) -> Probes:
+def _probes(data: dict[str, Any], seen_aces: dict[Ace, Ace]) -> Probes:
     return Probes(
         **{
             **data,
             "dcs": [DcProbe(**d) for d in data.get("dcs", [])],
             "ca_configs": [
-                CaConfig(**{**c, "aces": _aces(c.get("aces", []))})
+                CaConfig(**{**c, "aces": _aces(c.get("aces", []), seen_aces)})
                 for c in data.get("ca_configs", [])
             ],
         }
@@ -745,6 +756,8 @@ def _probes(data: dict[str, Any]) -> Probes:
 def _encode(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
+    if is_dataclass(value):
+        return {f.name: _encode(getattr(value, f.name)) for f in fields(value)}
     if isinstance(value, dict):
         return {k: _encode(v) for k, v in value.items()}
     if isinstance(value, list):

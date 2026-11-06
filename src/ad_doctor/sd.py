@@ -82,7 +82,7 @@ GROUP_CLASS = "bf967a9c-0de6-11d0-a285-00aa003049e2"
 OU_CLASS = "bf967aa5-0de6-11d0-a285-00aa003049e2"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Ace:
     sid: str
     mask: int

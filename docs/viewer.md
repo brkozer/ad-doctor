@@ -142,15 +142,15 @@ JavaScript heap after unlocking and one blast-radius lookup.
 
 | Domain | Graph | HTML file | `ad-doctor view` | Build memory | First screen | Unlock | JS heap |
 |---|---|---|---|---|---|---|---|
-| lab (40 accounts) | full | 223 KB | 0.8 s | 56 MB | 101 ms | 0.82 s | 2.7 MB |
-| 10,000 users | full | 746 KB | 2.5 s | 145 MB | 148 ms | 0.82 s | 6.8 MB |
-| 100,000 users | paths | 1.5 MB | 25 s | 0.85 GB | 210 ms | 0.82 s | 7.9 MB |
-| 250,000 users | paths | 3.5 MB | 68 s | 2.08 GB | 337 ms | 0.82 s | 14.4 MB |
+| lab (49 accounts) | full | 228 KB | 0.8 s | 54 MB | 108 ms | 0.82 s | 3.0 MB |
+| 10,000 users | full | 798 KB | 3.1 s | 108 MB | 154 ms | 0.82 s | 7.6 MB |
+| 100,000 users | paths | 1.5 MB | 33 s | 0.60 GB | 198 ms | 0.82 s | 7.9 MB |
+| 250,000 users | paths | 3.5 MB | 90 s | 1.43 GB | 354 ms | 0.83 s | 14.4 MB |
 
 An account's blast radius on the 10,000-user page, searched in the page and drawn, takes
-under 30 ms. Forcing `--graph full` on the 100,000-user domain gives a 5.9 MB file, a
-593 ms first screen, a 47 MB heap and 74 ms per account; `auto` switches to `paths` well
-before that. Encryption adds under half a second to the build (0.32 s on the lab, 0.3 s
+under 20 ms. Forcing `--graph full` on the 100,000-user domain gives a 6.3 MB file, a
+657 ms first screen, a 49 MB heap and 77 ms per account; `auto` switches to `paths` well
+before that. Encryption adds under half a second to the build (0.36 s on the lab, 0.3 s
 at 10,000 users). Object lists with
 thousands of rows are drawn as they scroll into view.
 
