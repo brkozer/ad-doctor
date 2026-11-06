@@ -33,10 +33,11 @@ with two lists:
 
 - **users** (not computers) whose primary group is 512 (Domain Admins), 518 (Schema
   Admins) or 519 (Enterprise Admins);
-- **any account that is not a DC** (neither `SERVER_TRUST_ACCOUNT` nor
-  `PARTIAL_SECRETS_ACCOUNT` in `userAccountControl`) whose primary group is 516 (Domain
+- **any account that is not a registered DC** whose primary group is 516 (Domain
   Controllers), 521 (Read-only Domain Controllers) or 498 (Enterprise Read-only Domain
-  Controllers).
+  Controllers). A DC has `SERVER_TRUST_ACCOUNT` or `PARTIAL_SECRETS_ACCOUNT` in
+  `userAccountControl`, and an `nTDSDSA` object when the snapshot holds that data: a flag alone
+  does not count ([AD-INF-014](AD-INF-014.md)).
 
 Examples: `hidden_admin (primary group Domain Admins)`,
 `WS01$ (primary group Domain Controllers, but not a DC)`.

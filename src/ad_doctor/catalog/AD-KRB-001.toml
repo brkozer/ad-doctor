@@ -8,8 +8,8 @@ old, and every forged ticket made with a key stolen in that window still works.
 """
 mitre = ["T1558.001"]
 data_sources = ["ldap"]
-attributes = ["sAMAccountName", "pwdLastSet"]
-related = ["AD-ACL-001", "AD-ACC-011"]
+attributes = ["sAMAccountName", "pwdLastSet", "msDS-ReplAttributeMetaData (unicodePwd)"]
+related = ["AD-ACL-001", "AD-ACC-011", "AD-ACC-012"]
 since = "0.1.0"
 
 risk = """
@@ -30,8 +30,10 @@ those years may still be live.
 """
 
 detection = """
-From the LDAP snapshot: the account whose `sAMAccountName` is `krbtgt`, and its
-`pwdLastSet`. ad-doctor compares that timestamp with the time the snapshot was taken
+From the LDAP snapshot: the account whose `sAMAccountName` is `krbtgt`, and when its
+password was last set. That time is the older of `pwdLastSet` and the last write of
+`unicodePwd` in replication metadata, because `pwdLastSet` can be moved forward
+([AD-ACC-012](AD-ACC-012.md)). ad-doctor compares it with the time the snapshot was taken
 and reports the account when the difference is more than **180 days**. The finding
 gives the age in days, for example:
 
@@ -40,7 +42,7 @@ krbtgt password is 612 days old; forged tickets stay valid until it changes.
 ```
 
 The object is always `krbtgt`. The per-RODC accounts (`krbtgt_12345`) are not
-examined. If `pwdLastSet` is not readable, the check stays silent.
+examined. If neither time is readable, the check stays silent.
 """
 
 false_positives = """

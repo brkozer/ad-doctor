@@ -1,0 +1,81 @@
+id = "AD-PRIV-012"
+aliases = ["unreadable-tier0-member"]
+summary = "A DN in the member attribute of a tier-0 group did not come back from the searches, so the object is hidden from, or unreadable by, the scanning account."
+severities = ["high"]
+severity_logic = """
+Always **high**. Nothing is known about the object except that it sits in a tier-0 group: it
+may be an administrator, a group with more members, or a backdoor, and every other check is
+blind to it.
+"""
+mitre = ["T1078.002", "T1564"]
+data_sources = ["ldap"]
+attributes = [
+    "member of the tier-0 groups, nesting included",
+    "objectClass and objectSid (BASE read of each value that no search returned)",
+    "nCName of the crossRef objects under CN=Partitions",
+]
+related = ["AD-PRIV-006", "AD-PRIV-007", "AD-ACC-011"]
+since = "unreleased"
+
+risk = """
+An object can be taken out of sight with permissions alone: a deny on the object, or no list
+right on its parent. It still works as a member of Domain Admins, but a search no longer
+returns it, so an audit that only looks at search results reports a smaller tier 0 than the
+real one.
+
+The `member` value of the group is stored on the group, and stays readable. That is the
+difference this check looks for.
+"""
+
+detection = """
+ad-doctor walks the `member` values of Domain Admins, Schema Admins, Enterprise Admins,
+Administrators, the operator groups, the DC groups and every group nested in them, and looks
+each DN up among the accounts and objects that came back. A value that is missing gets one
+BASE read (at most 500 per scan), and the line says what happened:
+
+- **not returned:** the read found nothing or was refused.
+- **returned without attributes:** the entry exists, but no attribute is readable. A dMSA looks
+  like this to an ordinary user.
+- **readable by its DN but missing from the searches:** a user, computer or group that the
+  searches should have returned, which means part of it is unreadable.
+
+These are skipped, because a search of this domain cannot return them: foreign security
+principals, members in other domains or forests, and anything in a naming context below the
+domain (a child domain, the DNS partitions). A readable object of another class, such as a
+contact, is not reported either.
+
+If the crossRef objects cannot be read, or the two main groups are not visible, the scan says
+so in a note and this check gives no result: following a child-domain DN could send the
+scan to another server. A group whose `member` attribute itself is denied looks empty, and
+that cannot be told apart from an empty group. Domain Admins or Administrators coming back
+empty gets a note; other tier-0 groups do not, because many are empty by design.
+"""
+
+false_positives = """
+- **A deliberate restriction.** Hardened domains take read rights on tier-0 objects away from
+  ordinary users. The finding then says the scan account is too weak for this part: give it
+  read access, or record it in an [accepted-risk file](../ci.md#accepted-risks).
+- **A dMSA in a tier-0 group.** Ordinary users cannot read dMSAs by default.
+"""
+
+remediation = """
+1. **Look at the object as a Domain Admin** (read-only):
+
+    ```powershell
+    Get-ADGroupMember 'Domain Admins' | Select-Object distinguishedName, objectClass
+    (Get-Acl "AD:CN=hidden,OU=Admins,DC=corp,DC=example").Access |
+        Where-Object AccessControlType -eq Deny
+    ```
+
+2. **Check the parent too**: a deny of *List Contents* on the OU hides everything in it.
+
+3. **If nobody can explain it**, treat it as an incident. Remove the member and find out who
+   changed the permissions.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-012"
+
+[[references]]
+title = "ANSSI: Active Directory security checklist"
+url = "https://cert.cyber.gouv.fr/uploads/ad_checklist.html"
+kind = "vendor"

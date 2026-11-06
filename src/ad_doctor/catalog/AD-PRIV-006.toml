@@ -38,8 +38,9 @@ Admins, Administrators and the four operator groups) and reports each transitive
 that is:
 
 - **disabled** (`ACCOUNTDISABLE` in `userAccountControl`), as `group: account (disabled)`;
-- a **computer** that is not a domain controller (neither `SERVER_TRUST_ACCOUNT` nor
-  `PARTIAL_SECRETS_ACCOUNT` is set), as `group: account (computer)`.
+- a **computer** that is not a registered domain controller, as `group: account (computer)`.
+  A DC has `SERVER_TRUST_ACCOUNT` or `PARTIAL_SECRETS_ACCOUNT` set, and an `nTDSDSA` object
+  when the snapshot holds that data: a flag alone does not count ([AD-INF-014](AD-INF-014.md)).
 
 It then reads the direct `member` values of every group whose SID is tier 0 (the groups
 above plus Domain Controllers, Read-only Domain Controllers and Enterprise Read-only

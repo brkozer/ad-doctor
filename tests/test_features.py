@@ -167,8 +167,8 @@ def test_score_and_grade() -> None:
     assert Report(snapshot(), []).score == 0
     assert Report(snapshot(), []).grade == "A"
     r = dirty()
-    # 3 high (ESC1, AS-REP, the Domain Users -> ESC1 path) x 15 + 2 medium x 6
-    assert r.score == 57
+    # 3 high (ESC1, AS-REP, the Domain Users -> ESC1 path) x 15 + 2 medium x 6 + 1 low x 2
+    assert r.score == 59
     assert r.grade == "D"
     assert r.category_scores()["Certificate services"] == 15
     assert r.category_scores()["Attack paths"] == 15
@@ -177,7 +177,7 @@ def test_score_and_grade() -> None:
 def test_renderers() -> None:
     r = dirty()
     text = render_text(r)
-    assert "risk score 57/100 (grade D)" in text
+    assert "risk score 59/100 (grade D)" in text
     html = viewer.render(viewer.viewmodel(r, r.snap, viewer.Options()))
     assert "Bad<t>" not in html  # names only travel inside the escaped, packed payload
     data = decode_payload(html)

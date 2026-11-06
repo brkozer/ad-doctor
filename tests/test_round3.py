@@ -197,7 +197,7 @@ def test_rc4_only_and_seamless_sso() -> None:
         computer("AZUREADSSOACC", pwd_last_set=NOW - timedelta(days=90)),
     )
     found = {f.check_id: f for f in run_all(snap)}
-    assert found["AD-KRB-005"].objects == ["svc_old"]
+    assert found["AD-KRB-005"].objects == ["svc_old: no AES in msDS-SupportedEncryptionTypes (0x4)"]
     assert "90 days" in found["AD-KRB-006"].detail
 
 

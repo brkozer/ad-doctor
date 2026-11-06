@@ -1,0 +1,88 @@
+id = "AD-ADCS-018"
+aliases = ["ca-audit-filter"]
+summary = "An enterprise CA's AuditFilter is not 127 or was never set, so at least one audit category is off."
+severities = ["low", "medium"]
+severity_logic = """
+**Medium** when *Issue and manage certificate requests* (bit 4) is off, or the value does not
+exist: that is the activity
+Microsoft's October 2026 intrusion report tells defenders to record. **Low** when only other
+categories are off. Never higher: this is a detection gap, not a way in.
+"""
+mitre = ["T1649"]
+data_sources = ["probe-winreg"]
+attributes = ["SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\<CA>\\AuditFilter (over \\pipe\\winreg)"]
+related = ["AD-ADCS-016", "AD-ADCS-001", "AD-ADCS-010"]
+since = "unreleased"
+
+risk = """
+A CA only writes audit events for the categories in its audit filter. Without *Issue and
+manage certificate requests*, a certificate requested for a Domain Admin through ESC1 or ESC8
+leaves no CA audit event. Certificates also outlive password resets, so the record of what was
+issued is what an investigation starts from.
+
+Microsoft's report on real ESC1 and ESC8 intrusions (2026-10-30) asks defenders to enable the
+Certification Services audit subcategory for success and failure, and to configure the
+audit filter to record request and issuance activity.
+"""
+
+detection = """
+During collection ad-doctor reads `AuditFilter` next to the CA's other settings over
+`\\pipe\\winreg`. The value is a bitmask, and all seven categories on make 127:
+
+| Bit | Category |
+| --- | --- |
+| 1 | Start and stop AD CS |
+| 2 | Back up and restore the CA database |
+| 4 | Issue and manage certificate requests |
+| 8 | Revoke certificates and publish CRLs |
+| 16 | Change CA security settings |
+| 32 | Store and retrieve archived keys |
+| 64 | Change CA configuration |
+
+Each CA with a bit off is listed, with the categories that are off. A CA where nobody ever
+configured auditing has no such value (seen on a new Server 2025 CA). That read worked, so it is
+listed as `AuditFilter not set`, with every category off. Reading it as "nothing audited" is an
+inference: nothing turned a category on. A value that could not be read is different: it is
+unknown, and [AD-ADCS-016](AD-ADCS-016.md) reports it.
+
+**127 does not prove events are written.** The CA hands events to the Security log only when
+the *Certification Services* audit subcategory is on, and ad-doctor does not read the CA's audit
+policy.
+"""
+
+false_positives = """
+- **A category turned off on purpose.** Record it in an
+  [accepted-risk file](../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **See the current value** on the CA (read-only):
+
+    ```powershell
+    certutil -getreg CA\\AuditFilter
+    ```
+
+2. **Turn on every category**, then restart the service:
+
+    ```powershell
+    certutil -setreg CA\\AuditFilter 127
+    Restart-Service certsvc
+    ```
+
+3. **Enable the audit subcategory** on the CA, for success and failure, through a GPO or with
+   `auditpol /set /subcategory:"Certification Services" /success:enable /failure:enable`.
+
+4. **Keep the events:** send the CA's Security log to your SIEM.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-018"
+
+[[references]]
+title = "Help desk impersonation and AD CS abuse: investigating ESC1 and ESC8 intrusion paths"
+url = "https://www.microsoft.com/en-us/security/blog/2026/10/30/help-desk-impersonation-ad-cs-abuse-investigating-esc1-esc8-intrusion-paths/"
+kind = "vendor"
+
+[[references]]
+title = "Securing PKI: Appendix B: Certification Authority Audit Filter"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2012-r2-and-2012/dn786422(v=ws.11)"
+kind = "vendor"

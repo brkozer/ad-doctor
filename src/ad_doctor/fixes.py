@@ -11,6 +11,7 @@ import re
 from collections.abc import Callable
 
 from . import catalog
+from .checks import OLD_KEYS
 from .model import Finding, Snapshot
 
 Fix = Callable[[Finding, Snapshot], list[str]]
@@ -53,6 +54,22 @@ def _per_object(template: str) -> Fix:
         return [template.format(o=_q(_name(o)), c=_q(_name(o).rstrip("$"))) for o in f.objects]
 
     return fix
+
+
+def _rc4_fix(f: Finding, snap: Snapshot) -> list[str]:
+    """Only an explicit RC4-only value on a user has a safe one-line change; the rest needs
+    a password reset or a test first. AES only on an account without AES keys makes the KDC
+    deny its tickets, so a suspect password comes first."""
+    out = []
+    for o in f.objects:
+        name = f.key(o)
+        if OLD_KEYS in o:
+            out.append(f"# {o}: reset the password first, see the AD-KRB-005 page")
+        elif "no AES in" in o and not name.endswith("$"):
+            out.append(f"Set-ADUser {_q(name)} -KerberosEncryptionType AES128,AES256 -WhatIf")
+        else:
+            out.append(f"# {o}: see the AD-KRB-005 page before changing it")
+    return out
 
 
 def _netbios(snap: Snapshot) -> str:
@@ -139,7 +156,7 @@ FIXES: dict[str, Fix] = {
         "Enable-ADOptionalFeature 'Recycle Bin Feature' -Scope ForestOrConfigurationSet "
         f"-Target {_q(snap.domain)} -WhatIf"
     ],
-    "AD-KRB-005": _per_object("Set-ADUser {o} -KerberosEncryptionType AES128,AES256 -WhatIf"),
+    "AD-KRB-005": _rc4_fix,
     "AD-ACC-009": _per_object(
         "Set-ADUser {o} -Clear userPassword,unixUserPassword,msSFU30Password -WhatIf"
     ),

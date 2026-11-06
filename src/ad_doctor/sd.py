@@ -8,6 +8,7 @@ broad allow covers is a documented way to restrict CA roles.
 
 from __future__ import annotations
 
+import re
 import struct
 import uuid
 from dataclasses import dataclass, field
@@ -66,7 +67,13 @@ INHERITED_OBJECT_TYPE_PRESENT = 0x2
 # writes every attribute in it.
 MEMBERSHIP_SET = "bc0ac240-79a9-11d0-9020-00c04fc2d4cf"  # member
 PUBLIC_INFORMATION_SET = "e48d0154-bcf8-11d1-8702-00c04fb96050"  # altSecurityIdentities
-PROPERTY_SET = {MEMBER: MEMBERSHIP_SET, ALT_SECURITY_IDENTITIES: PUBLIC_INFORMATION_SET}
+# User-Account-Restrictions (BloodHound: WriteAccountRestrictions)
+ACCOUNT_RESTRICTIONS_SET = "4c164200-20c0-11d0-a768-00aa006e0529"  # RBCD attribute
+PROPERTY_SET = {
+    MEMBER: MEMBERSHIP_SET,
+    ALT_SECURITY_IDENTITIES: PUBLIC_INFORMATION_SET,
+    ALLOWED_TO_ACT: ACCOUNT_RESTRICTIONS_SET,
+}
 
 # Object classes, for ACEs that only children of one class inherit
 USER_CLASS = "bf967aba-0de6-11d0-a285-00aa003049e2"
@@ -223,3 +230,62 @@ def parse_dacl(raw: bytes, inheritable: bool = False) -> list[Ace]:
             aces.append(Ace(sid, mask, object_type, inherited_type if inheritable else None))
         pos += size
     return aces
+
+
+# SDDL SID strings. Domain-relative ones take the domain's SID, forest-wide ones the root's.
+SDDL_SIDS = {
+    "WD": "S-1-1-0", "CO": "S-1-3-0", "CG": "S-1-3-1", "NU": "S-1-5-2", "IU": "S-1-5-4",
+    "SU": "S-1-5-6", "AN": "S-1-5-7", "ED": "S-1-5-9", "PS": "S-1-5-10", "AU": "S-1-5-11",
+    "RC": "S-1-5-12", "SY": "S-1-5-18", "LS": "S-1-5-19", "NS": "S-1-5-20",
+    "BA": "S-1-5-32-544", "BU": "S-1-5-32-545", "BG": "S-1-5-32-546", "PU": "S-1-5-32-547",
+    "AO": "S-1-5-32-548", "SO": "S-1-5-32-549", "PO": "S-1-5-32-550", "BO": "S-1-5-32-551",
+    "RE": "S-1-5-32-552", "RU": "S-1-5-32-554", "RD": "S-1-5-32-555", "NO": "S-1-5-32-556",
+    "MU": "S-1-5-32-558", "LU": "S-1-5-32-559", "IS": "S-1-5-32-568", "CY": "S-1-5-32-569",
+    "ER": "S-1-5-32-573", "CD": "S-1-5-32-574", "RA": "S-1-5-32-575", "ES": "S-1-5-32-576",
+    "MS": "S-1-5-32-577", "HA": "S-1-5-32-578", "AA": "S-1-5-32-579", "RM": "S-1-5-32-580",
+    "HO": "S-1-5-32-584", "SH": "S-1-5-32-585", "OW": "S-1-3-4", "WR": "S-1-5-33",
+    "UD": "S-1-5-84-0-0-0-0-0", "AC": "S-1-15-2-1", "LW": "S-1-16-4096", "ME": "S-1-16-8192",
+    "MP": "S-1-16-8448", "HI": "S-1-16-12288", "SI": "S-1-16-16384", "AS": "S-1-18-1",
+    "SS": "S-1-18-2",
+}  # fmt: skip
+SDDL_DOMAIN_RIDS = {
+    "LA": 500, "LG": 501, "DA": 512, "DU": 513, "DG": 514, "DC": 515, "DD": 516, "CA": 517,
+    "PA": 520, "CN": 522, "AP": 525, "KA": 526, "RS": 553,
+}  # fmt: skip
+SDDL_ROOT_RIDS = {"RO": 498, "SA": 518, "EA": 519, "EK": 527}
+SDDL_DACL = re.compile(r"D:[A-Z_]*((?:\([^()]*\))*)\s*$")
+SDDL_ACE = re.compile(r"\(([^;()]*);[^;()]*;[^;()]*;[^;()]*;[^;()]*;([^;()]*)(?:;[^()]*)?\)")
+
+
+def _sddl_sid(token: str, domain_sid: str, root_sid: str) -> str:
+    token = token.strip().upper()
+    if token.startswith("S-1-"):
+        return token
+    if token in SDDL_SIDS:
+        return SDDL_SIDS[token]
+    if token in SDDL_DOMAIN_RIDS:
+        return f"{domain_sid}-{SDDL_DOMAIN_RIDS[token]}"
+    if token in SDDL_ROOT_RIDS:
+        return f"{root_sid or domain_sid}-{SDDL_ROOT_RIDS[token]}"
+    raise ValueError(f"unknown SDDL trustee {token}")
+
+
+def sddl_trustees(text: str, domain_sid: str, root_sid: str = "") -> tuple[list[str], list[str]]:
+    """(allowed SIDs, denied SIDs) of the DACL in an SDDL string; ValueError when the text
+    holds anything but plain allow and deny ACEs."""
+    dacl = SDDL_DACL.search(text.split("S:(", 1)[0].strip())
+    if dacl is None:
+        raise ValueError("no DACL in the SDDL string")
+    body = dacl.group(1)
+    aces = list(SDDL_ACE.finditer(body))
+    if "".join(m.group(0) for m in aces) != body:
+        raise ValueError("ACE not understood")
+    allow: list[str] = []
+    deny: list[str] = []
+    for ace in aces:
+        kind = ace.group(1).strip().upper()
+        if kind not in ("A", "D"):
+            raise ValueError(f"ACE type {kind} not understood")
+        sid = _sddl_sid(ace.group(2), domain_sid, root_sid)
+        (allow if kind == "A" else deny).append(sid)
+    return allow, deny

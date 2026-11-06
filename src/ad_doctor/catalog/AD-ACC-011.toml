@@ -7,8 +7,8 @@ that has had a long time to leak and still works.
 """
 mitre = ["T1078.002"]
 data_sources = ["ldap"]
-attributes = ["pwdLastSet", "objectSid", "member (transitive) of the tier-0 groups", "primaryGroupID"]
-related = ["AD-ACC-003", "AD-KRB-001", "AD-KRB-003", "AD-ACC-005"]
+attributes = ["pwdLastSet", "msDS-ReplAttributeMetaData (unicodePwd)", "objectSid", "member (transitive) of the tier-0 groups", "primaryGroupID"]
+related = ["AD-ACC-003", "AD-ACC-012", "AD-KRB-001", "AD-KRB-003", "AD-ACC-005"]
 since = "0.1.0"
 
 risk = """
@@ -25,9 +25,11 @@ offline over weeks is worthless if the password changed in the meantime.
 detection = """
 From the LDAP snapshot: every **enabled user** (computers and managed service accounts
 excluded) that is a transitive member of a tier-0 group **or** has RID 500 (the built-in
-Administrator, even if renamed or removed from the groups), whose `pwdLastSet` is more
-than **365 days** before the scan time. Accounts with `pwdLastSet = 0` (must change at
-next logon) are not reported.
+Administrator, even if renamed or removed from the groups), whose password was last set
+more than **365 days** before the scan time. That time is the older of `pwdLastSet` and the
+last write of `unicodePwd` in replication metadata, because `pwdLastSet` can be moved forward
+([AD-ACC-012](AD-ACC-012.md)). An account with `pwdLastSet = 0` (must change at next logon)
+is judged by the metadata alone, and is not reported when that was not read either.
 
 The tier-0 groups are Domain Admins, Schema Admins, Enterprise Admins, Administrators,
 Account Operators, Server Operators, Print Operators and Backup Operators, including

@@ -46,6 +46,8 @@ class Account:
     is_computer: bool = False
     spns: list[str] = field(default_factory=list)
     pwd_last_set: datetime | None = None
+    # last write of unicodePwd from replication metadata; only read for tier-0 accounts
+    pwd_changed: datetime | None = None
     last_logon: datetime | None = None
     admin_count: bool = False
     rbcd: bool = False
@@ -73,6 +75,12 @@ class Account:
     managed: bool = False
     # for an Entra Connect sync account: the server it runs on, from its description/name
     sync_host: str | None = None
+    # DC flag in userAccountControl, but no nTDSDSA object in the Configuration partition
+    rogue_dc: bool = False
+    # pwdLastSet was read as 0: the password age is unknown, not "as old as the account"
+    pwd_must_change: bool = False
+    # the logical RODC object of Microsoft Entra Kerberos: no server behind it, by design
+    entra_kerberos: bool = False
 
     def has(self, flag: UAC) -> bool:
         return bool(self.uac & flag)
@@ -84,6 +92,19 @@ class Account:
     @property
     def is_dc(self) -> bool:
         return self.has(UAC.SERVER_TRUST_ACCOUNT) or self.has(UAC.PARTIAL_SECRETS_ACCOUNT)
+
+    @property
+    def is_registered_dc(self) -> bool:
+        """A DC that may be exempted from checks: the flag alone can be set on any
+        computer. is_dc stays true for a rogue object, so it remains a tier-0 target."""
+        return self.is_dc and not self.rogue_dc
+
+    @property
+    def password_changed(self) -> datetime | None:
+        """When the password was last really set, as far as known: pwdLastSet can be moved
+        forward without a password change, so the older of the two times counts."""
+        times = [t for t in (self.pwd_last_set, self.pwd_changed) if t is not None]
+        return min(times) if times else None
 
     @property
     def is_rodc(self) -> bool:
@@ -218,6 +239,12 @@ class GpoSettings:
     lm_compatibility: int | None = None
     no_lm_hash: int | None = None
     clear_text_password: int | None = None
+    # MSV1_0\RestrictSendingNTLMTraffic: 0 allow, 1 audit, 2 deny
+    restrict_sending_ntlm: int | None = None
+    # MSV1_0\ClientAllowedNTLMServers: servers the deny does not cover
+    ntlm_exceptions: list[str] = field(default_factory=list)
+    # Netlogon\\Parameters\\VulnerableChannelAllowList: an SDDL string
+    vulnerable_channel_allow: str | None = None
     # privilege constant -> SIDs (or names) granted
     privileges: dict[str, list[str]] = field(default_factory=dict)
 
@@ -275,6 +302,12 @@ class CaConfig:
     interface_flags: int | None = None
     request_disposition: int | None = None
     disabled_extensions: list[str] | None = None
+    # CA\\AuditFilter; None when absent (audit_absent) or unreadable
+    audit_filter: int | None = None
+    # the read of AuditFilter was attempted (False in older snapshots)
+    audit_checked: bool = False
+    # the read worked and the value does not exist; an error leaves this False
+    audit_absent: bool = False
     # allow ACEs of the CA security descriptor, with CA rights masks (sd.CA_*)
     aces: list[Ace] = field(default_factory=list)
     owner: str | None = None
@@ -286,6 +319,15 @@ class CaConfig:
         return self.policy_module is not None and (
             self.policy_module.lower() != DEFAULT_POLICY_MODULE.lower()
         )
+
+
+@dataclass
+class UnreadableMember:
+    """A DN in the member attribute of a tier-0 group that the scan could not read."""
+
+    dn: str
+    group: str
+    reason: str
 
 
 @dataclass
@@ -362,15 +404,39 @@ class Snapshot:
     backup_checked: bool = False
     # whether any fine-grained password policy was readable
     psos_visible: bool = False
+    # whether any dMSA came back; a plain user normally sees none, even when they exist.
+    # None in older snapshots, which did not record it.
+    dmsa_visible: bool | None = False
     # local group membership set by Restricted Groups and GPP Local Groups
     gpo_local_groups: list[GpoLocalGroup] = field(default_factory=list)
     # False in older snapshots and when SYSVOL was not read: "not collected", not "clean"
     local_groups_collected: bool = False
+    # False in older snapshots and when SYSVOL was not read: NTLM policy is unknown
+    ntlm_policy_collected: bool = False
+    # False in older snapshots and when no nTDSDSA object could be read
+    dc_registration_checked: bool = False
+    # False in older snapshots and when SYSVOL was not read: the Netlogon allow list is unknown
+    channel_policy_collected: bool = False
+    # whenCreated of Read-only Domain Controllers: the domain's first Server 2008 DC
+    aes_cutover: datetime | None = None
+    # False in older snapshots: Account.pwd_changed was not read
+    pwd_metadata_checked: bool = False
+    # members of tier-0 groups that did not come back from the searches
+    unreadable_members: list[UnreadableMember] = field(default_factory=list)
+    # False in older snapshots and when the comparison could not be made
+    tier0_members_checked: bool = False
     # DC computer DN (lower case) -> DN of its site
     dc_sites: dict[str, str] = field(default_factory=dict)
     site_count: int = 0
     # parts of the collection that could not run (no AD CS, SYSVOL unreachable, ...)
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def has_2025(self) -> bool:
+        """The domain looks like it has a Windows Server 2025 DC."""
+        return self.policy.functional_level >= 10 or any(
+            a.is_dc and a.os and "2025" in a.os for a in self.accounts
+        )
 
     def by_dn(self) -> dict[str, Account]:
         return {a.dn.lower(): a for a in self.accounts}
@@ -428,6 +494,7 @@ class Snapshot:
                     **{
                         **a,
                         "pwd_last_set": _dt(a["pwd_last_set"]),
+                        "pwd_changed": _dt(a.get("pwd_changed")),
                         "last_logon": _dt(a["last_logon"]),
                         "when_created": _dt(a.get("when_created")),
                     }
@@ -474,8 +541,16 @@ class Snapshot:
             last_backup=_dt(data.get("last_backup")),
             backup_checked=data.get("backup_checked", False),
             psos_visible=data.get("psos_visible", False),
+            dmsa_visible=data.get("dmsa_visible"),
             gpo_local_groups=[GpoLocalGroup(**x) for x in data.get("gpo_local_groups", [])],
             local_groups_collected=data.get("local_groups_collected", False),
+            ntlm_policy_collected=data.get("ntlm_policy_collected", False),
+            dc_registration_checked=data.get("dc_registration_checked", False),
+            channel_policy_collected=data.get("channel_policy_collected", False),
+            aes_cutover=_dt(data.get("aes_cutover")),
+            pwd_metadata_checked=data.get("pwd_metadata_checked", False),
+            unreadable_members=[UnreadableMember(**x) for x in data.get("unreadable_members", [])],
+            tier0_members_checked=data.get("tier0_members_checked", False),
             dc_sites=data.get("dc_sites", {}),
             site_count=data.get("site_count", 0),
             dns_admins=data.get("dns_admins", []),
@@ -483,7 +558,7 @@ class Snapshot:
             ds_heuristics=data.get("ds_heuristics", ""),
             recycle_bin=data.get("recycle_bin"),
             ldap_signing_required=data.get("ldap_signing_required"),
-            notes=data.get("notes", []),
+            notes=[*data.get("notes", []), *_older_snapshot_notes(data)],
         )
 
 
@@ -574,6 +649,30 @@ def exchange_members(objects: list[DirObject]) -> set[str]:
                 seen.add(key)
                 todo.append(key)
     return seen - {dn for dn in groups if groups[dn].name.lower() in EXCHANGE_GROUPS}
+
+
+def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
+    missing = [
+        text
+        for key, text in (
+            ("dc_registration_checked", "AD-INF-014 (rogue DC objects)"),
+            ("aes_cutover", "the password part of AD-KRB-005 (suspected no AES keys)"),
+            ("pwd_metadata_checked", "AD-ACC-012 (pwdLastSet against replication metadata)"),
+            ("channel_policy_collected", "AD-GPO-008 (Netlogon allow list)"),
+            ("tier0_members_checked", "AD-PRIV-012 (unreadable tier-0 members)"),
+        )
+        if key not in data
+    ]
+    cas = data.get("probes", {}).get("ca_configs", [])
+    if any("audit_checked" not in c for c in cas):
+        missing.append("AD-ADCS-018 (CA audit filter)")
+    notes = [f"snapshot from an older version: {text} not evaluated" for text in missing]
+    if "dmsa_visible" not in data:
+        notes.append(
+            "snapshot from an older version: whether a dMSA was visible is not recorded, so "
+            "AD-INF-007 may not have seen existing dMSA links"
+        )
+    return notes
 
 
 def _aces(items: list[dict[str, Any]]) -> list[Ace]:

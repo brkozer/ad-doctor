@@ -8,6 +8,7 @@ leave this module.
 
 from __future__ import annotations
 
+import errno
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -48,6 +49,7 @@ SECRET_PATTERNS = [
 ]
 
 LSA = r"MACHINE\System\CurrentControlSet\Control\Lsa"
+NETLOGON = r"MACHINE\System\CurrentControlSet\Services\Netlogon\Parameters"
 GPTTMPL = r"MACHINE\Microsoft\Windows NT\SecEdit\GptTmpl.inf"
 _GUID = r"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}"
 MACHINE_GROUPS = re.compile(
@@ -122,6 +124,14 @@ def parse_gpttmpl(text: str) -> GpoSettings:
                 settings.lm_compatibility = _int(data)
             elif key.lower() == rf"{LSA}\NoLMHash".lower():
                 settings.no_lm_hash = _int(data)
+            elif key.lower() == rf"{LSA}\MSV1_0\RestrictSendingNTLMTraffic".lower():
+                settings.restrict_sending_ntlm = _int(data)
+            elif key.lower() == rf"{LSA}\MSV1_0\ClientAllowedNTLMServers".lower():
+                # REG_MULTI_SZ: "7,<server>,<server>"
+                servers = value.partition(",")[2].split(",")
+                settings.ntlm_exceptions = [s for s in map(_unquote, servers) if s]
+            elif key.lower() == rf"{NETLOGON}\VulnerableChannelAllowList".lower():
+                settings.vulnerable_channel_allow = _unquote(data)
         elif section == "privilege rights":
             holders = [v.strip().lstrip("*") for v in value.split(",")]
             settings.privileges[key] = [h for h in holders if h]
@@ -327,8 +337,14 @@ def scan(
             rel = rf"Policies\{guid}\{GPTTMPL}"
             try:
                 text = _decode(_read(rf"{base}\{rel}", port))
-            except (SMBException, OSError):
-                continue  # no security settings in this GPO
+            except (SMBException, OSError) as exc:
+                if getattr(exc, "errno", None) == errno.ENOENT:
+                    # no security settings in this GPO: read, and nothing set. A failed read
+                    # stays out of gpo_settings, which the checks take as unknown.
+                    result.gpo_settings[guid] = GpoSettings()
+                else:
+                    result.unreadable.append(f"{rel} ({type(exc).__name__})")
+                continue
             result.gpo_settings[guid] = parse_gpttmpl(text)
             result.local_groups += parse_group_membership(text, guid.upper(), rel)
         if user_side:

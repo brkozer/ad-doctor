@@ -220,9 +220,11 @@ signature="$CHICAGO$"
 Revision=1
 [Registry Values]
 MACHINE\System\CurrentControlSet\Control\Lsa\LmCompatibilityLevel=4,1
+MACHINE\System\CurrentControlSet\Control\Lsa\MSV1_0\RestrictSendingNTLMTraffic=4,1
+MACHINE\System\CurrentControlSet\Services\Netlogon\Parameters\VulnerableChannelAllowList=1,"O:BAG:BAD:(A;;RC;;;DD)(A;;RC;;;HELPDESK_SID)"
 [Privilege Rights]
 SeDebugPrivilege = *S-1-5-32-544,*S-1-5-11
-'@ | Set-Content -Encoding Unicode "$secedit\GptTmpl.inf"
+'@.Replace('HELPDESK_SID', (Get-ADUser helpdesk).SID.Value) | Set-Content -Encoding Unicode "$secedit\GptTmpl.inf"
 
 # An unlinked GPO a non-admin can edit (AD-GPO-004)
 if (-not (Get-GPO -Name LabUserPolicy -ErrorAction SilentlyContinue)) { New-GPO -Name LabUserPolicy | Out-Null }
@@ -236,6 +238,18 @@ Grant-Ad "OU=Domain Controllers,$dn" (Get-ADUser gpo_linker).SID WriteProperty '
 Ensure-User kc_writer
 Grant-Ad (Get-ADComputer DC01).DistinguishedName (Get-ADUser kc_writer).SID WriteProperty '5b47d60f-6090-40b2-9f37-2a4de88f3063'
 
+# WriteAccountRestrictions: RBCD through the property set, on the DC (AD-ACL-004)
+Ensure-User rbcd_writer
+Grant-Ad (Get-ADComputer DC01).DistinguishedName (Get-ADUser rbcd_writer).SID WriteProperty '4c164200-20c0-11d0-a768-00aa006e0529'
+
+# A computer with the DC flag and no nTDSDSA object (AD-INF-014); AD sets its primary group to
+# Domain Controllers. In CN=Computers so that no lab GPO reaches it.
+Ensure-Computer ROGUE01 "CN=Computers,$dn"
+Set-ADComputer ROGUE01 -DNSHostName rogue01.adlab.test
+if (-not ((Get-ADComputer ROGUE01 -Properties userAccountControl).userAccountControl -band 0x2000)) {
+    Set-ADComputer ROGUE01 -Replace @{ userAccountControl = 0x2000 }
+}
+
 # AdminSDHolder inheriting from its parent (AD-ACL-005)
 $holderPath = "AD:\CN=AdminSDHolder,CN=System,$dn"
 $holderAcl = Get-Acl $holderPath
@@ -245,6 +259,11 @@ if ($holderAcl.AreAccessRulesProtected) { $holderAcl.SetAccessRuleProtection($fa
 if (-not (Get-KdsRootKey)) { Add-KdsRootKey -EffectiveTime ((Get-Date).AddHours(-10)) | Out-Null }
 if (-not (Get-ADServiceAccount -Filter "Name -eq 'gmsa_web'")) {
     New-ADServiceAccount gmsa_web -DNSHostName gmsa_web.adlab.test -PrincipalsAllowedToRetrieveManagedPassword 'Domain Users'
+}
+
+# A dMSA, which an ordinary user cannot read (the note of AD-INF-007)
+if (-not (Get-ADServiceAccount -Filter "Name -eq 'dmsa_lab'")) {
+    New-ADServiceAccount dmsa_lab -DNSHostName dmsa_lab.adlab.test -CreateDelegatedServiceAccount -Path $ou
 }
 
 # Account hygiene (AD-ACC-008, -010) and Kerberos (AD-KRB-005, AD-DEL-004). AD-ACC-009 is
@@ -538,6 +557,28 @@ if ($gF.GpoStatus -ne 'ComputerSettingsDisabled') { $gF.GpoStatus = 'ComputerSet
 $gG = Ensure-Gpo LabDcRdp
 Set-RestrictedGroups $gG @("*$dcRdp`__Memberof = *S-1-5-32-555")
 Ensure-Link LabDcRdp "OU=Domain Controllers,$dn"
+
+# AD-ADCS-018: a CA that audits backups and service starts, but no certificate requests. A
+# new CA has no AuditFilter value at all, which AD-ADCS-018 reports as not set.
+certutil -setreg CA\AuditFilter 3 | Out-Null
+
+# AD-ACC-012: pwdLastSet moved forward with no password change. Clearing and setting it is
+# what 'User must change password' does; the wait keeps it past the 5 second tolerance.
+Start-Sleep -Seconds 6
+Set-ADUser adm_bob -Replace @{ pwdLastSet = 0 }
+Set-ADUser adm_bob -Replace @{ pwdLastSet = -1 }
+
+# AD-PRIV-012: a Domain Admin the reader cannot see. The deny sits on the OU because SDProp
+# would remove it from the user; the group's member value stays readable.
+if (-not (Get-ADOrganizationalUnit -Filter "Name -eq 'Veiled'" -SearchBase $ou)) {
+    New-ADOrganizationalUnit -Name Veiled -Path $ou -ProtectedFromAccidentalDeletion $false
+}
+if (-not (Get-ADUser -Filter "SamAccountName -eq 'veiled_admin'")) {
+    New-ADUser -Name veiled_admin -SamAccountName veiled_admin -Path "OU=Veiled,$ou" `
+        -AccountPassword $pw -Enabled $true
+}
+Add-ADGroupMember 'Domain Admins' veiled_admin
+dsacls "OU=Veiled,$ou" /D 'ADLAB\adreader:LC' | Out-Null
 
 # SDProp copies the AdminSDHolder ACL onto protected objects now instead of within the hour
 $rootDse = [ADSI]'LDAP://RootDSE'

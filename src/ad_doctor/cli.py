@@ -499,8 +499,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument(
             "--no-ca-registry",
             action="store_true",
-            help="do not read CA settings (ESC6/7/11/16) over the winreg pipe; opening it "
-            "starts RemoteRegistry on the CA if it is stopped, and EDR or Defender for "
+            help="do not read CA settings (ESC6/7/11/16, audit filter) over the winreg pipe; "
+            "opening it starts RemoteRegistry on the CA if it is stopped, and EDR or Defender for "
             "Identity may alert on remote registry access",
         )
         p.add_argument(

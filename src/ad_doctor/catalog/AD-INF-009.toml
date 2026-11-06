@@ -7,7 +7,8 @@ severity_logic = """
 delegation ([AD-DEL-001](AD-DEL-001.md)): coercing the DC to that host hands over the DC's
 TGT. **Medium** otherwise. The pairing is also reported on its own by
 [AD-CHAIN-002](AD-CHAIN-002.md), and the pairing with web enrollment over HTTP by
-[AD-CHAIN-003](AD-CHAIN-003.md).
+[AD-CHAIN-003](AD-CHAIN-003.md); a confirmed spooler raises both to high, and they stay at
+medium without it. AD-CHAIN-003 stays medium either way when GPOs deny outgoing NTLM on every DC.
 """
 mitre = ["T1187"]
 data_sources = ["probe-smb", "ldap"]

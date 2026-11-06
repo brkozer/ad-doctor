@@ -10,7 +10,7 @@ connection per target, nothing is written, and `--no-probes` turns them all off.
 | SMB signing | each DC, port 445 | SMB negotiate, then a session as the scanning account |
 | Print Spooler | each DC | opens the `spoolss` named pipe and closes it |
 | Web enrollment (ESC8) | each enterprise CA, port 80 | one `GET /certsrv/` to read the authentication headers |
-| CA registry (ESC6/7/11/16) | each enterprise CA, port 445 | reads the CA's configuration over `\pipe\winreg` (MS-RRP), `KEY_READ` only; `--no-ca-registry` skips it |
+| CA registry (ESC6/7/11/16, audit filter) | each enterprise CA, port 445 | reads the CA's configuration over `\pipe\winreg` (MS-RRP), `KEY_READ` only; `--no-ca-registry` skips it |
 | SYSVOL | the scanned DC | reads GPO files and scripts (`--no-sysvol` skips it) |
 
 The DC being scanned is reached through the address and ports on the command line; the
@@ -28,7 +28,7 @@ Defender for Identity may alert on.
 
 It is still only a read: nothing in the directory, the CA database or the registry is
 modified. Use `--no-ca-registry` to skip just this probe, or `--no-probes` to skip them all.
-When it is skipped, the CA-side checks (ESC6, ESC7, ESC11, ESC16) simply produce no result
+When it is skipped, the CA-side checks (ESC6, ESC7, ESC11, ESC16, audit filter) simply produce no result
 for that CA.
 
 See [SECURITY.md](https://github.com/brkozer/ad-doctor/blob/main/SECURITY.md) for the

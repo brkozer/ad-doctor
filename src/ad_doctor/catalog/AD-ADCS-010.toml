@@ -4,8 +4,8 @@ summary = "AD CS web enrollment (/certsrv/) accepts NTLM or Negotiate over plain
 severities = ["high"]
 severity_logic = """
 Always **high**: with any coercion primitive the endpoint turns a domain user into a DC.
-When the Print Spooler also runs on a DC, the pair is reported by
-[AD-CHAIN-003](AD-CHAIN-003.md).
+[AD-CHAIN-003](AD-CHAIN-003.md) reports the coercion path as well, graded by what the scan
+knows about the spooler and outgoing NTLM on the DCs.
 """
 mitre = ["T1649", "T1557.001"]
 data_sources = ["probe-http", "ldap"]

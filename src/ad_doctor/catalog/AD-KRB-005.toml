@@ -1,51 +1,93 @@
 id = "AD-KRB-005"
-aliases = ["rc4-only"]
-summary = "Enabled user accounts with an SPN whose msDS-SupportedEncryptionTypes excludes AES, so their service tickets use RC4, the fastest kind to crack."
-severities = ["medium"]
+aliases = ["rc4-only", "rc4-readiness"]
+summary = "Enabled accounts with an SPN that are set to RC4 only, rely on the domain default, or look like they have no AES keys, read from configuration, not from the keys themselves."
+severities = ["low", "medium"]
 severity_logic = """
-Always **medium**. The account is already Kerberoastable ([AD-KRB-003](AD-KRB-003.md),
-which carries the privilege-based severity); this check reports the setting that makes
-cracking its tickets much faster.
+**Medium** when an account has an explicit value without AES, or is suspected of having no
+AES keys. **Low** when the only thing to report is that no value is set: after the 2026 KDC
+change that is usually fine, it just needs a look before a service breaks.
 """
 mitre = ["T1558.003"]
 data_sources = ["ldap"]
-attributes = ["msDS-SupportedEncryptionTypes", "servicePrincipalName", "userAccountControl", "objectClass"]
-related = ["AD-KRB-003", "AD-KRB-004"]
+attributes = [
+    "msDS-SupportedEncryptionTypes",
+    "servicePrincipalName",
+    "userAccountControl",
+    "objectClass",
+    "pwdLastSet",
+    "whenCreated",
+    "whenCreated of the Read-only Domain Controllers group (RID 521)",
+    "msDS-ReplAttributeMetaData (unicodePwd, tier-0 accounts only)",
+]
+related = ["AD-KRB-003", "AD-KRB-004", "AD-ACC-012"]
 since = "0.1.0"
 
 risk = """
-When any domain user requests a service ticket for an SPN (Kerberoasting), the KDC
-encrypts it with the strongest type the service account says it supports, taken from
-`msDS-SupportedEncryptionTypes`. If that value has no AES bit, the ticket is encrypted
-with **RC4-HMAC** (etype 23), whose key is just the NT hash of the password. Offline
-guessing against RC4 tickets is far faster than against AES ones, which go through
-thousands of PBKDF2 iterations per guess.
+A service ticket is encrypted with a key of the service account. With **RC4-HMAC** (etype 23)
+that key is just the NT hash of the password, so offline guessing is far faster than against
+AES tickets, which go through thousands of PBKDF2 iterations per guess.
 
-So the same weak service account password falls in much less time. The cracked password
-then gives the attacker the service account and whatever it can reach.
+CVE-2026-20833 changed how the KDC picks that key. Updates from January 2026 added audit
+events, and later updates make AES-SHA1 (`0x18`) the KDC default for accounts without
+`msDS-SupportedEncryptionTypes`. Microsoft's article gives both April and July 2026 for the
+start of enforcement, and says the rollback value `RC4DefaultDisablementPhase` goes away in
+July 2026. That creates two different problems:
+
+- **Accounts that keep RC4.** An explicit value is honoured, so an account set to RC4 only
+  still gets RC4 tickets, on a fully updated DC too.
+- **Accounts that can break.** An account that relies on the default gets AES only. That
+  fails if the account has no AES keys (events 202/204, and 207/209 for AES-only values) or a
+  client asks for RC4 only (201/203, 206/208).
+
+An account gets AES keys when its password is set on a DC that can make them. A password
+older than the domain's first Server 2008 DC was never turned into AES keys.
 """
 
 detection = """
-From the LDAP snapshot: every **enabled** user account with at least one
-`servicePrincipalName`, whose `msDS-SupportedEncryptionTypes` **is set** and has
-neither AES bit (`0x8` AES128, `0x10` AES256; the check tests `value & 0x18 == 0`).
-Computer accounts, gMSA/sMSA/dMSA and `krbtgt*` accounts are skipped. One finding lists
-the accounts by `sAMAccountName`, for example `svc_web`.
+From the LDAP snapshot, over enabled users and computers with at least one
+`servicePrincipalName`; gMSA, sMSA and dMSA are skipped. Each account gets one line, and the
+line says which of these applies:
 
-Accounts where the attribute is **not set** are not reported: the KDC then falls back to
-its `DefaultDomainSupportedEncTypes` value, which ad-doctor cannot read over LDAP. Those
-accounts may also receive RC4 tickets; Microsoft's RC4 guide below shows how to find
-them from the DC event logs.
+- **No AES in the value:** `msDS-SupportedEncryptionTypes` is set and has neither `0x8` nor
+  `0x10`, for example `0x4`, or Microsoft's `0x24`. The value `0` counts as not set.
+- **No value set:** the domain default applies. Non-DC computers in this state are normal on
+  non-Windows hosts, so they share one line with a count and the first five names. An attribute
+  the account cannot read looks the same as no value.
+- **Suspected no AES keys:** the time the password was last set is more than an hour older
+  than the `whenCreated` of the Read-only Domain Controllers group (RID 521), which the first
+  Server 2008 DC creates. The hour allows for accounts made during domain creation. When
+  `pwdLastSet` was not read, `whenCreated` of the account is used. `pwdLastSet = 0` (must change
+  at next logon) leaves the age unknown, so that account gets no such line. `krbtgt` is judged by this rule alone,
+  even though it is disabled. For tier-0 accounts the older of `pwdLastSet` and the unicodePwd
+  metadata counts ([AD-ACC-012](AD-ACC-012.md)).
+- **DC:** the same rules on domain controller accounts, with `DC` in the line.
+
+**This reads configuration, not keys.** Stored keys are not readable over LDAP, so the third
+line is a heuristic taken from PingCastle's `S-AesNotEnabled` and RC4_AD_Check. A faked
+`pwdLastSet` on a non-tier-0 account hides it. If the group cannot be read, the scan says so
+in a note and this part is skipped.
+
+Not visible: `DefaultDomainSupportedEncTypes` and `RC4DefaultDisablementPhase` in the DCs'
+registry, the DCs' update level, and what clients ask for. A value with AES next to RC4, such
+as the usual `0x1C` on a DC, is not reported.
 """
 
 false_positives = """
-- **A service that genuinely cannot use AES.** Then move it behind a gMSA or upgrade it;
-  until then record it in an [accepted-risk file](../ci.md#accepted-risks) and make the
-  password 25+ random characters, so RC4 cracking stays impractical.
+- **No value set, and everything works.** After the KDC change this is the expected state for
+  an account with AES keys. Windows clients and an account whose password was reset after
+  the 2008 move are fine. The DC events say more than this line can.
+- **Suspected no AES keys, but the keys exist.** The group date is a proxy. A domain restored
+  or rebuilt from an old backup can also shift it.
+- **A service that genuinely cannot use AES.** Microsoft's way to keep RC4 is `0x24` on that
+  account. Record it in an [accepted-risk file](../ci.md#accepted-risks) and make the password
+  25+ random characters, so RC4 cracking stays impractical.
 """
 
 remediation = """
-1. **See the current value** (read-only):
+1. **Look at the DCs first** (read-only): KDCSVC events 201 to 209 in the System log name the
+   account, the client and the available keys.
+
+2. **See the current values** (read-only):
 
     ```powershell
     Get-ADUser -LDAPFilter '(servicePrincipalName=*)' `
@@ -53,24 +95,32 @@ remediation = """
         Select-Object SamAccountName, 'msDS-SupportedEncryptionTypes', PasswordLastSet
     ```
 
-2. **Allow AES** on each account (this sets `0x18`):
+3. **Reset the password** of accounts suspected of having no AES keys, with a long random
+   password, before step 4: an AES-only value without AES keys makes the KDC deny the ticket. For `krbtgt`, rotate twice, waiting for replication in between. Keytabs of
+   non-Windows services must be exported again.
+
+4. **Allow AES** on each account (this sets `0x18`):
 
     ```powershell
     Set-ADUser svc_web -KerberosEncryptionType AES128, AES256 -WhatIf
     ```
 
-3. **Reset the password.** Accounts whose password predates the domain's support for
-   AES have no AES keys until the next reset, and tickets would keep failing or falling
-   back. Use a long random password.
-
-4. **Test the service**, then watch event 4769 on the DCs: the *Ticket Encryption Type*
+5. **Test the service**, then watch event 4769 on the DCs: the *Ticket Encryption Type*
    for this account should be `0x12` (AES256), not `0x17` (RC4).
 
-5. **Better: replace the account with a gMSA**, as described in
+6. **Better: replace the account with a gMSA**, as described in
    [AD-KRB-003](AD-KRB-003.md).
+
+Avoid putting RC4 back in `DefaultDomainSupportedEncTypes`: Microsoft calls that a last resort,
+because it exposes every account in the domain.
 """
 
 verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-KRB-005"
+
+[[references]]
+title = "How to manage Kerberos KDC usage of RC4 for service account ticket issuance changes related to CVE-2026-20833"
+url = "https://support.microsoft.com/en-us/topic/how-to-manage-kerberos-kdc-usage-of-rc4-for-service-account-ticket-issuance-changes-related-to-cve-2026-20833-1ebcda33-720a-4da8-93c1-b0496e1910dc"
+kind = "vendor"
 
 [[references]]
 title = "Detect and remediate RC4 usage in Kerberos"
@@ -86,3 +136,13 @@ kind = "spec"
 title = "Microsoft's guidance to help mitigate Kerberoasting"
 url = "https://www.microsoft.com/en-us/security/blog/2024/10/11/microsofts-guidance-to-help-mitigate-kerberoasting/"
 kind = "vendor"
+
+[[references]]
+title = "RC4-ADAssessment (formerly RC4_AD_Check)"
+url = "https://github.com/BetaHydri/RC4-ADAssessment"
+kind = "tool"
+
+[[references]]
+title = "PingCastle health check rules"
+url = "https://pingcastle.com/PingCastleFiles/ad_hc_rules_list.html"
+kind = "tool"

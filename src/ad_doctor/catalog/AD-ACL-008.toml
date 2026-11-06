@@ -47,8 +47,9 @@ For the sync account and its server it then reports, like [AD-ACL-004](AD-ACL-00
 - an **owner** outside tier 0;
 - an ACE for a principal outside tier 0 and the operator groups (SELF and CREATOR OWNER
   ignored) granting full control, write, WriteDacl, WriteOwner, reset password, or a write
-  to `msDS-KeyCredentialLink`, `msDS-AllowedToActOnBehalfOfOtherIdentity`,
-  `altSecurityIdentities` or `servicePrincipalName`.
+  to `msDS-KeyCredentialLink`, `msDS-AllowedToActOnBehalfOfOtherIdentity` or the
+  User-Account-Restrictions property set that holds it, `altSecurityIdentities` or
+  `servicePrincipalName`.
 
 Objects look like `MSOL_0a1b2c3d4e5f (sync account): helpdesk (reset password)` or
 `ENTRA01$ (sync server): srv_admins (write RBCD)`.

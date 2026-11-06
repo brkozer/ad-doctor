@@ -205,6 +205,12 @@ def render_json(r: Report) -> str:
 
 _CONTROL = re.compile("[\x00-\x1f\x7f\x85\u2028\u2029]")
 _BACKTICKS = re.compile("`+")
+# Not allowed in XML 1.0 even as an entity; directory text can hold them
+_XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+
+
+def _xml_safe(text: str) -> str:
+    return _XML_ILLEGAL.sub(lambda m: f"\\x{ord(m.group(0)):02x}", text)
 
 
 def _flat(text: str) -> str:
@@ -422,7 +428,7 @@ def render_junit(r: Report, ran: list[str] | None = None) -> str:
             lines = [f.detail, *f.objects, f"fix: {f.remediation}"]
             if (e := docs.get(check_id)) is not None:
                 lines.append(f"docs: {e.url}")
-            body = xml_escape("\n".join(lines))
+            body = xml_escape(_xml_safe("\n".join(lines)))
             cases.append(
                 f'  <testcase classname="ad-doctor.{f.category}" name={name}>'
                 f"<failure type={quoteattr(str(f.severity))} message={quoteattr(f.title)}>"
@@ -437,7 +443,7 @@ def render_junit(r: Report, ran: list[str] | None = None) -> str:
             cases.append(f'  <testcase classname="ad-doctor" name={name}/>')
     failures = sum(1 for i in ids if i in by_id)
     skipped = sum(1 for i in ids if i in accepted and i not in by_id)
-    suite = quoteattr(f"ad-doctor {r.snap.domain}")
+    suite = quoteattr(_xml_safe(f"ad-doctor {r.snap.domain}"))
     header = (
         f'<testsuite name={suite} tests="{len(cases)}" failures="{failures}" '
         f'skipped="{skipped}" errors="0">'

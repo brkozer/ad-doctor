@@ -88,9 +88,15 @@ uv run ad-doctor scan dc01.adlab.test --ldaps --port 10636 --smb-port 10445 --ht
   the classic `LDAPServerIntegrity`, and requires SSL on the CertSrv site by default;
   `seed.ps1` relaxes both so the probes have something to find.
 - Server Core 2025 has no Print Spooler and the Print-Server role fails to install on it,
-  so AD-INF-009 and AD-CHAIN-002/003 are covered by unit tests only.
+  so AD-INF-009 and the high grade of AD-CHAIN-002/003 are covered by unit tests only; the
+  lab shows those two chains at medium, with coercion assumed.
 - Seeding restarts NTDS once and asks SDProp to run immediately, so the AdminSDHolder ACL
   is copied onto protected objects before the tests.
+- `veiled_admin` is a Domain Admin in `OU=Veiled`, where `adreader` is denied List Contents.
+  The deny is on the OU because SDProp would take it off the user. Other accounts see it
+  as usual, so AD-PRIV-012 only fires when the scan runs as `adreader`.
+- A new CA has no `AuditFilter` value at all; `seed.ps1` sets it to 3 so that AD-ADCS-018 has
+  something to read. Without that line AD-ADCS-018 reports the value as not set.
 - Exchange and Entra Connect are seeded by their directory footprint only: the Exchange
   security groups with the pre-2019 WriteDacl on the domain head and a member server
   account, and an `MSOL_` sync account with DCSync and the description setup writes. Neither

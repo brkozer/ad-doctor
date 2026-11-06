@@ -1,0 +1,95 @@
+id = "AD-GPO-008"
+aliases = ["onelogon", "vulnerable-channel-allow-list"]
+summary = "A GPO that reaches domain controllers sets VulnerableChannelAllowList, which lets the listed accounts use Netlogon without secure RPC. No finding means no GPO sets it, not that no DC has it."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when the list holds a DC, a trust account, a tier-0 principal, a tier-0 host (CA,
+Entra Connect or Exchange server), a broad group such as Everyone, Authenticated Users or
+Domain Computers, or a group with any of those in it, nesting and foreign security principals
+included: every member of a listed group is exempted.
+**Medium** otherwise, and when the list cannot be parsed: a listed account can be taken over,
+but it is not the domain yet.
+"""
+mitre = ["T1210", "T1556"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "GptTmpl.inf [Registry Values]: MACHINE\\System\\CurrentControlSet\\Services\\Netlogon\\Parameters\\VulnerableChannelAllowList",
+    "gPLink, gPOptions and the GPO's status, version, extensions and DACL",
+]
+related = ["AD-GPO-003", "AD-GPO-001", "AD-CHAIN-002"]
+since = "unreleased"
+
+risk = """
+The Zerologon fix (CVE-2020-1472) makes DCs refuse Netlogon connections without secure RPC. The
+Group Policy setting *Domain controller: Allow vulnerable Netlogon secure channel connections*
+is the exception list for devices that cannot do better. Microsoft says enabling it exposes
+the domain-joined devices and the forest, calls it temporary, and warns against listing
+devices with admin-level rights and trust accounts.
+
+Onelogon (WOOT 2026, Ruhr University Bochum) shows what the exception costs: an unprivileged
+user in the domain can take over an account on the list in about 30 minutes. If that account
+is a DC, the domain is lost. The authors do not expect a fix from Microsoft.
+"""
+
+detection = """
+ad-doctor reads the value from each GPO's `GptTmpl.inf` over SMB, as an ordinary user. It keeps
+a GPO if it would be applied to at least one registered DC, using the same scope logic as the
+local group checks: links, Block Inheritance, Enforced, status, version, client-side extension
+and security filtering. A WMI filter or an assumed site membership is shown as a caveat.
+
+The SDDL is resolved: aliases (`WD`, `DC`, `DD`, ...) and SIDs become names. A Deny ACE removes
+the same SID from the list, and a Deny for Everyone or Authenticated Users empties it, as
+Microsoft describes Deny. Denying a group does not take its members off here, which can only
+over-report. An empty value is not reported. A list that cannot be parsed is reported with
+its raw text.
+
+When more than one GPO sets the value, all of them are listed: precedence is not worked out.
+
+**A clean result only means that no GPO reaching a DC sets it.** A value written straight into
+a DC's registry needs admin rights to read, so a normal user cannot see it. The scan says so
+in a note. A GPO reaching a DC whose template is unreadable, or a run without SYSVOL, gives a
+note as well.
+"""
+
+false_positives = """
+- **A GPO that loses on precedence.** A higher GPO may set another value. The listed one still
+  deserves removing.
+- **The list's Deny entries for groups** are not expanded, see above.
+"""
+
+remediation = """
+1. **Find out what needs the exception.** Events 5827 to 5831 in the DCs' System log show
+   denied and allowed vulnerable connections.
+
+2. **Update or replace those devices** so that they use secure RPC.
+
+3. **Remove the setting** from the GPO: *Computer Configuration > Windows Settings > Security
+   Settings > Local Policies > Security Options > Domain controller: Allow vulnerable Netlogon
+   secure channel connections*, set to *Not Defined*.
+
+4. **Check the DCs themselves** as an administrator, since this scan cannot:
+
+    ```powershell
+    Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Netlogon\\Parameters' `
+        -Name VulnerableChannelAllowList -ErrorAction SilentlyContinue
+    ```
+
+5. **Rotate the passwords** of listed accounts that matter, DCs first.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-008"
+
+[[references]]
+title = "Onelogon: Taking over Active Directory Accounts via Netlogon (WOOT 2026)"
+url = "https://softsec.rub.de/publications/woot2026-onelogon/"
+kind = "research"
+
+[[references]]
+title = "How to manage the changes in Netlogon secure channel connections associated with CVE-2020-1472"
+url = "https://support.microsoft.com/en-us/topic/how-to-manage-the-changes-in-netlogon-secure-channel-connections-associated-with-cve-2020-1472-f7e8cc17-0309-1d6a-304e-5ba73cd1a11e"
+kind = "vendor"
+
+[[references]]
+title = "Onelogon scanner"
+url = "https://github.com/rub-softsec/onelogon"
+kind = "tool"

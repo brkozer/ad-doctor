@@ -1,0 +1,102 @@
+id = "AD-ADCS-017"
+aliases = ["esc17"]
+summary = "A published template with the Server Authentication EKU lets broad groups supply the subject, so any enrollee can get a trusted TLS certificate for any internal host name."
+severities = ["medium"]
+severity_logic = """
+Always **medium**: a Server Authentication certificate cannot log on to the domain by itself
+(on a schema v1 template see [AD-ADCS-008](AD-ADCS-008.md)). The abuse also needs a service
+worth impersonating and a way into its traffic, and such a template is often deliberate.
+"""
+mitre = ["T1649", "T1557"]
+data_sources = ["ldap"]
+attributes = [
+    "msPKI-Certificate-Name-Flag (CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT 0x1)",
+    "pKIExtendedKeyUsage",
+    "msPKI-Certificate-Application-Policy",
+    "msPKI-Enrollment-Flag (CT_FLAG_PEND_ALL_REQUESTS 0x2)",
+    "msPKI-RA-Signature",
+    "nTSecurityDescriptor (template DACL)",
+    "certificateTemplates (on pKIEnrollmentService)",
+]
+related = ["AD-ADCS-001", "AD-ADCS-002", "AD-ADCS-008"]
+since = "unreleased"
+
+risk = """
+ESC17 is ESC1 for servers. The requester names the subject, and the template issues a
+certificate for server authentication, so a low-privileged user can ask for `wsus.corp.example`
+and receive a certificate every domain member trusts.
+
+With it an attacker can pose as an internal TLS service. The public attacks target WSUS over
+HTTPS: relay the client's authentication to LDAP, or serve it a malicious update. Getting the
+client to connect takes something more, for example a DNS record the attacker can write.
+
+Admins can create this by accident when they "fix" ESC1 by swapping Client Authentication for
+Server Authentication, and clones of the built-in WebServer template behave the same way.
+"""
+
+detection = """
+A published template is reported when all of these hold:
+
+- `CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT` is set;
+- its EKUs contain Server Authentication (`1.3.6.1.5.5.7.3.1`);
+- no manager approval and no authorized signatures are required;
+- a broad group (Domain Users, Domain Computers, Authenticated Users, Everyone) can enroll.
+
+Certipy and Locksmith flag the same combination. Two differences:
+
+- Certipy also counts Any Purpose and no-EKU templates. Those, and templates that also have a
+  client authentication EKU, are left to [AD-ADCS-001](AD-ADCS-001.md) and
+  [AD-ADCS-002](AD-ADCS-002.md), so one template is not reported twice for the same reason.
+- Both tools report any enrollee outside their safe list; like the other template checks, this
+  one only looks at broad groups.
+
+A schema v1 template can fire together with [AD-ADCS-008](AD-ADCS-008.md): they describe
+different problems. The object looks like `LabESC15 (enroll: Domain Users)`.
+"""
+
+false_positives = """
+- **A deliberate web server template.** If only a few servers or admins may enroll, it does not
+  fire. If it fires, a broad group can enroll, and that is the part to fix.
+- **No service worth impersonating.** Certipy's wiki says exploitation depends on further
+  prerequisites, and ad-doctor does not check them.
+"""
+
+remediation = """
+1. **Limit enrollment** to the servers or admins that need the template. Do not rely on Domain
+   Computers: any compromised computer account can then enroll.
+
+2. **Require CA certificate manager approval** where the requester must supply the subject:
+
+    ```powershell
+    $t = "CN=LabESC15,CN=Certificate Templates,CN=Public Key Services,CN=Services,$((Get-ADRootDSE).configurationNamingContext)"
+    Set-ADObject $t -Replace @{ 'msPKI-Enrollment-Flag' = 2 } -WhatIf
+    ```
+
+3. **Or clear *Supply in the request*** on the template's Subject Name tab, or unpublish the
+   template if nobody uses it.
+
+4. **Review certificates already issued** from the template for host names that do not belong
+   to the requester.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-017"
+
+[[references]]
+title = "Certipy wiki: privilege escalation (ESC17)"
+url = "https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation"
+kind = "tool"
+
+[[references]]
+title = "Locksmith: Find-ESC17.ps1"
+url = "https://github.com/jakehildreth/Locksmith/blob/main/Private/Find-ESC17.ps1"
+kind = "tool"
+
+[[references]]
+title = "Using AD CS to attack HTTPS-enabled WSUS clients (Digitrace)"
+url = "https://blog.digitrace.de/2026/01/using-adcs-to-attack-https-enabled-wsus-clients/"
+kind = "research"
+
+[[references]]
+title = "WSUS Is SUS: NTLM relay attacks in plain sight (TrustedSec)"
+url = "https://trustedsec.com/blog/wsus-is-sus-ntlm-relay-attacks-in-plain-sight"
+kind = "research"

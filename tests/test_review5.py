@@ -85,7 +85,7 @@ def test_absent_ca_values_are_unknown_not_clean() -> None:
     f = only(_snap(cfg), "AD-ADCS-016")
     assert f.objects == [
         f"{CA_HOST}: InterfaceFlags, security descriptor, EditFlags absent or empty; "
-        "ESC11, ESC7, ESC6 not judged"
+        "ESC11, ESC7, ESC6 not judged",
     ]
     assert "AD-ADCS-016" not in ids(_snap(clean_ca()))
 

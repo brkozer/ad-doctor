@@ -4,7 +4,8 @@
   a coercion vector, running on the DC?).
 - HTTP: ask the CA's web enrollment page for its authentication methods (ESC8).
 - LDAPS: an NTLM bind without channel binding (is channel binding enforced?).
-- MS-RRP over \\pipe\\winreg: read the CA's configuration (ESC6, ESC7, ESC11, ESC16).
+- MS-RRP over \\pipe\\winreg: read the CA's configuration (ESC6, ESC7, ESC11, ESC16, audit
+  filter).
 """
 
 from __future__ import annotations
@@ -251,6 +252,13 @@ def read_ca_config(reg: RegistryReader, host: str, fallback_name: str) -> CaConf
             ca_key = open_key(conf, active)
             flags = value(ca_key, "InterfaceFlags")
             cfg.interface_flags = flags if isinstance(flags, int) else None
+            cfg.audit_checked = True
+            try:
+                audit = value(ca_key, "AuditFilter")
+                cfg.audit_absent = audit is None
+            except (winreg.RegistryError, winreg.RpcFault):
+                audit = None  # AD-ADCS-016 reports it; the other values may still be readable
+            cfg.audit_filter = audit if isinstance(audit, int) else None
             security = value(ca_key, "Security")
             if isinstance(security, bytes) and security:
                 try:

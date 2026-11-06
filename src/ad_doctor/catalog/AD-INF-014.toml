@@ -1,0 +1,112 @@
+id = "AD-INF-014"
+aliases = ["rogue-dc"]
+summary = "A computer carries a domain controller flag in userAccountControl but has no nTDSDSA object in the Configuration partition, so it is a rogue DC candidate."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when an enabled computer has `SERVER_TRUST_ACCOUNT` (0x2000): Windows treats it as a
+writable DC, and it normally has Domain Controllers as its primary group. **Medium** when the
+account is disabled, or only has the read-only DC flag (`PARTIAL_SECRETS_ACCOUNT`).
+"""
+mitre = ["T1207", "T1098"]
+data_sources = ["ldap"]
+attributes = [
+    "userAccountControl (SERVER_TRUST_ACCOUNT 0x2000, PARTIAL_SECRETS_ACCOUNT 0x4000000)",
+    "server objects under CN=Sites (serverReference)",
+    "nTDSDSA objects under CN=Sites",
+    "msDS-KrbTgtLink",
+]
+related = ["AD-PRIV-007", "AD-ACL-001", "AD-DEL-001", "AD-INF-013"]
+since = "unreleased"
+
+risk = """
+A real domain controller has two halves: a computer account in the domain partition and,
+under `CN=Sites` in the Configuration partition, a `server` object with an `nTDSDSA` child
+(*NTDS Settings*). Promotion creates both.
+
+The flag in `userAccountControl` is only an attribute. Anyone who can set
+`SERVER_TRUST_ACCOUNT` on a computer gets an account that looks like a DC and normally has
+Domain Controllers as its primary group. That group holds *Replicating Directory Changes All*
+on the domain head (seen in the lab), so the flag is a quiet way to keep DCSync-level rights.
+
+Without this check, any logic that exempts DCs would exempt that computer too: unconstrained
+delegation, LAPS and primary group findings all skip real DCs.
+"""
+
+detection = """
+ad-doctor reads every `server` and `nTDSDSA` object under `CN=Sites`, follows
+`serverReference` from each `nTDSDSA` parent to its computer, and compares that set with the
+computers whose `userAccountControl` has `SERVER_TRUST_ACCOUNT` or
+`PARTIAL_SECRETS_ACCOUNT`. Read-only DCs have an `nTDSDSA` object as well, so they count as
+registered.
+
+A computer that fails the comparison stays a tier-0 target: control over it is still reported
+by [AD-ACL-004](AD-ACL-004.md) and the attack paths. It loses the DC exemptions:
+[AD-DEL-001](AD-DEL-001.md), [AD-SEC-001](AD-SEC-001.md), [AD-ACC-010](AD-ACC-010.md),
+[AD-PRIV-006](AD-PRIV-006.md) and [AD-PRIV-007](AD-PRIV-007.md) judge it as an ordinary
+computer. The probes do not contact it, so no credentials go to a host that only claims to be
+a DC.
+
+The Microsoft Entra Kerberos object is left out. Microsoft describes it as logical, not a
+physical server, working like a read-only DC, so it never has an `nTDSDSA` object. It is
+matched by structure, not name alone: `CN=AzureADKerberos` directly under `OU=Domain
+Controllers`, `PARTIAL_SECRETS_ACCOUNT` without `SERVER_TRUST_ACCOUNT`, and a set
+`msDS-KrbTgtLink`. That match has been tested on made-up data only; the lab has no such object.
+
+When no `nTDSDSA` object can be read, or one has no readable `serverReference`, nothing is
+marked and the report has a note that the check was not judged: part of the set is missing, and
+a real DC must not be called rogue because of it. A `server` object whose `nTDSDSA` did not come
+back may only be hidden from this account, so its computer is not marked, and a note gives the
+count. An older snapshot has no such data: it gets the same kind of note and
+every flagged computer stays a DC, as before.
+
+The opposite case, an `nTDSDSA` object with no computer behind it, is not reported: in a
+multi-domain forest most of those belong to other domains.
+"""
+
+false_positives = """
+- **A failed promotion or demotion.** The computer object can keep the flag after the
+  Configuration objects are gone. That still needs cleaning up, because the account keeps its
+  rights.
+- **A restored computer object** whose `server` object was not restored.
+- **A DC whose objects sit in another site container** is still found: the whole of `CN=Sites`
+  is searched.
+"""
+
+remediation = """
+1. **Find out who set the flag and when**: the replication metadata shows the last originating
+   change.
+
+    ```powershell
+    Get-ADReplicationAttributeMetadata -Object (Get-ADComputer ROGUE01) -Server dc01 |
+        Where-Object AttributeName -in 'userAccountControl', 'primaryGroupID'
+    ```
+
+2. **If it is not a DC, make it an ordinary computer again** and change its password:
+
+    ```powershell
+    Set-ADComputer ROGUE01 -Replace @{ userAccountControl = 4096; primaryGroupID = 515 } -WhatIf
+    ```
+
+3. **If it is the remains of a DC**, finish the metadata cleanup, then delete the computer
+   object or reset it as above.
+
+4. **Review who can write `userAccountControl` on computers** and hold the right to set the
+   flag: only tier-0 admins should.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-014"
+
+[[references]]
+title = "Purple Knight security indicators (Domain Controller in inconsistent state)"
+url = "https://www.semperis.com/purple-knight/security-indicators/"
+kind = "vendor"
+
+[[references]]
+title = "NTDS-DSA class (Active Directory schema)"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/c-ntdsdsa"
+kind = "spec"
+
+[[references]]
+title = "Configure Microsoft Entra Kerberos trust"
+url = "https://learn.microsoft.com/en-us/entra/identity/authentication/configure-microsoft-entra-kerberos-trust"
+kind = "vendor"

@@ -75,7 +75,8 @@ FIXED_KEYS = {
     for cls in (model.Snapshot, model.Account, model.DomainPolicy, model.CertTemplate,
                 model.DirObject, model.GpoSettings, model.Probes, model.DcProbe, model.CaConfig,
                 model.Gmsa, model.Rodc, model.Trust, model.Gpo, model.GppPassword,
-                model.ScriptSecret, model.GpoLocalGroup, model.GpLink)
+                model.ScriptSecret, model.GpoLocalGroup, model.GpLink,
+                model.UnreadableMember)
     for f in dataclasses.fields(cls)
 } | {"domain", "AdminSDHolder", "sid", "mask", "object_type", "inherited_object_type"}  # fmt: skip
 
@@ -134,6 +135,12 @@ class Redactor:
         for x in data.get("gpo_local_groups", []):
             for name in (x["member_name"], x["group_name"]):
                 words.update([name, *name.split("\\")])
+        for s in data.get("gpo_settings", {}).values():
+            for server in s.get("ntlm_exceptions", []):
+                words.update([server, *server.split(".")])
+        for m in data.get("unreadable_members", []):
+            words.add(m["group"])
+            words.update(_dn_values(m["dn"]))
         words.update(t["name"] for t in data.get("templates", []))
         for t in data.get("trusts", []):
             words.update([t["name"], *t["name"].split(".")])

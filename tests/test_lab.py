@@ -12,15 +12,15 @@ import pytest
 from ad_doctor import gpo_scope, opengraph, paths
 from ad_doctor.checks import run_all, tier0_hosts
 from ad_doctor.collect import Target, collect
-from ad_doctor.model import Snapshot
+from ad_doctor.model import Severity, Snapshot
 
 pytestmark = pytest.mark.lab
 
 # Every misconfiguration seed.ps1 plants. Covered by the unit tests only: AD-KRB-001,
 # AD-ACC-005, AD-ACC-011 and AD-KRB-006 (need time to pass), AD-ACC-007 and AD-INF-006
 # (need a second domain), AD-INF-012 (needs an RODC), AD-ACC-009 (confidential on 2025),
-# AD-INF-008 (DCs require SMB signing), AD-INF-009, AD-CHAIN-002/003 (no spooler on
-# Server Core 2025) and AD-INF-011 (needs a week without backup).
+# AD-INF-008 (DCs require SMB signing), AD-INF-009 and the high grade of AD-CHAIN-002/003
+# (no spooler on Server Core 2025) and AD-INF-011 (needs a week without backup).
 EXPECTED = {
     "AD-KRB-002": {"legacy_app"},
     "AD-KRB-003": {"svc_sql", "svc_web"},
@@ -35,7 +35,7 @@ EXPECTED = {
     "AD-PRIV-002": {"adm_bob", "svc_sql"},
     "AD-POL-001": {"adlab.test"},
     "AD-POL-002": {"adlab.test"},
-    "AD-SEC-001": {"APP01$", "FS01$", "OLD2008$", "PRE2K$"},
+    "AD-SEC-001": {"APP01$", "FS01$", "OLD2008$", "PRE2K$", "ROGUE01$"},
     "AD-ADCS-001": {"LabESC1 (enroll: Domain Users)"},
     "AD-ADCS-002": {"LabESC2 (enroll: Domain Users)"},
     "AD-ADCS-003": {"LabESC3 (enroll: Domain Users)"},
@@ -51,6 +51,10 @@ EXPECTED = {
     "AD-ADCS-013": {"adlab-CA: helpdesk (ManageCertificates)"},
     "AD-ADCS-014": {"adlab-CA"},
     "AD-ADCS-015": {"adlab-CA"},
+    # LabESC15 is a schema v1 server template, so it is both ESC15 and ESC17
+    "AD-ADCS-017": {"LabESC15 (enroll: Domain Users)"},
+    "AD-CHAIN-002": {"APP01$"},
+    "AD-CHAIN-003": {"http://DC01.adlab.test/certsrv/"},
     "AD-CHAIN-004": {"adlab-CA"},
     "AD-GPO-001": {"LabDCPolicy -> Domain Controllers OU (helpdesk)"},
     "AD-ACC-006": {"ex_admin"},
@@ -63,10 +67,18 @@ EXPECTED = {
     "AD-INF-005": {"DC01.adlab.test"},
     "AD-ACC-008": {"notes_user"},
     "AD-ACC-010": {"PRE2K$"},
-    "AD-KRB-005": {"svc_web"},
+    "AD-KRB-005": {
+        "svc_sql: no value set, the domain default applies",
+        "svc_web: no AES in msDS-SupportedEncryptionTypes (0x4)",
+    },
+    "AD-ADCS-018": {
+        "adlab-CA: AuditFilter 3, off: certificate requests, revocation and CRLs, "
+        "CA security settings, archived keys, CA configuration"
+    },
     "AD-DEL-004": {"svc_dc -> ldap/DC01.adlab.test"},
     "AD-ACL-004": {
         "DC01$: kc_writer (write msDS-KeyCredentialLink)",
+        "DC01$: rbcd_writer (write RBCD)",
         "adm_bob: helpdesk (write/WriteDacl/WriteOwner)",
     },
     "AD-ACL-005": {"CN=AdminSDHolder,CN=System,DC=adlab,DC=test"},
@@ -84,7 +96,11 @@ EXPECTED = {
     "AD-INF-007": {"Lab: ou_admin"},
     "AD-INF-010": {"DC01.adlab.test"},
     "AD-PRIV-006": {"Domain Admins: old_admin (disabled)"},
-    "AD-PRIV-007": {"hidden_admin (primary group Domain Admins)"},
+    "AD-PRIV-007": {
+        "hidden_admin (primary group Domain Admins)",
+        "ROGUE01$ (primary group Domain Controllers, but not a DC)",
+    },
+    "AD-INF-014": {"ROGUE01$"},
     "AD-PRIV-008": {"Backup Operators: op_user"},
     "AD-PRIV-009": {"helpdesk"},
     "AD-PRIV-010": {"adm_bob"},
@@ -93,6 +109,7 @@ EXPECTED = {
     "AD-PATH-001": {
         "gpo_linker -[link GPOs]-> Domain Controllers",
         "kc_writer -[write msDS-KeyCredentialLink]-> DC01$",
+        "rbcd_writer -[write RBCD]-> DC01$",
         "LabServerAdmins -[admin to via GPO LabLocalAdmins]-> ENTRA01$ -[hosts sync account]-> "
         "MSOL_0a1b2c3d4e5f -[DCSync]-> adlab.test",
     },
@@ -139,8 +156,8 @@ def snap() -> Snapshot:
     )
     snap = collect(target)
     assert snap.domain == "adlab.test"
-    # an ordinary user cannot see fine-grained password policies; nothing else may fail
-    assert [n for n in snap.notes if "fine-grained" not in n] == []
+    # an ordinary user cannot see fine-grained password policies or dMSAs; nothing else may fail
+    assert [n for n in snap.notes if "fine-grained" not in n and "dMSA" not in n] == []
     return snap
 
 
@@ -152,6 +169,82 @@ def findings(snap: Snapshot) -> dict[str, set[str]]:
 def test_every_dc_probed(snap: Snapshot) -> None:
     assert [d.name.lower() for d in snap.probes.dcs] == ["dc01.adlab.test"]
     assert snap.probes.dcs[0].error is None
+
+
+def test_registered_dcs_and_rogue_candidate(snap: Snapshot) -> None:
+    assert snap.dc_registration_checked
+    assert sorted(a.sam for a in snap.accounts if a.is_dc) == ["DC01$", "ROGUE01$"]
+    assert [a.sam for a in snap.accounts if a.rogue_dc] == ["ROGUE01$"]
+    rogue = next(a for a in snap.accounts if a.rogue_dc)
+    assert rogue.dn.lower() in snap.tier0_dns()
+
+
+def test_plain_user_is_blind_to_dmsas(snap: Snapshot) -> None:
+    # dmsa_lab exists (seed.ps1), and adreader must not see it
+    assert not snap.dmsa_visible
+    assert not any(a.sam.lower().startswith("dmsa_lab") for a in snap.accounts)
+    assert any("no dMSA visible" in n for n in snap.notes)
+    found = next(f for f in run_all(snap) if f.check_id == "AD-INF-007")
+    assert "existing dMSA links were not checked" in found.detail
+
+
+def test_coercion_is_assumed_without_a_spooler(snap: Snapshot) -> None:
+    assert snap.probes.dcs[0].spooler is False  # Server Core 2025 has none
+    grades = {f.check_id: f for f in run_all(snap)}
+    for check_id in ("AD-CHAIN-002", "AD-CHAIN-003"):
+        assert grades[check_id].severity is Severity.MEDIUM
+        assert "assumed possible" in grades[check_id].detail
+
+
+def test_outgoing_ntlm_read_from_the_dc_gpo(snap: Snapshot) -> None:
+    gpo = next(g for g in snap.gpos if g.name == "LabDCPolicy")
+    assert snap.gpo_settings[gpo.guid].restrict_sending_ntlm == 1  # audit, not deny
+    state = gpo_scope.dc_outgoing_ntlm(snap)
+    assert state.denied is False and "DC01" in state.detail
+
+
+def test_plain_user_reads_password_metadata_of_tier0(snap: Snapshot) -> None:
+    assert snap.pwd_metadata_checked
+    by_sam = {a.sam: a for a in snap.accounts}
+    for sam in ("krbtgt", "Administrator", "adm_bob", "DC01$"):
+        assert by_sam[sam].pwd_changed is not None, sam
+    assert by_sam["alice"].pwd_changed is None  # not tier 0: never asked for
+    assert not any("unicodePwd not readable" in n for n in snap.notes)
+
+
+def test_moved_pwd_last_set_is_found(snap: Snapshot) -> None:
+    (f,) = [f for f in run_all(snap) if f.check_id == "AD-ACC-012"]
+    assert f.severity is Severity.MEDIUM
+    assert [f.key(o) for o in f.objects] == ["adm_bob"]
+
+
+def test_cutover_read_from_the_rodc_group(snap: Snapshot) -> None:
+    assert snap.aes_cutover is not None
+
+
+def test_ca_audit_filter_read_over_winreg(snap: Snapshot) -> None:
+    (ca,) = snap.probes.ca_configs
+    assert ca.audit_checked and ca.audit_filter == 3
+    (f,) = [f for f in run_all(snap) if f.check_id == "AD-ADCS-018"]
+    assert f.severity is Severity.MEDIUM
+
+
+def test_netlogon_allow_list_from_the_dc_gpo(snap: Snapshot) -> None:
+    (hit,) = gpo_scope.dc_channel_allow(snap)[0]
+    assert hit.gpo.name == "LabDCPolicy" and hit.dcs == ("DC01$",)
+    (f,) = [f for f in run_all(snap) if f.check_id == "AD-GPO-008"]
+    assert f.severity is Severity.HIGH
+    assert f.objects == ["LabDCPolicy: Domain Controllers, helpdesk on DC01$"]
+
+
+def test_hidden_domain_admin_shows_up_as_a_member_value(snap: Snapshot) -> None:
+    assert snap.tier0_members_checked
+    (member,) = snap.unreadable_members
+    assert member.dn == "CN=veiled_admin,OU=Veiled,OU=Lab,DC=adlab,DC=test"
+    assert member.group == "Domain Admins"
+    assert "veiled_admin" not in {a.sam for a in snap.accounts}
+    (f,) = [f for f in run_all(snap) if f.check_id == "AD-PRIV-012"]
+    assert f.severity is Severity.HIGH
 
 
 def test_opengraph_export_of_the_lab(snap: Snapshot) -> None:
@@ -198,6 +291,8 @@ def test_clean_and_default_objects_not_flagged(findings: dict[str, set[str]]) ->
         "AD-GPO-005",
         "AD-GPO-006",
         "AD-GPO-007",
+        "AD-KRB-005",
+        "AD-ADCS-018",
     )
     for check_id in exact:
         assert findings[check_id] == EXPECTED[check_id]
@@ -232,6 +327,7 @@ def test_gpo_local_group_scope(snap: Snapshot) -> None:
         "Entra Connect server",
         "Exchange server",
         "domain controller",
+        "unregistered DC",
     ]
     g = paths.build(snap)
     ws03 = next(a.sid for a in snap.accounts if a.sam == "WS03$")

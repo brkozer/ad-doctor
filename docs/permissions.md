@@ -9,8 +9,12 @@ the directory.
 - users, computers, groups, OUs, GPOs and trusts
 - AD CS certificate templates, enrollment services and issuance-policy OIDs
 - gMSAs and their password-read permissions
-- the replication metadata of the domain head (for the last backup date)
+- the replication metadata of the domain head (for the last backup date) and of tier-0
+  accounts (for the last real password change)
 - the owners and DACLs of the security-critical objects
+- `server` and `nTDSDSA` objects under `CN=Sites`, and `crossRef` objects under `CN=Partitions`
+- one BASE read of each `member` value of a tier-0 group that no search returned, at most 500
+  per scan
 
 Security descriptors are requested with the SD-flags control for owner and DACL, which
 ordinary users may read, and parsed by a small built-in parser (`sd.py`).

@@ -6,9 +6,9 @@
 Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
-(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 87
+(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 93
 checks for what attackers look for first: roastable accounts, risky delegation,
-exploitable certificate templates and CA settings (ESC1–9, 11, 13–16), DCSync and other takeover rights,
+exploitable certificate templates and CA settings (ESC1–9, 11, 13–17), DCSync and other takeover rights,
 shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync accounts,
 editable GPOs on domain controllers, local admin and remote logon rights handed out by
 Group Policy, passwords in Group Policy and scripts, relay-friendly DCs, weak trusts and
@@ -30,14 +30,16 @@ DC seeded with one instance of every misconfiguration that a single domain can h
   answers "what does this account control if it is phished?".
 - **Plays well with BloodHound.** `ad-doctor export-graph` writes the same graph as a
   BloodHound OpenGraph payload. Principals keep their SIDs, so the edges attach to an
-  existing SharpHound graph of the domain instead of building a second one. Remote logon
-  rights that GPOs grant (RDP, WinRM, DCOM) are exported with `traversable: false`: logon
-  is not control, so the path search does not follow them.
+  existing SharpHound graph of the domain instead of building a second one. It is a generic
+  graph, so BloodHound offers Search and Cypher on it, not Pathfinding; the paths themselves
+  come from ad-doctor. Remote logon rights that GPOs grant (RDP, WinRM, DCOM) are marked
+  `traversable: false`, a property for your own queries: logon is not control, so ad-doctor's
+  path search does not follow them.
 - **Every DC, not just one.** LDAP signing, SMB signing, the spooler and channel binding
   are probed on each domain controller, and findings name the ones that drift from the
   rest; DCs that cannot be reached are reported rather than assumed fine.
 - **Fast on large domains.** 100,000 users, 33,000 computers and 127,000 ACEs load in
-  about 3 s and go through every check, attack paths included, in about 6 s on one 2017
+  about 3 s and go through every check, attack paths included, in about 7 s on one 2017
   Xeon core
   ([benchmark](#performance)).
 - **Compound findings.** `AD-CHAIN-*` raise the alarm when individually medium findings
@@ -84,7 +86,7 @@ against a live DC.
 | | AD-KRB-002 | Accounts without Kerberos pre-authentication (AS-REP roasting) | high |
 | | AD-KRB-003 | User accounts with SPNs (Kerberoasting); high when privileged | medium/high |
 | | AD-KRB-004 | Accounts limited to DES | medium |
-| | AD-KRB-005 | Service accounts without AES keys (RC4 only) | medium |
+| | AD-KRB-005 | RC4 readiness: RC4-only values, reliance on the default, suspected missing AES keys, DC values (reads configuration, not keys) | low/medium |
 | | AD-KRB-006 | Seamless SSO (`AZUREADSSOACC$`) key not rolled over in 30 days | medium |
 | Delegation | AD-DEL-001 | Unconstrained delegation outside domain controllers | high |
 | | AD-DEL-002 | Constrained delegation with protocol transition | medium |
@@ -101,6 +103,7 @@ against a live DC.
 | | AD-ACC-009 | Readable `userPassword` / `unixUserPassword` / `msSFU30Password` | high |
 | | AD-ACC-010 | Pre-created computers whose password is their name | high |
 | | AD-ACC-011 | Privileged passwords older than a year | medium |
+| | AD-ACC-012 | `pwdLastSet` newer than the real password change on tier-0 accounts | medium/high |
 | Privileged access | AD-PRIV-001 | Tier-0 groups with more than 5 members | low |
 | | AD-PRIV-002 | Privileged accounts that can be delegated | medium |
 | | AD-PRIV-003 | Schema Admins or Enterprise Admins not empty | low |
@@ -112,6 +115,7 @@ against a live DC.
 | | AD-PRIV-009 | Cert Publishers members that are not CA servers | medium |
 | | AD-PRIV-010 | Protected Users not used for administrators | info |
 | | AD-PRIV-011 | Entra Connect sync account can DCSync and its server is not protected as tier 0 | medium |
+| | AD-PRIV-012 | Tier-0 group members the scanning account cannot read | high |
 | Policy | AD-POL-001 | Weak default password policy | medium |
 | | AD-POL-002 | `ms-DS-MachineAccountQuota` above 0 | medium |
 | Hardening | AD-SEC-001 | Windows computers without LAPS | medium |
@@ -119,7 +123,7 @@ against a live DC.
 | Infrastructure | AD-INF-001 | Computers on unsupported Windows versions; high for DCs | medium/high |
 | | AD-INF-002 | AD Recycle Bin disabled | low |
 | | AD-INF-003 | Domain functional level below Windows Server 2016 | low |
-| | AD-INF-004 | Unsafe `dsHeuristics` (anonymous LDAP, AdminSDHolder exclusions) | medium/high |
+| | AD-INF-004 | Unsafe `dsHeuristics` (anonymous LDAP or NSPI, AdminSDHolder exclusions, uniqueness, encryption and CVE-2021-42291 checks off, List Object mode) | low/medium/high |
 | | AD-INF-005 | LDAP signing not required (probe, every DC) | medium |
 | | AD-INF-006 | Trusts without SID filtering or with TGT delegation | high |
 | | AD-INF-007 | BadSuccessor: dMSA creation rights outside tier 0 (2025 domains) | high |
@@ -129,6 +133,7 @@ against a live DC.
 | | AD-INF-011 | No backup of the domain partition in 7 days | medium |
 | | AD-INF-012 | RODCs that may cache privileged credentials | medium |
 | | AD-INF-013 | Domain controllers the probes could not reach | low |
+| | AD-INF-014 | Rogue DC candidates: DC flag without an NTDS Settings object | medium/high |
 | Certificate services | AD-ADCS-001 | ESC1: enrollee-supplied subject on an authentication template | high |
 | | AD-ADCS-002 | ESC2: any-purpose or no-EKU template | high |
 | | AD-ADCS-003 | ESC3: enrollment agent template open to broad groups | high |
@@ -145,6 +150,8 @@ against a live DC.
 | | AD-ADCS-014 | ESC11: CA does not require encryption for ICPR requests (registry probe) | high/medium |
 | | AD-ADCS-015 | ESC16: CA leaves out the SID security extension (registry probe) | medium/low |
 | | AD-ADCS-016 | CA configuration could not be read (registry probe) | low |
+| | AD-ADCS-017 | ESC17: enrollee-supplied subject on a server authentication template | medium |
+| | AD-ADCS-018 | CA audit filter not fully on (registry probe) | low/medium |
 | Permissions | AD-ACL-001 | Non-default principals with DCSync rights | high |
 | | AD-ACL-002 | Non-default control over AdminSDHolder | high |
 | | AD-ACL-003 | Non-default control over the domain object | high |
@@ -160,12 +167,13 @@ against a live DC.
 | | AD-GPO-005 | GPOs make broad groups local administrators (Restricted Groups, GPP Local Groups) | high |
 | | AD-GPO-006 | GPOs make non-tier-0 principals admins of tier-0 servers (DCs, CAs, Entra Connect, Exchange) | high |
 | | AD-GPO-007 | GPOs grant RDP, WinRM or DCOM to broad groups (medium) or on tier-0 servers (high) | medium/high |
+| | AD-GPO-008 | Onelogon: GPOs set the Netlogon vulnerable channel allow list on DCs | medium/high |
 | | AD-GPP-001 | Passwords in Group Policy Preferences (MS14-025) | high |
 | | AD-GPP-002 | Credentials in SYSVOL or NETLOGON scripts (values never reproduced) | high |
 | Attack paths | AD-PATH-001 | Control paths from non-tier-0 principals to tier 0 | high |
 | | AD-CHAIN-001 | Relay to RBCD (signing or channel binding off, plus machine account quota) | high |
-| | AD-CHAIN-002 | Coercion plus unconstrained delegation | high |
-| | AD-CHAIN-003 | Coercion plus web enrollment relay (ESC8) | high |
+| | AD-CHAIN-002 | Coercion plus unconstrained delegation (high with a confirmed spooler, else coercion assumed) | high/medium |
+| | AD-CHAIN-003 | Coercion plus web enrollment relay (ESC8); medium when GPOs deny outgoing NTLM on every DC | medium/high |
 | | AD-CHAIN-004 | ESC6 plus ESC16 on the same CA (SID in a SAN under strong mapping) | high/medium |
 
 Template checks fire only for templates published on an enterprise CA that issue without
@@ -240,7 +248,7 @@ ad-doctor export-graph 2026-11.json -o graph.json --paths-only
 | `-k`, `--kerberos` | bind with Kerberos instead of a password |
 | `--no-sysvol`, `--smb-port` | skip or redirect the SMB part |
 | `--no-probes`, `--http-port` | skip every probe (SMB, channel binding, ESC8, CA registry), or move the web enrollment port |
-| `--no-ca-registry` | skip reading CA settings (ESC6/7/11/16) over `\pipe\winreg` |
+| `--no-ca-registry` | skip reading CA settings (ESC6/7/11/16, audit filter) over `\pipe\winreg` |
 | `--single-dc` | probe only the DC being scanned instead of every DC in the domain |
 | `--signing-probe-port PORT` | plain LDAP port for the signing probe; `0` skips it |
 
@@ -264,7 +272,10 @@ LDAP binds, so use `--ldaps`.
 An enabled domain user is enough; no group memberships or delegated rights. ad-doctor
 reads users, computers, groups, OUs, GPOs, trusts, AD CS templates, enrollment services
 and OIDs, gMSAs, the replication metadata of the domain head (for the backup date) and
-the owners and DACLs of the security-critical objects. Security descriptors are requested
+of tier-0 accounts (for the real password change, in the BASE read it does anyway), and
+the owners and DACLs of the security-critical objects, the `server` and `nTDSDSA` objects
+under `CN=Sites` and the `crossRef` objects under `CN=Partitions`. A `member` value of a
+tier-0 group that no search returned gets one BASE read, at most 500 per scan. Security descriptors are requested
 with the SD flags control for owner and DACL, which ordinary users may read, and parsed
 by a small built-in parser (`sd.py`). For Group Policy scope it also reads `gPLink` and
 `gPOptions` on the domain, OUs and sites, the GPOs' status, version and extension
@@ -276,7 +287,8 @@ names and setting values, never a secret.
 Active probes, each one connection per DC: an unsigned NTLM bind on 389 (LDAP signing),
 an NTLM bind on LDAPS without a channel binding token, an SMB negotiate plus an attempt
 to open the `spoolss` pipe, and an unauthenticated `GET /certsrv/` on each CA. On each
-enterprise CA it also reads the CA's own configuration (ESC6, ESC7, ESC11, ESC16) over
+enterprise CA it also reads the CA's own configuration (ESC6, ESC7, ESC11, ESC16, audit
+filter) over
 `\pipe\winreg` (MS-RRP) with a small built-in client: every call is a `KEY_READ`, nothing
 is written. Opening that pipe trigger-starts the RemoteRegistry service on the CA host if
 it is set to start on demand (a visible change of service state), and remote registry
@@ -289,7 +301,7 @@ narrow or turn them off; [SECURITY.md](SECURITY.md) lists every probe.
 ## Limits
 
 - One domain per run; trusts are inspected from this side only.
-- The CA-side checks (ESC6, ESC7, ESC11, ESC16) read the CA's registry over
+- The CA-side checks (ESC6, ESC7, ESC11, ESC16, audit filter) read the CA's registry over
   `\pipe\winreg`, which needs TCP 445 to each CA and credentials; a run that cannot reach a
   CA, where RemoteRegistry is disabled, or where a GPO has removed `CertSvc` from the
   winreg AllowedPaths reports AD-ADCS-016 rather than a clean result. A third-party policy
@@ -336,11 +348,28 @@ narrow or turn them off; [SECURITY.md](SECURITY.md) lists every probe.
   installing either product.
 - Deny ACEs on directory objects are ignored, which can only over-report, never hide a
   finding (the CA's own descriptor is the exception, see above).
+- AD-KRB-005 reads configuration, not keys: stored keys are not visible over LDAP, so
+  "suspected no AES keys" is a heuristic based on the age of the password.
+  `DefaultDomainSupportedEncTypes`, the DCs' update level and what clients ask for are
+  not visible either.
+- `pwdLastSet` is checked against replication metadata for tier 0 only (AD-ACC-012);
+  elsewhere it is taken at face value. Metadata that does not come back is noted.
+- AD-GPO-008 only sees GPOs. No finding means no GPO reaching a DC sets
+  `VulnerableChannelAllowList`: a value in a DC's own registry needs admin rights to read.
+  Precedence between GPOs is not worked out, and a Deny for a group does not take its
+  members off the list.
+- AD-ADCS-018 reads the CA's audit filter only. Whether the Certification Services audit
+  subcategory is on is not read, so 127 does not prove events are written. A CA where
+  auditing was never configured has no such value, and is reported as not set.
+- AD-PRIV-012 compares `member` values with search results. A group whose `member`
+  attribute is denied looks empty, and groups of other domains are not read.
 - An ordinary user cannot read fine-grained password policies; the report says so
   instead of assuming the default policy applies to admins.
 - Some checks cannot be reproduced in a single lab DC and are covered by unit tests only:
-  krbtgt, Seamless SSO and admin password age, SID history, trusts, RODCs, SMB signing
-  off on a DC, the spooler on Server Core 2025 (which ships without it) and
+  krbtgt, Seamless SSO and admin password age, the password and DC parts of AD-KRB-005,
+  SID history, trusts, RODCs, SMB signing
+  off on a DC, the spooler and the high grade of AD-CHAIN-002 and -003 on Server Core 2025
+  (which ships without it), the Entra Kerberos object and
   `unixUserPassword` (confidential on 2025).
 
 ## How it works
@@ -355,7 +384,7 @@ flowchart LR
     P --> S
     S -- "collect -o / redact" --> F[(snapshot.json)]
     F --> A
-    S --> A[checks.py + paths.py<br/>87 pure functions]
+    S --> A[checks.py + paths.py<br/>93 pure functions]
     A --> I[invariants.py<br/>accept.py]
     I --> R[report.py<br/>text, JSON, Markdown,<br/>SARIF, JUnit]
     I --> W[viewer.py<br/>offline HTML viewer]
@@ -441,15 +470,15 @@ JavaScript heap after unlocking and one blast-radius lookup.
 
 | Domain | Graph | HTML file | `ad-doctor view` | Build memory | First screen | Unlock | JS heap |
 |---|---|---|---|---|---|---|---|
-| lab (38 accounts) | full | 215 KB | 0.8 s | 54 MB | 98 ms | 0.82 s | 2.7 MB |
-| 10,000 users | full | 743 KB | 2.3 s | 124 MB | 152 ms | 0.82 s | 6.9 MB |
-| 100,000 users | paths | 1.5 MB | 23 s | 0.64 GB | 207 ms | 0.82 s | 7.9 MB |
-| 250,000 users | paths | 3.5 MB | 62 s | 1.55 GB | 335 ms | 0.82 s | 14.3 MB |
+| lab (40 accounts) | full | 223 KB | 0.8 s | 56 MB | 101 ms | 0.82 s | 2.7 MB |
+| 10,000 users | full | 746 KB | 2.5 s | 145 MB | 148 ms | 0.82 s | 6.8 MB |
+| 100,000 users | paths | 1.5 MB | 25 s | 0.85 GB | 210 ms | 0.82 s | 7.9 MB |
+| 250,000 users | paths | 3.5 MB | 68 s | 2.08 GB | 337 ms | 0.82 s | 14.4 MB |
 
 An account's blast radius on the 10,000-user page, searched in the page and drawn, takes
 under 30 ms. Forcing `--graph full` on the 100,000-user domain gives a 5.9 MB file, a
-603 ms first screen, a 47 MB heap and 78 ms per account; `auto` switches to `paths` well
-before that. Encryption adds under half a second to the build (0.35 s on the lab, 0.3 s
+593 ms first screen, a 47 MB heap and 74 ms per account; `auto` switches to `paths` well
+before that. Encryption adds under half a second to the build (0.32 s on the lab, 0.3 s
 at 10,000 users). Object lists with
 thousands of rows are drawn as they scroll into view.
 
@@ -462,9 +491,9 @@ Xeon Gold 6138 (2017), Python 3.12:
 
 | Domain | Snapshot | Load | All checks + paths | OpenGraph export | Peak memory |
 |---|---|---|---|---|---|
-| 10,000 users, 3,300 computers, 19,000 ACEs | 12 MB | 0.4 s | 0.6 s | 0.7 s | 0.2 GB |
-| 100,000 users, 33,000 computers, 127,000 ACEs | 111 MB | 3.3 s | 5.7 s | 6.3 s | 1.4 GB |
-| 250,000 users, 83,000 computers, 308,000 ACEs | 277 MB | 8.1 s | 15.1 s | 16.8 s | 3.5 GB |
+| 10,000 users, 3,300 computers, 19,000 ACEs | 13 MB | 0.4 s | 0.8 s | 0.6 s | 0.2 GB |
+| 100,000 users, 33,000 computers, 127,000 ACEs | 123 MB | 3.4 s | 7.2 s | 6.1 s | 1.8 GB |
+| 250,000 users, 83,000 computers, 308,000 ACEs | 306 MB | 9.4 s | 18.6 s | 16.9 s | 4.5 GB |
 
 Analysis grows linearly with the size of the domain. Collection time is set by the DC:
 the snapshot comes from a few paged LDAP searches, so it scales with the number of objects

@@ -33,15 +33,16 @@ The attacker does not have to wait for an admin to log on:
 3. The DC's own TGT arrives on the host; with it the attacker runs DCSync and has every
    hash in the domain.
 
-[AD-CHAIN-002](AD-CHAIN-002.md) reports this combination when the scan also finds the
-Print Spooler running on a DC.
+[AD-CHAIN-002](AD-CHAIN-002.md) reports the coercion path as well: at high when the scan finds
+the Print Spooler running on a DC, otherwise at medium with coercion assumed possible.
 """
 
 detection = """
 From the LDAP snapshot: every **enabled** account (computer, user or managed service
 account) with the `TRUSTED_FOR_DELEGATION` bit (`0x80000`) in `userAccountControl`,
-except domain controllers and RODCs (accounts with `SERVER_TRUST_ACCOUNT`, `0x2000`, or
-`PARTIAL_SECRETS_ACCOUNT`, `0x4000000`), which need the flag. One finding lists the
+except registered domain controllers and RODCs (accounts with `SERVER_TRUST_ACCOUNT`,
+`0x2000`, or `PARTIAL_SECRETS_ACCOUNT`, `0x4000000`, and an `nTDSDSA` object when the snapshot
+holds that data; see [AD-INF-014](AD-INF-014.md)), which need the flag. One finding lists the
 accounts by `sAMAccountName`, for example `APP01$`.
 """
 

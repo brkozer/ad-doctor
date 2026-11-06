@@ -9,8 +9,8 @@ Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
 (plus SYSVOL and a few cheap probes of every DC over SMB, LDAP, HTTP and the CA registry)
-and runs 87 checks for what attackers look for first: roastable accounts, risky delegation,
-exploitable certificate templates and CA settings (ESC1-9, 11, 13-16), DCSync and other takeover
+and runs 93 checks for what attackers look for first: roastable accounts, risky delegation,
+exploitable certificate templates and CA settings (ESC1-9, 11, 13-17), DCSync and other takeover
 rights, shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync
 accounts, editable GPOs on domain controllers, local admin and remote logon rights handed
 out by Group Policy, passwords in Group Policy and scripts, relay-friendly DCs, weak trusts
@@ -22,7 +22,7 @@ and legacy configuration. It then finds every control path from a non-admin to t
 <div class="grid cards" markdown>
 
 - **[Quick start](quickstart.md)**: install and run your first scan.
-- **[Check catalog](checks/index.md)**: what each of the 87 checks and 5 invariants looks for and how to fix it.
+- **[Check catalog](checks/index.md)**: what each of the 93 checks and 5 invariants looks for and how to fix it.
 - **[CI integration](ci.md)**: SARIF, JUnit, baselines and accepted risks.
 - **[Permissions needed](permissions.md)**: an enabled domain user, nothing more.
 
@@ -34,7 +34,8 @@ and legacy configuration. It then finds every control path from a non-admin to t
   snapshot and reports the shortest path from every non-tier-0 principal to tier 0;
   `ad-doctor blast-radius` answers "what does this account control if it is phished?".
 - **Plays well with BloodHound.** The [OpenGraph export](bloodhound.md) keeps SIDs, so its
-  edges attach to an existing SharpHound graph instead of building a second one.
+  edges attach to an existing SharpHound graph instead of building a second one. BloodHound
+  offers Search and Cypher on it, not Pathfinding.
 - **Every DC, not just one.** LDAP signing, SMB signing, the spooler and channel binding are
   [probed](probes.md) on each domain controller, and findings name the ones that drift.
 - **Compound findings.** `AD-CHAIN-*` raise the alarm when individually medium findings add

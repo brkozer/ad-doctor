@@ -58,7 +58,7 @@ ad-doctor scan dc01.corp.example --ldaps -k
 | `--only ID ...` | run a subset of checks |
 | `-k`, `--kerberos` | bind with Kerberos instead of a password |
 | `--no-sysvol`, `--no-probes` | skip the SMB part, or every [probe](probes.md) |
-| `--no-ca-registry` | skip reading CA settings (ESC6/7/11/16) over `\pipe\winreg` |
+| `--no-ca-registry` | skip reading CA settings (ESC6/7/11/16, audit filter) over `\pipe\winreg` |
 | `--single-dc` | probe only the DC being scanned |
 
 Parts that cannot run (no AD CS, SYSVOL unreachable) become notes in the report rather than

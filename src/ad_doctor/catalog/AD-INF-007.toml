@@ -29,8 +29,20 @@ that class (or ownership or full control of the OU), can create one, point
 `msDS-ManagedAccountPrecededByLink` at a domain admin or `krbtgt`, and request a ticket as
 that dMSA. The result carries the victim's privileges, and the ticket response also
 holds the victim's keys. This works as soon as one Windows Server 2025 DC exists in the
-domain. Microsoft fixed the abuse in August 2025 (CVE-2025-53779), but the delegated
-creation rights stay a tier-0 path on unpatched DCs and are worth removing in any case.
+domain.
+
+The August 2025 updates (CVE-2025-53779) narrowed this rather than ending it. The write to
+the link still succeeds, but the KDC now refuses a one-sided link and wants a mutual pairing
+that looks like a real migration. Akamai's analysis of the patch shows what is left: someone who
+controls a dMSA and also the target account object still gets the target's privileges and keys,
+which is less than BadSuccessor gave, but with different telemetry from DCSync or shadow
+credentials. So the delegated creation rights stay a tier-0 path on unpatched DCs, and on
+patched DCs they still give control over the OU and a route for abuse after a compromise.
+
+Golden dMSA is a separate route that does not use the link at all. With the forest's KDS root
+key, which takes SYSTEM on a DC or Enterprise Admin rights to dump, Semperis shows that an attacker
+can work out dMSA passwords from a small set of candidates and needs no further privileged access.
+ad-doctor does not check for it.
 """
 
 detection = """
@@ -46,7 +58,11 @@ It then reports, from the security descriptors in the LDAP snapshot:
   on all classes, or `GenericAll`), or that is a takeover right (`WriteDacl`,
   `WriteOwner`, `GenericWrite`, write to all properties), as `<object>: <principal>`;
 - every existing dMSA whose `msDS-ManagedAccountPrecededByLink` already points at a
-  privileged account or `krbtgt`, as `<dMSA>: dMSA superseding <victim>`.
+  privileged account or `krbtgt`, as `<dMSA>: dMSA superseding <victim>`. **An ordinary user
+  normally cannot do this one**: dMSAs grant Authenticated Users no read access by default, so
+  they do not come back at all (checked in the lab with `adreader`). On a 2025 domain, when no
+  dMSA is visible the report has a note saying so, and the finding text repeats it. Run the scan
+  with an account that can read them to cover this part.
 
 Tier 0 here is SYSTEM, Enterprise Domain Controllers, Administrators, the built-in
 Administrator, Domain, Enterprise and Schema Admins, the domain controller and RODC
@@ -58,9 +74,10 @@ In the lab, the finding object is
 false_positives = """
 - **No Windows Server 2025 DC yet.** The check stays silent; it does not report rights
   that would become dangerous after a 2025 DC is added. Re-run it before promoting one.
-- **Patched DCs.** The August 2025 updates close the BadSuccessor abuse itself, and
-  ad-doctor does not check the patch level. The rights reported here still give control
-  over the OU and its objects; review them rather than accepting them wholesale.
+- **Patched DCs.** The August 2025 updates stop the one-sided link, not every abuse of a
+  migration pairing, and ad-doctor does not check the patch level. The rights reported here
+  still give control over the OU and its objects; review them rather than accepting them
+  wholesale.
 """
 
 remediation = """
@@ -112,6 +129,16 @@ kind = "vendor"
 title = "CVE-2025-53779: Windows Kerberos elevation of privilege vulnerability"
 url = "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-53779"
 kind = "vendor"
+
+[[references]]
+title = "BadSuccessor is dead, long live BadSuccessor(?) (Akamai)"
+url = "https://www.akamai.com/blog/security-research/2025/aug/badsuccessor-is-dead-analyzing-badsuccessor-patch"
+kind = "research"
+
+[[references]]
+title = "Golden dMSA: what is dMSA authentication bypass? (Semperis)"
+url = "https://www.semperis.com/blog/golden-dmsa-what-is-dmsa-authentication-bypass/"
+kind = "research"
 
 [[references]]
 title = "When Good Accounts Go Bad: Exploiting Delegated Managed Service Accounts in Active Directory (Unit 42)"

@@ -1,0 +1,80 @@
+id = "AD-ACC-012"
+aliases = ["fake-pwdlastset"]
+summary = "On krbtgt or a tier-0 account, pwdLastSet is later than the time replication metadata gives for the last write of unicodePwd, so the password is older than it looks."
+severities = ["medium", "high"]
+severity_logic = """
+**High** for `krbtgt`: nobody has a routine reason to touch its `pwdLastSet`, and its age is
+what limits forged tickets. **Medium** for other tier-0 accounts, where an administrator
+clearing *User must change password at next logon* has the same effect.
+"""
+mitre = ["T1098"]
+data_sources = ["ldap"]
+attributes = [
+    "pwdLastSet",
+    "msDS-ReplAttributeMetaData (unicodePwd, BASE read of tier-0 accounts)",
+]
+related = ["AD-KRB-001", "AD-ACC-011", "AD-KRB-005"]
+since = "unreleased"
+
+risk = """
+`pwdLastSet` is not a record of a password change. Anyone who may write it can set it to `0`
+and then to `-1`, and the directory stores the current time, while the password stays the
+same. A stolen password or a `krbtgt` key an attacker holds then looks freshly rotated, and
+every age check that trusts the attribute goes quiet.
+
+A real password change writes `unicodePwd`. Replication metadata records when that attribute
+was last written, and that time cannot be moved the same way.
+"""
+
+detection = """
+For `krbtgt`, the built-in Administrator, domain controllers and every account in a tier-0
+group, ad-doctor asks for `msDS-ReplAttributeMetaData` in the BASE read of the account it
+makes anyway. The attribute is constructed, so a subtree search cannot return it, and the
+cost stays limited to tier 0. An ordinary domain user could read it on every account tried in
+the lab, `krbtgt` included.
+
+An enabled account (and `krbtgt`, which is always disabled) is listed when `pwdLastSet` is
+more than **5 seconds** later than the last originating change of `unicodePwd`. That is the
+rounding tolerance PingCastle's `FakePasswordChangeDetector` uses. The other direction is
+not reported: the built-in Administrator of a new forest has a `pwdLastSet` from before the
+promotion.
+
+[AD-KRB-001](AD-KRB-001.md), [AD-ACC-011](AD-ACC-011.md) and the password part of
+[AD-KRB-005](AD-KRB-005.md) use the older of the two times. If the metadata does not come back
+for an account, the scan names it in a note, and its age checks fall back on `pwdLastSet`.
+
+Accounts outside tier 0 are not read, so their `pwdLastSet` is still taken at face value.
+"""
+
+false_positives = """
+- **"User must change password at next logon" ticked and cleared.** Both steps write
+  `pwdLastSet` only. On an admin account it is still worth knowing: the password did not change.
+"""
+
+remediation = """
+1. **Find out when and where it was written** (read-only):
+
+    ```powershell
+    Get-ADReplicationAttributeMetadata -Object (Get-ADUser adm_bob) -Server dc01 `
+        -Properties pwdLastSet, unicodePwd
+    ```
+
+    Event 4738 on that DC, at that time, names the account that made the change.
+
+2. **Really change the password.** For `krbtgt`, rotate it twice, waiting for replication
+   in between.
+
+3. **Treat an unexplained case as an incident:** someone hid the age of a tier-0 password.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-012"
+
+[[references]]
+title = "PingCastle: FakePasswordChangeDetector"
+url = "https://raw.githubusercontent.com/netwrix/pingcastle/master/PingCastleCommon/Healthcheck/FakePasswordChangeDetector.cs"
+kind = "tool"
+
+[[references]]
+title = "ms-DS-Repl-Attribute-Meta-Data attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-msds-replattributemetadata"
+kind = "spec"

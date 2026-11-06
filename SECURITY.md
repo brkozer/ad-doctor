@@ -34,7 +34,7 @@ which `--no-probes` turns off:
 | SMB signing | each DC, port 445 | SMB negotiate, then a session as the scanning account |
 | Print Spooler | each DC | opens the `spoolss` named pipe and closes it |
 | Web enrollment (ESC8) | each enterprise CA, port 80 | one `GET /certsrv/` to read the authentication headers |
-| CA registry (ESC6/7/11/16) | each enterprise CA, port 445 | reads the CA's configuration over `\pipe\winreg` (MS-RRP), `KEY_READ` only; `--no-ca-registry` skips it |
+| CA registry (ESC6/7/11/16, audit filter) | each enterprise CA, port 445 | reads the CA's configuration over `\pipe\winreg` (MS-RRP), `KEY_READ` only; `--no-ca-registry` skips it |
 | SYSVOL | the scanned DC | reads GPO files (security templates, Group Policy Preferences, Restricted Groups and Local Groups) and scripts (`--no-sysvol` skips it) |
 
 `--single-dc` limits the DC probes to the DC being scanned.

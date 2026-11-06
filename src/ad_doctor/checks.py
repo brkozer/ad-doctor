@@ -113,9 +113,10 @@ STALE_AFTER = timedelta(days=90)
 @check("AD-KRB-001", "krbtgt password not rotated recently")
 def krbtgt_age(snap: Snapshot) -> Finding | None:
     krbtgt = next((a for a in snap.accounts if a.sam.lower() == "krbtgt"), None)
-    if krbtgt is None or krbtgt.pwd_last_set is None:
+    changed = krbtgt.password_changed if krbtgt else None
+    if changed is None:
         return None
-    age = snap.collected_at - krbtgt.pwd_last_set
+    age = snap.collected_at - changed
     if age <= KRBTGT_MAX_AGE:
         return None
     return _finding(
@@ -178,7 +179,9 @@ def des_only(snap: Snapshot) -> Finding | None:
 @check("AD-DEL-001", "Unconstrained delegation outside domain controllers")
 def unconstrained_delegation(snap: Snapshot) -> Finding | None:
     hits = [
-        a for a in snap.accounts if a.enabled and a.has(UAC.TRUSTED_FOR_DELEGATION) and not a.is_dc
+        a
+        for a in snap.accounts
+        if a.enabled and a.has(UAC.TRUSTED_FOR_DELEGATION) and not a.is_registered_dc
     ]
     if not hits:
         return None
@@ -384,7 +387,7 @@ def laps_missing(snap: Snapshot) -> Finding | None:
         for a in snap.accounts
         if a.is_computer
         and a.enabled
-        and not a.is_dc
+        and not a.is_registered_dc
         and not a.laps
         # cluster names, NAS and Linux joins have no local admin for LAPS to manage
         and (a.os is None or "windows" in a.os.lower())
@@ -410,6 +413,7 @@ EKU_CLIENT_AUTH = {
 }
 EKU_ANY = "2.5.29.37.0"
 EKU_REQUEST_AGENT = "1.3.6.1.4.1.311.20.2.1"
+EKU_SERVER_AUTH = "1.3.6.1.5.5.7.3.1"
 
 
 def _broad_enroll(snap: Snapshot, t: CertTemplate) -> list[str]:
@@ -885,22 +889,93 @@ def functional_level(snap: Snapshot) -> Finding | None:
     )
 
 
+def _heuristic(h: str, position: int) -> str:
+    """Character at a 1-based position as MS-ADTS numbers them; "" past the end."""
+    return h[position - 1] if len(h) >= position else ""
+
+
+def _bits(h: str, position: int, names: tuple[str, ...]) -> tuple[Severity, str] | None:
+    """A character MS-ADTS reads as a bitwise OR, with bit 0 first in `names`."""
+    value = _heuristic(h, position)
+    if value in ("", "0"):
+        return None
+    if not value.isdecimal():
+        return Severity.LOW, f"character {position} is {value!r}, not a number: not judged"
+    on = [name for bit, name in enumerate(names) if int(value) >> bit & 1]
+    if not on:
+        return Severity.LOW, f"character {position} is {value}, no known bit: not judged"
+    return Severity.MEDIUM, f"{' and '.join(on)} (character {position} = {value})"
+
+
+def _kb5008383(h: str, position: int, what: str) -> tuple[Severity, str] | None:
+    """Characters 28 and 29: 0 or unset audit, 1 enforce, 2 disabled. 3 is new, and MS-ADTS
+    gives it no meaning we can judge; any other value counts as 1."""
+    value = _heuristic(h, position)
+    if value == "2":
+        return Severity.MEDIUM, f"{what} disabled ({position}th character = 2)"
+    if value == "3":
+        return Severity.LOW, f"{what}: {position}th character is 3, not judged"
+    return None
+
+
+def ds_heuristic_issues(h: str) -> list[tuple[Severity, str]]:
+    """(severity, text) per risky character. Positions are 1-based, as in MS-ADTS
+    6.1.1.2.4.1.2; an unset character takes its default, which is never reported."""
+    issues: list[tuple[Severity, str] | None] = []
+    if _heuristic(h, 3) == "1":
+        issues.append(
+            (
+                Severity.LOW,
+                "List Object mode on, so ACLs can hide objects from this scan and its results "
+                "may be incomplete (3rd character = 1)",
+            )
+        )
+    if _heuristic(h, 7) == "2":
+        issues.append((Severity.HIGH, "anonymous LDAP operations allowed (7th character = 2)"))
+    if _heuristic(h, 8) not in ("", "0"):
+        issues.append(
+            (
+                Severity.HIGH,
+                f"anonymous NSPI binds allowed (8th character = {_heuristic(h, 8)})",
+            )
+        )
+    if _heuristic(h, 16) not in ("", "0"):
+        issues.append(
+            (Severity.MEDIUM, "operator groups excluded from AdminSDHolder (16th character)")
+        )
+    issues.append(
+        _bits(
+            h, 21, ("UPN uniqueness check off", "SPN uniqueness check off", "SPN alias check off")
+        )
+    )
+    issues.append(_kb5008383(h, 28, "CVE-2021-42291 checks on LDAP add"))
+    issues.append(_kb5008383(h, 29, "CVE-2021-42291 owner rights checks"))
+    issues.append(
+        _bits(
+            h,
+            31,
+            (
+                "confidential attributes readable without encryption",
+                "confidential attributes writable without encryption on modify",
+                "confidential attributes writable without encryption on add",
+            ),
+        )
+    )
+    return [i for i in issues if i is not None]
+
+
 @check("AD-INF-004", "Unsafe dsHeuristics settings")
 def ds_heuristics(snap: Snapshot) -> Finding | None:
     h = snap.ds_heuristics
-    issues, severity = [], Severity.MEDIUM
-    if len(h) >= 7 and h[6] == "2":
-        issues.append("anonymous LDAP operations allowed (7th character = 2)")
-        severity = Severity.HIGH
-    if len(h) >= 16 and h[15] != "0":
-        issues.append("operator groups excluded from AdminSDHolder (16th character)")
+    issues = ds_heuristic_issues(h)
     if not issues:
         return None
     return _finding(
         "AD-INF-004",
-        severity,
-        "dsHeuristics: " + "; ".join(issues) + ".",
-        "Reset the affected characters of dsHeuristics to 0.",
+        max(severity for severity, _ in issues),
+        "dsHeuristics: " + "; ".join(text for _, text in issues) + ".",
+        "Reset the affected characters of dsHeuristics to 0; set characters 28 and 29 to 1 "
+        "(enforce, KB5008383). Keep the check characters: 10th 1, 20th 2, 30th 3.",
         [h],
     )
 
@@ -1067,26 +1142,82 @@ def weak_template_keys(snap: Snapshot) -> Finding | None:
 AES_TYPES = 0x18
 
 
-@check("AD-KRB-005", "Service accounts without AES Kerberos keys")
-def rc4_only(snap: Snapshot) -> Finding | None:
-    hits = [
-        a
-        for a in _enabled_users(snap)
-        if a.spns
-        and not a.sam.lower().startswith("krbtgt")
-        and a.enc_types is not None
-        and not a.enc_types & AES_TYPES
-    ]
-    if not hits:
+# Accounts the domain creates around the same moment can be a little older than the group
+AES_CUTOVER_MARGIN = timedelta(hours=1)
+OLD_KEYS = "suspected no AES keys (password older than the domain's move to Server 2008)"
+NO_VALUE = "no value set, the domain default applies"
+COMPUTERS_NO_VALUE = "computer(s) with an SPN"
+
+
+def _old_password(snap: Snapshot, a: Account) -> bool:
+    """The password predates AES support, so no AES key was ever derived from it."""
+    changed = a.password_changed
+    if changed is None and not a.pwd_must_change:
+        changed = a.when_created
+    if snap.aes_cutover is None or changed is None:
+        return False
+    return changed + AES_CUTOVER_MARGIN < snap.aes_cutover
+
+
+def _rc4_row(snap: Snapshot, a: Account) -> tuple[Severity, str] | None:
+    """Grade and text for one account; msDS-SupportedEncryptionTypes 0 counts as not set."""
+    if a.sam.lower() == "krbtgt":
+        return (Severity.MEDIUM, OLD_KEYS) if _old_password(snap, a) else None
+    if not a.enabled or a.managed or not a.spns or a.sam.lower().startswith("krbtgt"):
         return None
-    return _finding(
+    dc = "DC, " if a.is_registered_dc else ""
+    if a.enc_types and not a.enc_types & AES_TYPES:
+        grade = Severity.MEDIUM
+        text = f"{dc}no AES in msDS-SupportedEncryptionTypes (0x{a.enc_types:X})"
+    elif not a.enc_types:
+        grade = Severity.LOW
+        text = f"{dc}{NO_VALUE}"
+    else:
+        grade, text = Severity.LOW, ""
+    if _old_password(snap, a):
+        return Severity.MEDIUM, f"{text}; {OLD_KEYS}" if text else OLD_KEYS
+    return (grade, text) if text else None
+
+
+@check("AD-KRB-005", "RC4 readiness: Kerberos encryption settings of service accounts")
+def rc4_readiness(snap: Snapshot) -> Finding | None:
+    rows = [(a, row) for a in snap.accounts if (row := _rc4_row(snap, a))]
+    if not rows:
+        return None
+    # normal on non-Windows hosts: a line each would bury the accounts that matter
+    quiet = sorted(a.sam for a, (_, text) in rows if a.is_computer and text == NO_VALUE)
+    objects = {f"{a.sam}: {text}": a.sam for a, (_, text) in rows if a.sam not in quiet}
+    if quiet:
+        shown = ", ".join(quiet[:SHOWN_HOSTS]) + (", ..." if len(quiet) > SHOWN_HOSTS else "")
+        objects[f"{len(quiet)} {COMPUTERS_NO_VALUE}: {NO_VALUE} ({shown})"] = COMPUTERS_NO_VALUE
+    texts = " ".join(objects)
+    detail = "This reads configuration, not keys: stored keys cannot be seen over LDAP."
+    if "no AES in" in texts:
+        detail += (
+            " An explicit value without AES is honoured after the 2026 RC4 changes, so these "
+            "accounts keep getting RC4 tickets, the fastest kind to crack offline."
+        )
+    if NO_VALUE in texts:
+        detail += (
+            " With no value set the KDC default applies, which is AES only on DCs with the "
+            "2026 updates: services or clients that need RC4 fail there. An attribute this "
+            "account cannot read looks the same as no value."
+        )
+    if OLD_KEYS in texts:
+        detail += (
+            " A password older than the Read-only Domain Controllers group was probably never "
+            "turned into AES keys, so the KDC cannot issue AES tickets for the account."
+        )
+    finding = _finding(
         "AD-KRB-005",
-        Severity.MEDIUM,
-        "msDS-SupportedEncryptionTypes excludes AES, so tickets for these SPNs use RC4, the "
-        "fastest kind to crack offline.",
-        "Enable AES128/AES256 (0x18) on the account and reset its password.",
-        _names(hits),
+        max(grade for _, (grade, _) in rows),
+        detail + " DefaultDomainSupportedEncTypes and the DCs' update level are not visible here.",
+        "Check KDCSVC events 201 to 209 on the DCs. Reset the password of accounts suspected of "
+        "having no AES keys, then set AES128/AES256 (0x18) on service accounts and test them.",
+        sorted(objects),
     )
+    finding.keys = objects
+    return finding
 
 
 SSO_ROLLOVER = timedelta(days=30)
@@ -1284,7 +1415,7 @@ def precreated_computers(snap: Snapshot) -> Finding | None:
         for a in snap.accounts
         if a.is_computer
         and a.enabled
-        and not a.is_dc
+        and not a.is_registered_dc
         and a.has(UAC.PASSWD_NOTREQD)
         and a.logon_count == 0
     ]
@@ -1311,8 +1442,8 @@ def privileged_old_password(snap: Snapshot) -> Finding | None:
         a
         for a in _enabled_users(snap)
         if (a.dn.lower() in privileged or a.rid == 500)
-        and a.pwd_last_set is not None
-        and a.pwd_last_set < cutoff
+        and (changed := a.password_changed) is not None
+        and changed < cutoff
     ]
     if not hits:
         return None
@@ -1323,6 +1454,61 @@ def privileged_old_password(snap: Snapshot) -> Finding | None:
         "Rotate the passwords; consider a PAM tool for tier-0 credentials.",
         _names(hits),
     )
+
+
+# FILETIME rounding, the tolerance PingCastle uses for the same comparison
+FAKE_PWD_TOLERANCE = timedelta(seconds=5)
+
+
+@check("AD-ACC-012", "pwdLastSet newer than the real password change on tier-0 accounts")
+def fake_password_change(snap: Snapshot) -> Finding | None:
+    hits = [
+        a
+        for a in snap.accounts
+        if a.pwd_changed is not None
+        and a.pwd_last_set is not None
+        and a.pwd_last_set - a.pwd_changed > FAKE_PWD_TOLERANCE
+        and (a.enabled or a.sam.lower() == "krbtgt")
+    ]
+    if not hits:
+        return None
+    objects = {
+        f"{a.sam} (pwdLastSet {a.pwd_last_set:%Y-%m-%d}, written {a.pwd_changed:%Y-%m-%d})": a.sam
+        for a in hits
+    }
+    finding = _finding(
+        "AD-ACC-012",
+        Severity.HIGH if any(a.sam.lower() == "krbtgt" for a in hits) else Severity.MEDIUM,
+        "pwdLastSet was moved forward without a password change: replication metadata shows "
+        "unicodePwd was written earlier. Password age checks use the older time. Ticking and "
+        "clearing 'User must change password' does this, and so does hiding an old password.",
+        "Find who wrote pwdLastSet (the metadata names the originating DC and time), then "
+        "really change the password; for krbtgt rotate it twice.",
+        sorted(objects),
+    )
+    finding.keys = objects
+    return finding
+
+
+@check("AD-PRIV-012", "Tier-0 group members this account cannot read")
+def unreadable_members(snap: Snapshot) -> Finding | None:
+    objects = {
+        f"{m.group}: {m.dn} ({m.reason})": f"{m.group}: {m.dn}" for m in snap.unreadable_members
+    }
+    if not objects:
+        return None
+    finding = _finding(
+        "AD-PRIV-012",
+        Severity.HIGH,
+        "These DNs are in the member attribute of a tier-0 group, but the object did not come "
+        "back: every check is blind to it, and a member that is a group hides its own members. "
+        "It is either a hidden admin or a deliberate read restriction.",
+        "Look at the object as a Domain Admin and find who denied read or list rights. If the "
+        "restriction is deliberate, give the scanning account read access or accept the risk.",
+        sorted(objects),
+    )
+    finding.keys = objects
+    return finding
 
 
 @check("AD-PRIV-006", "Disabled, computer or foreign accounts in tier-0 groups")
@@ -1336,7 +1522,7 @@ def odd_privileged_members(snap: Snapshot) -> Finding | None:
                 continue
             if not a.enabled:
                 hits.add(f"{group}: {a.sam} (disabled)")
-            elif a.is_computer and not a.is_dc:
+            elif a.is_computer and not a.is_registered_dc:
                 hits.add(f"{group}: {a.sam} (computer)")
     tier0 = _tier0_group_sids(snap)
     for o in snap.objects:
@@ -1373,7 +1559,7 @@ def hidden_primary_group(snap: Snapshot) -> Finding | None:
             continue
         if not a.is_computer and a.primary_group in PRIVILEGED_PRIMARY_GROUPS:
             hits.append(f"{a.sam} (primary group {PRIVILEGED_PRIMARY_GROUPS[a.primary_group]})")
-        elif not a.is_dc and a.primary_group in DC_PRIMARY_GROUPS:
+        elif not a.is_registered_dc and a.primary_group in DC_PRIMARY_GROUPS:
             hits.append(
                 f"{a.sam} (primary group {DC_PRIMARY_GROUPS[a.primary_group]}, but not a DC)"
             )
@@ -1462,10 +1648,7 @@ def laps_readable(snap: Snapshot) -> Finding | None:
 
 @check("AD-INF-007", "BadSuccessor: dMSA creation rights outside tier 0")
 def bad_successor(snap: Snapshot) -> Finding | None:
-    has_2025 = snap.policy.functional_level >= 10 or any(
-        a.is_dc and a.os and "2025" in a.os for a in snap.accounts
-    )
-    if not has_2025:
+    if not snap.has_2025:
         return None
     tier0 = _tier0_group_sids(snap)
     hits = set()
@@ -1488,13 +1671,21 @@ def bad_successor(snap: Snapshot) -> Finding | None:
             hits.add(f"{a.sam}: dMSA superseding {victim}")
     if not hits:
         return None
+    seen = snap.dmsa_visible is not False or any(a.preceded_by for a in snap.accounts)
+    blind = (
+        ""
+        if seen
+        else " No dMSA was visible to this account, so existing dMSA links were not checked."
+    )
     return _finding(
         "AD-INF-007",
         Severity.HIGH,
         "On Windows Server 2025 domains, anyone who can create a dMSA in a container can make it "
-        "inherit the rights of any account, including domain admins.",
+        "inherit the rights of any account, including domain admins. The August 2025 updates "
+        "stop a one-sided link; a pairing with an account the attacker also controls still "
+        "works." + blind,
         "Remove CreateChild/GenericAll/WriteDacl/WriteOwner for these principals and install "
-        "the August 2025 updates (CVE-2025-53779).",
+        "the August 2025 updates (CVE-2025-53779); the update alone leaves these rights in place.",
         sorted(hits),
     )
 
@@ -1575,6 +1766,90 @@ def gpo_security(snap: Snapshot) -> Finding | None:
         "the privileges to the default holders.",
         sorted(hits),
     )
+
+
+INTERDOMAIN_TRUST_ACCOUNT = 0x800
+
+
+def _group_reach(snap: Snapshot, sid: str) -> set[str]:
+    """Lower-cased DNs inside a group, nesting included; empty for anything else."""
+    groups = {o.dn.lower(): o for o in snap.objects if o.kind == "group"}
+    start = next((o for o in groups.values() if o.sid == sid), None)
+    todo = [start] if start else []
+    seen: set[str] = set()
+    while todo:
+        for member in todo.pop().members:
+            key = member.lower()
+            if key not in seen:
+                seen.add(key)
+                if key in groups:
+                    todo.append(groups[key])
+    return seen
+
+
+FOREIGN_MEMBER = re.compile(r"^cn=(s-1-[0-9-]+),cn=foreignsecurityprincipals,", re.I)
+
+
+def _channel_severe(snap: Snapshot, sid: str) -> bool:
+    """A DC, trust account, tier-0 principal, tier-0 host or broad group on the list exposes
+    the domain, directly or through any member: every member of a listed group is exempted."""
+    accounts = {a.dn.lower(): a for a in snap.accounts}
+    inside = _group_reach(snap, sid) | {a.dn.lower() for a in snap.accounts if a.sid == sid}
+    sids = {sid}
+    known = {o.dn.lower(): o.sid for o in snap.objects} | {k: a.sid for k, a in accounts.items()}
+    for dn in inside:
+        if foreign := FOREIGN_MEMBER.match(dn):
+            sids.add(foreign.group(1).upper())
+        elif dn in known:
+            sids.add(known[dn])
+    if sids & (snap.broad_sids() | snap.tier0_sids()):
+        return True
+    tier0 = snap.tier0_dns() | tier0_hosts(snap).keys()
+    return any(
+        dn in tier0 or (dn in accounts and accounts[dn].uac & INTERDOMAIN_TRUST_ACCOUNT)
+        for dn in inside
+    )
+
+
+def _channel_row(snap: Snapshot, hit: gpo_scope.ChannelAllow) -> tuple[Severity, str] | None:
+    where = f" on {', '.join(hit.dcs)}" + (f" [{'; '.join(hit.caveats)}]" if hit.caveats else "")
+    try:
+        allow, deny = sd.sddl_trustees(hit.sddl, snap.domain_sid, snap.root_sid)
+    except ValueError:
+        return Severity.MEDIUM, f"{hit.gpo.name}: list not understood{where}: {hit.sddl[:200]}"
+    # Microsoft: a Deny entry acts as if the account was never added. Denying a group does
+    # not take its members off here, which can only over-report.
+    if {"S-1-1-0", "S-1-5-11"} & set(deny):
+        return None
+    listed = sorted(set(allow) - set(deny))
+    if not listed:
+        return None
+    severe = any(_channel_severe(snap, sid) for sid in listed)
+    names = ", ".join(sorted(snap.name_of(sid) for sid in listed))
+    return Severity.HIGH if severe else Severity.MEDIUM, f"{hit.gpo.name}: {names}{where}"
+
+
+@check("AD-GPO-008", "GPOs set the Netlogon vulnerable channel allow list on DCs (Onelogon)")
+def netlogon_allow_list(snap: Snapshot) -> Finding | None:
+    hits, _ = gpo_scope.dc_channel_allow(snap)
+    rows = [(h.gpo.name, row) for h in hits if (row := _channel_row(snap, h))]
+    if not rows:
+        return None
+    objects = {text: name for name, (_, text) in rows}
+    finding = _finding(
+        "AD-GPO-008",
+        max(grade for _, (grade, _) in rows),
+        "These GPOs let the listed accounts use Netlogon without secure RPC. Onelogon shows an "
+        "unprivileged domain user can take over a listed account; a listed DC means the domain. "
+        "Which GPO wins is not worked out. This only sees GPOs: a value in a DC's own registry "
+        "is not visible, so no finding means no GPO sets it.",
+        "Remove the setting 'Domain controller: Allow vulnerable Netlogon secure channel "
+        "connections'. Microsoft treats it as temporary and warns against listing admin-level "
+        "devices or trust accounts.",
+        sorted(objects),
+    )
+    finding.keys = objects
+    return finding
 
 
 @check("AD-GPO-004", "GPOs editable outside tier 0")
@@ -1764,31 +2039,62 @@ def chain_relay_rbcd(snap: Snapshot) -> Finding | None:
     )
 
 
+COERCION_ASSUMED = (
+    "Coercion is assumed possible: no DC spooler was confirmed, but PetitPotam (EFSRPC) and "
+    "DFSCoerce (MS-DFSNM) need no spooler, and nothing here proves them blocked."
+)
+
+
+def _spooler_route(dcs: list[str]) -> str:
+    return f"Confirmed coercion route: the Print Spooler runs on {', '.join(dcs)}."
+
+
 @check("AD-CHAIN-002", "Coercion plus unconstrained delegation")
 def chain_coerce_unconstrained(snap: Snapshot) -> Finding | None:
     delegated = unconstrained_delegation(snap)
-    if not _spooler_dcs(snap) or delegated is None:
+    if delegated is None:
         return None
+    spooler = _spooler_dcs(snap)
+    route = _spooler_route(spooler) if spooler else COERCION_ASSUMED
     return _finding(
         "AD-CHAIN-002",
-        Severity.HIGH,
-        "The DC's spooler can be made to authenticate to a host with unconstrained "
-        "delegation, which then holds the DC's TGT: whoever controls that host can DCSync.",
-        "Disable the spooler on DCs and remove unconstrained delegation.",
+        Severity.HIGH if spooler else Severity.MEDIUM,
+        f"{route} A DC made to authenticate to a host with unconstrained delegation leaves its "
+        "TGT there: whoever controls that host can DCSync. This path uses Kerberos, so "
+        "RestrictSendingNTLMTraffic does not stop it.",
+        "Remove unconstrained delegation: that closes this path. Disabling the spooler on DCs "
+        "removes one route only.",
         delegated.objects,
     )
 
 
 @check("AD-CHAIN-003", "Coercion plus web enrollment relay (ESC8)")
 def chain_esc8(snap: Snapshot) -> Finding | None:
-    if not snap.probes.web_enrollment_ntlm or not _spooler_dcs(snap):
+    if not snap.probes.web_enrollment_ntlm:
         return None
+    spooler = _spooler_dcs(snap)
+    ntlm = gpo_scope.dc_outgoing_ntlm(snap)
+    route = _spooler_route(spooler) if spooler else COERCION_ASSUMED
+    if ntlm.denied:
+        severity = Severity.MEDIUM
+        detail = (
+            f"Group Policy blocks the NTLM half of this relay: {ntlm.detail}. Web enrollment "
+            "still offers Windows authentication, and a coerced DC can also be relayed there "
+            "with Kerberos, which that setting does not cover."
+        )
+    else:
+        severity = Severity.HIGH if spooler else Severity.MEDIUM
+        state = f"unknown ({ntlm.detail})" if ntlm.denied is None else ntlm.detail
+        detail = (
+            f"{route} A coerced DC's authentication can be relayed to web enrollment for a DC "
+            f"certificate: domain compromise in two commands. Outgoing NTLM on DCs: {state}."
+        )
     return _finding(
         "AD-CHAIN-003",
-        Severity.HIGH,
-        "Any user can coerce the DC through the spooler and relay its authentication to web "
-        "enrollment for a DC certificate: domain compromise in two commands.",
-        "Fix either side: disable the spooler on DCs, or HTTP/NTLM on web enrollment.",
+        severity,
+        detail,
+        "Fix web enrollment: require HTTPS with Extended Protection for Authentication, or "
+        "remove it. Disabling the spooler on DCs removes one coercion route only.",
         sorted(snap.probes.web_enrollment_ntlm),
     )
 
@@ -1809,6 +2115,34 @@ def unprobed_dcs(snap: Snapshot) -> Finding | None:
         "Run the scan from a host that reaches every DC (TCP 389, 445 and 636), or scan each "
         "DC separately.",
         hits,
+    )
+
+
+@check("AD-INF-014", "Rogue DC candidates: DC flag without an NTDS Settings object")
+def rogue_dcs(snap: Snapshot) -> Finding | None:
+    hits = [a for a in snap.accounts if a.rogue_dc]
+    if not hits:
+        return None
+    live = [a for a in hits if a.enabled and a.has(UAC.SERVER_TRUST_ACCOUNT)]
+    detail = (
+        "These computers carry a domain controller flag in userAccountControl, but no nTDSDSA "
+        "object in the Configuration partition says they are DCs. It can be a leftover of a "
+        "failed promotion or demotion, or a computer turned into a fake DC."
+    )
+    if live:
+        detail += (
+            f" Enabled with SERVER_TRUST_ACCOUNT, so treated as DCs by Windows: "
+            f"{', '.join(_names(live))}. With primary group Domain Controllers such an account "
+            "holds that group's replication rights."
+        )
+    return _finding(
+        "AD-INF-014",
+        Severity.HIGH if live else Severity.MEDIUM,
+        detail,
+        "Find out who set the flag (replication metadata of userAccountControl). If it is not a "
+        "DC, reset userAccountControl and primaryGroupID, then rotate its password; if it is "
+        "a failed DC, finish metadata cleanup.",
+        _names(hits),
     )
 
 
@@ -2211,19 +2545,95 @@ def unread_ca_config(snap: Snapshot) -> Finding | None:
                 f"{c.host}: {', '.join(n for n, _ in absent)} absent or empty; "
                 f"{', '.join(e for _, e in absent)} not judged"
             )
+        if c.audit_checked and c.audit_filter is None and not c.audit_absent:
+            hits.append(f"{c.host}: AuditFilter unreadable; AD-ADCS-018 not judged")
     if not hits:
         return None
     return _finding(
         "AD-ADCS-016",
         Severity.LOW,
-        "ESC6, ESC7, ESC11 and ESC16 depend on CA settings that LDAP cannot show. On these CAs "
-        "some of them could not be read or judged (a read error affects all four; otherwise "
-        "each line names the checks affected), so those checks say nothing about them.",
+        "ESC6, ESC7, ESC11, ESC16 and the CA audit filter depend on CA settings that LDAP "
+        "cannot show. On these CAs some of them could not be read or judged (a read error "
+        "affects all of them; otherwise each line names the checks affected), so those checks "
+        "say nothing about them.",
         "Run the scan from a host that reaches TCP 445 on each CA. RemoteRegistry must not be "
         "disabled, and SYSTEM\\CurrentControlSet\\Services\\CertSvc must stay in the winreg "
         "AllowedPaths list (a GPO that sets 'Network access: Remotely accessible registry "
         "paths and subpaths' replaces the whole list).",
         hits,
+    )
+
+
+# certutil CA\\AuditFilter: Securing PKI, Appendix B
+CA_AUDIT_CATEGORIES = {
+    1: "start and stop",
+    2: "backup and restore",
+    4: "certificate requests",
+    8: "revocation and CRLs",
+    16: "CA security settings",
+    32: "archived keys",
+    64: "CA configuration",
+}
+CA_AUDIT_ALL = 127
+CA_AUDIT_REQUESTS = 4
+
+
+@check("AD-ADCS-018", "CA audit filter not fully on")
+def ca_audit_filter(snap: Snapshot) -> Finding | None:
+    hits = sorted(
+        (
+            c
+            for c in snap.probes.ca_configs
+            if c.audit_absent
+            or (c.audit_filter is not None and c.audit_filter & CA_AUDIT_ALL != CA_AUDIT_ALL)
+        ),
+        key=lambda c: c.name.lower(),
+    )
+    if not hits:
+        return None
+    objects = {}
+    for c in hits:
+        value = c.audit_filter or 0
+        off = [name for bit, name in CA_AUDIT_CATEGORIES.items() if not value & bit]
+        state = "not set" if c.audit_absent else str(value)
+        objects[f"{c.name}: AuditFilter {state}, off: {', '.join(off)}"] = c.name
+    blind = any(not (c.audit_filter or 0) & CA_AUDIT_REQUESTS for c in hits)
+    finding = _finding(
+        "AD-ADCS-018",
+        Severity.MEDIUM if blind else Severity.LOW,
+        "The CA does not audit every category."
+        + (
+            " Without certificate requests in the filter, the requests and issuance of an "
+            "ESC1 or ESC8 intrusion leave no CA audit event."
+            if blind
+            else ""
+        )
+        + " The filter alone proves nothing: the Certification Services audit subcategory must "
+        "also be on, and that is not read here.",
+        "Run certutil -setreg CA\\AuditFilter 127 on the CA, restart CertSvc, and enable the "
+        "Certification Services audit subcategory for success and failure.",
+        sorted(objects),
+    )
+    finding.keys = objects
+    return finding
+
+
+@check("AD-ADCS-017", "ESC17: enrollee-supplied subject on a server authentication template")
+def esc17(snap: Snapshot) -> Finding | None:
+    return _template_finding(
+        snap,
+        "AD-ADCS-017",
+        "Any member of the enrolling group can get a trusted TLS certificate for any host name, "
+        "which allows impersonating an internal server such as WSUS. A Server Authentication "
+        "certificate does not log on to the domain by itself (on a schema v1 template see "
+        "AD-ADCS-008); abuse also needs a way into the traffic, such as a DNS record.",
+        "Clear 'Supply in the request', require manager approval, or limit enrollment to the "
+        "servers and admins that need it.",
+        # anything that also authenticates is AD-ADCS-001 or -002
+        lambda t: (
+            t.enrollee_supplies_subject and EKU_SERVER_AUTH in t.ekus and not _authenticates(t)
+        ),
+        Severity.MEDIUM,
     )
 
 
@@ -2260,6 +2670,7 @@ def tier0_hosts(snap: Snapshot) -> dict[str, str]:
     dcsync = _dcsync_sids(snap)
     sync_servers = {s.dn.lower() for a in _sync_accounts(snap) for s in _sync_servers(snap, a)}
     for role, holds in (
+        ("unregistered DC", lambda a: a.rogue_dc),
         ("domain controller", lambda a: a.is_dc),
         ("CA server", lambda a: a.sam.upper() in ca_hosts),
         ("Entra Connect server", lambda a: a.dn.lower() in sync_servers),

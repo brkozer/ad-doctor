@@ -1,10 +1,15 @@
 id = "AD-CHAIN-003"
 aliases = ["esc8-chain"]
-summary = "A DC runs the Print Spooler and a CA's web enrollment accepts NTLM over HTTP, so any user can relay the DC's authentication into a DC certificate (ESC8)."
-severities = ["high"]
+summary = "A CA's web enrollment accepts NTLM over HTTP and DC coercion is confirmed through the Print Spooler or assumed, so a user can relay a DC's authentication into a DC certificate (ESC8)."
+severities = ["medium", "high"]
 severity_logic = """
-Always **high**: with both halves present, a domain user gets a certificate for a domain
-controller and from it DCSync, with public tools and no other foothold.
+**High** when a DC answered the spooler probe: a domain user gets a certificate for a domain
+controller and from it DCSync, with public tools and no other foothold. **Medium** when no
+spooler was confirmed: coercion is then assumed possible, not shown. Also **medium**, whatever
+the spooler state, when a GPO that reaches every DC denies outgoing NTLM: the NTLM relay is
+blocked, but the same coerced DC can be relayed to `/certsrv/` with Kerberos. That takes more
+work (a crafted DNS record), and it needs Negotiate or Kerberos on the site; the probe does not
+record which scheme was offered, so an NTLM-only site is graded the same.
 """
 mitre = ["T1187", "T1557.001", "T1649"]
 data_sources = ["derived"]
@@ -15,8 +20,9 @@ since = "0.1.0"
 risk = """
 The ESC8 attack from *Certified Pre-Owned*:
 
-1. Any domain user makes a DC authenticate to their host through the Print Spooler (or
-   EFSRPC, PetitPotam).
+1. Any domain user makes a DC authenticate to their host through the Print Spooler, EFSRPC
+   (PetitPotam) or another coercion method. Microsoft's post of 2026-10-30 describes a real
+   intrusion that used PetitPotam with ESC8.
 2. They relay that NTLM authentication to the CA's web enrollment page (`/certsrv/`) over
    plain HTTP, which has no signing or channel binding to stop a relay
    ([AD-ADCS-010](AD-ADCS-010.md)).
@@ -26,36 +32,56 @@ The ESC8 attack from *Certified Pre-Owned*:
 
 The whole chain runs in minutes and leaves the attacker with a certificate that stays
 valid after password changes.
+
+The policy *Restrict NTLM: Outgoing NTLM traffic to remote servers* set to *Deny all*
+(`RestrictSendingNTLMTraffic` = 2) on the DCs stops step 2 for NTLM: the coerced DC no longer
+sends NTLM to the attacker. It does not stop a Kerberos relay of the same coerced connection
+to web enrollment (Synacktiv showed this with a crafted DNS record), and it says nothing about
+the CA, so the endpoint stays reported as [AD-ADCS-010](AD-ADCS-010.md).
 """
 
 detection = """
-A compound finding. It fires when **both** hold:
+A compound finding. It fires when the HTTP probe found web enrollment on a CA host:
+`GET /certsrv/` over plain HTTP returned 401 with `NTLM` or `Negotiate` in `WWW-Authenticate`
+([AD-ADCS-010](AD-ADCS-010.md)). The grade then depends on two more facts:
 
-- at least one DC answered the SMB probe by opening the `spoolss` named pipe (the Print
-  Spooler is running, [AD-INF-009](AD-INF-009.md)), and
-- the HTTP probe found web enrollment on a CA host: `GET /certsrv/` over plain HTTP
-  returned 401 with `NTLM` or `Negotiate` in `WWW-Authenticate`
-  ([AD-ADCS-010](AD-ADCS-010.md)).
+- whether a DC opened the `spoolss` named pipe in the SMB probe (the Print Spooler is running,
+  [AD-INF-009](AD-INF-009.md)). The spooler is the only coercion method ad-doctor tests, so
+  without it the text says coercion is assumed possible;
+- whether `MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\MSV1_0\\RestrictSendingNTLMTraffic`
+  is 2 in the `GptTmpl.inf` of a GPO that applies to **every** DC, using the same link, Block
+  Inheritance, Enforced and security filter logic as the local group checks.
+
+The second one is reported as one of three states, and only the first lowers the grade:
+
+- **denied**: every enabled DC gets the value from a GPO with no doubt about its scope;
+- **not denied**: some DC has no GPO that sets it. A value set by hand in a DC's registry cannot
+  be seen, so this means "no GPO sets it", not "NTLM is allowed";
+- **unknown**: SYSVOL was not read, the snapshot is older, the security settings of a GPO that
+  reaches the DC could not be read (even when another GPO denies NTLM), GPOs disagree (precedence
+  between GPOs is not worked out), the GPO has a WMI filter or an unreadable security filter, or
+  a GPO reaching the DC lists exceptions in `ClientAllowedNTLMServers`: the detail then says
+  "denied with exceptions" and names them, because an exception can cover the relay host.
+
+A GPO with no `GptTmpl.inf` counts as read and empty. One limit can make **denied** too kind: a
+deny ACE that excludes a DC from the GPO is not seen, because deny ACEs are not parsed.
 
 The objects are the web enrollment URLs, for example `http://ca01.corp.example/certsrv/`.
 The HTTP probe uses `--http-port` (80 by default, 0 skips it); both probes are skipped with
 `--no-probes`. HTTPS endpoints without Extended Protection are not probed, so this check
 can miss them.
-
-The spooler is the only coercion method ad-doctor checks. A DC with the spooler off can
-still often be coerced through EFSRPC, so [AD-ADCS-010](AD-ADCS-010.md) on its own remains
-serious.
 """
 
 false_positives = """
 - **The CA's web enrollment requires HTTPS with Extended Protection** on another port while
   plain HTTP still answers: the HTTP endpoint is still relayable. Remove it.
-- There is no benign reason to keep both halves; fix at least one.
+- **Coercion really is blocked** by RPC filters or a firewall. ad-doctor cannot see that, so
+  the finding stays at medium. Fixing web enrollment clears it.
 """
 
 remediation = """
-Fixing **either** side breaks this chain; fix the CA side first, because it is also
-reachable without the spooler:
+Fix the CA side: that is what closes the chain, because coercion has more routes than the
+spooler:
 
 1. **Remove web enrollment** if nobody uses it:
 
@@ -69,7 +95,10 @@ reachable without the spooler:
    HTTP binding.
 
 3. **Stop and disable the Print Spooler on every DC**, preferably with the Default Domain
-   Controllers Policy (*System Services > Print Spooler = Disabled*).
+   Controllers Policy (*System Services > Print Spooler = Disabled*). This removes one route.
+
+   If you can test it first, also set *Network security: Restrict NTLM: Outgoing NTLM traffic to
+   remote servers* to *Deny all* in a GPO for the DCs.
 
 4. **Look for certificates already issued to DCs from unexpected requesters**, and revoke
    them:
@@ -95,6 +124,21 @@ kind = "vendor"
 title = "ADV210003: Mitigating NTLM relay attacks on AD CS"
 url = "https://msrc.microsoft.com/update-guide/vulnerability/ADV210003"
 kind = "vendor"
+
+[[references]]
+title = "Help desk impersonation and AD CS abuse: investigating ESC1 and ESC8 intrusion paths (Microsoft)"
+url = "https://www.microsoft.com/en-us/security/blog/2026/10/30/help-desk-impersonation-ad-cs-abuse-investigating-esc1-esc8-intrusion-paths/"
+kind = "vendor"
+
+[[references]]
+title = "Relaying Kerberos over SMB using krbrelayx (Synacktiv)"
+url = "https://www.synacktiv.com/publications/relaying-kerberos-over-smb-using-krbrelayx"
+kind = "research"
+
+[[references]]
+title = "PingCastle rule A-DC-Coerce"
+url = "https://github.com/netwrix/pingcastle/blob/master/PingCastleCommon/Healthcheck/Rules/HeatlcheckRuleAnomalyDCCoerce.cs"
+kind = "tool"
 
 [[references]]
 title = "PetitPotam (topotam)"

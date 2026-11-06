@@ -24,7 +24,7 @@ change one of them can become it:
 |---|---|
 | Reset password (user) | Set a new password and log on as the admin |
 | Write `msDS-KeyCredentialLink` (user, computer) | Shadow credentials: add a key, get a TGT with PKINIT |
-| Write `msDS-AllowedToActOnBehalfOfOtherIdentity` (computer) | RBCD: impersonate a domain admin to the DC |
+| Write `msDS-AllowedToActOnBehalfOfOtherIdentity`, or the User-Account-Restrictions property set that holds it (computer) | RBCD: impersonate a domain admin to the DC |
 | Write `member` or add self (group) | Join Domain Admins or another tier-0 group |
 | Write `altSecurityIdentities` (user, computer) | ESC14: map an attacker's certificate to the account |
 | Write `servicePrincipalName` (user) | Targeted Kerberoasting of the admin |

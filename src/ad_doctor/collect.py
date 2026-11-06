@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -11,6 +12,7 @@ from typing import Any
 import ldap3
 from ldap3.core.exceptions import (
     LDAPException,
+    LDAPInsufficientAccessRightsResult,
     LDAPNoSuchObjectResult,
     LDAPOperationResult,
 )
@@ -18,6 +20,8 @@ from ldap3.protocol.microsoft import security_descriptor_control
 
 from . import gpo_scope, probes, sd, sysvol
 from .model import (
+    TIER0_RIDS,
+    UAC,
     Account,
     CaConfig,
     CertTemplate,
@@ -33,6 +37,7 @@ from .model import (
     Rodc,
     Snapshot,
     Trust,
+    UnreadableMember,
     exchange_members,
     filetime_to_datetime,
     well_known_sid,
@@ -51,6 +56,13 @@ PRIVILEGED_BUILTIN = {
     "Backup Operators": "S-1-5-32-551",
 }
 PROTECTED_USERS_RID = 525
+RODC_GROUP_RID = 521
+REPL_METADATA = "msDS-ReplAttributeMetaData"
+# direct reads of member values that no search returned; each one is a BASE search
+MAX_MEMBER_READS = 500
+NOT_RETURNED = "not returned: hidden, or this account has no right to see it"
+NO_ATTRIBUTES = "returned without attributes: this account cannot read it"
+SEARCH_MISSED = "readable by its DN but missing from the searches"
 PRE2K_SID = "S-1-5-32-554"
 DACL_ONLY = security_descriptor_control(sdflags=0x04)  # readable without admin rights
 OWNER_AND_DACL = security_descriptor_control(sdflags=0x05)
@@ -78,10 +90,13 @@ SYNC_DESCRIPTION = re.compile(r"running on computer ([A-Za-z0-9._-]+)", re.IGNOR
 SYNC_SAM = re.compile(r"^(?:MSOL_[0-9a-f]{12}|Sync_(?P<host>.+)_[0-9a-f]{12})$", re.IGNORECASE)
 PASSWORD_ATTRIBUTES = ("userPassword", "unixUserPassword", "msSFU30Password", "orclCommonAttribute")
 LAPS_PASSWORD_ATTRIBUTES = ("ms-Mcs-AdmPwd", "msLAPS-Password", "msLAPS-EncryptedPassword")
+DMSA_CLASS = "msds-delegatedmanagedserviceaccount"
+# Microsoft Entra Kerberos writes this fixed object: a logical RODC with its own krbtgt
+ENTRA_KERBEROS_DN = re.compile(r"^cn=azureadkerberos,ou=domain controllers,", re.IGNORECASE)
 MANAGED_CLASSES = {
     "msds-groupmanagedserviceaccount",
     "msds-managedserviceaccount",
-    "msds-delegatedmanagedserviceaccount",
+    DMSA_CLASS,
 }
 
 ACCOUNT_ATTRS = [
@@ -109,6 +124,7 @@ ACCOUNT_ATTRS = [
     "description",
     "info",
     "msDS-ManagedAccountPrecededByLink",
+    "msDS-KrbTgtLink",
     "msDS-RevealOnDemandGroup",
     "msDS-NeverRevealGroup",
     *PASSWORD_ATTRIBUTES,
@@ -179,6 +195,8 @@ class Collector:
         self.rodc_policies: list[tuple[Account, list[str], list[str]]] = []
         self.domain_dn = ""
         self.scanned_ldap_signing: bool | None = None
+        self.dmsa_seen = False
+        self.pwd_unread: list[str] = []
 
     def search(
         self,
@@ -285,6 +303,10 @@ class Collector:
             + self.search(domain_dn, "(objectClass=computer)", ACCOUNT_ATTRS)
         ]
 
+        registered = self._registered_dcs(config_dn)
+        if registered is not None:
+            mark_rogue_dcs(accounts, registered)
+
         privileged = {}
         for name, rid in PRIVILEGED_RIDS.items():
             privileged[name] = self._members(domain_dn, f"(objectSid={domain_sid}-{rid})")
@@ -330,6 +352,7 @@ class Collector:
         get_all = {a.sid for a in domain_aces if a.extended_right(sd.DS_REPL_GET_CHANGES_ALL)}
         priv_dns |= {a.dn.lower() for a in accounts if a.sid and a.sid in get & get_all}
         objects = self._objects(domain_dn, accounts, priv_dns)
+        unreadable = self._unreadable_members(domain_dn, config_dn, domain_sid, accounts, objects)
         gpos = self._gpos(domain_dn, config_dn, h, objects)
         dc_sites, site_count = self._dc_sites(config_dn)
         ca_configs = self._ca_configs(dc_dns_host)
@@ -349,6 +372,7 @@ class Collector:
         )
         trustees |= {x.member_sid for x in local_groups if x.member_sid.startswith("S-1-5-21-")}
         trustees |= {x.group_sid for x in local_groups if x.group_sid.startswith("S-1-5-21-")}
+        trustees |= _channel_trustees(gpo_settings, domain_sid, root_sid)
         # one value per attribute; dSASignature changes on every backup
         metadata = "".join(_str(h.get("msds-replattributemetadata", [])))
         snap = Snapshot(
@@ -383,8 +407,16 @@ class Collector:
             last_backup=_last_backup(metadata),
             backup_checked="dSASignature" in metadata,
             psos_visible=self._psos_visible(domain_dn),
+            dmsa_visible=self.dmsa_seen,
             gpo_local_groups=local_groups,
             local_groups_collected=sysvol_result.scanned,
+            ntlm_policy_collected=sysvol_result.scanned,
+            dc_registration_checked=registered is not None,
+            channel_policy_collected=sysvol_result.scanned,
+            aes_cutover=self._aes_cutover(domain_dn, domain_sid),
+            pwd_metadata_checked=True,
+            unreadable_members=unreadable or [],
+            tier0_members_checked=unreadable is not None,
             dc_sites=dc_sites,
             site_count=site_count,
             notes=self.notes,
@@ -392,6 +424,20 @@ class Collector:
         snap.ldap_signing_required = self.scanned_ldap_signing
         snap.probes.ca_configs = ca_configs
         snap.notes += gpo_scope.resolve(snap).notes
+        snap.notes += _channel_notes(snap)
+        if self.pwd_unread:
+            shown = ", ".join(sorted(self.pwd_unread)[:5])
+            more = len(self.pwd_unread) - 5
+            snap.notes.append(
+                f"replication metadata of unicodePwd not readable for {shown}"
+                + (f" (+{more} more)" if more > 0 else "")
+                + ": AD-ACC-012 not judged for them, and their age checks trust pwdLastSet"
+            )
+        if snap.has_2025 and not snap.dmsa_visible:
+            snap.notes.append(
+                "no dMSA visible (none exist, or this account cannot read them; by default "
+                "ordinary users cannot): AD-INF-007 did not check existing dMSA links"
+            )
         return snap
 
     # --- DACLs and objects -----------------------------------------------------------
@@ -462,8 +508,136 @@ class Collector:
         ]
         for a in sensitive:
             kind = "computer" if a.is_computer else "user"
-            objects += [self._object(e, kind) for e in self._base(a.dn, attrs)]
+            # the attribute is constructed, so it only comes back from a BASE read: this
+            # read happens anyway, which keeps the cost to tier 0 and to no extra search
+            tier0 = a.dn.lower() in priv_dns or a.is_dc or a.sam.lower() == "krbtgt" or a.rid == 500
+            entries = self._base(a.dn, [*attrs, REPL_METADATA] if tier0 else attrs)
+            objects += [self._object(e, kind) for e in entries]
+            if tier0:
+                a.pwd_changed = _pwd_changed(entries)
+                if a.pwd_changed is None:
+                    self.pwd_unread.append(a.sam)
         return objects
+
+    def _unreadable_members(
+        self,
+        domain_dn: str,
+        config_dn: str,
+        domain_sid: str,
+        accounts: list[Account],
+        objects: list[DirObject],
+    ) -> list[UnreadableMember] | None:
+        """Member values of tier-0 groups, nesting included, that no search returned.
+
+        Skipped, because a search of this domain cannot return them: foreign security
+        principals, and DNs in other naming contexts. Values that turn out to be readable
+        objects of another class (a contact) are not reported. None when it cannot be told.
+        """
+        groups = {o.dn.lower(): o for o in objects if o.kind == "group"}
+        seeds = {f"{domain_sid}-{rid}" for rid in PRIVILEGED_RIDS.values()}
+        seeds |= {f"{domain_sid}-{rid}" for rid in TIER0_RIDS} | set(PRIVILEGED_BUILTIN.values())
+        todo = [g for g in groups.values() if g.sid in seeds]
+        if not {g.sid for g in todo} >= {f"{domain_sid}-512", "S-1-5-32-544"}:
+            self.notes.append(
+                "Domain Admins or Administrators not readable: AD-PRIV-012 not judged"
+            )
+            return None
+        for g in todo:
+            if g.sid in (f"{domain_sid}-512", "S-1-5-32-544") and not g.members:
+                self.notes.append(
+                    f"{g.name}: member attribute empty or unreadable, so AD-PRIV-012 cannot "
+                    "see hidden members there"
+                )
+        seen = {g.dn.lower() for g in todo}
+        known = {a.dn.lower() for a in accounts} | {o.dn.lower() for o in objects}
+        missing: dict[str, tuple[str, str]] = {}
+        while todo:
+            group = todo.pop()
+            for member in group.members:
+                key = member.lower()
+                if key in groups and key not in seen:
+                    seen.add(key)
+                    todo.append(groups[key])
+                elif key not in known:
+                    missing.setdefault(key, (member, group.name))
+        fsp = f",cn=foreignsecurityprincipals,{domain_dn.lower()}"
+        head = "," + domain_dn.lower()
+        missing = {k: v for k, v in missing.items() if k.endswith(head) and not k.endswith(fsp)}
+        if not missing:
+            return []
+        contexts = self._other_contexts(domain_dn, config_dn)
+        if contexts is None:
+            return None
+        missing = {
+            k: v for k, v in missing.items() if not any(k.endswith("," + c) for c in contexts)
+        }
+        if len(missing) > MAX_MEMBER_READS:
+            self.notes.append(
+                f"{len(missing)} members of tier-0 groups did not come back from the searches; "
+                f"AD-PRIV-012 read only the first {MAX_MEMBER_READS}"
+            )
+        sids = {a.sid for a in accounts} | {o.sid for o in objects}
+        out = []
+        failed: Counter[tuple[str, str]] = Counter()
+        for key in sorted(missing)[:MAX_MEMBER_READS]:
+            dn, group_name = missing[key]
+            try:
+                reason = self._member_problem(dn, sids)
+            except LDAPOperationResult as exc:
+                failed[group_name, str(exc.description)] += 1
+                continue
+            if reason:
+                out.append(UnreadableMember(dn, group_name, reason))
+        # counts only: a DN here would survive redaction, unlike one in unreadable_members
+        for (group_name, why), count in sorted(failed.items()):
+            self.notes.append(
+                f"{count} member value(s) of {group_name} not judged by AD-PRIV-012: {why}"
+            )
+        return out
+
+    def _other_contexts(self, domain_dn: str, config_dn: str) -> list[str] | None:
+        """Lower-cased naming contexts below this domain (child domains, DNS partitions);
+        a DN in them is out of this scan's reach. None when the crossRefs were not readable,
+        because reading such a DN here could follow a referral to another host."""
+        entries = self.optional(
+            f"CN=Partitions,{config_dn}", "(objectClass=crossRef)", ["nCName"], scope=ldap3.LEVEL
+        )
+        names = [_first(e, "nCName").lower() for e in entries]
+        if domain_dn.lower() not in names:
+            self.notes.append("naming contexts not readable: AD-PRIV-012 not judged")
+            return None
+        return [n for n in names if n != domain_dn.lower()]
+
+    def _member_problem(self, dn: str, sids: set[str]) -> str | None:
+        """Why a member value is a blind spot; None when it is a readable object that the
+        searches had no reason to return."""
+        try:
+            hit = self.search(dn, "(objectClass=*)", ["objectClass", "objectSid"], ldap3.BASE)
+        except (LDAPNoSuchObjectResult, LDAPInsufficientAccessRightsResult):
+            return NOT_RETURNED
+        if not hit:
+            return NOT_RETURNED
+        classes = {c.lower() for c in _str(hit[0].get("objectclass", []))}
+        if not classes:
+            return NO_ATTRIBUTES
+        raw_sid = hit[0].get("objectsid")
+        if raw_sid and sid_to_str(raw_sid[0]) in sids:
+            return None  # same object under another spelling of its DN
+        return SEARCH_MISSED if classes & {"user", "computer", "group"} else None
+
+    def _aes_cutover(self, domain_dn: str, domain_sid: str) -> datetime | None:
+        """The first Server 2008 DC created Read-only Domain Controllers; passwords from
+        before it were never turned into AES keys. A proxy, used by PingCastle as well."""
+        hit = self.optional(
+            domain_dn, f"(objectSid={domain_sid}-{RODC_GROUP_RID})", ["whenCreated"]
+        )
+        created = _generalized_time(_first(hit[0], "whenCreated")) if hit else None
+        if created is None:
+            self.notes.append(
+                "Read-only Domain Controllers group not readable: AD-KRB-005 did not look for "
+                "passwords older than AES support"
+            )
+        return created
 
     def _base(self, dn: str, attrs: list[str]) -> list[dict[str, Any]]:
         """One object with its owner and DACL."""
@@ -584,6 +758,41 @@ class Collector:
                 dc_sites[ref.lower()] = _parent(e["distinguishedname"][0], 2)
         count = len(self.optional(sites, "(objectClass=site)", ["name"], scope=ldap3.LEVEL))
         return dc_sites, count
+
+    def _registered_dcs(self, config_dn: str) -> set[str] | None:
+        """Lower-cased DNs of the computers that have a server object with an nTDSDSA
+        child (read-only DCs included); None when the set cannot be trusted. A server whose
+        nTDSDSA did not come back counts as registered: it may only be hidden."""
+        entries = self.optional(
+            f"CN=Sites,{config_dn}",
+            "(|(objectClass=server)(objectClass=nTDSDSA))",
+            ["objectClass", "serverReference"],
+        )
+        servers = {
+            e["distinguishedname"][0].lower(): _first(e, "serverReference").lower() for e in entries
+        }
+        dsas = [
+            servers.get(_parent(e["distinguishedname"][0]).lower(), "")
+            for e in entries
+            if "ntdsdsa" in {c.lower() for c in _str(e.get("objectclass", []))}
+        ]
+        registered = set(dsas) - {""}
+        if not registered:
+            self.notes.append("no nTDSDSA object readable: AD-INF-014 (rogue DCs) not judged")
+            return None
+        if "" in dsas:
+            self.notes.append(
+                f"{dsas.count('')} nTDSDSA object(s) without a readable serverReference: "
+                "AD-INF-014 (rogue DCs) not judged"
+            )
+            return None
+        hidden = set(servers.values()) - registered - {""}
+        if hidden:
+            self.notes.append(
+                f"{len(hidden)} server object(s) without a visible nTDSDSA: AD-INF-014 (rogue "
+                "DCs) not judged for those computers"
+            )
+        return registered | hidden
 
     def _resolve_local_groups(
         self,
@@ -796,7 +1005,10 @@ class Collector:
             ["dSHeuristics"],
             scope=ldap3.BASE,
         )
-        return _first(entry[0], "dSHeuristics") if entry else ""
+        if not entry:
+            self.notes.append("dSHeuristics not readable: AD-INF-004 not judged")
+            return ""
+        return _first(entry[0], "dSHeuristics")
 
     def _recycle_bin(self, config_dn: str) -> bool | None:
         entry = self.optional(
@@ -904,7 +1116,12 @@ class Collector:
         others = {
             a.dns_host.lower(): a.dns_host
             for a in accounts
-            if a.is_dc and a.enabled and a.dns_host and a.dns_host.lower() != scanned.lower()
+            # credentials never go to an unregistered "DC", and Entra Kerberos has no host
+            if a.is_registered_dc
+            and not a.entra_kerberos
+            and a.enabled
+            and a.dns_host
+            and a.dns_host.lower() != scanned.lower()
         }
         return out + [(others[k], False) for k in sorted(others)]
 
@@ -979,7 +1196,7 @@ class Collector:
         t = self.target
         if t is None or not t.probes or not self.ca_dns_hosts:
             return []
-        skipped = "CA configuration (ESC6, ESC7, ESC11, ESC16) not read"
+        skipped = "CA configuration (ESC6, ESC7, ESC11, ESC16, audit filter) not read"
         if not t.ca_registry:
             self.notes.append(f"{skipped}: --no-ca-registry")
             return []
@@ -1015,6 +1232,7 @@ class Collector:
         classes = {c.lower() for c in _str(e.get("objectclass", []))}
         text = " ".join(_str(e.get("description", [])) + _str(e.get("info", [])))
         uac = _int(e, "userAccountControl")
+        self.dmsa_seen = self.dmsa_seen or DMSA_CLASS in classes
         account = Account(
             dn=e["distinguishedname"][0],
             sam=_first(e, "sAMAccountName"),
@@ -1022,6 +1240,7 @@ class Collector:
             is_computer="computer" in classes and not classes & MANAGED_CLASSES,
             spns=_str(e.get("serviceprincipalname", [])),
             pwd_last_set=filetime_to_datetime(_int(e, "pwdLastSet")),
+            pwd_must_change=_int(e, "pwdLastSet", -1) == 0,
             last_logon=filetime_to_datetime(_int(e, "lastLogonTimestamp")),
             admin_count=_int(e, "adminCount") == 1,
             rbcd=bool(e.get("msds-allowedtoactonbehalfofotheridentity")),
@@ -1048,6 +1267,9 @@ class Collector:
             preceded_by=_first(e, "msDS-ManagedAccountPrecededByLink") or None,
             managed=bool(classes & MANAGED_CLASSES),
             sync_host=_sync_host(_first(e, "sAMAccountName"), text),
+            entra_kerberos=is_entra_kerberos(
+                e["distinguishedname"][0], uac, _first(e, "msDS-KrbTgtLink")
+            ),
         )
         if account.is_rodc:
             self.rodc_policies.append(
@@ -1058,6 +1280,21 @@ class Collector:
                 )
             )
         return account
+
+
+def is_entra_kerberos(dn: str, uac: int, krbtgt_link: str) -> bool:
+    """The Entra Kerberos object by structure: its fixed place, RODC flags without the
+    writable-DC bit, and a link to its own krbtgt account. The name alone proves nothing."""
+    rodc_style = bool(uac & UAC.PARTIAL_SECRETS_ACCOUNT) and not uac & UAC.SERVER_TRUST_ACCOUNT
+    return rodc_style and bool(krbtgt_link) and bool(ENTRA_KERBEROS_DN.match(dn))
+
+
+def mark_rogue_dcs(accounts: list[Account], registered: set[str]) -> None:
+    """Flag computers with a DC bit in userAccountControl that have no nTDSDSA object."""
+    for a in accounts:
+        a.rogue_dc = (
+            a.is_computer and a.is_dc and not a.entra_kerberos and a.dn.lower() not in registered
+        )
 
 
 def parse_gplink(container: str, kind: str, value: str) -> list[tuple[str, GpLink]]:
@@ -1097,14 +1334,56 @@ META_BLOCK = re.compile(r"<DS_REPL_ATTR_META_DATA>(.*?)</DS_REPL_ATTR_META_DATA>
 LAST_CHANGE = re.compile(r"<ftimeLastOriginatingChange>([^<]+)</ftimeLastOriginatingChange>")
 
 
-def _last_backup(metadata_xml: str) -> datetime | None:
-    """dSASignature's last originating change in msDS-ReplAttributeMetaData = last backup."""
+def _meta_time(metadata_xml: str, attribute: str) -> datetime | None:
+    """Last originating change of one attribute in msDS-ReplAttributeMetaData."""
     for block in META_BLOCK.findall(metadata_xml):
-        if "<pszAttributeName>dSASignature</pszAttributeName>" in block:
+        if f"<pszAttributeName>{attribute}</pszAttributeName>" in block:
             m = LAST_CHANGE.search(block)
             if m and not m.group(1).startswith("1601"):
-                return datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+                try:
+                    return datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+                except ValueError:
+                    return None  # the caller's "not readable" case
     return None
+
+
+def _last_backup(metadata_xml: str) -> datetime | None:
+    """dSASignature's last originating change = last backup."""
+    return _meta_time(metadata_xml, "dSASignature")
+
+
+def _pwd_changed(entries: list[dict[str, Any]]) -> datetime | None:
+    """When unicodePwd was really written, from one account's BASE read."""
+    if not entries:
+        return None
+    return _meta_time("".join(_str(entries[0].get(REPL_METADATA.lower(), []))), "unicodePwd")
+
+
+def _channel_trustees(settings: dict[str, GpoSettings], domain_sid: str, root_sid: str) -> set[str]:
+    """SIDs named by the Netlogon allow lists, so they can be given names."""
+    sids: set[str] = set()
+    for s in settings.values():
+        if s.vulnerable_channel_allow:
+            try:
+                allow, deny = sd.sddl_trustees(s.vulnerable_channel_allow, domain_sid, root_sid)
+            except ValueError:
+                continue  # AD-GPO-008 shows the raw text
+            sids |= set(allow) | set(deny)
+    return sids
+
+
+def _channel_notes(snap: Snapshot) -> list[str]:
+    if not snap.channel_policy_collected:
+        return ["AD-GPO-008 (Netlogon allow list) not judged: SYSVOL was not read"]
+    hits, unread = gpo_scope.dc_channel_allow(snap)
+    if unread:
+        return [f"AD-GPO-008 did not read the security template of: {', '.join(unread)}"]
+    if hits:
+        return []
+    return [
+        "no GPO reaching a DC sets VulnerableChannelAllowList; a value set in a DC's own "
+        "registry cannot be seen by this scan (AD-GPO-008)"
+    ]
 
 
 def connect(target: Target) -> ldap3.Connection:

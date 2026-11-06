@@ -236,7 +236,7 @@ class _Resolver:
                 named = settings.privileges[REMOTE_LOGON_RIGHT]
                 holders = (holders or set()) | {_holder(h) for h in named}
         if holders is None:
-            holders = {ADMINISTRATORS} if a.is_dc else {ADMINISTRATORS, RDP_USERS}
+            holders = {ADMINISTRATORS} if a.is_registered_dc else {ADMINISTRATORS, RDP_USERS}
         if RDP_USERS in holders or member_sid in holders:
             return True, False
         unresolved = any(not h.startswith("S-1-") for h in holders)
@@ -247,6 +247,134 @@ def _holder(value: str) -> str:
     if value.upper().startswith("S-1-"):
         return value.upper()
     return well_known_sid(value) or value.lower()
+
+
+@dataclass(frozen=True)
+class NtlmOut:
+    """Outgoing NTLM on the DCs as far as Group Policy shows it."""
+
+    # True: denied on every DC. False: some DC has no GPO that denies it. None: unknown.
+    denied: bool | None
+    detail: str
+
+
+NTLM_DENY = 2
+MAX_EXCEPTIONS = 5
+
+
+def _dc_ntlm(r: _Resolver, a: Account) -> tuple[bool | None, str, list[str]]:
+    """(denied, why, GPOs that deny it) for one DC. Conflicting GPOs stay unknown,
+    because precedence between GPOs is not worked out here."""
+    deny: list[str] = []
+    other: list[str] = []
+    unread: list[str] = []
+    exceptions: set[str] = set()
+    caveats: set[str] = set()
+    for g, notes in r.applied(a, "restricted"):
+        settings = r.snap.gpo_settings.get(g.guid)
+        if settings is None:
+            unread.append(g.name)
+            continue
+        exceptions.update(settings.ntlm_exceptions)
+        if settings.restrict_sending_ntlm == NTLM_DENY:
+            deny.append(g.name)
+            caveats.update(notes)
+        elif settings.restrict_sending_ntlm is not None:
+            other.append(g.name)
+    who = a.sam.rstrip("$")
+    if deny and other:
+        names = ", ".join(sorted(deny + other))
+        return None, f"GPOs disagree on outgoing NTLM on {who} ({names})", []
+    if deny and unread:
+        names = ", ".join(sorted(unread))
+        return (
+            None,
+            f"{', '.join(sorted(deny))} denies outgoing NTLM on {who}, but GPOs reaching it "
+            f"are not readable and may set something else ({names})",
+            [],
+        )
+    if deny and caveats:
+        return (
+            None,
+            f"the GPO denying outgoing NTLM on {who} may not apply: "
+            + (", ".join(sorted(caveats))),
+            [],
+        )
+    if deny and exceptions:
+        shown = sorted(exceptions)
+        more = f" (+{len(shown) - MAX_EXCEPTIONS} more)" if len(shown) > MAX_EXCEPTIONS else ""
+        listed = ", ".join(shown[:MAX_EXCEPTIONS]) + more
+        return None, f"outgoing NTLM on {who} denied with exceptions: {listed}", []
+    if deny:
+        return True, "", deny
+    if unread:
+        names = ", ".join(sorted(unread))
+        return None, f"security settings of GPOs reaching {who} not readable ({names})", []
+    return False, f"no GPO reaching {who} denies outgoing NTLM", []
+
+
+def dc_outgoing_ntlm(snap: Snapshot) -> NtlmOut:
+    """Whether MSV1_0\\RestrictSendingNTLMTraffic = 2 reaches every DC through a GPO.
+
+    "Not denied" only means no GPO sets it: a value set in the DC's own registry is not
+    visible over LDAP or SYSVOL.
+    """
+    if not snap.ntlm_policy_collected:
+        return NtlmOut(None, "GPO security settings were not read")
+    dcs = _dcs(snap)
+    if not dcs:
+        return NtlmOut(None, "no domain controller in the snapshot")
+    r = _Resolver(snap)
+    results = [_dc_ntlm(r, a) for a in dcs]
+    open_dcs = [why for denied, why, _ in results if denied is False]
+    if open_dcs:
+        return NtlmOut(False, "; ".join(sorted(open_dcs)))
+    unknown = [why for denied, why, _ in results if denied is None]
+    if unknown:
+        return NtlmOut(None, "; ".join(sorted(unknown)))
+    gpos = sorted({name for _, _, names in results for name in names})
+    return NtlmOut(True, f"{', '.join(gpos)} denies outgoing NTLM on every DC")
+
+
+@dataclass(frozen=True)
+class ChannelAllow:
+    """One GPO that sets the Netlogon vulnerable channel allow list on DCs."""
+
+    gpo: Gpo
+    sddl: str
+    dcs: tuple[str, ...]
+    caveats: tuple[str, ...]
+
+
+def dc_channel_allow(snap: Snapshot) -> tuple[list[ChannelAllow], list[str]]:
+    """GPOs that bring VulnerableChannelAllowList to a DC, and the GPOs reaching a DC whose
+    security template could not be read. Every such GPO is listed: which one wins is not
+    worked out. A value set in the DC's own registry is not visible here."""
+    if not snap.channel_policy_collected:
+        return [], []
+    r = _Resolver(snap)
+    found: dict[str, tuple[Gpo, str, set[str], set[str]]] = {}
+    unread: set[str] = set()
+    for a in _dcs(snap):
+        for g, notes in r.applied(a, "restricted"):
+            settings = snap.gpo_settings.get(g.guid)
+            if settings is None:
+                unread.add(g.name)
+            elif settings.vulnerable_channel_allow:
+                entry = found.setdefault(
+                    g.guid.upper(), (g, settings.vulnerable_channel_allow, set(), set())
+                )
+                entry[2].add(a.sam)
+                entry[3].update(notes)
+    hits = [
+        ChannelAllow(g, sddl, tuple(sorted(dcs)), tuple(sorted(caveats)))
+        for g, sddl, dcs, caveats in found.values()
+    ]
+    return sorted(hits, key=lambda h: h.gpo.name.lower()), sorted(unread)
+
+
+def _dcs(snap: Snapshot) -> list[Account]:
+    return [a for a in _computers(snap) if a.is_registered_dc and not a.entra_kerberos]
 
 
 def _computers(snap: Snapshot) -> list[Account]:
@@ -278,7 +406,7 @@ def resolve(snap: Snapshot) -> Scope:
         if x.filtered:
             caveats = (*caveats, ILT_CAVEAT)
         adds = x.action in ("add", "set") and bool(x.member_sid)
-        if not a.is_dc:
+        if not a.is_registered_dc:
             # only local groups exist here: an entry for a domain group has no effect
             if adds and x.group_sid in LOCAL_GROUPS:
                 keep((guid, x.group_sid, x.member_sid, a.sid), Grant(g, x, a, False, caveats))
@@ -301,13 +429,13 @@ def resolve(snap: Snapshot) -> Scope:
                 ]
                 if active and a.is_rodc:
                     rodcs.add(a.sam)  # an RODC cannot write domain groups
-                elif active and a.is_dc and source == "gpp":
+                elif active and a.is_registered_dc and source == "gpp":
                     gpp_on_dcs.add(g.name)
                 else:
                     for x in active:
                         place(a, g, x, caveats)
 
-    writable_dcs = [a for a in _computers(snap) if a.is_dc and not a.is_rodc]
+    writable_dcs = [a for a in _computers(snap) if a.is_registered_dc and not a.is_rodc]
     out = []
     for grant in grants.values():
         if grant.item.group_sid == RDP_USERS:

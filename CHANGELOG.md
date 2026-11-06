@@ -129,7 +129,67 @@ logic or severity between versions, but an ID is never reused for something else
   every stage.
 - CHANGELOG, SECURITY, CONTRIBUTING, issue and pull request templates, Dependabot.
 
+- **AD-INF-014: rogue DC candidates.** `userAccountControl` is compared with the `server` and
+  `nTDSDSA` objects under `CN=Sites`. A computer with a DC flag and no `nTDSDSA` object is
+  reported, stays a tier-0 target, loses the DC exemptions in AD-DEL-001, AD-SEC-001, AD-ACC-010,
+  AD-PRIV-006, AD-PRIV-007 and the local group logic, and is not probed. The Microsoft Entra
+  Kerberos object is matched by structure and left out. Older snapshots keep the old behaviour
+  and get a note.
+- **AD-ADCS-017: ESC17.** Server Authentication template with an enrollee-supplied subject,
+  medium. Templates AD-ADCS-001 or -002 already report are skipped.
+- **AD-ACC-012: faked `pwdLastSet`.** For krbtgt, the built-in Administrator, DCs and tier-0
+  group members, the BASE read ad-doctor already makes now also asks for
+  `msDS-ReplAttributeMetaData`. `pwdLastSet` more than 5 seconds later than the last write of
+  `unicodePwd` is a finding, high on krbtgt, medium otherwise. AD-KRB-001, AD-ACC-011 and
+  AD-KRB-005 use the older of the two times. Metadata that does not come back gives a note.
+- **AD-ADCS-018: CA audit filter.** `AuditFilter` is read with the other CA values. Medium when
+  certificate requests are not audited or the value was never set, low when another category is
+  off. A value that cannot be read goes to AD-ADCS-016.
+- **AD-GPO-008: Onelogon.** `VulnerableChannelAllowList` is read from `GptTmpl.inf` in GPOs that
+  reach DCs, with the existing scope logic, and the SDDL is resolved to principals. High for a
+  DC, trust account, tier-0 principal or host, broad group, or a group holding any of those,
+  medium otherwise. No finding means no GPO sets it; the scan says so in a note.
+- **AD-PRIV-012: unreadable tier-0 members.** `member` values of tier-0 groups, nesting included,
+  are compared with what the searches returned. A value that did not come back gets one BASE
+  read. Foreign security principals, other domains and other naming contexts are skipped.
+
 ### Changed
+
+- **AD-KRB-005 is now RC4 readiness.** It follows the CVE-2026-20833 changes and states that it
+  reads configuration, not keys. Besides explicit values without AES (medium) it reports accounts
+  with an SPN and no value set (low, new), passwords older than the Read-only Domain Controllers
+  group, as suspected no AES keys (medium, new), and the same on DC accounts. Computers with an
+  SPN are now included, and a value of 0 counts as not set; non-DC computers with no value share
+  one line with a count. Domains can see new objects and a
+  low finding they did not have. Object text changed to say which case applies, but the identity
+  stays the account name, so **fingerprints, baselines and accepted risks are unchanged**. An
+  accepted-risk entry that names the account keeps working. The fix script only changes explicit
+  values on users with no password doubt; other lines are comments.
+- **AD-ACC-011 and AD-KRB-001** use the older of `pwdLastSet` and the unicodePwd metadata, so an
+  account with `pwdLastSet` 0 can now be reported when the metadata shows an old password.
+- **AD-ADCS-016** also covers the audit filter. Existing lines and fingerprints stay as they were;
+  the AuditFilter line is separate.
+- **AD-CHAIN-002 and AD-CHAIN-003 no longer depend on the spooler.** A missing spooler used to
+  silence them, although PetitPotam and DFSCoerce need none. They now fire with "coercion assumed
+  possible" at medium, and at high with a confirmed spooler, so domains with the spooler off can
+  see two findings they did not have. AD-CHAIN-003 reads `RestrictSendingNTLMTraffic` from GPOs
+  that reach the DCs: denied on every DC gives medium, because a Kerberos relay stays possible,
+  and anything else states "not denied" or "unknown". An unreadable GPO next to a deny, or
+  exceptions in `ClientAllowedNTLMServers`, give unknown. A GPO with no `GptTmpl.inf` now counts
+  as read and empty. AD-CHAIN-002 ignores it, because that path is Kerberos. Their objects and
+  fingerprints are unchanged.
+- **WriteAccountRestrictions.** A write to the User-Account-Restrictions property set on a computer
+  now counts as "write RBCD" in AD-ACL-004, AD-ACL-008 and the graph.
+- **AD-INF-004 reads more of dSHeuristics:** characters 3, 8, 21, 28, 29 and 31, with a new low
+  grade. The object is still the string, so its fingerprint is unchanged.
+- **Netlogon allow lists and other SDDL:** the alias `RO` now means Enterprise Read-only Domain
+  Controllers (RID 498), as Microsoft defines it, and the rest of the documented aliases are known.
+- **JUnit output** escapes characters XML does not allow.
+- **AD-INF-007** says when no dMSA was visible to the scanning account (the default for an
+  ordinary user), and no longer says the August 2025 updates close the abuse.
+- **`docs/bloodhound.md` and the README** no longer imply that BloodHound walks the export: a
+  generic OpenGraph payload gets Search and Cypher, not Pathfinding. The `traversable` property is
+  ad-doctor's own marker. The export itself is unchanged.
 
 - **`-f html` on `scan` and `analyze` now writes the viewer page** (the same builder as
   `ad-doctor view`, without fix lines), so there is one HTML code path. The previous
