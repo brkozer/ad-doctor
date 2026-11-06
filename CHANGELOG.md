@@ -7,6 +7,19 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-07
+
+### Added
+
+- **AD-ADCS-019: HTTPS enrollment endpoints where EPA is not verified.** The enrollment probe
+  now also asks `/certsrv/` over HTTPS and every URL in `msPKI-Enrollment-Servers` (CES) for
+  their authentication methods, with one unauthenticated `GET` each. An endpoint that offers
+  NTLM or Negotiate over HTTPS is listed with EPA as unknown, at low: IIS shows EPA only to a
+  client that authenticates, and this probe sends no credentials, so a listed endpoint may or
+  may not be relayable and an unlisted one is not proven safe. A CES URL over plain HTTP
+  counts for AD-ADCS-010 and AD-CHAIN-003. New option `--https-port` (443, 0 skips it). An
+  older snapshot says in a note that this was not evaluated.
+
 ## [0.1.2] - 2026-11-07
 
 ### Added

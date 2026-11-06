@@ -2,7 +2,8 @@
 
 - SMB: negotiate (is signing required?) and open the spoolss pipe (is the Print Spooler,
   a coercion vector, running on the DC?).
-- HTTP: ask the CA's web enrollment page for its authentication methods (ESC8).
+- HTTP and HTTPS: ask the CA's web enrollment page and the CES URLs in the directory for
+  their authentication methods (ESC8). No credentials go to these endpoints.
 - LDAPS: an NTLM bind without channel binding (is channel binding enforced?).
 - MS-RRP over \\pipe\\winreg: read the CA's configuration (ESC6, ESC7, ESC11, ESC16, audit
   filter).
@@ -93,25 +94,47 @@ def smb_posture(
     return signing, spooler
 
 
-def web_enrollment_ntlm(
-    connect_host: str, host_header: str, port: int
+def _windows_auth_url(
+    conn: http.client.HTTPConnection, scheme: str, host_header: str, path: str
 ) -> tuple[str | None, str | None]:
-    """(URL if /certsrv/ answers over plain HTTP with NTLM or Negotiate (ESC8), error)."""
-    conn = http.client.HTTPConnection(connect_host, port, timeout=TIMEOUT)
+    """(URL if an unauthenticated GET is answered with NTLM or Negotiate, error)."""
     try:
-        conn.request("GET", "/certsrv/", headers={"Host": host_header})
+        conn.request("GET", path, headers={"Host": host_header})
         resp = conn.getresponse()
         schemes = " ".join(v for k, v in resp.getheaders() if k.lower() == "www-authenticate")
-    except (OSError, http.client.HTTPException) as exc:
+    except (OSError, ValueError, http.client.HTTPException) as exc:
         # unreachable is not the same as not vulnerable: the caller reports it
         if isinstance(exc, ConnectionRefusedError):
-            return None, None  # nothing listens on the port: no web enrollment
+            return None, None  # nothing listens on the port: no such endpoint
         return None, str(exc) or type(exc).__name__
     finally:
         conn.close()
     if resp.status == 401 and any(s in schemes for s in ("NTLM", "Negotiate")):
-        return f"http://{host_header}/certsrv/", None
+        return f"{scheme}://{host_header}{path}", None
     return None, None
+
+
+def web_enrollment_ntlm(
+    connect_host: str, host_header: str, port: int, path: str = "/certsrv/"
+) -> tuple[str | None, str | None]:
+    """(URL if the endpoint answers over plain HTTP with NTLM or Negotiate (ESC8), error)."""
+    conn = http.client.HTTPConnection(connect_host, port, timeout=TIMEOUT)
+    return _windows_auth_url(conn, "http", host_header, path)
+
+
+def enrollment_https(
+    connect_host: str, host_header: str, port: int, path: str = "/certsrv/"
+) -> tuple[str | None, str | None]:
+    """(URL if the endpoint answers over HTTPS with NTLM or Negotiate, error).
+
+    Says nothing about EPA: IIS only shows it to a client that authenticates, and this
+    probe sends no credentials. That is also why the certificate is not verified.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    conn = http.client.HTTPSConnection(connect_host, port, timeout=TIMEOUT, context=context)
+    return _windows_auth_url(conn, "https", host_header, path)
 
 
 def tls_end_point(cert_der: bytes) -> GssChannelBindings:

@@ -18,6 +18,7 @@ import hmac
 import re
 import uuid
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import model
 
@@ -55,6 +56,8 @@ KEEP = {
     # the checks find Exchange servers by these group names
     *model.EXCHANGE_GROUPS,
     model.DEFAULT_POLICY_MODULE.lower(),
+    # the fixed parts of enrollment URLs
+    "certsrv", "service.svc", "ces",
 }  # fmt: skip
 UNKNOWN_SYNC_HOST = "unknown server"
 SID_PREFIX = re.compile(r"S-1-5-21-\d+-\d+-\d+")
@@ -138,6 +141,12 @@ class Redactor:
             words.update([c["name"], c["host"], *c["host"].split(".")])
             if c.get("policy_module"):
                 words.add(c["policy_module"])  # a vendor name; Microsoft's is in KEEP
+        probes = data.get("probes", {})
+        for url in [*probes.get("web_enrollment_ntlm", []), *probes.get("enrollment_https", [])]:
+            # a CES path holds the CA name, and its host need not be a computer in the snapshot
+            parts = urlsplit(url)
+            host = parts.hostname or ""
+            words.update([host, *host.split("."), *parts.path.split("/")])
         for dc_dn, site_dn in data.get("dc_sites", {}).items():
             words.update(_dn_values(dc_dn))
             words.update(_dn_values(site_dn))

@@ -10,6 +10,7 @@ connection per target, nothing is written, and `--no-probes` turns them all off.
 | SMB signing | each DC, port 445 | SMB negotiate, then a session as the scanning account |
 | Print Spooler | each DC | opens the `spoolss` named pipe and closes it |
 | Web enrollment (ESC8) | each enterprise CA, port 80 | one `GET /certsrv/` to read the authentication headers |
+| HTTPS enrollment | each enterprise CA, port 443, and each URL in `msPKI-Enrollment-Servers` | one `GET` over TLS to read the authentication headers; no credentials are sent, the server certificate is not checked, and EPA is not determined (`--https-port 0` skips it). A URL that uses plain HTTP gets the same `GET` over HTTP |
 | CA registry (ESC6/7/11/16, audit filter) | each enterprise CA, port 445 | reads the CA's configuration over `\pipe\winreg` (MS-RRP), `KEY_READ` only; `--no-ca-registry` skips it |
 | SYSVOL | the scanned DC | reads GPO files and scripts (`--no-sysvol` skips it) |
 

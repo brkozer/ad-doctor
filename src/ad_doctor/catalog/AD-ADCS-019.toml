@@ -1,0 +1,79 @@
+id = "AD-ADCS-019"
+aliases = ["esc8-https", "epa-unknown"]
+summary = "AD CS web enrollment or CES offers Windows authentication over HTTPS, and the scan cannot tell whether Extended Protection is enforced."
+severities = ["low"]
+severity_logic = """
+Always **low**: this is a gap in what the scan knows, not a proven weakness. An endpoint
+without EPA is as serious as [AD-ADCS-010](AD-ADCS-010.md), so check it by hand.
+"""
+mitre = ["T1649", "T1557.001"]
+data_sources = ["probe-http", "ldap"]
+attributes = [
+    "dNSHostName and msPKI-Enrollment-Servers (on pKIEnrollmentService)",
+    "HTTPS GET /certsrv/ and each CES URL: status and WWW-Authenticate",
+]
+related = ["AD-ADCS-010", "AD-CHAIN-003"]
+since = "0.1.3"
+
+risk = """
+HTTPS on its own does not stop an NTLM relay: the attacker opens their own TLS session to
+the endpoint and passes the coerced authentication through it, as in
+[AD-ADCS-010](AD-ADCS-010.md). What stops it is Extended Protection for Authentication
+(EPA), which ties the authentication to the TLS channel. The same goes for the Certificate
+Enrollment Web Service (CES), which issues certificates like web enrollment does.
+
+Three settings look the same from outside. *Require* stops the relay. *Off* leaves it open.
+*Allow* also leaves it open, because a client that sends no channel binding is still let in.
+"""
+
+detection = """
+ad-doctor sends one unauthenticated `GET` over TLS to `/certsrv/` on each enterprise CA (the
+port given by `--https-port`, default 443) and to each HTTPS URL in `msPKI-Enrollment-Servers`.
+The endpoint is reported when the server answers **401** and the `WWW-Authenticate` headers
+offer `NTLM` or `Negotiate`. A refused connection means no such endpoint; any other error is
+noted in the report as not probed rather than clean.
+
+The probe sends no credentials, so it **does not determine EPA**: a server shows EPA only to
+a client that authenticates, by accepting the authentication with a channel binding and
+refusing it without one. Every endpoint that offers Windows authentication is therefore
+listed, whatever its setting. The server certificate is not checked, since nothing secret is
+sent. Each object is the endpoint URL. The check runs unless `--no-probes` is given or
+`--https-port 0` is set.
+"""
+
+false_positives = """
+- **EPA is set to Require.** The endpoint is fine and the scan cannot see it. Confirm with
+  the commands below, then accept the finding for that URL
+  ([accepted risks](../ci.md#accepted-risks)).
+- **Negotiate restricted to Kerberos.** If IIS offers `Negotiate` but NTLM is disabled for
+  the site, the NTLM relay fails; the header alone does not show this.
+- **Not found at all**: endpoints at a non-default path that the directory does not publish.
+"""
+
+remediation = """
+Read the setting on the server that hosts the endpoint. Use `CertSrv` for web enrollment and
+the application name in the URL for CES:
+
+```powershell
+Import-Module WebAdministration
+Get-WebConfigurationProperty -PSPath 'IIS:\\' -Location 'Default Web Site/CertSrv' `
+    -Filter 'system.webServer/security/authentication/windowsAuthentication/extendedProtection' `
+    -Name tokenChecking
+```
+
+`Require` is what KB5005413 asks for. If it says `None` or `Allow`, treat the endpoint like
+[AD-ADCS-010](AD-ADCS-010.md): set `Require` after review and restart IIS, or remove the role
+if nobody uses it. Clients on old systems may stop working, so test first.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-019"
+
+[[references]]
+title = "KB5005413: Mitigating NTLM relay attacks on Active Directory Certificate Services (AD CS)"
+url = "https://support.microsoft.com/en-us/servicing/os/windows-server/2021/07/kb5005413-mitigating-ntlm-relay-attacks-on-active-directory-certificate-services-ad-cs"
+kind = "vendor"
+
+[[references]]
+title = "Certipy: find command, web enrollment and channel binding checks"
+url = "https://github.com/ly4k/Certipy/blob/main/certipy/commands/find.py"
+kind = "tool"

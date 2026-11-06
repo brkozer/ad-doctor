@@ -360,6 +360,8 @@ class Probes:
     ldaps_channel_binding_required: bool | None = None
     # web enrollment URLs that answered with NTLM over plain HTTP (ESC8)
     web_enrollment_ntlm: list[str] = field(default_factory=list)
+    # enrollment URLs that answered with NTLM or Negotiate over HTTPS; EPA is not known
+    enrollment_https: list[str] = field(default_factory=list)
     # every DC that was probed, the scanned one included (empty in older snapshots)
     dcs: list[DcProbe] = field(default_factory=list)
     # configuration of each enterprise CA (empty when not read, and in older snapshots)
@@ -693,6 +695,8 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
     cas = data.get("probes", {}).get("ca_configs", [])
     if any("audit_checked" not in c for c in cas):
         missing.append("AD-ADCS-018 (CA audit filter)")
+    if "enrollment_https" not in data.get("probes", {}):
+        missing.append("AD-ADCS-019 (HTTPS enrollment endpoints)")
     notes = [f"snapshot from an older version: {text} not evaluated" for text in missing]
     if "dmsa_visible" not in data:
         notes.append(

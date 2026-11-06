@@ -7,7 +7,7 @@
 Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
-(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 94
+(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 95
 checks for what attackers look for first: roastable accounts, risky delegation,
 exploitable certificate templates and CA settings (ESC1–9, 11, 13–17), DCSync and other takeover rights,
 shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync accounts,
@@ -155,6 +155,7 @@ against a live DC.
 | | AD-ADCS-016 | CA configuration could not be read (registry probe) | low |
 | | AD-ADCS-017 | ESC17: enrollee-supplied subject on a server authentication template | medium |
 | | AD-ADCS-018 | CA audit filter not fully on (registry probe) | low/medium |
+| | AD-ADCS-019 | HTTPS enrollment endpoints where EPA is not verified (probe) | low |
 | Permissions | AD-ACL-001 | Non-default principals with DCSync rights | high |
 | | AD-ACL-002 | Non-default control over AdminSDHolder | high |
 | | AD-ACL-003 | Non-default control over the domain object | high |
@@ -250,7 +251,7 @@ ad-doctor export-graph 2026-11.json -o graph.json --paths-only
 | `explain ID\|alias` | print a check's full explanation and fix offline (`-f text\|markdown\|json`, `--web`) |
 | `-k`, `--kerberos` | bind with Kerberos instead of a password |
 | `--no-sysvol`, `--smb-port` | skip or redirect the SMB part |
-| `--no-probes`, `--http-port` | skip every probe (SMB, channel binding, ESC8, CA registry), or move the web enrollment port |
+| `--no-probes`, `--http-port`, `--https-port` | skip every probe (SMB, channel binding, ESC8, CA registry), or move the web enrollment ports (0 skips one) |
 | `--no-ca-registry` | skip reading CA settings (ESC6/7/11/16, audit filter) over `\pipe\winreg` |
 | `--single-dc` | probe only the DC being scanned instead of every DC in the domain |
 | `--signing-probe-port PORT` | plain LDAP port for the signing probe; `0` skips it |
@@ -317,10 +318,12 @@ narrow or turn them off; [SECURITY.md](SECURITY.md) lists every probe.
   when a within-forest trust object gives their domain's SID; on a CA outside the scanned
   domain with no such trust object, any other domain's Administrator and Domain Admins are
   accepted. ESC10 and ESC12 (DC certificate-mapping registry settings, a CA key on an HSM
-  reachable from a shell on the CA) are not checked. EPA on
-  HTTPS web enrollment, and host settings beyond what the DC probes see, remain out of
-  scope: local group membership that Group Policy sets is covered, changes made directly
-  in a computer's local SAM are not.
+  reachable from a shell on the CA) are not checked. HTTPS web enrollment and the CES URLs
+  in the directory are found, but whether they enforce EPA is not determined: IIS shows that
+  only to a client that authenticates, and the probe sends these endpoints no credentials,
+  so AD-ADCS-019 lists them as unknown. Host settings beyond what the DC probes see remain
+  out of scope: local group membership that Group Policy sets is covered, changes made
+  directly in a computer's local SAM are not.
 - GPO reach in the control graph uses the links, Enforced, Block Inheritance, the user and
   computer side flags and security filtering described below. An empty GPO counts,
   because its writer fills it in. Not evaluated: WMI filters (assumed to match, with a
@@ -397,7 +400,7 @@ flowchart LR
     P --> S
     S -- "collect -o / redact" --> F[(snapshot.json)]
     F --> A
-    S --> A[checks.py + paths.py<br/>94 pure functions]
+    S --> A[checks.py + paths.py<br/>95 pure functions]
     A --> I[invariants.py<br/>accept.py]
     I --> R[report.py<br/>text, JSON, Markdown,<br/>SARIF, JUnit]
     I --> W[viewer.py<br/>offline HTML viewer]

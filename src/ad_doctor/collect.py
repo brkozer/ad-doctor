@@ -8,6 +8,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import ldap3
 from ldap3.core.exceptions import (
@@ -153,6 +154,8 @@ class Target:
     plain_port: int = 389
     # web enrollment port for the ESC8 probe; 0 disables it
     http_port: int = 80
+    # HTTPS port for web enrollment and CES URLs without a port; 0 disables those probes
+    https_port: int = 443
     # SMB posture and channel binding probes
     probes: bool = True
     kerberos: bool = False
@@ -160,6 +163,12 @@ class Target:
     all_dcs: bool = True
     # read each CA's configuration over the winreg pipe (part of the probes)
     ca_registry: bool = True
+
+
+def _ces_urls(values: list[str]) -> list[str]:
+    """HTTP and HTTPS URLs of msPKI-Enrollment-Servers values (priority, auth, renewal, URL)."""
+    lines = (line.strip() for value in values for line in value.splitlines())
+    return [line for line in lines if line.lower().startswith(("http://", "https://"))]
 
 
 def sid_to_str(raw: bytes) -> str:
@@ -194,6 +203,7 @@ class Collector:
         self.notes: list[str] = []
         self.ca_hosts: list[str] = []
         self.ca_dns_hosts: list[str] = []
+        self.ces_urls: list[str] = []
         # CA host (lower-cased dNSHostName) -> enrollment service name
         self.ca_names: dict[str, str] = {}
         self.rodc_policies: list[tuple[Account, list[str], list[str]]] = []
@@ -929,7 +939,7 @@ class Collector:
         services = self.optional(
             f"CN=Enrollment Services,{pks}",
             "(objectClass=pKIEnrollmentService)",
-            ["name", "certificateTemplates", "dNSHostName"],
+            ["name", "certificateTemplates", "dNSHostName", "msPKI-Enrollment-Servers"],
         )
         entries = self.optional(
             f"CN=Certificate Templates,{pks}",
@@ -955,6 +965,9 @@ class Collector:
             self.notes.append("no enterprise CA found, so no template is published")
         ca_dns = {_first(s, "name"): s["distinguishedname"][0] for s in services}
         self.ca_dns_hosts = sorted({_first(s, "dNSHostName") for s in services} - {""})
+        self.ces_urls = sorted(
+            {u for s in services for u in _ces_urls(_str(s.get("mspki-enrollment-servers", [])))}
+        )
         self.ca_names = {
             _first(s, "dNSHostName").lower(): _first(s, "name")
             for s in services
@@ -1213,18 +1226,46 @@ class Collector:
                     self.notes.append("SMB probes did not run: no SMB connection to the DC")
             elif dc.error:
                 self.notes.append(f"{name}: not probed ({dc.error})")
-        if t.probes and t.http_port:
-            for ca_host in self.ca_dns_hosts:
-                # a CA on the DC being scanned is reached through the address given for it
-                same = ca_host.lower() == dc_dns_host.lower()
-                url, error = probes.web_enrollment_ntlm(
-                    t.host if same else ca_host, ca_host, t.http_port
-                )
-                if error:
-                    self.notes.append(f"web enrollment on {ca_host} not probed: {error}")
-                if url:
-                    result.web_enrollment_ntlm.append(url)
+        if t.probes:
+            self._probe_enrollment(dc_dns_host, result)
         return result
+
+    def _enrollment_targets(self) -> list[tuple[str, str, str, str, int]]:
+        """(scheme, host, Host header, path, port): each CA's web enrollment, then CES URLs."""
+        t = self.target
+        assert t is not None
+        ports = {"http": t.http_port, "https": t.https_port}
+        out = [
+            (scheme, host, host, "/certsrv/", port)
+            for host in self.ca_dns_hosts
+            for scheme, port in ports.items()
+        ]
+        for url in self.ces_urls:
+            try:
+                parts = urlsplit(url)
+                scheme, host, port = parts.scheme.lower(), parts.hostname, parts.port
+            except ValueError:
+                host = None
+            if not host:
+                self.notes.append(f"enrollment URL {url} not probed: not a valid URL")
+                continue
+            # a URL that names no port follows the port options, as web enrollment does
+            out.append((scheme, host, parts.netloc, parts.path or "/", port or ports[scheme]))
+        return [target for target in out if ports[target[0]]]
+
+    def _probe_enrollment(self, dc_dns_host: str, result: Probes) -> None:
+        t = self.target
+        assert t is not None
+        for scheme, host, header, path, port in self._enrollment_targets():
+            # an endpoint on the DC being scanned is reached through the address given for it
+            connect = t.host if host.lower() == dc_dns_host.lower() else host
+            probe = probes.web_enrollment_ntlm if scheme == "http" else probes.enrollment_https
+            url, error = probe(connect, header, port, path)
+            if error:
+                self.notes.append(f"{scheme}://{header}{path} not probed: {error}")
+            found = result.web_enrollment_ntlm if scheme == "http" else result.enrollment_https
+            if url and url not in found:
+                found.append(url)
 
     def _ca_configs(self, dc_dns_host: str) -> list[CaConfig]:
         """Each enterprise CA's configuration, read from its registry over the winreg pipe."""

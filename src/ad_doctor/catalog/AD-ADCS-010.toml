@@ -13,7 +13,7 @@ attributes = [
     "dNSHostName (on pKIEnrollmentService)",
     "HTTP GET /certsrv/: status and WWW-Authenticate",
 ]
-related = ["AD-CHAIN-003", "AD-INF-009", "AD-ADCS-014", "AD-CHAIN-001"]
+related = ["AD-CHAIN-003", "AD-INF-009", "AD-ADCS-014", "AD-ADCS-019", "AD-CHAIN-001"]
 since = "0.1.0"
 
 risk = """
@@ -37,7 +37,8 @@ ad-doctor sends an unauthenticated `GET /certsrv/` over plain HTTP to the port g
 `--http-port` (default 80). The CA is reported when the server answers **401** and the
 `WWW-Authenticate` headers offer `NTLM` or `Negotiate` (which falls back to NTLM). A
 refused connection means no web enrollment; any other error is noted in the report as
-not probed rather than clean.
+not probed rather than clean. A CES URL in `msPKI-Enrollment-Servers` that uses plain HTTP
+gets the same probe and is reported here too.
 
 The probe sends no credentials and does not request a certificate. Each object is the
 endpoint URL, for example `http://ca01.corp.example/certsrv/`. It runs unless
@@ -45,9 +46,10 @@ endpoint URL, for example `http://ca01.corp.example/certsrv/`. It runs unless
 """
 
 false_positives = """
-- **Not covered**: HTTPS endpoints without EPA, which are also relayable, and the
-  Certificate Enrollment Web Service (`/<CA>_CES_Kerberos/service.svc` and its
-  siblings). ad-doctor probes only `/certsrv/` over HTTP.
+- **Not covered here**: HTTPS endpoints, which are also relayable without EPA.
+  [AD-ADCS-019](AD-ADCS-019.md) lists them with EPA as unknown. CES and web enrollment
+  installed at a path other than the default and not published in the directory are not
+  found at all.
 - **Negotiate restricted to Kerberos.** If IIS offers `Negotiate` but NTLM is disabled
   for the site, the relay fails; ad-doctor cannot tell from the header alone. Confirm
   with the read-only commands below.

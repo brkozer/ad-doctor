@@ -1121,6 +1121,22 @@ def esc8(snap: Snapshot) -> Finding | None:
     )
 
 
+@check("AD-ADCS-019", "HTTPS enrollment endpoints where EPA is not verified")
+def enrollment_epa_unknown(snap: Snapshot) -> Finding | None:
+    if not snap.probes.enrollment_https:
+        return None
+    return _finding(
+        "AD-ADCS-019",
+        Severity.LOW,
+        "These endpoints offer Windows authentication over HTTPS. Without Extended Protection "
+        "for Authentication they are as relayable as HTTP (ESC8). The scan sends them no "
+        "credentials and cannot see EPA from outside, so the state is unknown, not clean.",
+        "On each server check that tokenChecking is Require for the application (IIS, Windows "
+        "Authentication, Extended Protection), and remove endpoints nobody uses.",
+        sorted(snap.probes.enrollment_https),
+    )
+
+
 ECC_KEY_SIZES = {256, 384, 521}
 
 

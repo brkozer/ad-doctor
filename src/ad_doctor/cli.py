@@ -66,6 +66,7 @@ def _target(args: argparse.Namespace) -> Target:
         smb_port=args.smb_port,
         plain_port=args.signing_probe_port,
         http_port=args.http_port,
+        https_port=args.https_port,
         probes=not args.no_probes,
         kerberos=args.kerberos,
         all_dcs=not args.single_dc,
@@ -490,6 +491,12 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--smb-port", type=int, default=445)
         p.add_argument(
             "--http-port", type=int, default=80, help="CA web enrollment port for ESC8 (0 to skip)"
+        )
+        p.add_argument(
+            "--https-port",
+            type=int,
+            default=443,
+            help="HTTPS port for CA web enrollment and CES URLs (0 to skip)",
         )
         p.add_argument(
             "--no-probes",

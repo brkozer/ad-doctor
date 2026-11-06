@@ -18,6 +18,13 @@ connections anywhere, and its ports are forwarded to `127.0.0.1` on the host onl
 | 10053 | 53 | DNS |
 | 15985 | 5985 | WinRM |
 
+Port 443 is not forwarded. For the HTTPS enrollment probe, tunnel it over SSH and pass the
+local port with `--https-port`, or to the live tests as `AD_DOCTOR_LAB_HTTPS_PORT`:
+
+```bash
+ssh -f -N -L 127.0.0.1:10443:127.0.0.1:443 -p 12222 -i ~/.ssh/adlab_ed25519 Administrator@127.0.0.1
+```
+
 ## Build
 
 Needs a Linux host with KVM, libvirt, `virt-install`, `qemu-img` and `xorriso`
@@ -101,6 +108,11 @@ uv run ad-doctor scan dc01.adlab.test --ldaps --port 10636 --smb-port 10445 --ht
   security groups with the pre-2019 WriteDacl on the domain head and a member server
   account, and an `MSOL_` sync account with DCSync and the description setup writes. Neither
   product is installed.
+- `seed.ps1` adds an HTTPS binding and CES (Kerberos) to the DC and publishes the CES URL in
+  `msPKI-Enrollment-Servers`. CertSrv has EPA required and CES has it off; the scan cannot
+  tell them apart without authenticating, so AD-ADCS-019 lists both.
+- The seeded Guest account changes what IIS does with an unknown user: NTLM falls back to
+  Guest. Do not read a made-up user's result here as what a domain with Guest off would show.
 - With one DC, the every-DC probes cover the scanned DC only; the multi-DC paths are
   unit-tested.
 - The evaluation licence runs for 180 days. Rebuild from scratch rather than extend it.

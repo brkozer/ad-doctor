@@ -68,8 +68,9 @@ deny ACE that excludes a DC from the GPO is not seen, because deny ACEs are not 
 
 The objects are the web enrollment URLs, for example `http://ca01.corp.example/certsrv/`.
 The HTTP probe uses `--http-port` (80 by default, 0 skips it); both probes are skipped with
-`--no-probes`. HTTPS endpoints without Extended Protection are not probed, so this check
-can miss them.
+`--no-probes`. Only endpoints over plain HTTP count here: whether an HTTPS endpoint has
+Extended Protection is not known, so [AD-ADCS-019](AD-ADCS-019.md) lists those instead and
+this check can miss a relay to one of them.
 """
 
 false_positives = """

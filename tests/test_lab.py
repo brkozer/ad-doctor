@@ -160,6 +160,7 @@ def snap() -> Snapshot:
         smb_port=int(os.environ.get("AD_DOCTOR_LAB_SMB_PORT", "445")),
         plain_port=int(os.environ.get("AD_DOCTOR_LAB_PLAIN_PORT", "389")),
         http_port=int(os.environ.get("AD_DOCTOR_LAB_HTTP_PORT", "80")),
+        https_port=int(os.environ.get("AD_DOCTOR_LAB_HTTPS_PORT", "0")),
     )
     snap = collect(target)
     assert snap.domain == "adlab.test"
@@ -308,6 +309,15 @@ def test_opengraph_export_of_the_lab(snap: Snapshot) -> None:
     assert all(":" not in n["id"] for n in payload["graph"]["nodes"])
 
 
+# one has EPA required, the other has it off: from outside they look the same
+HTTPS_ENDPOINTS = {
+    "https://DC01.adlab.test/certsrv/",
+    "https://dc01.adlab.test/adlab-CA_CES_Kerberos/service.svc/CES",
+}
+if os.environ.get("AD_DOCTOR_LAB_HTTPS_PORT"):
+    EXPECTED["AD-ADCS-019"] = HTTPS_ENDPOINTS
+
+
 @pytest.mark.parametrize("check_id", sorted(EXPECTED))
 def test_seeded_misconfiguration_found(findings: dict[str, set[str]], check_id: str) -> None:
     assert check_id in findings
@@ -386,3 +396,11 @@ def test_gpo_local_group_scope(snap: Snapshot) -> None:
     ws03 = next(a.sid for a in snap.accounts if a.sam == "WS03$")
     server_admins = next(o.sid for o in snap.objects if o.name == "LabServerAdmins")
     assert (f"sid:{ws03}", "can RDP via GPO LabEnforced") in g.logon_edges[f"sid:{server_admins}"]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("AD_DOCTOR_LAB_HTTPS_PORT"), reason="port 443 of the lab is not tunnelled"
+)
+def test_https_endpoints_stay_out_of_the_http_list(snap: Snapshot) -> None:
+    assert set(snap.probes.enrollment_https) == HTTPS_ENDPOINTS
+    assert snap.probes.web_enrollment_ntlm == ["http://DC01.adlab.test/certsrv/"]

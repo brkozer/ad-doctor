@@ -379,6 +379,31 @@ try {
         -Filter system.webServer/security/access -Name sslFlags -Value 'None'
 } catch { "web enrollment not installed: $($_.Exception.Message)" }
 
+# The same site over HTTPS and the enrollment web service (CES) next to it (AD-ADCS-019).
+# CertSrv keeps the Server 2025 default of EPA required; CES has EPA turned off, so the lab
+# holds one HTTPS endpoint of each kind.
+try {
+    $fqdn = "$env:COMPUTERNAME.$((Get-ADDomain).DNSRoot)".ToLower()
+    $tls = Get-ChildItem Cert:\LocalMachine\My |
+        Where-Object { $_.Subject -eq "CN=$fqdn" -and $_.HasPrivateKey } | Select-Object -First 1
+    if (-not (Get-WebBinding -Name 'Default Web Site' -Protocol https)) {
+        New-WebBinding -Name 'Default Web Site' -Protocol https -Port 443
+        (Get-WebBinding -Name 'Default Web Site' -Protocol https).AddSslCertificate($tls.Thumbprint, 'My')
+    }
+    if (-not (Get-WindowsFeature ADCS-Enroll-Web-Svc -ErrorAction Stop).Installed) {
+        Install-WindowsFeature ADCS-Enroll-Web-Svc -ErrorAction Stop | Out-Null
+    }
+    if (-not (Get-WebApplication -Name 'adlab-CA_CES_Kerberos')) {
+        Install-AdcsEnrollmentWebService -CAConfig "$fqdn\adlab-CA" -AuthenticationType Kerberos `
+            -SSLCertThumbprint $tls.Thumbprint -ApplicationPoolIdentity -Force -ErrorAction Stop | Out-Null
+    }
+    Set-WebConfigurationProperty -PSPath 'IIS:\' -Location 'Default Web Site/adlab-CA_CES_Kerberos' `
+        -Filter system.webServer/security/authentication/windowsAuthentication/extendedProtection `
+        -Name tokenChecking -Value 'None'
+    certutil -config "$fqdn\adlab-CA" -enrollmentServerURL `
+        "https://$fqdn/adlab-CA_CES_Kerberos/service.svc/CES" Kerberos 1 | Out-Null
+} catch { "HTTPS enrollment not set up: $($_.Exception.Message)" }
+
 # --- Round 4 ---
 # Exchange: the groups Exchange setup creates, with the pre-2019 WriteDacl on the domain head
 # (PrivExchange, AD-ACL-007). No Exchange install: only the directory side matters here.
