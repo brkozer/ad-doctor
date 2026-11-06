@@ -249,7 +249,6 @@ def test_no_delegation_stays_quiet() -> None:
         "CIFS/FS01",
         "http/fs01.lab.test",
         "cifs/fs01.lab.test.",
-        "cifs/fs01.lab.test:445",
     ],
 )
 def test_host_aliases_are_no_false_positive(target: str) -> None:
@@ -306,9 +305,9 @@ def test_ghost_does_not_depend_on_mappings() -> None:
     assert only(snap, "AD-DEL-005").severity is Severity.MEDIUM
 
 
-def test_host_exists_but_nothing_holds_the_spn_is_low() -> None:
+def test_host_exists_but_nothing_holds_the_spn_is_graded_by_the_account() -> None:
     f = only(targets(delegating("MSSQLSvc/fs01.lab.test:1433"), fs01()), "AD-DEL-005")
-    assert f.severity is Severity.LOW
+    assert f.severity is Severity.MEDIUM
     assert f.objects == [
         "svc_app -> MSSQLSvc/fs01.lab.test:1433 (no account holds it, the host exists)"
     ]
@@ -317,7 +316,7 @@ def test_host_exists_but_nothing_holds_the_spn_is_low() -> None:
 def test_prestaged_computer_counts_as_a_host() -> None:
     bare = computer("NEW01", UAC.WORKSTATION_TRUST_ACCOUNT)
     f = only(targets(delegating("cifs/new01.lab.test"), bare), "AD-DEL-005")
-    assert f.severity is Severity.LOW
+    assert "the host exists" in f.objects[0]
 
 
 def test_without_mappings_a_target_on_a_known_host_is_not_judged() -> None:
@@ -325,10 +324,8 @@ def test_without_mappings_a_target_on_a_known_host_is_not_judged() -> None:
     assert "AD-DEL-005" not in ids(run_all(snap))
 
 
-@pytest.mark.parametrize(
-    "target", ["cifs/fs.partner.test", "cifs/fs01.child.lab.test", "cifs/10.0.0.5"]
-)
-def test_other_domains_get_review_wording(target: str) -> None:
+@pytest.mark.parametrize("target", ["cifs/fs01.child.lab.test", "cifs/10.0.0.5"])
+def test_only_what_may_be_this_domain_gets_review_wording(target: str) -> None:
     f = only(targets(delegating(target)), "AD-DEL-005")
     assert f.severity is Severity.LOW
     assert f.objects == [f"svc_app -> {target} (not in this domain's snapshot, review)"]
@@ -344,7 +341,12 @@ def test_entry_that_cannot_be_parsed_is_reported() -> None:
 
 def test_redaction_hides_ghost_hosts_and_keeps_the_findings() -> None:
     snap = targets(
-        delegating("cifs/gone.lab.test", "cifs/fs.partner.test", "cifs/fs01.lab.test"),
+        delegating(
+            "cifs/gone.lab.test",
+            "cifs/fs.partner.test",
+            "cifs/fs.child.lab.test",
+            "cifs/fs01.lab.test",
+        ),
         fs01(),
         user("svc_web", NORMAL, spns=["http/portal.intranet.test:8080"]),
     )

@@ -128,14 +128,14 @@ def test_enforced_link_without_a_block_shares_the_plain_scope() -> None:
     assert len(reach.names) == 1 and len({node for _, node, _ in reach.applies}) == 1
 
 
-def test_side_flags_split_users_from_computers() -> None:
+def test_side_flags_do_not_stop_the_writer_but_leave_a_caveat() -> None:
     accounts = (host("SRV"), person("ann"))
-    computer_off = gsnap(*accounts, gpos=writer(link(LAB), flags=2), entries=[])
-    assert reach_of(computer_off) == {"ann"}
-    user_off = gsnap(*accounts, gpos=writer(link(LAB), flags=1), entries=[])
-    assert reach_of(user_off) == {"SRV$"}
-    all_off = gsnap(*accounts, gpos=writer(link(LAB), flags=3), entries=[])
-    assert reach_of(all_off) == set()
+    for flags, off in ((2, ["computer"]), (1, ["user"]), (3, ["computer", "user"])):
+        snap = gsnap(*accounts, gpos=writer(link(LAB), flags=flags), entries=[])
+        assert reach_of(snap) == {"SRV$", "ann"}
+        built = paths.build(snap)
+        caveats = [c for props in built.edge_props.values() for c in props["caveats"]]
+        assert caveats == [f"{side} side disabled, the writer can enable it" for side in off]
 
 
 def test_an_empty_gpo_is_what_its_writer_fills_in() -> None:
@@ -283,13 +283,14 @@ def test_link_edge_to_tier0_needs_the_gpo_to_reach_a_dc() -> None:
         fields = {"aces": OPEN, **kw}
         g = gpo("Reach", GUID_A, link(DC_OU), **fields)
         g.linked_to = ["Domain Controllers OU"]
-        built = paths.build(gsnap(dc(), gpos=[g], entries=[]))
+        group = DirObject(f"CN=Filter,{LAB}", "Filter", "group", sid=FILTER_GROUP)
+        built = paths.build(gsnap(dc(), gpos=[g], entries=[], objects=[group]))
         return {h for outs in built.edges.values() for _, h in outs if h.startswith("linked to")}
 
     assert linked() == {"linked to Domain Controllers OU"}
-    assert linked(flags=2) == set()  # user side only: nothing runs on the DCs
+    assert linked(flags=2) == {"linked to Domain Controllers OU"}  # the writer can flip it
     only_group = [sd.Ace(FILTER_GROUP, 0x20094 | sd.CONTROL_ACCESS, sd.APPLY_GROUP_POLICY), WRITE]
-    assert linked(aces=only_group) == set()
+    assert linked(aces=only_group) == set()  # a writer of values cannot change the filter
 
 
 def test_older_snapshot_without_links_keeps_the_link_edge() -> None:

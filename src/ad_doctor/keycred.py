@@ -11,6 +11,7 @@ of linked attributes even when the attribute itself is denied, so it tells the t
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
@@ -37,6 +38,7 @@ VALUE_CREATED = re.compile(r"<ftimeCreated>([^<]*)</ftimeCreated>")
 # the DC cuts this short of the whole blob, so it can only match the start of a value
 VALUE_DATA = re.compile(r"<pbData>([0-9A-Fa-f]*)</pbData>")
 DOTNET_TICKS = 0x3FFFFFFFFFFFFFFF  # DateTime.ToBinary: the top two bits hold the kind
+KEY_ID_LENGTH = 16
 
 
 def _blob(value: str) -> bytes | None:
@@ -81,6 +83,14 @@ def parse_blob(blob: bytes) -> KeyCredential:
     device = entries.get(DEVICE_ID, bytes(16))
     if not entries.get(KEY_MATERIAL) or len(usage) != 1 or len(source) != 1 or len(device) != 16:
         return KeyCredential()
+    # DSInternals refuses a device ID on a computer key; the spec does not mention one
+    computer_shape = (
+        usage[0] == USAGE_NGC
+        and source[0] == SOURCE_AD
+        and not any(device)
+        and LAST_LOGON not in entries
+    )
+    custom = CUSTOM_KEY_INFORMATION in entries
     return KeyCredential(
         parsed=True,
         device_id=str(UUID(bytes_le=device)) if any(device) else "",
@@ -88,10 +98,9 @@ def parse_blob(blob: bytes) -> KeyCredential:
         usage=usage[0],
         source=source[0],
         # the only shape a computer may write to itself ([MS-ADTS] validated write)
-        self_written=usage[0] == USAGE_NGC
-        and source[0] == SOURCE_AD
-        and CUSTOM_KEY_INFORMATION not in entries
-        and LAST_LOGON not in entries,
+        self_written=computer_shape and not custom,
+        custom_info=computer_shape and custom,
+        key_id=hashlib.sha256(entries[KEY_MATERIAL]).hexdigest()[:KEY_ID_LENGTH],
     )
 
 
@@ -120,14 +129,29 @@ def _live_rows(metadata: str) -> list[tuple[str, datetime | None]]:
 def read(values: list[str], metadata: str) -> list[KeyCredential]:
     """Every key on an account: the values read, then those only the metadata shows."""
     rows = _live_rows(metadata)
+    pending = []
     keys = []
     for value in values:
         blob = _blob(value)
         key = parse_blob(blob) if blob is not None else KeyCredential()
         text = blob.hex() if blob is not None else None
-        row = next((r for r in rows if text is None or text.startswith(r[0])), None)
-        if row is not None:
-            rows.remove(row)
-            key.added = row[1]
         keys.append(key)
+        pending.append((key, text))
+
+    def take(key: KeyCredential, row: tuple[str, datetime | None]) -> None:
+        rows.remove(row)
+        key.added = row[1]
+
+    # rows that match by content go first, so a value that does not parse cannot take them
+    unmatched = []
+    for key, text in pending:
+        row = next((r for r in rows if r[0] and text and text.startswith(r[0])), None)
+        if row is not None:
+            take(key, row)
+        else:
+            unmatched.append((key, text))
+    for key, text in unmatched:
+        row = next((r for r in rows if text is None or not r[0]), None)
+        if row is not None:
+            take(key, row)
     return keys + [KeyCredential(readable=False, added=added) for _, added in rows]

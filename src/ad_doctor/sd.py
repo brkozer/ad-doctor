@@ -103,6 +103,13 @@ class Ace:
         # WriteProperty on every attribute, not on one attribute or property set
         return bool(self.mask & WRITE_PROPERTY) and self.object_type is None
 
+    @property
+    def rewrites_dacl(self) -> bool:
+        """Rights that let the trustee change who the object applies to, not only its values."""
+        if self.mask & (GENERIC_ALL | WRITE_DAC | WRITE_OWNER):
+            return True
+        return (self.mask & FULL_CONTROL) == FULL_CONTROL
+
     def writes(self, attribute: str) -> bool:
         """True if the ACE lets the trustee write this attribute (or all attributes)."""
         if self.mask & (GENERIC_ALL | GENERIC_WRITE):

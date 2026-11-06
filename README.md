@@ -18,8 +18,9 @@ non-admin to tier 0. It writes nothing to the directory.
 
 <p align="center"><img src="docs/demo.svg" alt="ad-doctor scanning the lab domain: ESC8 web enrollment, a relay-to-RBCD chain, a password in a logon script, BadSuccessor rights and the control paths to tier 0" width="100%"></p>
 
-The screenshots are real scans of the lab domain in [`lab/`](lab): a Windows Server 2025
-DC seeded with one instance of every misconfiguration that a single domain can hold.
+The screenshots are real scans of the lab domain in [`lab/`](lab), a Windows Server 2025
+DC seeded with the misconfigurations `seed.ps1` plants. They were taken before the lab's
+latest additions, so the counts in them are lower than a scan shows today.
 
 ## What sets it apart
 
@@ -255,7 +256,7 @@ ad-doctor export-graph 2026-11.json -o graph.json --paths-only
 | `explain ID\|alias` | print a check's full explanation and fix offline (`-f text\|markdown\|json`, `--web`) |
 | `-k`, `--kerberos` | bind with Kerberos instead of a password |
 | `--no-sysvol`, `--smb-port` | skip or redirect the SMB part |
-| `--no-probes`, `--http-port`, `--https-port` | skip every probe (SMB, channel binding, ESC8, CA registry), or move the web enrollment ports (0 skips one) |
+| `--no-probes`, `--http-port`, `--https-port` | skip every probe (LDAP signing, SMB, channel binding, enrollment, CA registry; SYSVOL has its own `--no-sysvol`), or move the web enrollment ports (0 skips one) |
 | `--no-ca-registry` | skip reading CA settings (ESC6/7/11/16, audit filter) over `\pipe\winreg` |
 | `--single-dc` | probe only the DC being scanned instead of every DC in the domain |
 | `--signing-probe-port PORT` | plain LDAP port for the signing probe; `0` skips it |
@@ -280,7 +281,10 @@ LDAP binds, so use `--ldaps`.
 An enabled domain user is enough; no group memberships or delegated rights. ad-doctor
 reads users, computers, groups, OUs, GPOs, trusts, AD CS templates, enrollment services
 and OIDs, gMSAs, the replication metadata of the domain head (for the backup date) and
-of tier-0 accounts (for the real password change, in the BASE read it does anyway), and
+of tier-0 accounts (for the real password change, in the BASE read it does anyway),
+`msDS-KeyCredentialLink` and `msDS-ReplValueMetaData` of tier-0 accounts, CA servers and
+Entra Connect sync accounts and servers (the keys themselves are not kept), `sPNMappings`
+on `CN=Directory Service`, and
 the owners and DACLs of the security-critical objects, the `server` and `nTDSDSA` objects
 under `CN=Sites` and the `crossRef` objects under `CN=Partitions`. A `member` value of a
 tier-0 group that no search returned gets one BASE read, at most 500 per scan. Security descriptors are requested
@@ -294,7 +298,8 @@ names and setting values, never a secret.
 
 Active probes, each one connection per DC: an unsigned NTLM bind on 389 (LDAP signing),
 an NTLM bind on LDAPS without a channel binding token, an SMB negotiate plus an attempt
-to open the `spoolss` pipe, and an unauthenticated `GET /certsrv/` on each CA. On each
+to open the `spoolss` pipe, an unauthenticated `GET /certsrv/` on each CA over HTTP and
+over HTTPS, and the same `GET` to each URL in `msPKI-Enrollment-Servers` (CES). On each
 enterprise CA it also reads the CA's own configuration (ESC6, ESC7, ESC11, ESC16, audit
 filter) over
 `\pipe\winreg` (MS-RRP) with a small built-in client: every call is a `KEY_READ`, nothing
@@ -303,12 +308,15 @@ it is set to start on demand (a visible change of service state), and remote reg
 access to `CertSvc` is the kind of thing EDR and Microsoft Defender for Identity may alert
 on; `--no-ca-registry` skips just that read. The DC being scanned is reached through the
 address and ports given on the command line, the others by their DNS names on the standard
-ports. `--single-dc`, `--no-probes`, `--no-ca-registry` and `--signing-probe-port 0`
-narrow or turn them off; [SECURITY.md](SECURITY.md) lists every probe.
+ports. A CES URL is reached on the port it names; only a URL with no port follows
+`--http-port` or `--https-port`. `--single-dc`, `--no-probes`, `--no-ca-registry` and
+`--signing-probe-port 0` narrow or turn them off, and `--no-sysvol` skips SYSVOL, which
+`--no-probes` leaves on; [SECURITY.md](SECURITY.md) lists every probe.
 
 ## Limits
 
 - One domain per run; trusts are inspected from this side only.
+- CI runs on Python 3.12 and 3.13 only.
 - The CA-side checks (ESC6, ESC7, ESC11, ESC16, audit filter) read the CA's registry over
   `\pipe\winreg`, which needs TCP 445 to each CA and credentials; a run that cannot reach a
   CA, where RemoteRegistry is disabled, or where a GPO has removed `CertSvc` from the
@@ -385,7 +393,10 @@ narrow or turn them off; [SECURITY.md](SECURITY.md) lists every probe.
   attribute is denied looks empty, and groups of other domains are not read.
 - An ordinary user cannot read fine-grained password policies; the report says so
   instead of assuming the default policy applies to admins.
-- Some checks cannot be reproduced in a single lab DC and are covered by unit tests only:
+- Some checks do not fire on the lab DC and are covered by unit tests only: stale accounts
+  (AD-ACC-005 needs 90 days to pass), a missing backup (AD-INF-011 needs a week), a domain
+  below level 2016 (AD-INF-003: a 2025 DC needs that level), a DC or CA the probes cannot
+  read (AD-INF-013, AD-ADCS-016), large tier-0 groups (AD-PRIV-001, not seeded),
   krbtgt, Seamless SSO and admin password age, the password and DC parts of AD-KRB-005,
   SID history, trust SID filtering, the age of a trust (AD-INF-016 needs 40 days to pass;
   the lab test moves the snapshot's date instead), RODCs, SMB signing
@@ -481,7 +492,7 @@ The security model:
   open it on a trusted workstation in a clean browser profile ([SECURITY.md](SECURITY.md)).
 
 Measured on `scripts/bench.py` domains and the lab, on one core of an Intel Xeon Gold 6138
-(2017), from the installed wheel, with the defaults: `--graph auto`, and so encrypted,
+(2017), on Python 3.12, with the defaults: `--graph auto`, and so encrypted,
 since every one of these files embeds graph data. `ad-doctor view` includes loading the
 snapshot, running every check, building the graph data and encrypting; peak memory is the
 build's. First screen is from opening the same file built with `--no-encrypt` to the
@@ -492,9 +503,9 @@ JavaScript heap after unlocking and one blast-radius lookup.
 | Domain | Graph | HTML file | `ad-doctor view` | Build memory | First screen | Unlock | JS heap |
 |---|---|---|---|---|---|---|---|
 | lab (49 accounts) | full | 228 KB | 0.8 s | 54 MB | 108 ms | 0.82 s | 3.0 MB |
-| 10,000 users | full | 798 KB | 3.1 s | 108 MB | 154 ms | 0.82 s | 7.6 MB |
-| 100,000 users | paths | 1.5 MB | 33 s | 0.60 GB | 198 ms | 0.82 s | 7.9 MB |
-| 250,000 users | paths | 3.5 MB | 90 s | 1.43 GB | 354 ms | 0.83 s | 14.4 MB |
+| 10,000 users | full | 794 KB | 3.3 s | 106 MB | 154 ms | 0.82 s | 7.6 MB |
+| 100,000 users | paths | 1.5 MB | 30 s | 0.60 GB | 198 ms | 0.82 s | 7.9 MB |
+| 250,000 users | paths | 3.5 MB | 83 s | 1.43 GB | 354 ms | 0.83 s | 14.4 MB |
 
 An account's blast radius on the 10,000-user page, searched in the page and drawn, takes
 under 20 ms. Forcing `--graph full` on the 100,000-user domain gives a 6.3 MB file, a
@@ -512,9 +523,9 @@ Xeon Gold 6138 (2017), Python 3.12:
 
 | Domain | Snapshot | Load | All checks + paths | OpenGraph export | Peak memory |
 |---|---|---|---|---|---|
-| 10,000 users, 3,300 computers, 19,000 ACEs | 13 MB | 0.4 s | 0.9 s | 0.7 s | 0.1 GB |
-| 100,000 users, 33,000 computers, 127,000 ACEs | 126 MB | 3.8 s | 9.9 s | 7.0 s | 0.8 GB |
-| 250,000 users, 83,000 computers, 308,000 ACEs | 314 MB | 9.6 s | 26.0 s | 18.1 s | 2.1 GB |
+| 10,000 users, 3,300 computers, 19,000 ACEs | 13 MB | 0.4 s | 0.8 s | 0.6 s | 0.1 GB |
+| 100,000 users, 33,000 computers, 127,000 ACEs | 126 MB | 3.9 s | 8.5 s | 6.8 s | 0.8 GB |
+| 250,000 users, 83,000 computers, 308,000 ACEs | 314 MB | 9.5 s | 22.7 s | 18.1 s | 2.1 GB |
 
 Analysis grows linearly with the size of the domain. Collection time is set by the DC:
 the snapshot comes from a few paged LDAP searches, so it scales with the number of objects

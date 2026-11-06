@@ -14,6 +14,7 @@ from xml.sax.saxutils import quoteattr
 from . import __version__, docgen
 from . import catalog as docs  # report.catalog() exists
 from .checks import MITRE, REGISTRY
+from .fixes import one_line
 from .model import CATEGORIES, Finding, Severity, Snapshot
 
 WEIGHT = {Severity.HIGH: 15, Severity.MEDIUM: 6, Severity.LOW: 2, Severity.INFO: 0}
@@ -125,17 +126,18 @@ def render_text(r: Report, color: bool = False) -> str:
         tag = c(SEVERITY_COLOR[f.severity], f"[{str(f.severity).upper():6}]")
         new = c(BOLD, " NEW") if r.is_new(f) else ""
         lines.append(f"{tag} {c(BOLD, f.check_id)}  {f.title}{new}")
-        lines.append(_wrap(f.detail))
-        shown = f.objects[:10]
+        lines.append(_wrap(one_line(f.detail)))
+        shown = [one_line(o) for o in f.objects[:10]]
         more = f" (+{len(f.objects) - len(shown)} more)" if len(f.objects) > len(shown) else ""
         lines.append(_wrap(", ".join(shown) + more, c(DIM, "objects:") + " ", len("objects: ")))
-        lines.append(_wrap(f.remediation, c(DIM, "fix:") + " ", len("fix: ")))
+        lines.append(_wrap(one_line(f.remediation), c(DIM, "fix:") + " ", len("fix: ")))
         lines.append("")
     for a in r.accepted:
         scope = ", ".join(a.objects) if a.objects else "all objects"
-        lines.append(c(DIM, f"accepted: {a.check_id} ({scope}) until {a.expires}: {a.reason}"))
+        accepted = f"accepted: {a.check_id} ({scope}) until {a.expires}: {a.reason}"
+        lines.append(c(DIM, one_line(accepted)))
     for note in snap.notes:
-        lines.append(c(DIM, f"note: {note}"))
+        lines.append(c(DIM, f"note: {one_line(note)}"))
     counts = r.counts()
     lines.append(
         f"risk score {c(BOLD, str(r.score))}/100 (grade {r.grade})  "
@@ -219,8 +221,13 @@ def _flat(text: str) -> str:
     return _CONTROL.sub(" ", text)
 
 
+def _prose(text: str) -> str:
+    """Text outside a code span: a tag in a directory name stays text."""
+    return _flat(text).replace("<", "\\<")
+
+
 def _md(text: str) -> str:
-    return _flat(text).replace("|", "\\|")
+    return _prose(text).replace("|", "\\|")
 
 
 def _code(text: str) -> str:
@@ -263,9 +270,9 @@ def render_markdown(r: Report) -> str:
             f"**Severity:** {f.severity}. **Category:** {f.category}."
             + (f" **ATT&CK:** {', '.join(f.mitre)}." if f.mitre else ""),
             "",
-            _flat(f.detail),
+            _prose(f.detail),
             "",
-            f"**Fix:** {_flat(f.remediation)}" + _docs_suffix(f.check_id),
+            f"**Fix:** {_prose(f.remediation)}" + _docs_suffix(f.check_id),
             "",
             *[f"- {_code(o)}" for o in f.objects],
         ]
@@ -275,9 +282,9 @@ def render_markdown(r: Report) -> str:
         out += ["", "## Accepted risks", ""]
         for a in r.accepted:
             scope = ", ".join(a.objects) or "all objects"
-            out.append(f"- {a.check_id} ({scope}), until {a.expires}: {a.reason}")
+            out.append(_prose(f"- {a.check_id} ({scope}), until {a.expires}: {a.reason}"))
     if snap.notes:
-        out += ["", "## Notes", "", *[f"- {_flat(n)}" for n in snap.notes]]
+        out += ["", "## Notes", "", *[f"- {_prose(n)}" for n in snap.notes]]
     return "\n".join(out) + "\n"
 
 

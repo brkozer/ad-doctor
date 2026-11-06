@@ -650,8 +650,9 @@ Add-ADGroupMember 'Domain Admins' veiled_admin
 dsacls "OU=Veiled,$ou" /D 'ADLAB\adreader:LC' | Out-Null
 
 # GPO reach in the control graph (AD-PATH-001). Edit rights on a GPO linked to OU=Lab and on
-# one linked to the site are paths to tier 0; gpo_ctl can edit only GPOs that reach nothing:
-# a disabled link, the computer side off over an OU of computers, filtered to nobody.
+# one linked to the site are paths to tier 0; gpo_ctl can edit only GPOs that stop short of
+# it: a disabled link and a filter to nobody reach nothing, and the computer side off over an
+# OU of computers reaches them only because an editor can turn it back on.
 Ensure-User gpo_editor
 Ensure-User gpo_site_editor
 Ensure-User gpo_ctl

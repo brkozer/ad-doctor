@@ -41,7 +41,7 @@ from .checks import (
     check,
     officer_templates,
 )
-from .model import WELL_KNOWN_SIDS, Account, Finding, Severity, Snapshot
+from .model import WELL_KNOWN_SIDS, Account, DirObject, Finding, Severity, Snapshot
 
 Edge = tuple[str, str]  # (target node, label)
 GPO_APPLIES = "GPO applies to"  # GPO to the scope of a link
@@ -120,8 +120,13 @@ class Path:
 
     def render(self, g: Graph) -> str:
         out = g.name(self.start)
+        src = self.start
         for node, how in self.steps:
-            out += f" -[{how}]-> {g.name(node)}"
+            caveats = g.edge_props.get((src, node, how), {}).get("caveats")
+            # a report has only this text: what an edge assumes must show in it
+            mark = f" ({'; '.join(caveats)})".replace("]", "") if caveats else ""
+            out += f" -[{how}{mark}]-> {g.name(node)}"
+            src = node
         return out
 
     def record(self, g: Graph) -> dict[str, Any]:
@@ -273,20 +278,51 @@ def build(snap: Snapshot) -> Graph:
     edge_props: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     # GPOs reach what they are linked to. A link to the domain or the DC OU counts as
-    # control of tier 0 only if the GPO gets to a DC (older snapshots hold no links; a
-    # snapshot without DCs cannot tell)
+    # control of tier 0 only if the GPO gets to a writable DC (older snapshots hold no
+    # links; a snapshot without DCs cannot tell)
     reach = gpo_scope.reach(snap)
     gpo_nodes: dict[str, str] = {}
-    has_dcs = any(a.is_registered_dc for a in snap.accounts)
+    has_dcs = any(a.is_registered_dc and not a.is_rodc for a in snap.accounts)
+    gpo_objects = {o.dn.lower(): o for o in snap.objects if o.kind == "gpo"}
     for g in snap.gpos:
-        gpo_node = node_of(f"CN={g.guid},CN=Policies,CN=System,{snap.domain_dn}")
-        gpo_nodes[g.guid.upper()] = gpo_node
+        guid = g.guid.upper()
+        dn = f"CN={g.guid},CN=Policies,CN=System,{snap.domain_dn}"
+        gpo_node = node_of(dn)
+        gpo_nodes[guid] = gpo_node
         names.setdefault(gpo_node, f"GPO {g.name}")
         kinds[gpo_node] = "gpo"
-        if g.links and has_dcs and g.guid.upper() not in reach.dc_gpos:
-            continue
-        for where in g.linked_to:
-            add(gpo_node, domain_node if where == "domain" else "tier0:dc-ou", f"linked to {where}")
+        targets = [
+            (domain_node if where == "domain" else "tier0:dc-ou", f"linked to {where}")
+            for where in g.linked_to
+        ]
+        if not (g.links and has_dcs) or guid in reach.dc_gpos:
+            for target, how in targets:
+                add(gpo_node, target, how)
+                if reach.dc_gpos.get(guid):
+                    edge_props[(gpo_node, target, how)] = {
+                        "gpo": g.name,
+                        "caveats": list(reach.dc_gpos[guid]),
+                    }
+        # a filter stops a writer of values, not whoever can rewrite the DACL: that writer
+        # gets a node of its own, which goes where the GPO would with no filter
+        wide = reach.widened.get(guid, [])
+        rewriters = _dacl_writers(gpo_objects.get(dn.lower()), skip) if wide else {}
+        if rewriters:
+            unfiltered = node_of(f"CN=Filter,{dn}")
+            names[unfiltered] = f"GPO {g.name} with its filter changed"
+            kinds[unfiltered] = "gpo"
+            for sid, how in rewriters.items():
+                add(principal(sid), unfiltered, how)
+            for scope, caveats in wide:
+                add(unfiltered, scope, GPO_APPLIES)
+                if caveats:
+                    edge_props[(unfiltered, scope, GPO_APPLIES)] = {
+                        "gpo": g.name,
+                        "caveats": list(caveats),
+                    }
+            if guid in reach.dc_widened:
+                for target, how in targets:
+                    add(unfiltered, target, how)
     names.update(reach.names)
     for g, scope, caveats in reach.applies:
         src = gpo_nodes[g.guid.upper()]
@@ -394,6 +430,16 @@ def build(snap: Snapshot) -> Graph:
             if a.sam.upper() == ca.upper() and a.sid:
                 tier0.add(_sid_node(a.sid))
     return Graph(edges, names, tier0, logon_edges, edge_props, kinds)
+
+
+def _dacl_writers(o: DirObject | None, skip: set[str]) -> dict[str, str]:
+    """SID -> edge label, for those who can change who a GPO applies to."""
+    if o is None:
+        return {}
+    found = {a.sid: "full control" for a in o.aces if a.rewrites_dacl and a.sid not in skip}
+    if o.owner and o.owner not in skip:
+        found[o.owner] = "owns"
+    return found
 
 
 def paths_to_tier0(g: Graph) -> dict[str, Path]:

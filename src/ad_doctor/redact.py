@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import hmac
+import ipaddress
 import re
 import uuid
 from typing import Any
@@ -58,6 +59,18 @@ KEEP = {
     model.DEFAULT_POLICY_MODULE.lower(),
     # the fixed parts of enrollment URLs
     "certsrv", "service.svc", "ces",
+    # DN attribute types: a host label with one of these names must not rewrite every DN
+    "dc", "cn",
+    # the Entra Kerberos realm is the same everywhere, and the checks skip it by name
+    "kerberos.microsoftonline.com",
+    # service classes the checks read, and those of a default sPNMappings
+    "host", "ldap", "gc", "wsman", "alerter", "appmgmt", "cisvc", "clipsrv", "browser",
+    "dhcp", "dnscache", "replicator", "eventlog", "eventsystem", "policyagent", "oakley",
+    "dmserver", "dns", "mcsvc", "fax", "msiserver", "ias", "messenger", "netlogon", "netman",
+    "netdde", "netddedsm", "nmagent", "plugplay", "protectedstorage", "rasman", "rpclocator",
+    "rpc", "rpcss", "remoteaccess", "rsvp", "samss", "scardsvr", "scesrv", "seclogon", "scm",
+    "dcom", "cifs", "spooler", "snmp", "schedule", "tapisrv", "trksvr", "trkwks", "ups", "time",
+    "wins", "www", "http", "w3svc", "iisadmin", "msdtc",
 }  # fmt: skip
 UNKNOWN_SYNC_HOST = "unknown server"
 SID_PREFIX = re.compile(r"S-1-5-21-\d+-\d+-\d+")
@@ -72,9 +85,16 @@ IPV6 = re.compile(
 )
 GUID_LIKE = re.compile(r"^\{?[0-9a-fA-F-]{36}\}?$")
 # altSecurityIdentities: X509:<I>issuer<SR>serial; the tags decide weak or strong
-MAPPING_PART = re.compile(r"(<[A-Za-z0-9-]+>)([^<]*)")
+MAPPING_PART = re.compile(r"(<(?:I|S|SR|SKI|SHA1-PUKEY|RFC822)>)([^<]*)", re.IGNORECASE)
+MAPPING_SCHEMES = ("X509", "KERBEROS")
 # SIDs as Restricted Groups writes them (*S-1-...): rewritten by SID_PREFIX, not tokenized
 SID_TOKEN = re.compile(r"^\*?S-1-", re.IGNORECASE)
+# a timestamp as to_json writes it: a digit-only name must not reach inside it
+TIMESTAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:[+-]\d\d:\d\d|Z)?")
+# a name starts and ends where these runs do, so a run is the key to look a name up by
+NAME_RUN = re.compile(r"[\w$]+")
+# a backslash pair of a DN: \, \+ \" \\ \< \> \; \= \# and a leading or trailing space
+DN_ESCAPE = re.compile(r"\\([,+\"\\<>;=# ])")
 # keys that are field names or fixed labels, never data
 FIXED_KEYS = {
     f.name
@@ -85,6 +105,8 @@ FIXED_KEYS = {
                 model.UnreadableMember, model.KeyCredential)
     for f in dataclasses.fields(cls)
 } | {"domain", "AdminSDHolder", "sid", "mask", "object_type", "inherited_object_type"}  # fmt: skip
+# values from a fixed list, which the checks compare: never data, whatever the names around
+FIXED_VALUES = {"kind", "source", "action"}
 
 
 class Redactor:
@@ -92,7 +114,10 @@ class Redactor:
         self.key = key
         self.names: dict[str, str] = {}
         self.sids: dict[str, str] = {}
-        self._pattern: re.Pattern[str] | None = None
+        # first word of a name -> (lengths, longest first; lower-cased name -> token)
+        self._index: dict[str, tuple[list[int], dict[str, str]]] = {}
+        # the few names that start with neither a letter nor a digit
+        self._odd: re.Pattern[str] | None = None
 
     def _digest(self, value: str) -> str:
         return hmac.new(self.key, value.lower().encode(), hashlib.sha256).hexdigest()
@@ -115,15 +140,16 @@ class Redactor:
 
     def mapping(self, value: str) -> str:
         """Every value of a certificate mapping replaced, its type kept: subjects and
-        e-mail addresses in it need not belong to any object the scan saw."""
+        e-mail addresses in it need not belong to any object the scan saw. Only known tags
+        and schemes survive; anything else in a malformed value is a token."""
         kind, sep, rest = value.partition(":")
-        if not sep:
+        if not sep or kind.upper() not in MAPPING_SCHEMES:
             return self.token(value)
-        if kind.upper() == "X509":
-            return f"{kind}:" + MAPPING_PART.sub(
-                lambda m: m.group(1) + self.token(m.group(2)), rest
-            )
-        return f"{kind}:{self.token(rest)}"
+        if kind.upper() != "X509":
+            return f"{kind}:{self.token(rest)}"
+        kept = "".join(tag + self.token(text) for tag, text in MAPPING_PART.findall(rest))
+        left = MAPPING_PART.sub("", rest)
+        return f"{kind}:{kept}" + (self.token(left) if left else "")
 
     def collect(self, data: dict[str, Any]) -> None:
         """Learn which words are sensitive: account, object, host, file and domain names."""
@@ -138,8 +164,10 @@ class Redactor:
             # label by label: a delegation target's host need not be a computer in the
             # snapshot, and AD-DEL-005 tells other domains by the dots that stay
             for spn in [*a.get("spns", []), *a.get("allowed_to_delegate_to", [])]:
-                rest = spn.partition("/")[2]
-                words.update(p for p in re.split(r"[.:/]", rest) if not p.isdigit())
+                service, slash, rest = spn.partition("/")
+                words.update(p for p in re.split(r"[.:/]", rest or service) if not p.isdigit())
+                if slash:
+                    words.add(service)
         for d in data.get("probes", {}).get("dcs", []):
             words.update([d["name"], *d["name"].split(".")])
         for c in data.get("probes", {}).get("ca_configs", []):
@@ -147,11 +175,14 @@ class Redactor:
             if c.get("policy_module"):
                 words.add(c["policy_module"])  # a vendor name; Microsoft's is in KEEP
         probes = data.get("probes", {})
-        for url in [*probes.get("web_enrollment_ntlm", []), *probes.get("enrollment_https", [])]:
-            # a CES path holds the CA name, and its host need not be a computer in the snapshot
-            parts = urlsplit(url)
-            host = parts.hostname or ""
-            words.update([host, *host.split("."), *parts.path.split("/")])
+        for url in [
+            *probes.get("web_enrollment_ntlm", []),
+            *probes.get("enrollment_https", []),
+            *data.get("enrollment_urls", []),
+        ]:
+            words.update(_url_words(url))
+        for mapping in data.get("spn_mappings", []):
+            words.update(p.strip() for p in re.split(r"[=,]", mapping))
         for dc_dn, site_dn in data.get("dc_sites", {}).items():
             words.update(_dn_values(dc_dn))
             words.update(_dn_values(site_dn))
@@ -175,7 +206,8 @@ class Redactor:
             words.update(_dn_values(m["dn"]))
         words.update(t["name"] for t in data.get("templates", []))
         for t in data.get("trusts", []):
-            words.update([t["name"], *t["name"].split(".")])
+            if t["name"].lower() not in KEEP:
+                words.update([t["name"], *t["name"].split(".")])
         words.update(data.get("principals", {}).values())
         words.update(
             k.removeprefix("PKI:CA ") for k in data.get("acls", {}) if k.startswith("PKI:CA ")
@@ -190,21 +222,56 @@ class Redactor:
                 p for p in re.split(r"[\\/]", item["path"]) if p and not GUID_LIKE.match(p)
             )
         words.update(data.get("ca_hosts", []))
+        odd = []
         for w in words:
             if w and w.lower() not in KEEP and not GUID_LIKE.match(w) and not SID_TOKEN.match(w):
-                self.names[w.lower()] = self.token(w)
-        if self.names:
-            alternatives = "|".join(re.escape(n) for n in sorted(self.names, key=len, reverse=True))
-            # whole names only: not inside a longer word
-            self._pattern = re.compile(rf"(?<![\w$])(?:{alternatives})(?![\w$])", re.IGNORECASE)
+                # an escaped DN value and its plain form are one name, with one token
+                token = self.token(DN_ESCAPE.sub(r"\1", w))
+                self.names[w.lower()] = token
+                first = NAME_RUN.match(w)
+                if first is None:
+                    odd.append(w.lower())
+                    continue
+                lengths, names = self._index.setdefault(first.group().lower(), ([], {}))
+                names[w.lower()] = token
+                if len(w) not in lengths:
+                    lengths.append(len(w))
+                    lengths.sort(reverse=True)
+        if odd:
+            alternatives = "|".join(re.escape(n) for n in sorted(odd, key=len, reverse=True))
+            self._odd = re.compile(rf"(?<![\w$])(?:{alternatives})(?![\w$])", re.IGNORECASE)
+
+    def _replace_names(self, value: str) -> str:
+        """Whole names only, longest first, leftmost first. Looking each word up keeps the
+        cost linear in the text; one alternation of all names is not, on a large domain."""
+        if self._odd is not None:
+            value = self._odd.sub(lambda m: self.names[m.group(0).lower()], value)
+        out: list[str] = []
+        last = 0
+        for run in NAME_RUN.finditer(value):
+            start = run.start()
+            found = self._index.get(run.group().lower()) if start >= last else None
+            if found is None:
+                continue
+            for length in found[0]:
+                end = start + length
+                token = found[1].get(value[start:end].lower())
+                if token is not None and not NAME_RUN.match(value, end):
+                    out += [value[last:start], token]
+                    last = end
+                    break
+        return "".join([*out, value[last:]]) if out else value
 
     def text(self, value: str) -> str:
-        value = SID_PREFIX.sub(lambda m: self.fake_sid(m.group(0)), value)
-        value = IPV4.sub("0.0.0.0", value)
-        value = IPV6.sub("::", value)
-        if self._pattern is None:
+        if TIMESTAMP.fullmatch(value):
             return value
-        return self._pattern.sub(lambda m: self.names[m.group(0).lower()], value)
+        if "S-1-5-21-" in value:
+            value = SID_PREFIX.sub(lambda m: self.fake_sid(m.group(0)), value)
+        if "." in value:
+            value = IPV4.sub("0.0.0.0", value)
+        if ":" in value:
+            value = IPV6.sub("::", value)
+        return self._replace_names(value)
 
     def walk(self, value: Any) -> Any:
         if isinstance(value, str):
@@ -212,7 +279,9 @@ class Redactor:
         if isinstance(value, list):
             return [self.walk(v) for v in value]
         if isinstance(value, dict):
-            return {self._key(k): self.walk(v) for k, v in value.items()}
+            return {
+                self._key(k): v if k in FIXED_VALUES else self.walk(v) for k, v in value.items()
+            }
         return value
 
     def _key(self, key: Any) -> Any:
@@ -222,11 +291,30 @@ class Redactor:
 
 
 def _dn_values(dn: str) -> list[str]:
+    """Each RDN value as the DN writes it, for the DN itself, and in its plain form, which
+    is how a display name or a group name holds the same words."""
     out = []
     for part in re.split(r"(?<!\\),", dn):
         if "=" in part:
-            out.append(part.split("=", 1)[1].strip().replace("\\,", ","))
+            value = part.split("=", 1)[1].strip()
+            out += [value, DN_ESCAPE.sub(r"\1", value)]
     return out
+
+
+def _url_words(url: str) -> list[str]:
+    """The sensitive parts of a URL: a CES path holds the CA name, a host need not be a
+    computer in the snapshot, and a URL can carry a user and a password."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        found = [parts.username or "", parts.password or "", *parts.path.split("/")]
+    except ValueError:  # still text someone wrote in the directory
+        return [p for p in re.split(r"[/:@\s\[\]]+", url) if len(p) > 1 and not p.isdigit()]
+    try:
+        ipaddress.ip_address(host)  # text() replaces addresses; their digits are not names
+    except ValueError:
+        found += [host, *host.split(".")]
+    return [p for p in found if len(p) > 1 and not p.isdigit()]
 
 
 def redact(data: dict[str, Any], key: bytes) -> dict[str, Any]:
@@ -241,5 +329,7 @@ def redact(data: dict[str, Any], key: bytes) -> dict[str, Any]:
         for credential in after.get("key_credentials", []):
             if credential["device_id"]:
                 credential["device_id"] = r.fake_guid(credential["device_id"])
+            if credential.get("key_id"):
+                credential["key_id"] = r.fake_guid(credential["key_id"]).replace("-", "")[:16]
     out["redacted"] = True
     return out

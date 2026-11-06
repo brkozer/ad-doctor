@@ -30,15 +30,20 @@ detection = """
 ad-doctor sends one unauthenticated `GET` over TLS to `/certsrv/` on each enterprise CA (the
 port given by `--https-port`, default 443) and to each HTTPS URL in `msPKI-Enrollment-Servers`.
 The endpoint is reported when the server answers **401** and the `WWW-Authenticate` headers
-offer `NTLM` or `Negotiate`. A refused connection means no such endpoint; any other error is
-noted in the report as not probed rather than clean.
+offer `NTLM` or `Negotiate`.
+
+For `/certsrv/`, which is only a guess, a refused connection or another status means no such
+endpoint. A URL in `msPKI-Enrollment-Servers` exists because the directory says so, so a refused
+connection or any status but 401 gives a note that EPA and NTLM were not judged, not a clean
+result. A 401 that offers neither scheme, such as Basic on a user name and password endpoint,
+is a real answer and is not listed. Any other error is noted as not probed.
 
 The probe sends no credentials, so it **does not determine EPA**: a server shows EPA only to
 a client that authenticates, by accepting the authentication with a channel binding and
 refusing it without one. Every endpoint that offers Windows authentication is therefore
 listed, whatever its setting. The server certificate is not checked, since nothing secret is
-sent. Each object is the endpoint URL. The check runs unless `--no-probes` is given or
-`--https-port 0` is set.
+sent. Each object is the endpoint URL. With `--no-probes` or `--https-port 0` the check does
+not run, and a note says so.
 """
 
 false_positives = """
@@ -59,11 +64,23 @@ Import-Module WebAdministration
 Get-WebConfigurationProperty -PSPath 'IIS:\\' -Location 'Default Web Site/CertSrv' `
     -Filter 'system.webServer/security/authentication/windowsAuthentication/extendedProtection' `
     -Name tokenChecking
+Get-WebConfigurationProperty -PSPath 'IIS:\\' -Location 'Default Web Site/CertSrv' `
+    -Filter 'system.webServer/security/authentication/windowsAuthentication/extendedProtection' `
+    -Name flags
 ```
 
 `Require` is what KB5005413 asks for. If it says `None` or `Allow`, treat the endpoint like
 [AD-ADCS-010](AD-ADCS-010.md): set `Require` after review and restart IIS, or remove the role
 if nobody uses it. Clients on old systems may stop working, so test first.
+
+`Require` alone does not settle it:
+
+- **Flags.** With the `Proxy` flag IIS checks SPNs and not the channel binding, so
+  `tokenChecking` proves nothing. A client connecting straight over TLS needs `None` here.
+- **CES needs more.** KB5005413 also asks for `<extendedProtectionPolicy
+  policyEnforcement="Always" />` in the `Web.config` the CES role created (`Always` goes with
+  `Required` in IIS), and for **Require SSL** on the application. Accept the finding for a CES
+  URL only when all three are in place.
 """
 
 verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-019"
@@ -71,6 +88,11 @@ verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-
 [[references]]
 title = "KB5005413: Mitigating NTLM relay attacks on Active Directory Certificate Services (AD CS)"
 url = "https://support.microsoft.com/en-us/servicing/os/windows-server/2021/07/kb5005413-mitigating-ntlm-relay-attacks-on-active-directory-certificate-services-ad-cs"
+kind = "vendor"
+
+[[references]]
+title = "IIS: Windows Extended Protection (extendedProtection)"
+url = "https://learn.microsoft.com/en-us/iis/configuration/system.webserver/security/authentication/windowsauthentication/extendedprotection/"
 kind = "vendor"
 
 [[references]]

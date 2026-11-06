@@ -7,6 +7,8 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-07
+
 ### Changed
 
 - **Less memory.** Four new `Account` fields in 0.1.0 took it to 30 attributes, where
@@ -15,9 +17,45 @@ logic or severity between versions, but an ID is never reused for something else
   the parsed file once the snapshot is built, loading shares equal ACEs and member DNs, the
   control graph shares node strings, `to_json` no longer makes a deep copy first, OpenGraph
   edges share repeated dicts, and `export-graph` writes the file in pieces. On the
-  250,000-user bench domain `view` peaks at 1.43 GB instead of 2.45 GB, `scripts/bench.py`
-  at 2.1 GB instead of 4.8 GB, and `export-graph` at 1.8 GB where it did not fit in 5 GB
-  before. Findings, fingerprints and every report and export are byte for byte the same.
+  250,000-user bench domain on Python 3.12, `view` peaks at 1.43 GB instead of 2.35 GB,
+  `scripts/bench.py` at 2.1 GB instead of about 4.9 GB, and `export-graph` at 1.8 GB where
+  it did not fit in 5 GB before. Findings, fingerprints and every report and export are byte
+  for byte the same.
+- **`redact` no longer slows down with the square of the domain.** Each word is looked up
+  instead of one pattern of every name running over every string: 1.4 s instead of 40 s at
+  5,000 users, 4 s at 20,000, and 49 s with a 3.0 GB peak at 250,000 users, where it could
+  not finish before.
+- **GPO reach.** A disabled side stays in with a caveat, because the writer can flip it. A
+  filter stops a writer of values, but an owner or DACL writer gets a path through a node
+  `GPO ... with its filter changed`. User-side reach needs some computer able to read the
+  GPO, as Windows has required since MS16-072. A filter on a group the snapshot does not
+  hold, such as another domain's, is assumed to apply, with a caveat and a note.
+- **AD-ACC-013.** Any key on a DC or RODC is high, and so is a second key on a computer. CA
+  servers and Entra Connect sync accounts and servers are read too. A short hash now tells
+  keys and mappings apart, so the object text and identities of this check differ from 0.1.2.
+- **AD-DEL-005.** Graded by the delegating account rather than the host: medium, or high with
+  protocol transition. `sPNMappings` changes only the service class, so ports and instance
+  names are kept. Entries for another domain get their own wording.
+- **AD-ADCS-019.** A URL the directory lists that refuses or answers with anything but 401
+  gets a note that EPA and NTLM were not judged.
+
+### Fixed
+
+- **Redaction.** A comma in a name defeated it: `Doe\, John` stayed readable in every DN, and
+  so did any name with a dotted capital I. Also covered now: enrollment URLs that exist only
+  in a note, user names and passwords in such URLs, service classes outside a default
+  `sPNMappings`, delegation targets with no `/`, and text around the tags of a malformed
+  `altSecurityIdentities` value. An IP address in an enrollment URL no longer makes the output
+  impossible to load, a host label such as `group` no longer changes findings, and the Entra
+  Kerberos trust stays skipped after redaction.
+- **`--no-probes` also skips the LDAP signing bind**, as the docs said. AD-INF-005 then says in
+  a note that it did not judge. The SYSVOL read has its own `--no-sysvol`; the docs no longer
+  put it under `--no-probes`.
+- A control path now says in its text what an edge assumes, such as a WMI filter or a
+  disabled side, instead of only in the OpenGraph export. Fingerprints are unchanged.
+- A host with a space in `msPKI-Enrollment-Servers` no longer ends the scan with a traceback.
+- Text reports show control characters in directory names as escapes, and Markdown reports
+  escape `<` outside code spans.
 
 ## [0.1.4] - 2026-11-07
 

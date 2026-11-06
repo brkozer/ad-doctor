@@ -22,7 +22,9 @@ pytestmark = pytest.mark.lab
 # AD-ACC-005, AD-ACC-011 and AD-KRB-006 (need time to pass), AD-ACC-007 and AD-INF-006
 # (need a real second domain), AD-INF-012 (needs an RODC), AD-ACC-009 (confidential on 2025),
 # AD-INF-008 (DCs require SMB signing), AD-INF-009 and the high grade of AD-CHAIN-002/003
-# (no spooler on Server Core 2025) and AD-INF-011 (needs a week without backup).
+# (no spooler on Server Core 2025), AD-INF-011 (needs a week without backup), AD-INF-003 (a
+# 2025 DC needs level 2016), AD-INF-013 and AD-ADCS-016 (need a host the probes cannot read)
+# and AD-PRIV-001 (not seeded: no tier-0 group here has more than five members).
 EXPECTED = {
     "AD-KRB-002": {"legacy_app"},
     "AD-KRB-003": {"svc_sql", "svc_web"},
@@ -118,7 +120,7 @@ EXPECTED = {
     "AD-INF-017": {"forest.partner.test"},
     "AD-DEL-005": {
         "svc_ghost -> MSSQLSvc/fs01.adlab.test:1433 (no account holds it, the host exists)",
-        "svc_ghost -> cifs/files.partner.test (not in this domain's snapshot, review)",
+        "svc_ghost -> cifs/files.partner.test (another domain, this delegation cannot reach it)",
         "svc_ghost -> cifs/oldfs.adlab.test (no computer object)",
         "svc_ghost_pt -> http/oldweb.adlab.test (no computer object, protocol transition)",
     },
@@ -179,7 +181,8 @@ def snap() -> Snapshot:
     snap = collect(target)
     assert snap.domain == "adlab.test"
     # an ordinary user cannot see fine-grained password policies or dMSAs; nothing else may fail
-    assert [n for n in snap.notes if "fine-grained" not in n and "dMSA" not in n] == []
+    ok = ("fine-grained", "dMSA", "by choice")
+    assert [n for n in snap.notes if not any(word in n for word in ok)] == []
     return snap
 
 
@@ -200,8 +203,9 @@ def test_gpo_reach_through_ou_and_site_links(snap: Snapshot) -> None:
     assert {"ENTRA01$", "EXCH01$", "WS02$"} <= computers and tier0
     computers, tier0 = own_reach("gpo_site_editor")
     assert {"DC01$", "ROGUE01$", "WS02$"} <= computers and tier0
-    # a disabled link, the computer side off, a filter that matches nobody
-    assert own_reach("gpo_ctl") == (set(), 0)
+    # a disabled link and a filter that matches nobody stop an editor; the computer side
+    # off does not, because the status flags sit on the GPO the editor writes
+    assert own_reach("gpo_ctl") == ({"WS02$"}, 0)
     # the block on OU=Isolated stops LabOuReach: only the enforced GPO gets through
     lab = next(n for n, name in g.names.items() if name == "computers under Lab")
     assert "WS03$" not in {g.name(d) for d, _ in g.edges[lab]}
@@ -287,7 +291,7 @@ def test_key_credentials_on_tier_0(snap: Snapshot) -> None:
     assert not any("key credentials there are unknown" in n for n in snap.notes)
 
     (f,) = [f for f in run_all(snap) if f.check_id == "AD-ACC-013"]
-    assert f.severity is Severity.MEDIUM
+    assert f.severity is Severity.HIGH  # any key on a DC
     assert {f.key(o).split(":")[0] for o in f.objects} == {
         "adm_bob",
         "DC01$",
@@ -296,7 +300,7 @@ def test_key_credentials_on_tier_0(snap: Snapshot) -> None:
     }
     text = "\n".join(f.objects)
     assert f"device {user_key.device_id}" in text
-    assert "DC01$: computer key" in text
+    assert f"DC01$: key credential {computer_key.key_id[:8]} (NGC), no device ID" in text
     assert "ROGUE01$: key credential, contents not readable" in text
     assert "svc_sql: certificate mapping X509:<I><SR>" in text
 

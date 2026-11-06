@@ -412,6 +412,7 @@ class Collector:
             gpos=gpos,
             oid_group_links=self._oid_links(pks),
             ca_hosts=self.ca_hosts,
+            enrollment_urls=self.ces_urls,
             root_sid=root_sid,
             dns_admins=dns_admins or [],
             pre2k_members=_str(pre2k[0].get("member", [])) if pre2k else [],
@@ -446,6 +447,7 @@ class Collector:
         snap.probes.ca_configs = ca_configs
         snap.notes += gpo_scope.resolve(snap).notes
         snap.notes += gpo_scope.site_note(snap)
+        snap.notes += gpo_scope.filter_note(snap)
         snap.notes += _channel_notes(snap)
         if self.pwd_unread:
             shown = ", ".join(sorted(self.pwd_unread)[:5])
@@ -517,6 +519,7 @@ class Collector:
         # Entra Connect sync accounts and their servers, and Exchange servers: whoever
         # controls them controls what they hold over the domain
         sync_hosts = {a.sync_host.lower() for a in accounts if a.sync_host}
+        ca_hosts = {h.upper() for h in self.ca_hosts}
         exchange = exchange_members(objects)
         sensitive = [
             a
@@ -528,18 +531,26 @@ class Collector:
             or a.sync_host
             or (a.is_computer and a.sam.lower().rstrip("$") in sync_hosts)
             or a.dn.lower() in exchange
+            or a.sam.upper() in ca_hosts
         ]
         for a in sensitive:
             kind = "computer" if a.is_computer else "user"
             # the attribute is constructed, so it only comes back from a BASE read: this
             # read happens anyway, which keeps the cost to tier 0 and to no extra search
             tier0 = a.dn.lower() in priv_dns or a.is_dc or a.sam.lower() == "krbtgt" or a.rid == 500
-            entries = self._base(a.dn, [*attrs, *TIER0_ATTRS] if tier0 else attrs)
+            # the graph treats CA and sync servers as tier 0, so a key on one is a way in too
+            keys = tier0 or (
+                bool(a.sync_host)
+                or a.sam.upper() in ca_hosts
+                or (a.is_computer and a.sam.lower().rstrip("$") in sync_hosts)
+            )
+            entries = self._base(a.dn, [*attrs, *TIER0_ATTRS] if keys else attrs)
             objects += [self._object(e, kind) for e in entries]
             if tier0:
                 a.pwd_changed = _pwd_changed(entries)
                 if a.pwd_changed is None:
                     self.pwd_unread.append(a.sam)
+            if keys:
                 self._read_keys(a, entries)
         return objects
 
@@ -1240,6 +1251,12 @@ class Collector:
                 "LDAP signing and channel binding not probed: they need a DOMAIN\\user account "
                 "with a password (NTLM)"
             )
+        if not t.plain_port:
+            self.notes.append("LDAP signing not probed by choice: AD-INF-005 did not judge it")
+        if (self.ca_dns_hosts or self.ces_urls) and not (t.probes and t.https_port):
+            self.notes.append(
+                "HTTPS enrollment endpoints not probed by choice: AD-ADCS-019 did not judge them"
+            )
         if not t.probes and not t.plain_port:
             return result
         for name, scanned in self._dc_targets(dc_dns_host, accounts):
@@ -1260,13 +1277,14 @@ class Collector:
             self._probe_enrollment(dc_dns_host, result)
         return result
 
-    def _enrollment_targets(self) -> list[tuple[str, str, str, str, int]]:
-        """(scheme, host, Host header, path, port): each CA's web enrollment, then CES URLs."""
+    def _enrollment_targets(self) -> list[tuple[str, str, str, str, int, bool]]:
+        """(scheme, host, Host header, path, port, published): each CA's web enrollment, which
+        is only a guess, then the CES URLs the directory lists."""
         t = self.target
         assert t is not None
         ports = {"http": t.http_port, "https": t.https_port}
         out = [
-            (scheme, host, host, "/certsrv/", port)
+            (scheme, host, host, "/certsrv/", port, False)
             for host in self.ca_dns_hosts
             for scheme, port in ports.items()
         ]
@@ -1279,18 +1297,20 @@ class Collector:
             if not host:
                 self.notes.append(f"enrollment URL {url} not probed: not a valid URL")
                 continue
-            # a URL that names no port follows the port options, as web enrollment does
-            out.append((scheme, host, parts.netloc, parts.path or "/", port or ports[scheme]))
+            # a URL that names no port follows the port options, as web enrollment does;
+            # a user and password in it stay out of the request
+            header = parts.netloc.rpartition("@")[2]
+            out.append((scheme, host, header, parts.path or "/", port or ports[scheme], True))
         return [target for target in out if ports[target[0]]]
 
     def _probe_enrollment(self, dc_dns_host: str, result: Probes) -> None:
         t = self.target
         assert t is not None
-        for scheme, host, header, path, port in self._enrollment_targets():
+        for scheme, host, header, path, port, published in self._enrollment_targets():
             # an endpoint on the DC being scanned is reached through the address given for it
             connect = t.host if host.lower() == dc_dns_host.lower() else host
             probe = probes.web_enrollment_ntlm if scheme == "http" else probes.enrollment_https
-            url, error = probe(connect, header, port, path)
+            url, error = probe(connect, header, port, path, published)
             if error:
                 self.notes.append(f"{scheme}://{header}{path} not probed: {error}")
             found = result.web_enrollment_ntlm if scheme == "http" else result.enrollment_https

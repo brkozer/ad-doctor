@@ -6,6 +6,7 @@ stays one line per problem rather than one line per account.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -1363,6 +1364,7 @@ def seamless_sso(snap: Snapshot) -> Finding | None:
 
 
 DC_SERVICES = ("ldap", "cifs", "host", "http", "gc", "rpcss", "wsman", "dns")
+IP_LIKE = re.compile(r"[\d.]+")
 
 
 def _spn_parts(spn: str) -> tuple[str, str]:
@@ -1429,22 +1431,31 @@ def ghost_spn_delegation(snap: Snapshot) -> Finding | None:
             # krbtgt is AD-DEL-004's; the KDC finds it by name, not by an SPN
             if spn.lower() in held or service == "krbtgt":
                 continue
-            if mapped and {f"{mapped}/{rest}", f"{mapped}/{host}"} & held:
+            # MapSPN changes the service class and nothing else: a port or instance stays
+            if mapped and f"{mapped}/{rest.rstrip('.')}" in held:
                 continue
             short = host.removesuffix(suffix)
             if not host:
                 hits.append(f"{a.sam} -> {spn} (cannot be parsed, review)")
-            elif host in hosts or short in hosts:
-                if aliases:
-                    hits.append(f"{a.sam} -> {spn} (no account holds it, the host exists)")
-            elif "." in short:
+                continue
+            if host in hosts or short in hosts:
+                if not aliases:
+                    continue  # a mapping could explain it
+                why = "no account holds it, the host exists"
+            elif "." in short and (host.endswith(suffix) or IP_LIKE.fullmatch(host)):
                 hits.append(f"{a.sam} -> {spn} (not in this domain's snapshot, review)")
-            elif a.has(UAC.TRUSTED_TO_AUTH_FOR_DELEGATION):
+                continue
+            elif "." in short:
+                why = "another domain, this delegation cannot reach it"
+            else:
+                why = "no computer object"
+            # the host decides nothing: the attack is a write on an account the attacker holds
+            if a.has(UAC.TRUSTED_TO_AUTH_FOR_DELEGATION):
                 severity = Severity.HIGH
-                hits.append(f"{a.sam} -> {spn} (no computer object, protocol transition)")
+                why += ", protocol transition"
             else:
                 severity = max(severity, Severity.MEDIUM)
-                hits.append(f"{a.sam} -> {spn} (no computer object)")
+            hits.append(f"{a.sam} -> {spn} ({why})")
     if not hits:
         return None
     return _finding(
@@ -1454,8 +1465,9 @@ def ghost_spn_delegation(snap: Snapshot) -> Finding | None:
         "delegating account and can write servicePrincipalName on any account can register a "
         "target there and impersonate users to that account (SPN-jacking). Targets marked "
         "review need a check by hand.",
-        "Remove dead entries from msDS-AllowedToDelegateTo (Delegation tab of the account), "
-        "and confirm that targets in other domains still exist.",
+        "Remove dead entries from msDS-AllowedToDelegateTo (Delegation tab of the account). "
+        "An entry for another domain cannot work with this kind of delegation, so remove it "
+        "too.",
         sorted(set(hits)),
     )
 
@@ -1674,62 +1686,91 @@ def fake_password_change(snap: Snapshot) -> Finding | None:
 
 
 KEY_USAGES = {0x01: "NGC", 0x07: "FIDO", 0x08: "FEK"}
+KEY_ID_SHOWN = 8
 USER_KEY_USAGES = (0x01, 0x07)
 
 
-def _key_line(a: Account, key: KeyCredential) -> tuple[str, str, Severity]:
-    """Object text, stable identity and grade of one key credential."""
+def _key_line(a: Account, key: KeyCredential, count: int) -> tuple[str, str, Severity]:
+    """Object text, stable identity and grade of one of an account's `count` key credentials."""
     added = f", added {key.added:%Y-%m-%d}" if key.added else ""
     created = f", created {key.created:%Y-%m-%d}" if key.created else ""
-    identity = f"{a.sam}: key {key.device_id or key.added or key.created or 'without ID'}"
+    short = f" {key.key_id[:KEY_ID_SHOWN]}" if key.key_id else ""
+    name = key.key_id or key.device_id or key.added or key.created or "without ID"
+    identity = f"{a.sam}: key {name}"
+    # no normal flow leaves a key on a DC, whatever its shape
+    unusual = Severity.HIGH if a.is_dc else Severity.MEDIUM
     if not key.readable:
-        return f"{a.sam}: key credential, contents not readable{added}", identity, Severity.MEDIUM
+        return f"{a.sam}: key credential, contents not readable{added}", identity, unusual
     if not key.parsed:
         return f"{a.sam}: key credential that does not parse{added}", identity, Severity.HIGH
     usage = KEY_USAGES.get(key.usage or 0, f"usage {key.usage}")
     device = f", device {key.device_id}" if key.device_id else ", no device ID"
-    text = f"{a.sam}: key credential ({usage}){device}{created}{added}"
-    if a.is_computer and key.self_written:
-        return f"{a.sam}: computer key{created}{added}", identity, Severity.LOW
+    text = f"{a.sam}: key credential{short} ({usage}){device}{created}{added}"
+    # a computer may write one key to itself, and only with no value there already
+    if a.is_computer and not a.managed and not a.is_dc and count == 1:
+        if key.self_written:
+            return f"{a.sam}: computer key{short}{created}{added}", identity, Severity.LOW
+        if key.custom_info:
+            label = "computer key with custom key information"
+            return f"{a.sam}: {label}{short}{created}{added}", identity, Severity.MEDIUM
     person = not a.is_computer and not a.managed and a.sam.lower() != "krbtgt"
     if person and key.device_id and key.usage in USER_KEY_USAGES:
         return text, identity, Severity.MEDIUM
     return text, identity, Severity.HIGH
 
 
+def _mapping_line(snap: Snapshot, a: Account, mapping: str) -> str:
+    """Object text of one mapping. The value stays out of reports; a salted hash tells two
+    of one shape apart, so a backdoor beside a known mapping does not pass as the known one."""
+    salted = f"{snap.domain_sid}:{a.sam}:{mapping}".encode()
+    mark = hashlib.sha256(salted).hexdigest()[:KEY_ID_SHOWN]
+    scheme = mapping.split(":", 1)[0]
+    if scheme.upper() == "KERBEROS":
+        return f"{a.sam}: Kerberos name mapping {mark}"
+    scheme = scheme if scheme.upper() in MAPPING_SCHEMES else "other"
+    return f"{a.sam}: certificate mapping {scheme}:{''.join(MAPPING_TAG.findall(mapping))} {mark}"
+
+
 @check("AD-ACC-013", "Key credentials or certificate mappings on tier-0 accounts")
 def tier0_key_credentials(snap: Snapshot) -> Finding | None:
     privileged = snap.privileged_dns()
+    ca_hosts = {h.upper() for h in snap.ca_hosts}
+    sync_servers = {s.dn.lower() for a in _sync_accounts(snap) for s in _sync_servers(snap, a)}
     objects: dict[str, str] = {}
     grades = []
+
+    def report(text: str, identity: str, grade: Severity) -> None:
+        # keys the snapshot cannot tell apart still count as two
+        number = sum(1 for o in objects if o == text or o.startswith(f"{text} ("))
+        suffix = f" ({number + 1})" if number else ""
+        objects[text + suffix] = identity + suffix
+        grades.append(grade)
+
     for a in snap.accounts:
         krbtgt = a.sam.lower() == "krbtgt"
         tier0 = a.dn.lower() in privileged or a.is_dc or krbtgt or a.rid == 500
-        if not tier0 or not (a.enabled or krbtgt):
+        tier0 = tier0 or bool(a.sync_host) or a.dn.lower() in sync_servers
+        if not (tier0 or a.sam.upper() in ca_hosts) or not (a.enabled or krbtgt):
             continue
         for key in a.key_credentials:
-            text, identity, grade = _key_line(a, key)
-            objects[text] = identity
-            grades.append(grade)
+            report(*_key_line(a, key, len(a.key_credentials)))
         for mapping in a.alt_security_identities:
             if not WEAK_MAPPING.match(mapping):  # AD-ADCS-009 has the weak ones
-                scheme = mapping.split(":", 1)[0]
-                scheme = scheme if scheme.upper() in MAPPING_SCHEMES else "other"
-                tags = "".join(MAPPING_TAG.findall(mapping))
-                text = f"{a.sam}: certificate mapping {scheme}:{tags}"
-                objects[text] = text
-                grades.append(Severity.MEDIUM)
+                text = _mapping_line(snap, a, mapping)
+                report(text, text, Severity.MEDIUM)
     if not objects:
         return None
     finding = _finding(
         "AD-ACC-013",
         max(grades),
         "Whoever holds the private key behind one of these can log on as the account without "
-        "its password, and a password reset does not stop it. Windows Hello for Business, a "
-        "computer's own key and smart cards leave the same values as a backdoor does, so this "
-        "needs a person to confirm each one.",
+        "its password, and a password reset does not stop it. A Kerberos name mapping does the "
+        "same for whoever controls that principal in the other realm. Windows Hello for "
+        "Business, a computer's own key and smart cards leave the same values as a backdoor "
+        "does, so this needs a person to confirm each one.",
         "Match each device ID to a device the owner enrolled and each mapping to a certificate "
-        "you issued. Remove what nobody can explain and treat it as an incident.",
+        "you issued or a principal you know. Remove what nobody can explain and treat it as an "
+        "incident.",
         sorted(objects),
     )
     finding.keys = objects

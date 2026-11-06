@@ -24,8 +24,8 @@ vulnerability: please open a regular issue (there is a template for false positi
 ## What ad-doctor does on the network
 
 ad-doctor is read-only. It binds to LDAP with the account you give it and reads; it never
-modifies an object. On top of that it makes these active, non-intrusive probes, all of
-which `--no-probes` turns off:
+modifies an object. On top of that it makes these active, non-intrusive probes.
+`--no-probes` turns off all of them except SYSVOL, which has `--no-sysvol`:
 
 | Probe | Against | What it does |
 |---|---|---|
@@ -38,7 +38,9 @@ which `--no-probes` turns off:
 | CA registry (ESC6/7/11/16, audit filter) | each enterprise CA, port 445 | reads the CA's configuration over `\pipe\winreg` (MS-RRP), `KEY_READ` only; `--no-ca-registry` skips it |
 | SYSVOL | the scanned DC | reads GPO files (security templates, Group Policy Preferences, Restricted Groups and Local Groups) and scripts (`--no-sysvol` skips it) |
 
-`--single-dc` limits the DC probes to the DC being scanned.
+`--single-dc` limits the DC probes to the DC being scanned. A URL from
+`msPKI-Enrollment-Servers` is reached on the port it names; only a URL with no port follows
+`--http-port` or `--https-port`.
 
 The CA registry probe opens `\pipe\winreg` on the CA host. On a host where the RemoteRegistry
 service is set to start on demand, opening that pipe trigger-starts it: a visible change of

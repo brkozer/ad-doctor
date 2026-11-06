@@ -1,8 +1,8 @@
 # Lab domain
 
 A disposable Windows Server 2025 domain controller for ad-doctor's live tests, seeded
-with one instance of every misconfiguration that a single domain can hold (the rest are
-listed in the main README's "Limits" and covered by unit tests).
+with the misconfigurations `seed.ps1` plants (what it leaves out is listed in the main
+README's "Limits" and covered by unit tests).
 
 The DC runs under KVM with QEMU user networking (`restrict=on`): it cannot open
 connections anywhere, and its ports are forwarded to `127.0.0.1` on the host only.

@@ -1,12 +1,14 @@
 id = "AD-DEL-005"
 aliases = ["ghost-spn", "spn-jacking", "orphaned-spn"]
-summary = "msDS-AllowedToDelegateTo names an SPN no account holds, so someone with SPN write on any account can take over the target."
+summary = "msDS-AllowedToDelegateTo names an SPN no account holds, so someone who controls the delegating account and can write SPNs can register it and impersonate users to an account they control."
 severities = ["low", "medium", "high"]
 severity_logic = """
-Set by the worst target. **High** when the host has no computer object and the delegating
-account has protocol transition, so it can impersonate anyone without their credentials.
-**Medium** when the host has no computer object and the account is Kerberos-only.
-**Low** when the host exists but nothing holds the SPN, and for targets that need a review.
+Set by the worst target, and by the delegating account, not by the host: the attack is a
+write on an account the attacker holds, so a free SPN on a live host can be claimed like one
+on a dead host. **High** when the account has protocol transition, so it can impersonate
+anyone without their credentials. **Medium** without it: that takes one more step, not a
+limit, because a forwardable ticket can come from resource-based delegation. **Low** for
+targets that need a review.
 """
 mitre = ["T1558", "T1134"]
 data_sources = ["ldap"]
@@ -29,8 +31,9 @@ This is SPN-jacking. It needs two things: control of the delegating account, and
 right to write `servicePrincipalName` on any account, which may be a low-value one. The
 attacker registers the dead SPN there, and the delegating account now gets tickets as any
 user to an account the attacker controls. With protocol transition no user has to
-authenticate first. Taken alone the leftover grants nothing, so it is a condition for an
-attack, not a proven path.
+authenticate first, and without it the attacker can still chain resource-based delegation.
+Taken alone the leftover grants nothing, so it is a condition for an attack, not a proven
+path.
 """
 
 detection = """
@@ -39,19 +42,25 @@ Each `msDS-AllowedToDelegateTo` value of an enabled account is judged from the s
 1. Any account, enabled or not, holds the exact SPN: fine.
 2. The service class maps to another one through `sPNMappings`, and an account holds the
    mapped SPN: fine. On a default forest `cifs/fs01.corp.example`, `http/...` and about 50
-   other classes are answered by `HOST/fs01.corp.example`. Custom mappings count.
+   other classes are answered by `HOST/fs01.corp.example`. Custom mappings count. Only the
+   class changes, so `http/fs01.corp.example:8080` needs `HOST/fs01.corp.example:8080`.
 3. The host is known, as a computer or managed service account, or as the host of any SPN:
-   `(no account holds it, the host exists)`, low.
+   `(no account holds it, the host exists)`.
 4. The host is short, or directly under the scanned domain's name, and unknown:
-   `(no computer object)`, medium, or `(no computer object, protocol transition)`, high.
-5. Any other host: `(not in this domain's snapshot, review)`, low. It may live in a child or
-   trusted domain, which this snapshot does not hold.
+   `(no computer object)`.
+5. A host below the scanned domain's name, or an address:
+   `(not in this domain's snapshot, review)`, low. It may be a child domain.
+6. Any other host: `(another domain, this delegation cannot reach it)`. Delegation set on the
+   account works in one domain only, so the entry cannot work, and anyone able to write SPNs
+   here can still claim the name.
+
+Steps 3, 4 and 6 are medium, or high with `, protocol transition` added to the text.
 
 `krbtgt` targets are [AD-DEL-004](AD-DEL-004.md)'s. No DNS query is made: the answer comes
 from directory objects only.
 
 If `sPNMappings` cannot be read, step 3 is left out, because a mapping could explain the
-target, and a note says so. Steps 4 and 5 do not need it. An older snapshot behaves the same.
+target, and a note says so. The other steps do not need it. An older snapshot behaves the same.
 """
 
 false_positives = """
@@ -61,6 +70,8 @@ false_positives = """
   SPN with that name, so an alias with no SPN is reported, and rightly: the KDC cannot find it.
 - **Hosts in a subdomain of the DNS name** that belong to this AD domain are reported as
   `review`, not as ghosts.
+- **An SPN that only a port or instance name keeps from matching** is reported on purpose:
+  the KDC looks for that exact name. This reading comes from [MS-DRSR], not from a KDC.
 """
 
 remediation = """
@@ -71,8 +82,9 @@ remediation = """
         Select-Object Name, msDS-AllowedToDelegateTo
     ```
 
-2. **Remove dead targets**, on the Delegation tab of the account or with a command that
-   you review first:
+2. **Remove dead targets**, and entries for other domains, which this kind of delegation
+   cannot reach, on the Delegation tab of the account or with a command that you review
+   first:
 
     ```powershell
     Set-ADUser svc_app -Remove @{ 'msDS-AllowedToDelegateTo' = 'cifs/oldfs.corp.example' } -WhatIf
@@ -94,6 +106,16 @@ kind = "vendor"
 [[references]]
 title = "Purple Knight security indicators: constrained delegation to ghost SPN"
 url = "https://www.semperis.com/purple-knight/security-indicators/"
+kind = "vendor"
+
+[[references]]
+title = "[MS-DRSR]: MapSPN"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-drsr/77063286-8864-438e-9a71-74e1efac2a9e"
+kind = "spec"
+
+[[references]]
+title = "Kerberos constrained delegation overview"
+url = "https://learn.microsoft.com/en-us/windows-server/security/kerberos/kerberos-constrained-delegation-overview"
 kind = "vendor"
 
 [[references]]

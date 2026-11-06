@@ -94,10 +94,17 @@ def smb_posture(
     return signing, spooler
 
 
+NOT_JUDGED = "EPA and NTLM not judged"
+
+
 def _windows_auth_url(
-    conn: http.client.HTTPConnection, scheme: str, host_header: str, path: str
+    conn: http.client.HTTPConnection, scheme: str, host_header: str, path: str, published: bool
 ) -> tuple[str | None, str | None]:
-    """(URL if an unauthenticated GET is answered with NTLM or Negotiate, error)."""
+    """(URL if an unauthenticated GET is answered with NTLM or Negotiate, error).
+
+    `published` is for a URL the directory lists: it exists, so silence from it is unknown.
+    For the guessed /certsrv/ a closed port or another status just means no such endpoint.
+    """
     try:
         conn.request("GET", path, headers={"Host": host_header})
         resp = conn.getresponse()
@@ -105,25 +112,39 @@ def _windows_auth_url(
     except (OSError, ValueError, http.client.HTTPException) as exc:
         # unreachable is not the same as not vulnerable: the caller reports it
         if isinstance(exc, ConnectionRefusedError):
-            return None, None  # nothing listens on the port: no such endpoint
+            # nothing listens on the port
+            return None, f"connection refused, {NOT_JUDGED}" if published else None
         return None, str(exc) or type(exc).__name__
     finally:
         conn.close()
     if resp.status == 401 and any(s in schemes for s in ("NTLM", "Negotiate")):
         return f"{scheme}://{host_header}{path}", None
+    if published and resp.status != 401:
+        return None, f"answered {resp.status}, {NOT_JUDGED}"
     return None, None
 
 
 def web_enrollment_ntlm(
-    connect_host: str, host_header: str, port: int, path: str = "/certsrv/"
+    connect_host: str,
+    host_header: str,
+    port: int,
+    path: str = "/certsrv/",
+    published: bool = False,
 ) -> tuple[str | None, str | None]:
     """(URL if the endpoint answers over plain HTTP with NTLM or Negotiate (ESC8), error)."""
-    conn = http.client.HTTPConnection(connect_host, port, timeout=TIMEOUT)
-    return _windows_auth_url(conn, "http", host_header, path)
+    try:
+        conn = http.client.HTTPConnection(connect_host, port, timeout=TIMEOUT)
+    except (ValueError, http.client.HTTPException) as exc:  # a host the directory got wrong
+        return None, str(exc) or type(exc).__name__
+    return _windows_auth_url(conn, "http", host_header, path, published)
 
 
 def enrollment_https(
-    connect_host: str, host_header: str, port: int, path: str = "/certsrv/"
+    connect_host: str,
+    host_header: str,
+    port: int,
+    path: str = "/certsrv/",
+    published: bool = False,
 ) -> tuple[str | None, str | None]:
     """(URL if the endpoint answers over HTTPS with NTLM or Negotiate, error).
 
@@ -133,8 +154,11 @@ def enrollment_https(
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
-    conn = http.client.HTTPSConnection(connect_host, port, timeout=TIMEOUT, context=context)
-    return _windows_auth_url(conn, "https", host_header, path)
+    try:
+        conn = http.client.HTTPSConnection(connect_host, port, timeout=TIMEOUT, context=context)
+    except (ValueError, http.client.HTTPException) as exc:  # a host the directory got wrong
+        return None, str(exc) or type(exc).__name__
+    return _windows_auth_url(conn, "https", host_header, path, published)
 
 
 def tls_end_point(cert_der: bytes) -> GssChannelBindings:

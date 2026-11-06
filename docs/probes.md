@@ -1,7 +1,8 @@
 # Network probes
 
 On top of the LDAP reads, ad-doctor makes a few active, read-only probes. Each is one
-connection per target, nothing is written, and `--no-probes` turns them all off.
+connection per target and nothing is written. `--no-probes` turns off all of them except
+SYSVOL, which has `--no-sysvol`.
 
 | Probe | Against | What it does |
 |---|---|---|
@@ -16,7 +17,9 @@ connection per target, nothing is written, and `--no-probes` turns them all off.
 
 The DC being scanned is reached through the address and ports on the command line; the
 other DCs by their DNS names on the standard ports. `--single-dc` limits the DC probes to
-the DC being scanned.
+the DC being scanned. A URL from `msPKI-Enrollment-Servers` is reached on the port it names;
+only a URL with no port follows `--http-port` or `--https-port`. When one of these probes
+does not run, or such a URL gives no answer to judge, a note says so.
 
 ## Intrusiveness of the CA registry probe
 
@@ -28,7 +31,8 @@ that key. Remote registry access to a CA is also the kind of activity EDR and Mi
 Defender for Identity may alert on.
 
 It is still only a read: nothing in the directory, the CA database or the registry is
-modified. Use `--no-ca-registry` to skip just this probe, or `--no-probes` to skip them all.
+modified. Use `--no-ca-registry` to skip just this probe, or `--no-probes` to skip it with
+the others.
 When it is skipped, the CA-side checks (ESC6, ESC7, ESC11, ESC16, audit filter) simply produce no result
 for that CA.
 

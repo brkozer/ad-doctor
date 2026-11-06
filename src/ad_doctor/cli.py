@@ -65,7 +65,8 @@ def _target(args: argparse.Namespace) -> Target:
         use_ssl=args.ldaps,
         sysvol=not args.no_sysvol,
         smb_port=args.smb_port,
-        plain_port=args.signing_probe_port,
+        # --no-probes means every probe, the signing bind included
+        plain_port=0 if args.no_probes else args.signing_probe_port,
         http_port=args.http_port,
         https_port=args.https_port,
         probes=not args.no_probes,
@@ -505,7 +506,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument(
             "--no-probes",
             action="store_true",
-            help="skip every probe: SMB, channel binding, ESC8 and the CA registry",
+            help="skip every probe: LDAP signing, SMB, channel binding, enrollment and the "
+            "CA registry",
         )
         p.add_argument(
             "--no-ca-registry",

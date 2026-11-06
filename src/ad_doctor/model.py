@@ -53,8 +53,12 @@ class KeyCredential:
     added: datetime | None = None
     usage: int | None = None
     source: int | None = None
-    # the only shape a computer may write to itself
+    # the only shape [MS-ADTS] lets a computer write to itself
     self_written: bool = False
+    # the same with CustomKeyInformation, which DSInternals says Windows adds in practice
+    custom_info: bool = False
+    # start of a SHA-256 of the key material: tells keys apart, cannot rebuild the key
+    key_id: str = ""
 
 
 # slots: a domain has hundreds of thousands of these, and from 30 attributes on, CPython
@@ -415,6 +419,8 @@ class Snapshot:
     oid_group_links: dict[str, str] = field(default_factory=dict)
     # computer accounts (sAMAccountName) of the enterprise CA servers
     ca_hosts: list[str] = field(default_factory=list)
+    # msPKI-Enrollment-Servers URLs as read, probed or not: redact learns its words from them
+    enrollment_urls: list[str] = field(default_factory=list)
     # SID of the forest root domain (differs from domain_sid in child domains)
     root_sid: str = ""
     dns_admins: list[str] = field(default_factory=list)
@@ -568,6 +574,7 @@ class Snapshot:
             ],
             oid_group_links=data.get("oid_group_links", {}),
             ca_hosts=data.get("ca_hosts", []),
+            enrollment_urls=data.get("enrollment_urls", []),
             root_sid=data.get("root_sid", ""),
             probes=_probes(data.get("probes", {}), seen_aces),
             objects=[

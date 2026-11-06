@@ -165,8 +165,11 @@ def test_ntlm_deny_must_reach_every_dc() -> None:
 
 
 def test_ntlm_ignores_a_gpo_that_is_filtered_away_from_the_dc() -> None:
-    g = gpo("Hardening", "{A}", aces=[Ace(f"{SID}-9999", sd.READ_PROPERTY | sd.CONTROL_ACCESS)])
-    assert gpo_scope.dc_outgoing_ntlm(ntlm_snapshot(2, gpos=[g])).denied is False
+    filtered = sd.READ_PROPERTY | sd.CONTROL_ACCESS
+    g = gpo("Hardening", "{A}", aces=[Ace(f"{SID}-9999", filtered)])
+    snap = ntlm_snapshot(2, gpos=[g])
+    snap.objects.append(DirObject("CN=F,DC=lab,DC=test", "F", "group", sid=f"{SID}-9999"))
+    assert gpo_scope.dc_outgoing_ntlm(snap).denied is False
 
 
 def test_gpttmpl_registry_value_is_read() -> None:

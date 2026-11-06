@@ -269,7 +269,7 @@ def test_metadata_is_asked_for_tier0_accounts_only() -> None:
     )
     c._objects(DOMAIN, [admin, sync, plain], {admin.dn.lower()})
     asked = [base for base, attrs in c.reads if collect.REPL_METADATA in attrs]
-    assert asked == [admin.dn]
+    assert asked == [admin.dn, sync.dn]  # a sync account is read for keys, not for age
     assert admin.pwd_changed is not None and sync.pwd_changed is None
     assert plain.dn not in {base for base, _ in c.reads}
 

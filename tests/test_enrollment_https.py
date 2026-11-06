@@ -131,11 +131,15 @@ def test_ces_urls_from_the_stored_format() -> None:
 def run(c: Collector, monkeypatch: pytest.MonkeyPatch, answers: dict[str, Any]) -> Probes:
     calls: list[tuple[Any, ...]] = []
 
-    def web(connect: str, header: str, port: int, path: str) -> tuple[str | None, str | None]:
+    def web(
+        connect: str, header: str, port: int, path: str, published: bool = False
+    ) -> tuple[str | None, str | None]:
         calls.append(("http", connect, header, port, path))
         return answers.get("http", (None, None))
 
-    def tls(connect: str, header: str, port: int, path: str) -> tuple[str | None, str | None]:
+    def tls(
+        connect: str, header: str, port: int, path: str, published: bool = False
+    ) -> tuple[str | None, str | None]:
         calls.append(("https", connect, header, port, path))
         return answers.get("https", (None, None))
 

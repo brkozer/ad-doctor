@@ -3,12 +3,16 @@ aliases = ["shadow-credentials-present", "tier0-key-credentials"]
 summary = "A tier-0 account holds a key credential or a strong certificate mapping: a way to log on without its password. Normal for Windows Hello and smart cards, and also what a backdoor looks like."
 severities = ["low", "medium", "high"]
 severity_logic = """
-**Low** for a key on a computer in the only shape a computer can write to itself. **Medium**
-for a key on a user with a device ID, which is what Windows Hello for Business leaves, a key
-whose contents this account may not read, and a strong certificate mapping. **High** for a
-key no normal flow leaves: on `krbtgt`, a managed service account or a computer in any other
-shape, on a user without a device ID or with an unusual key usage, or a value that does not
-parse. The grade says how a value looks. It does not say who wrote it: see the false positives.
+**Low** for the only key on a member computer, in the only shape [MS-ADTS] lets a computer
+write to itself. **Medium** for the only key on a member computer in that shape plus custom
+key information (see the false positives), a key on a user with a device ID, which is what
+Windows Hello for Business leaves, a key whose contents this account may not read, a strong
+certificate mapping and a Kerberos name mapping. **High** for a key no normal flow leaves: any
+key on a domain controller, read-only ones included, whatever its shape; a second key on a
+computer, since a computer may write to itself only when no value is there; a key on `krbtgt`
+or a managed service account; a computer key in any other shape, a device ID included; a key
+on a user without a device ID or with an unusual key usage; and a value that does not parse.
+The grade says how a value looks. It does not say who wrote it: see the false positives.
 """
 mitre = ["T1098", "T1649"]
 data_sources = ["ldap"]
@@ -24,7 +28,9 @@ risk = """
 Anyone who can write `msDS-KeyCredentialLink` on an account can add a public key and then log
 on as that account with PKINIT, holding the private key. This is the Shadow Credentials
 attack. A certificate mapping in `altSecurityIdentities` does the same for a certificate the
-attacker holds. Neither touches the password, so the access survives a password reset.
+attacker holds, and a `Kerberos:` value does it for a principal in another realm: whoever
+controls that principal can log on as this account. None of these touches the password, so
+the access survives a password reset.
 
 [AD-ACL-004](AD-ACL-004.md) reports who could write these attributes. This check reports what
 is already there, which matters after an incident, when the rights may be gone and the key
@@ -34,14 +40,17 @@ certificate.
 """
 
 detection = """
-For `krbtgt`, the built-in Administrator, domain controllers and every account in a tier-0
-group, ad-doctor asks for `msDS-KeyCredentialLink` and `msDS-ReplValueMetaData` in the BASE
-read of the account it makes anyway. Accounts outside tier 0 are not read for keys.
+For `krbtgt`, the built-in Administrator, domain controllers, every account in a tier-0
+group, CA servers and Entra Connect sync accounts and servers, ad-doctor asks for
+`msDS-KeyCredentialLink` and `msDS-ReplValueMetaData` in the BASE read of the account. Other
+accounts are not read for keys.
 
 From each value it keeps the device ID, the key usage and source, the creation time in the
 blob and, from the metadata, the time the value was added. The blob's time is whatever the
 writer put there; the metadata's time is the directory's own. The key itself is not kept in
-the snapshot or in any report, and only the type of a certificate mapping is shown.
+the snapshot or in any report, and of a mapping only the type is shown. A short hash of the
+key material or of the mapping tells two values apart, so a value added next to a known one
+counts as new in a diff and is not covered by an acceptance of the known one.
 
 **What an ordinary account can see.** LDAP leaves out an attribute the account may not read
 exactly as it leaves out an empty one, so an empty read proves nothing alone. In the lab an
@@ -66,9 +75,15 @@ false_positives = """
   and it looks the same as a planted key: tools that plant them write a device ID too. Only
   the device list can tell them apart. Hello on a tier-0 account is itself worth a question,
   since that device then holds the keys to the domain.
-- **A computer's own key.** A computer may add one key to itself, with no custom key
-  information and no last logon time. Anyone able to write the attribute can copy that shape,
-  so it is reported at low and not dropped.
+- **A computer's own key.** [MS-ADTS] lets a computer add one key to itself when no value
+  is there, with no custom key information and no last logon time. Anyone able to write the
+  attribute can copy that shape, so it is reported at low and not dropped. On a domain
+  controller it says nothing: no normal flow leaves a key there, so any key is high, and tools
+  such as Keycred write this shape on purpose.
+- **Custom key information on a computer key.** The spec and the DSInternals parser disagree:
+  DSInternals says that in practice Windows adds this entry with `MFANotUsed`. No key from a
+  hybrid-joined computer has been read to settle it, so one such key on a member computer is
+  medium, labelled `computer key with custom key information`, and not called abnormal.
 - **Smart card logon.** An explicit strong mapping is the supported way to map a certificate
   that cannot carry the SID extension (KB5014754).
 """
@@ -81,8 +96,9 @@ remediation = """
         -Properties msDS-KeyCredentialLink -ShowAllLinkedValues
     ```
 
-2. **Match each device ID** to a device the account's owner really enrolled, and each
-   mapping to a certificate you issued.
+2. **Match each device ID** to a device the account's owner really enrolled, each
+   certificate mapping to a certificate you issued, and each Kerberos name mapping to a
+   principal you know.
 
 3. **Remove what nobody can explain.** Copy the exact value first:
 

@@ -51,7 +51,7 @@ A -> B means A controls B or can become B:
 | `owns`, takeover rights (`full control`, `write/WriteDacl/WriteOwner`, `write msDS-KeyCredentialLink`, reset password, ...) | owner and ACEs on users, computers, groups, OUs and the domain head |
 | `... (inherited)`, `contains` | inheritable ACEs on OUs and containers, and control of a container over what is below it; AdminSDHolder-protected objects are excluded |
 | `DCSync` | both replication rights on the domain head |
-| `link GPOs`, `linked to domain` | write access to `gPLink`, and GPO links to the domain or the Domain Controllers OU for a GPO that reaches a DC |
+| `link GPOs`, `linked to domain` | write access to `gPLink`, and GPO links to the domain or the Domain Controllers OU for a GPO that reaches a writable DC |
 | `GPO applies to`, `GPO inherited by`, `GPO reaches` | whoever can write a GPO controls what it applies to: from the GPO through its links on OUs, the domain head and sites, down the OU tree to computers and users |
 | `admin to via GPO ...` | local administrator (or equivalent) groups set by Group Policy; admin on a computer becomes that computer account |
 | `hosts sync account` | an Entra Connect server holds its sync account's password |
@@ -70,11 +70,21 @@ Domain Users -[enroll (ESC1-3)]-> template LabESC1
 LabServerAdmins -[admin to via GPO LabLocalAdmins]-> ENTRA01$ -[hosts sync account]-> MSOL_0a1b2c3d4e5f -[DCSync]-> corp.example
 ```
 
-GPO reach follows Group Policy, not containment. Disabled links, Block Inheritance,
-Enforced and security filtering count, and a GPO with its computer or user side disabled
-reaches only the other side. A GPO reaches computers and users, not groups or the OU
-itself, and it does reach objects with inheritance disabled. The steps between the GPO
-and the account are scope nodes such as `users under Lab`:
+GPO reach follows Group Policy, not containment. Disabled links, Block Inheritance and
+Enforced count, because they sit on the OU and the writer of a GPO cannot change them. What
+sits on the GPO does not hold its writer back: a disabled computer or user side stays in the
+graph, with a caveat in the path text, because the writer can flip the `flags` attribute. A
+security filter stops a writer of values, but not one who owns the GPO or can rewrite its
+DACL: that path runs through a node `GPO ... with its filter changed`. A filter naming a group
+the snapshot does not hold (another domain's, or one not readable) cannot be judged, so the
+GPO is assumed to apply, with a caveat and a note naming it. Since MS16-072 Windows fetches
+user policy as the computer, so user-side reach also needs some computer to be able to read
+the GPO.
+
+A GPO that reaches only a read-only DC gets no `linked to domain` edge, because an RODC cannot
+write the domain; an RODC itself counts as tier 0, so the path to it stays. A GPO reaches
+computers and users, not groups or the OU itself, and it does reach objects with inheritance
+disabled. The steps between the GPO and the account are scope nodes such as `users under Lab`:
 
 ```text
 gpo_editor -[full control]-> LabOuReach -[GPO applies to]-> users under Lab -[GPO reaches]-> svc_sql
@@ -93,12 +103,12 @@ false_positives = """
   [accepted-risk file](../ci.md#accepted-risks).
 - **Local accounts and local groups** on servers are invisible over LDAP, so paths through
   them are missed rather than over-reported; the same goes for sessions and logons.
-- **GPO reach** assumes WMI filters match (the edge carries a caveat), ignores Deny ACEs
-  on the GPO, and assumes a user in scope logs on somewhere. Empty GPOs count, because
-  the writer fills them in. It can also miss: a writer may be able to re-enable a
-  disabled side or change the filter, loopback processing is not modelled, and with more
-  than one site, site links are followed only to the domain controllers of that site (the
-  scan says so in a note).
+- **GPO reach** assumes WMI filters match (the path shows the caveat), ignores Deny ACEs
+  on the GPO, and assumes a user in scope logs on somewhere. Empty GPOs and disabled sides
+  count, because the writer fills them in or turns them on. It can also miss: loopback
+  processing is not modelled, and with more than one site, site links are followed only to
+  the domain controllers of that site (the scan says so in a note). A DC whose site is
+  unknown counts as reached, with a caveat.
 - **Deny ACEs** that cancel an allow are not modelled; a reported ACL step may be blocked
   in practice. Confirm with the steps below before removing a right in a hurry.
 """
@@ -158,3 +168,8 @@ kind = "vendor"
 title = "BloodHound documentation (SpecterOps)"
 url = "https://bloodhound.specterops.io/home"
 kind = "tool"
+
+[[references]]
+title = "Deploying Group Policy Security Update MS16-072 (AskDS)"
+url = "https://learn.microsoft.com/en-us/archive/blogs/askds/deploying-group-policy-security-update-ms16-072-kb3163622"
+kind = "vendor"

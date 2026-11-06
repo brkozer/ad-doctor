@@ -298,11 +298,11 @@ def test_unreadable_key_is_reported_not_passed() -> None:
     assert f.objects == ["adm: key credential, contents not readable, added 2026-11-01"]
 
 
-def test_computer_own_key_on_a_dc_is_low() -> None:
+def test_a_key_in_the_computer_shape_on_a_dc_is_high() -> None:
     key = keycred.parse_blob(computer_blob())
     dc = computer("DC02", 0x2000, laps=False, key_credentials=[key])
     f = only(snapshot(dc), "AD-ACC-013")
-    assert f.severity is Severity.LOW and f.objects[0].startswith("DC02$: computer key")
+    assert f.severity is Severity.HIGH and "computer key" not in f.objects[0]
 
 
 def test_other_key_shape_on_a_dc_is_high() -> None:
@@ -335,17 +335,21 @@ def test_outside_tier_0_and_disabled_accounts_are_silent() -> None:
 def test_strong_mapping_on_tier_0_is_medium_and_shows_only_its_type() -> None:
     f = only(admin_snapshot(admin(alt_security_identities=[STRONG])), "AD-ACC-013")
     assert f.severity is Severity.MEDIUM
-    assert f.objects == ["adm: certificate mapping X509:<I><SR>"]
+    (text,) = f.objects
+    assert text.startswith("adm: certificate mapping X509:<I><SR> ")
+    assert "lab-CA" not in text and "1200000000" not in text
 
 
 def test_kerberos_mapping_is_listed_by_type() -> None:
     a = admin(alt_security_identities=["Kerberos:adm@LAB.TEST"])
-    assert only(admin_snapshot(a), "AD-ACC-013").objects == ["adm: certificate mapping Kerberos:"]
+    (text,) = only(admin_snapshot(a), "AD-ACC-013").objects
+    assert text.startswith("adm: Kerberos name mapping ") and "LAB.TEST" not in text
 
 
 def test_a_value_that_is_no_mapping_is_not_shown() -> None:
     a = admin(alt_security_identities=["person@corp.example"])
-    assert only(admin_snapshot(a), "AD-ACC-013").objects == ["adm: certificate mapping other:"]
+    (text,) = only(admin_snapshot(a), "AD-ACC-013").objects
+    assert text.startswith("adm: certificate mapping other: ") and "corp" not in text
 
 
 def test_weak_mapping_stays_with_esc14_and_ordinary_users_are_silent() -> None:

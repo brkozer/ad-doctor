@@ -132,7 +132,7 @@ ad-doctor view snap.json --graph none -o summary.html   # no graph, not encrypte
 ## Size and speed
 
 Measured on `scripts/bench.py` domains and the lab, on one core of an Intel Xeon Gold 6138
-(2017), from the installed wheel, with the defaults: `--graph auto`, and so encrypted,
+(2017), on Python 3.12, with the defaults: `--graph auto`, and so encrypted,
 since every one of these files embeds graph data. `ad-doctor view` includes loading the
 snapshot, running every check, building the graph data and encrypting; peak memory is the
 build's. First screen is from opening the same file built with `--no-encrypt` to the
@@ -143,9 +143,9 @@ JavaScript heap after unlocking and one blast-radius lookup.
 | Domain | Graph | HTML file | `ad-doctor view` | Build memory | First screen | Unlock | JS heap |
 |---|---|---|---|---|---|---|---|
 | lab (49 accounts) | full | 228 KB | 0.8 s | 54 MB | 108 ms | 0.82 s | 3.0 MB |
-| 10,000 users | full | 798 KB | 3.1 s | 108 MB | 154 ms | 0.82 s | 7.6 MB |
-| 100,000 users | paths | 1.5 MB | 33 s | 0.60 GB | 198 ms | 0.82 s | 7.9 MB |
-| 250,000 users | paths | 3.5 MB | 90 s | 1.43 GB | 354 ms | 0.83 s | 14.4 MB |
+| 10,000 users | full | 794 KB | 3.3 s | 106 MB | 154 ms | 0.82 s | 7.6 MB |
+| 100,000 users | paths | 1.5 MB | 30 s | 0.60 GB | 198 ms | 0.82 s | 7.9 MB |
+| 250,000 users | paths | 3.5 MB | 83 s | 1.43 GB | 354 ms | 0.83 s | 14.4 MB |
 
 An account's blast radius on the 10,000-user page, searched in the page and drawn, takes
 under 20 ms. Forcing `--graph full` on the 100,000-user domain gives a 6.3 MB file, a
