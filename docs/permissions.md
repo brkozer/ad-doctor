@@ -10,7 +10,8 @@ the directory.
 - AD CS certificate templates, enrollment services and issuance-policy OIDs
 - gMSAs and their password-read permissions
 - the replication metadata of the domain head (for the last backup date) and of tier-0
-  accounts (for the last real password change)
+  accounts (for the last real password change, and key credentials that cannot be read)
+- `msDS-KeyCredentialLink` of tier-0 accounts; the keys themselves are not kept
 - the owners and DACLs of the security-critical objects
 - `server` and `nTDSDSA` objects under `CN=Sites`, and `crossRef` objects under `CN=Partitions`
 - one BASE read of each `member` value of a tier-0 group that no search returned, at most 500

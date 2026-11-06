@@ -39,6 +39,25 @@ def filetime_to_datetime(value: int) -> datetime | None:
 
 
 @dataclass
+class KeyCredential:
+    """One msDS-KeyCredentialLink value, without the key itself."""
+
+    # False: only replication metadata shows it, the value could not be read
+    readable: bool = True
+    # False: unreadable, or the blob is malformed
+    parsed: bool = False
+    device_id: str = ""
+    # the time in the blob, which is whatever the writer put there
+    created: datetime | None = None
+    # when the directory added the value, from msDS-ReplValueMetaData
+    added: datetime | None = None
+    usage: int | None = None
+    source: int | None = None
+    # the only shape a computer may write to itself
+    self_written: bool = False
+
+
+@dataclass
 class Account:
     dn: str
     sam: str
@@ -61,6 +80,8 @@ class Account:
     # msDS-SupportedEncryptionTypes; None when the attribute is not set
     enc_types: int | None = None
     alt_security_identities: list[str] = field(default_factory=list)
+    # msDS-KeyCredentialLink; only read for tier-0 accounts
+    key_credentials: list[KeyCredential] = field(default_factory=list)
     logon_count: int | None = None
     when_created: datetime | None = None
     # names of password-bearing attributes that came back (values are never kept)
@@ -421,6 +442,7 @@ class Snapshot:
     aes_cutover: datetime | None = None
     # False in older snapshots: Account.pwd_changed was not read
     pwd_metadata_checked: bool = False
+    key_credentials_checked: bool = False
     # members of tier-0 groups that did not come back from the searches
     unreadable_members: list[UnreadableMember] = field(default_factory=list)
     # False in older snapshots and when the comparison could not be made
@@ -497,6 +519,9 @@ class Snapshot:
                         "pwd_changed": _dt(a.get("pwd_changed")),
                         "last_logon": _dt(a["last_logon"]),
                         "when_created": _dt(a.get("when_created")),
+                        "key_credentials": [
+                            _key_credential(k) for k in a.get("key_credentials", [])
+                        ],
                     }
                 )
                 for a in data["accounts"]
@@ -549,6 +574,7 @@ class Snapshot:
             channel_policy_collected=data.get("channel_policy_collected", False),
             aes_cutover=_dt(data.get("aes_cutover")),
             pwd_metadata_checked=data.get("pwd_metadata_checked", False),
+            key_credentials_checked=data.get("key_credentials_checked", False),
             unreadable_members=[UnreadableMember(**x) for x in data.get("unreadable_members", [])],
             tier0_members_checked=data.get("tier0_members_checked", False),
             dc_sites=data.get("dc_sites", {}),
@@ -658,6 +684,7 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
             ("dc_registration_checked", "AD-INF-014 (rogue DC objects)"),
             ("aes_cutover", "the password part of AD-KRB-005 (suspected no AES keys)"),
             ("pwd_metadata_checked", "AD-ACC-012 (pwdLastSet against replication metadata)"),
+            ("key_credentials_checked", "the key credential part of AD-ACC-013"),
             ("channel_policy_collected", "AD-GPO-008 (Netlogon allow list)"),
             ("tier0_members_checked", "AD-PRIV-012 (unreadable tier-0 members)"),
         )
@@ -673,6 +700,10 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
             "AD-INF-007 may not have seen existing dMSA links"
         )
     return notes
+
+
+def _key_credential(data: dict[str, Any]) -> KeyCredential:
+    return KeyCredential(**{**data, "created": _dt(data["created"]), "added": _dt(data["added"])})
 
 
 def _aces(items: list[dict[str, Any]]) -> list[Ace]:

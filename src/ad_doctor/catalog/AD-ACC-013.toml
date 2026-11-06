@@ -1,0 +1,126 @@
+id = "AD-ACC-013"
+aliases = ["shadow-credentials-present", "tier0-key-credentials"]
+summary = "A tier-0 account holds a key credential or a strong certificate mapping: a way to log on without its password. Normal for Windows Hello and smart cards, and also what a backdoor looks like."
+severities = ["low", "medium", "high"]
+severity_logic = """
+**Low** for a key on a computer in the only shape a computer can write to itself. **Medium**
+for a key on a user with a device ID, which is what Windows Hello for Business leaves, a key
+whose contents this account may not read, and a strong certificate mapping. **High** for a
+key no normal flow leaves: on `krbtgt`, a managed service account or a computer in any other
+shape, on a user without a device ID or with an unusual key usage, or a value that does not
+parse. The grade says how a value looks. It does not say who wrote it: see the false positives.
+"""
+mitre = ["T1098", "T1649"]
+data_sources = ["ldap"]
+attributes = [
+    "msDS-KeyCredentialLink (BASE read of tier-0 accounts)",
+    "msDS-ReplValueMetaData (BASE read of tier-0 accounts)",
+    "altSecurityIdentities",
+]
+related = ["AD-ACL-004", "AD-ADCS-009", "AD-ACC-012", "AD-PRIV-012"]
+since = "0.1.2"
+
+risk = """
+Anyone who can write `msDS-KeyCredentialLink` on an account can add a public key and then log
+on as that account with PKINIT, holding the private key. This is the Shadow Credentials
+attack. A certificate mapping in `altSecurityIdentities` does the same for a certificate the
+attacker holds. Neither touches the password, so the access survives a password reset.
+
+[AD-ACL-004](AD-ACL-004.md) reports who could write these attributes. This check reports what
+is already there, which matters after an incident, when the rights may be gone and the key
+is not. [AD-ADCS-009](AD-ADCS-009.md) reports weak mappings; a strong mapping names one
+certificate, so it is safe by itself, but on an admin account somebody should know that
+certificate.
+"""
+
+detection = """
+For `krbtgt`, the built-in Administrator, domain controllers and every account in a tier-0
+group, ad-doctor asks for `msDS-KeyCredentialLink` and `msDS-ReplValueMetaData` in the BASE
+read of the account it makes anyway. Accounts outside tier 0 are not read for keys.
+
+From each value it keeps the device ID, the key usage and source, the creation time in the
+blob and, from the metadata, the time the value was added. The blob's time is whatever the
+writer put there; the metadata's time is the directory's own. The key itself is not kept in
+the snapshot or in any report, and only the type of a certificate mapping is shown.
+
+**What an ordinary account can see.** LDAP leaves out an attribute the account may not read
+exactly as it leaves out an empty one, so an empty read proves nothing alone. In the lab an
+ordinary domain user could read the values on accounts protected by AdminSDHolder and on the
+domain controller, because both give Authenticated Users read access. With read denied on the
+attribute, the value was gone but `msDS-ReplValueMetaData` still listed it, with its time. Such
+a key is reported as present with contents not readable.
+
+No value and no metadata row counts as no key only when the object's
+`msDS-ReplAttributeMetaData` came back, which shows the account may read the object's metadata.
+If it did not come back, or if the value metadata is too long for one LDAP page, the scan
+names the account in a note and the account is **not judged**. That is unknown, not clean.
+A DACL that denies `msDS-ReplValueMetaData` alone would not be noticed; this was not tried in
+the lab.
+
+Disabled accounts other than `krbtgt` are not reported. Weak mappings stay with
+[AD-ADCS-009](AD-ADCS-009.md) and are not listed here.
+"""
+
+false_positives = """
+- **Windows Hello for Business.** Key trust stores a key for each device a user enrolls,
+  and it looks the same as a planted key: tools that plant them write a device ID too. Only
+  the device list can tell them apart. Hello on a tier-0 account is itself worth a question,
+  since that device then holds the keys to the domain.
+- **A computer's own key.** A computer may add one key to itself, with no custom key
+  information and no last logon time. Anyone able to write the attribute can copy that shape,
+  so it is reported at low and not dropped.
+- **Smart card logon.** An explicit strong mapping is the supported way to map a certificate
+  that cannot carry the SID extension (KB5014754).
+"""
+
+remediation = """
+1. **See when each value was added and from which DC** (read-only):
+
+    ```powershell
+    Get-ADReplicationAttributeMetadata -Object (Get-ADUser adm_bob) -Server dc01 `
+        -Properties msDS-KeyCredentialLink -ShowAllLinkedValues
+    ```
+
+2. **Match each device ID** to a device the account's owner really enrolled, and each
+   mapping to a certificate you issued.
+
+3. **Remove what nobody can explain.** Copy the exact value first:
+
+    ```powershell
+    $value = (Get-ADUser adm_bob -Properties msDS-KeyCredentialLink).'msDS-KeyCredentialLink'[0]
+    Set-ADUser adm_bob -Remove @{'msDS-KeyCredentialLink' = $value} -WhatIf
+    Set-ADUser adm_bob -Clear altSecurityIdentities -WhatIf
+    ```
+
+4. **Treat an unexplained key as an incident:** someone could log on as a tier-0 account
+   without its password. Look for who wrote it, and for what that account did since.
+
+5. **Limit who can write** these attributes; see [AD-ACL-004](AD-ACL-004.md).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-013"
+
+[[references]]
+title = "[MS-ADTS]: KEYCREDENTIALLINK_ENTRY identifiers"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/a99409ea-4982-4f72-b7ef-8596013a36c7"
+kind = "spec"
+
+[[references]]
+title = "[MS-ADTS]: msDS-KeyCredentialLink validated write"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/f70afbcc-780e-4d91-850c-cfadce5bb15c"
+kind = "spec"
+
+[[references]]
+title = "Tenable: Shadow Credentials indicator of exposure"
+url = "https://www.tenable.com/indicators/ioe/ad/C-SHADOW-CREDENTIALS"
+kind = "vendor"
+
+[[references]]
+title = "KB5014754: Certificate-based authentication changes on Windows domain controllers"
+url = "https://support.microsoft.com/en-us/servicing/os/windows-server/2022/05/kb5014754-certificate-based-authentication-changes-on-windows-domain-controllers"
+kind = "vendor"
+
+[[references]]
+title = "DSInternals: KeyCredential parser"
+url = "https://raw.githubusercontent.com/MichaelGrafnetter/DSInternals/master/Src/DSInternals.Common/Data/Hello/KeyCredential.cs"
+kind = "tool"

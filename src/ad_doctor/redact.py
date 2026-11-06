@@ -16,6 +16,7 @@ import dataclasses
 import hashlib
 import hmac
 import re
+import uuid
 from typing import Any
 
 from . import model
@@ -67,6 +68,8 @@ IPV6 = re.compile(
     re.IGNORECASE,
 )
 GUID_LIKE = re.compile(r"^\{?[0-9a-fA-F-]{36}\}?$")
+# altSecurityIdentities: X509:<I>issuer<SR>serial; the tags decide weak or strong
+MAPPING_PART = re.compile(r"(<[A-Za-z0-9-]+>)([^<]*)")
 # SIDs as Restricted Groups writes them (*S-1-...): rewritten by SID_PREFIX, not tokenized
 SID_TOKEN = re.compile(r"^\*?S-1-", re.IGNORECASE)
 # keys that are field names or fixed labels, never data
@@ -76,7 +79,7 @@ FIXED_KEYS = {
                 model.DirObject, model.GpoSettings, model.Probes, model.DcProbe, model.CaConfig,
                 model.Gmsa, model.Rodc, model.Trust, model.Gpo, model.GppPassword,
                 model.ScriptSecret, model.GpoLocalGroup, model.GpLink,
-                model.UnreadableMember)
+                model.UnreadableMember, model.KeyCredential)
     for f in dataclasses.fields(cls)
 } | {"domain", "AdminSDHolder", "sid", "mask", "object_type", "inherited_object_type"}  # fmt: skip
 
@@ -103,6 +106,21 @@ class Redactor:
             parts = (str(int(d[i : i + 8], 16) % 4_000_000_000) for i in (0, 8, 16))
             self.sids[prefix] = "S-1-5-21-" + "-".join(parts)
         return self.sids[prefix]
+
+    def fake_guid(self, value: str) -> str:
+        return str(uuid.UUID(self._digest(value)[:32]))
+
+    def mapping(self, value: str) -> str:
+        """Every value of a certificate mapping replaced, its type kept: subjects and
+        e-mail addresses in it need not belong to any object the scan saw."""
+        kind, sep, rest = value.partition(":")
+        if not sep:
+            return self.token(value)
+        if kind.upper() == "X509":
+            return f"{kind}:" + MAPPING_PART.sub(
+                lambda m: m.group(1) + self.token(m.group(2)), rest
+            )
+        return f"{kind}:{self.token(rest)}"
 
     def collect(self, data: dict[str, Any]) -> None:
         """Learn which words are sensitive: account, object, host, file and domain names."""
@@ -201,5 +219,13 @@ def redact(data: dict[str, Any], key: bytes) -> dict[str, Any]:
     r = Redactor(key)
     r.collect(data)
     out: dict[str, Any] = r.walk(data)
+    for before, after in zip(data["accounts"], out["accounts"], strict=True):
+        if before.get("alt_security_identities"):
+            after["alt_security_identities"] = [
+                r.mapping(m) for m in before["alt_security_identities"]
+            ]
+        for credential in after.get("key_credentials", []):
+            if credential["device_id"]:
+                credential["device_id"] = r.fake_guid(credential["device_id"])
     out["redacted"] = True
     return out

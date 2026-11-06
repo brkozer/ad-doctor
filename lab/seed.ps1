@@ -293,6 +293,50 @@ Add-ADGroupMember 'Cert Publishers' helpdesk
 Ensure-User map_user
 Set-ADUser map_user -Replace @{ altSecurityIdentities = 'X509:<I>DC=test,DC=adlab,CN=adlab-CA<S>CN=map_user' }
 
+# Key credentials on tier 0 and a strong certificate mapping (AD-ACC-013): a user key on
+# adm_bob, and on the DC the shape a computer writes for itself. The keys are random bytes:
+# no private key exists, so they cannot log on.
+function New-LabKeyEntry([int]$Id, [byte[]]$Value) {
+    [byte[]]$head = @(($Value.Length -band 255), ($Value.Length -shr 8), $Id)
+    return ,[byte[]]($head + $Value)
+}
+function New-LabKeyCredential([string]$Owner, [switch]$Computer) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $material = New-Object byte[] 270
+    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($material)
+    $keyId = $sha.ComputeHash($material)
+    $time = [BitConverter]::GetBytes([DateTime]::UtcNow.ToFileTimeUtc())
+    $device = [guid]::NewGuid().ToByteArray()
+    [byte[]]$tail = (New-LabKeyEntry 3 $material) + (New-LabKeyEntry 4 @(1)) + (New-LabKeyEntry 5 @(0))
+    if (-not $Computer) {
+        $tail += (New-LabKeyEntry 6 $device) + (New-LabKeyEntry 7 @(1, 0)) + (New-LabKeyEntry 8 $time)
+    }
+    $tail += New-LabKeyEntry 9 $time
+    $keyHash = $sha.ComputeHash($tail)
+    [byte[]]$blob = @(0, 2, 0, 0) + (New-LabKeyEntry 1 $keyId) + (New-LabKeyEntry 2 $keyHash) + $tail
+    $hex = -join ($blob | ForEach-Object { $_.ToString('X2') })
+    return "B:$($hex.Length):${hex}:$Owner"
+}
+$keyUser = Get-ADUser adm_bob -Properties 'msDS-KeyCredentialLink'
+if (-not $keyUser.'msDS-KeyCredentialLink') {
+    Set-ADObject $keyUser.DistinguishedName -Add @{ 'msDS-KeyCredentialLink' = (New-LabKeyCredential $keyUser.DistinguishedName) }
+}
+$keyDc = Get-ADComputer $env:COMPUTERNAME -Properties 'msDS-KeyCredentialLink'
+if (-not $keyDc.'msDS-KeyCredentialLink') {
+    Set-ADObject $keyDc.DistinguishedName -Add @{ 'msDS-KeyCredentialLink' = (New-LabKeyCredential $keyDc.DistinguishedName -Computer) }
+}
+# a key the scan account may not read: the check must say so, not report a clean account.
+# ROGUE01 counts as a DC but is in no protected group, so SDProp leaves this deny in place
+$keyRogue = Get-ADComputer ROGUE01 -Properties 'msDS-KeyCredentialLink'
+if (-not $keyRogue.'msDS-KeyCredentialLink') {
+    Set-ADObject $keyRogue.DistinguishedName -Add @{ 'msDS-KeyCredentialLink' = (New-LabKeyCredential $keyRogue.DistinguishedName) }
+}
+$rogueAcl = Get-Acl "AD:\$($keyRogue.DistinguishedName)"
+$rogueAcl.AddAccessRule((New-Object DirectoryServices.ActiveDirectoryAccessRule(
+    (Get-ADUser adreader).SID, 'ReadProperty', 'Deny', [guid]'5b47d60f-6090-40b2-9f37-2a4de88f3063')))
+Set-Acl "AD:\$($keyRogue.DistinguishedName)" $rogueAcl
+Set-ADUser svc_sql -Replace @{ altSecurityIdentities = 'X509:<I>DC=test,DC=adlab,CN=adlab-CA<SR>1200000000ac11000000002b' }
+
 # A published template that allows 1024-bit keys (AD-ADCS-011)
 New-LabTemplate LabWeakKey @{ 'msPKI-Minimal-Key-Size' = 1024 }
 $ca = Get-ADObject -SearchBase "CN=Enrollment Services,$pks" -Filter "objectClass -eq 'pKIEnrollmentService'" -Properties certificateTemplates

@@ -238,6 +238,33 @@ def test_plain_user_reads_password_metadata_of_tier0(snap: Snapshot) -> None:
     assert not any("unicodePwd not readable" in n for n in snap.notes)
 
 
+def test_key_credentials_on_tier_0(snap: Snapshot) -> None:
+    by_sam = {a.sam: a for a in snap.accounts}
+    (user_key,) = by_sam["adm_bob"].key_credentials
+    assert user_key.parsed and user_key.device_id and user_key.created and user_key.added
+    (computer_key,) = by_sam["DC01$"].key_credentials
+    assert computer_key.self_written and not computer_key.device_id
+    # read denied to the scan account: the metadata still shows the value
+    (denied,) = by_sam["ROGUE01$"].key_credentials
+    assert not denied.readable and denied.added
+    assert by_sam["hidden_admin"].key_credentials == []
+    assert not any("key credentials there are unknown" in n for n in snap.notes)
+
+    (f,) = [f for f in run_all(snap) if f.check_id == "AD-ACC-013"]
+    assert f.severity is Severity.MEDIUM
+    assert {f.key(o).split(":")[0] for o in f.objects} == {
+        "adm_bob",
+        "DC01$",
+        "ROGUE01$",
+        "svc_sql",
+    }
+    text = "\n".join(f.objects)
+    assert f"device {user_key.device_id}" in text
+    assert "DC01$: computer key" in text
+    assert "ROGUE01$: key credential, contents not readable" in text
+    assert "svc_sql: certificate mapping X509:<I><SR>" in text
+
+
 def test_moved_pwd_last_set_is_found(snap: Snapshot) -> None:
     (f,) = [f for f in run_all(snap) if f.check_id == "AD-ACC-012"]
     assert f.severity is Severity.MEDIUM

@@ -7,6 +7,25 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-07
+
+### Added
+
+- **AD-ACC-013: key credentials and strong certificate mappings on tier 0.** For krbtgt, the
+  built-in Administrator, DCs and tier-0 group members, the BASE read now also asks for
+  `msDS-KeyCredentialLink` and `msDS-ReplValueMetaData`. The check shows each key's device ID,
+  creation time and the time the directory added it, and each strong mapping's type; the
+  key itself is not kept. A value the account may not read still shows in the metadata and is
+  reported as present; where metadata does not come back, a note says the account was not
+  judged. Windows Hello for Business and a computer's own key are told apart by shape only,
+  so the finding asks a person to confirm each one. Older snapshots load with a note.
+
+### Fixed
+
+- **Redaction of `altSecurityIdentities`.** Serial numbers, key hashes, e-mail addresses and
+  subjects of no known object stayed readable in a redacted snapshot. Every value in a
+  mapping is now replaced and its type kept, so AD-ADCS-009 gives the same result.
+
 ## [0.1.1] - 2026-11-07
 
 ### Added

@@ -20,6 +20,7 @@ from .model import (
     CaConfig,
     CertTemplate,
     Finding,
+    KeyCredential,
     Severity,
     Snapshot,
     exchange_members,
@@ -1075,6 +1076,8 @@ def _account_names(snap: Snapshot, dns: Iterable[str]) -> list[str]:
 
 
 WEAK_MAPPING = re.compile(r"^X509:(?!.*<(?:SR|SKI|SHA1-PUKEY)>).*<(?:S|RFC822)>", re.IGNORECASE)
+MAPPING_TAG = re.compile(r"<[A-Za-z0-9-]+>")
+MAPPING_SCHEMES = ("X509", "KERBEROS")
 
 
 @check("AD-ADCS-009", "ESC14: weak explicit certificate mappings")
@@ -1484,6 +1487,69 @@ def fake_password_change(snap: Snapshot) -> Finding | None:
         "clearing 'User must change password' does this, and so does hiding an old password.",
         "Find who wrote pwdLastSet (the metadata names the originating DC and time), then "
         "really change the password; for krbtgt rotate it twice.",
+        sorted(objects),
+    )
+    finding.keys = objects
+    return finding
+
+
+KEY_USAGES = {0x01: "NGC", 0x07: "FIDO", 0x08: "FEK"}
+USER_KEY_USAGES = (0x01, 0x07)
+
+
+def _key_line(a: Account, key: KeyCredential) -> tuple[str, str, Severity]:
+    """Object text, stable identity and grade of one key credential."""
+    added = f", added {key.added:%Y-%m-%d}" if key.added else ""
+    created = f", created {key.created:%Y-%m-%d}" if key.created else ""
+    identity = f"{a.sam}: key {key.device_id or key.added or key.created or 'without ID'}"
+    if not key.readable:
+        return f"{a.sam}: key credential, contents not readable{added}", identity, Severity.MEDIUM
+    if not key.parsed:
+        return f"{a.sam}: key credential that does not parse{added}", identity, Severity.HIGH
+    usage = KEY_USAGES.get(key.usage or 0, f"usage {key.usage}")
+    device = f", device {key.device_id}" if key.device_id else ", no device ID"
+    text = f"{a.sam}: key credential ({usage}){device}{created}{added}"
+    if a.is_computer and key.self_written:
+        return f"{a.sam}: computer key{created}{added}", identity, Severity.LOW
+    person = not a.is_computer and not a.managed and a.sam.lower() != "krbtgt"
+    if person and key.device_id and key.usage in USER_KEY_USAGES:
+        return text, identity, Severity.MEDIUM
+    return text, identity, Severity.HIGH
+
+
+@check("AD-ACC-013", "Key credentials or certificate mappings on tier-0 accounts")
+def tier0_key_credentials(snap: Snapshot) -> Finding | None:
+    privileged = snap.privileged_dns()
+    objects: dict[str, str] = {}
+    grades = []
+    for a in snap.accounts:
+        krbtgt = a.sam.lower() == "krbtgt"
+        tier0 = a.dn.lower() in privileged or a.is_dc or krbtgt or a.rid == 500
+        if not tier0 or not (a.enabled or krbtgt):
+            continue
+        for key in a.key_credentials:
+            text, identity, grade = _key_line(a, key)
+            objects[text] = identity
+            grades.append(grade)
+        for mapping in a.alt_security_identities:
+            if not WEAK_MAPPING.match(mapping):  # AD-ADCS-009 has the weak ones
+                scheme = mapping.split(":", 1)[0]
+                scheme = scheme if scheme.upper() in MAPPING_SCHEMES else "other"
+                tags = "".join(MAPPING_TAG.findall(mapping))
+                text = f"{a.sam}: certificate mapping {scheme}:{tags}"
+                objects[text] = text
+                grades.append(Severity.MEDIUM)
+    if not objects:
+        return None
+    finding = _finding(
+        "AD-ACC-013",
+        max(grades),
+        "Whoever holds the private key behind one of these can log on as the account without "
+        "its password, and a password reset does not stop it. Windows Hello for Business, a "
+        "computer's own key and smart cards leave the same values as a backdoor does, so this "
+        "needs a person to confirm each one.",
+        "Match each device ID to a device the owner enrolled and each mapping to a certificate "
+        "you issued. Remove what nobody can explain and treat it as an incident.",
         sorted(objects),
     )
     finding.keys = objects

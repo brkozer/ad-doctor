@@ -18,7 +18,7 @@ from ldap3.core.exceptions import (
 )
 from ldap3.protocol.microsoft import security_descriptor_control
 
-from . import gpo_scope, probes, sd, sysvol
+from . import gpo_scope, keycred, probes, sd, sysvol
 from .model import (
     TIER0_RIDS,
     UAC,
@@ -58,6 +58,7 @@ PRIVILEGED_BUILTIN = {
 PROTECTED_USERS_RID = 525
 RODC_GROUP_RID = 521
 REPL_METADATA = "msDS-ReplAttributeMetaData"
+VALUE_METADATA = "msDS-ReplValueMetaData"
 # direct reads of member values that no search returned; each one is a BASE search
 MAX_MEMBER_READS = 500
 NOT_RETURNED = "not returned: hidden, or this account has no right to see it"
@@ -98,6 +99,9 @@ MANAGED_CLASSES = {
     "msds-managedserviceaccount",
     DMSA_CLASS,
 }
+
+# asked for in the BASE read of tier-0 accounts only
+TIER0_ATTRS = [REPL_METADATA, VALUE_METADATA, keycred.ATTRIBUTE]
 
 ACCOUNT_ATTRS = [
     "distinguishedName",
@@ -197,6 +201,9 @@ class Collector:
         self.scanned_ldap_signing: bool | None = None
         self.dmsa_seen = False
         self.pwd_unread: list[str] = []
+        self.keys_unread: list[str] = []
+        # (lower-cased DN, attribute) that came back in ranges: only part of it was read
+        self.ranged: set[tuple[str, str]] = set()
 
     def search(
         self,
@@ -226,6 +233,7 @@ class Collector:
                 if ";range=" in key:  # ranged retrieval of a large multi-valued attribute
                     key = key.split(";", 1)[0]
                     self.notes.append(f"{e['dn']}: {key} has more values than one LDAP page")
+                    self.ranged.add((e["dn"].lower(), key))
                 raw[key] = list(v)
             raw["distinguishedname"] = [e["dn"]]
             out.append(raw)
@@ -415,6 +423,7 @@ class Collector:
             channel_policy_collected=sysvol_result.scanned,
             aes_cutover=self._aes_cutover(domain_dn, domain_sid),
             pwd_metadata_checked=True,
+            key_credentials_checked=True,
             unreadable_members=unreadable or [],
             tier0_members_checked=unreadable is not None,
             dc_sites=dc_sites,
@@ -434,6 +443,7 @@ class Collector:
                 + (f" (+{more} more)" if more > 0 else "")
                 + ": AD-ACC-012 not judged for them, and their age checks trust pwdLastSet"
             )
+        snap.notes += self._keys_note()
         if snap.has_2025 and not snap.dmsa_visible:
             snap.notes.append(
                 "no dMSA visible (none exist, or this account cannot read them; by default "
@@ -512,13 +522,37 @@ class Collector:
             # the attribute is constructed, so it only comes back from a BASE read: this
             # read happens anyway, which keeps the cost to tier 0 and to no extra search
             tier0 = a.dn.lower() in priv_dns or a.is_dc or a.sam.lower() == "krbtgt" or a.rid == 500
-            entries = self._base(a.dn, [*attrs, REPL_METADATA] if tier0 else attrs)
+            entries = self._base(a.dn, [*attrs, *TIER0_ATTRS] if tier0 else attrs)
             objects += [self._object(e, kind) for e in entries]
             if tier0:
                 a.pwd_changed = _pwd_changed(entries)
                 if a.pwd_changed is None:
                     self.pwd_unread.append(a.sam)
+                self._read_keys(a, entries)
         return objects
+
+    def _read_keys(self, a: Account, entries: list[dict[str, Any]]) -> None:
+        """Key credentials of one tier-0 account, from its BASE read."""
+        e = entries[0] if entries else {}
+        a.key_credentials = keycred.read(
+            _str(e.get(keycred.ATTRIBUTE.lower(), [])),
+            "".join(_str(e.get(VALUE_METADATA.lower(), []))),
+        )
+        # no value and no row proves nothing unless this account may read the metadata
+        partial = (a.dn.lower(), VALUE_METADATA.lower()) in self.ranged
+        if partial or not e.get(REPL_METADATA.lower()):
+            self.keys_unread.append(a.sam)
+
+    def _keys_note(self) -> list[str]:
+        if not self.keys_unread:
+            return []
+        shown = ", ".join(sorted(self.keys_unread)[:5])
+        more = len(self.keys_unread) - 5
+        return [
+            f"replication metadata not fully readable for {shown}"
+            + (f" (+{more} more)" if more > 0 else "")
+            + ": key credentials there are unknown, AD-ACC-013 did not judge them"
+        ]
 
     def _unreadable_members(
         self,

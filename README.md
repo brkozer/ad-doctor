@@ -7,7 +7,7 @@
 Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
-(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 93
+(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 94
 checks for what attackers look for first: roastable accounts, risky delegation,
 exploitable certificate templates and CA settings (ESC1–9, 11, 13–17), DCSync and other takeover rights,
 shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync accounts,
@@ -106,6 +106,7 @@ against a live DC.
 | | AD-ACC-010 | Pre-created computers whose password is their name | high |
 | | AD-ACC-011 | Privileged passwords older than a year | medium |
 | | AD-ACC-012 | `pwdLastSet` newer than the real password change on tier-0 accounts | medium/high |
+| | AD-ACC-013 | Key credentials or strong certificate mappings on tier-0 accounts | low/medium/high |
 | Privileged access | AD-PRIV-001 | Tier-0 groups with more than 5 members | low |
 | | AD-PRIV-002 | Privileged accounts that can be delegated | medium |
 | | AD-PRIV-003 | Schema Admins or Enterprise Admins not empty | low |
@@ -362,6 +363,10 @@ narrow or turn them off; [SECURITY.md](SECURITY.md) lists every probe.
   not visible either.
 - `pwdLastSet` is checked against replication metadata for tier 0 only (AD-ACC-012);
   elsewhere it is taken at face value. Metadata that does not come back is noted.
+- AD-ACC-013 reads key credentials on tier 0 only, and cannot say who wrote a key: Windows
+  Hello for Business looks the same as a planted key. A key this account may not read still
+  shows through replication metadata; where that metadata does not come back, the account
+  is named in a note and not judged.
 - AD-GPO-008 only sees GPOs. No finding means no GPO reaching a DC sets
   `VulnerableChannelAllowList`: a value in a DC's own registry needs admin rights to read.
   Precedence between GPOs is not worked out, and a Deny for a group does not take its
@@ -392,7 +397,7 @@ flowchart LR
     P --> S
     S -- "collect -o / redact" --> F[(snapshot.json)]
     F --> A
-    S --> A[checks.py + paths.py<br/>93 pure functions]
+    S --> A[checks.py + paths.py<br/>94 pure functions]
     A --> I[invariants.py<br/>accept.py]
     I --> R[report.py<br/>text, JSON, Markdown,<br/>SARIF, JUnit]
     I --> W[viewer.py<br/>offline HTML viewer]
