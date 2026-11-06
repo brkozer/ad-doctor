@@ -1,6 +1,7 @@
 # ad-doctor
 
 [![ci](https://github.com/brkozer/ad-doctor/actions/workflows/ci.yml/badge.svg)](https://github.com/brkozer/ad-doctor/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/brkozer/ad-doctor)](https://github.com/brkozer/ad-doctor/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Read-only Active Directory security audit that fits in a pipeline.
@@ -193,7 +194,7 @@ time, not for comparing domains.
 ## Documentation
 
 Full docs, including a page for every check, are at
-<https://brkozer.github.io/ad-doctor/> (published from `main` once the repo is public).
+<https://brkozer.github.io/ad-doctor/>.
 The same per-check explanation is available offline:
 
 ```bash

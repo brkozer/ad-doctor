@@ -7,6 +7,14 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-06
+
+First public release: 93 checks and 5 invariants, the control-path engine with
+`blast-radius` and chokepoints, compound findings, policy as code, accepted risks with
+owners and expiry, a reviewable fix script, redaction for sharing snapshots, the offline
+HTML viewer, text, JSON, Markdown, SARIF and JUnit reports, BloodHound OpenGraph export,
+NTLM with channel binding and Kerberos authentication, and a seeded lab.
+
 ### Added
 
 - **`ad-doctor view`: the report as one offline HTML file.** It takes a snapshot or a
@@ -233,10 +241,3 @@ logic or severity between versions, but an ID is never reused for something else
   can no longer close the string; AD-PRIV-007 looks the account up with `-LDAPFilter` in a
   verbatim string instead of putting the name in a double-quoted `-Filter`, where `$()`
   would run. A test feeds hostile names through every fix template.
-
-## [0.1.0] - unreleased
-
-First version: 74 checks, the control-path engine and `blast-radius`, compound findings,
-policy as code (`--invariants`), accepted risks with owners and expiry, a reviewable fix
-script, redaction for sharing snapshots, text, JSON, Markdown, HTML, SARIF and JUnit
-reports, NTLM with channel binding and Kerberos authentication, and a seeded lab.
