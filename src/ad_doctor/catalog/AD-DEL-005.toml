@@ -1,0 +1,107 @@
+id = "AD-DEL-005"
+aliases = ["ghost-spn", "spn-jacking", "orphaned-spn"]
+summary = "msDS-AllowedToDelegateTo names an SPN no account holds, so someone with SPN write on any account can take over the target."
+severities = ["low", "medium", "high"]
+severity_logic = """
+Set by the worst target. **High** when the host has no computer object and the delegating
+account has protocol transition, so it can impersonate anyone without their credentials.
+**Medium** when the host has no computer object and the account is Kerberos-only.
+**Low** when the host exists but nothing holds the SPN, and for targets that need a review.
+"""
+mitre = ["T1558", "T1134"]
+data_sources = ["ldap"]
+attributes = [
+    "servicePrincipalName",
+    "msDS-AllowedToDelegateTo",
+    "userAccountControl",
+    "dNSHostName",
+    "sPNMappings (on CN=Directory Service)",
+]
+related = ["AD-DEL-002", "AD-DEL-004"]
+since = "0.1.4"
+
+risk = """
+Decommissioned servers leave their names behind in delegation settings. The KDC finds the
+target of a delegated ticket by looking for the account that holds the SPN, so an SPN that
+nobody holds can be claimed.
+
+This is SPN-jacking. It needs two things: control of the delegating account, and the
+right to write `servicePrincipalName` on any account, which may be a low-value one. The
+attacker registers the dead SPN there, and the delegating account now gets tickets as any
+user to an account the attacker controls. With protocol transition no user has to
+authenticate first. Taken alone the leftover grants nothing, so it is a condition for an
+attack, not a proven path.
+"""
+
+detection = """
+Each `msDS-AllowedToDelegateTo` value of an enabled account is judged from the snapshot:
+
+1. Any account, enabled or not, holds the exact SPN: fine.
+2. The service class maps to another one through `sPNMappings`, and an account holds the
+   mapped SPN: fine. On a default forest `cifs/fs01.corp.example`, `http/...` and about 50
+   other classes are answered by `HOST/fs01.corp.example`. Custom mappings count.
+3. The host is known, as a computer or managed service account, or as the host of any SPN:
+   `(no account holds it, the host exists)`, low.
+4. The host is short, or directly under the scanned domain's name, and unknown:
+   `(no computer object)`, medium, or `(no computer object, protocol transition)`, high.
+5. Any other host: `(not in this domain's snapshot, review)`, low. It may live in a child or
+   trusted domain, which this snapshot does not hold.
+
+`krbtgt` targets are [AD-DEL-004](AD-DEL-004.md)'s. No DNS query is made: the answer comes
+from directory objects only.
+
+If `sPNMappings` cannot be read, step 3 is left out, because a mapping could explain the
+target, and a note says so. Steps 4 and 5 do not need it. An older snapshot behaves the same.
+"""
+
+false_positives = """
+- **Objects the scan cannot see.** A computer in an OU the scanning account cannot list
+  looks absent. Scan with an account that can list the whole domain before removing anything.
+- **Aliases without an SPN.** A DNS alias works for delegation only if some account holds an
+  SPN with that name, so an alias with no SPN is reported, and rightly: the KDC cannot find it.
+- **Hosts in a subdomain of the DNS name** that belong to this AD domain are reported as
+  `review`, not as ghosts.
+"""
+
+remediation = """
+1. **List what each account may delegate to**:
+
+    ```powershell
+    Get-ADObject -LDAPFilter '(msDS-AllowedToDelegateTo=*)' -Properties msDS-AllowedToDelegateTo |
+        Select-Object Name, msDS-AllowedToDelegateTo
+    ```
+
+2. **Remove dead targets**, on the Delegation tab of the account or with a command that
+   you review first:
+
+    ```powershell
+    Set-ADUser svc_app -Remove @{ 'msDS-AllowedToDelegateTo' = 'cifs/oldfs.corp.example' } -WhatIf
+    ```
+
+3. **If the service moved**, point the entry at the new host, or register the SPN on the
+   account that runs the service with `setspn -S`.
+4. **Review who can write `servicePrincipalName`**, and move to resource-based delegation
+   where you can. It is set on the target, so there is no name left to claim.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-DEL-005"
+
+[[references]]
+title = "Tenable Identity Exposure release notes 2026 (3.93.5: orphaned SPN in Dangerous Kerberos Delegation)"
+url = "https://docs.tenable.com/release-notes/Content/identity-exposure/onprem/2026.htm"
+kind = "vendor"
+
+[[references]]
+title = "Purple Knight security indicators: constrained delegation to ghost SPN"
+url = "https://www.semperis.com/purple-knight/security-indicators/"
+kind = "vendor"
+
+[[references]]
+title = "SPN-Mappings attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-spnmappings"
+kind = "spec"
+
+[[references]]
+title = "SPN-jacking: an edge case in WriteSPN abuse (Semperis)"
+url = "https://www.semperis.com/blog/spn-jacking-an-edge-case-in-writespn-abuse/"
+kind = "research"

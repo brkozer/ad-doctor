@@ -23,6 +23,7 @@ from .model import (
     KeyCredential,
     Severity,
     Snapshot,
+    Trust,
     exchange_members,
 )
 
@@ -1014,9 +1015,19 @@ TRUST_QUARANTINED = 0x4
 TRUST_FOREST = 0x8
 TRUST_WITHIN_FOREST = 0x20
 TRUST_TREAT_AS_EXTERNAL = 0x40
+TRUST_CROSS_ORGANIZATION = 0x10  # Selective Authentication
+TRUST_USES_AES_KEYS = 0x100
 TRUST_ENABLE_TGT_DELEGATION = 0x800
 TRUST_INBOUND = 0x1
 TRUST_OUTBOUND = 0x2
+TRUST_TYPE_DOWNLEVEL = 1
+TRUST_TYPE_UPLEVEL = 2
+TRUST_TYPE_MIT = 3
+TRUST_TYPE_AAD = 5
+ENTRA_KERBEROS_REALM = "kerberos.microsoftonline.com"
+ENC_AES = 0x18
+# Trust passwords change every 30 days; PingCastle's T-Inactive allows 40
+TRUST_STALE_AFTER = timedelta(days=40)
 
 
 @check("AD-INF-006", "Trusts that let SIDs or TGTs through")
@@ -1044,6 +1055,93 @@ def trusts(snap: Snapshot) -> Finding | None:
         "SID history or captured TGTs.",
         "Enable SID filtering (netdom trust /quarantine:yes or /enablesidhistory:no) and "
         "disable TGT delegation across the trust.",
+        sorted(hits),
+    )
+
+
+def _entra_trust(t: Trust) -> bool:
+    return t.trust_type == TRUST_TYPE_AAD or t.name.lower() == ENTRA_KERBEROS_REALM
+
+
+@check("AD-INF-015", "Trusts limited to old protocols")
+def trust_protocols(snap: Snapshot) -> Finding | None:
+    severity = Severity.LOW
+    hits = []
+    for t in snap.trusts:
+        if _entra_trust(t):
+            continue
+        if t.trust_type == TRUST_TYPE_DOWNLEVEL:
+            severity = Severity.MEDIUM
+            hits.append(f"{t.name} (downlevel, NT4 style)")
+        # this domain's KDC encrypts referrals only over trusts its users can cross
+        elif not snap.trust_details_checked or not t.direction & TRUST_INBOUND:
+            continue
+        elif t.enc_types:
+            if not t.enc_types & ENC_AES:
+                severity = Severity.MEDIUM
+                hits.append(f"{t.name} (no AES, encryption types {t.enc_types:#x})")
+        elif not t.attributes & TRUST_USES_AES_KEYS:
+            hits.append(f"{t.name} (AES not set on the trust)")
+    if not hits:
+        return None
+    return _finding(
+        "AD-INF-015",
+        severity,
+        "These trusts rest on old cryptography: a downlevel trust is the form made for NT4 "
+        "domains, and a trust without AES can have its referral tickets encrypted with RC4.",
+        "Recreate downlevel trusts as forest or external trusts, or remove them. Enable AES "
+        "with ksetup /setenctypeattr once both sides support it.",
+        sorted(hits),
+    )
+
+
+@check("AD-INF-016", "Trusts unchanged for over 40 days")
+def trust_stale(snap: Snapshot) -> Finding | None:
+    severity = Severity.LOW
+    hits = []
+    for t in snap.trusts:
+        if _entra_trust(t) or t.when_changed is None:
+            continue
+        if snap.collected_at - t.when_changed <= TRUST_STALE_AFTER:
+            continue
+        changed = t.when_changed.date().isoformat()
+        if t.trust_type == TRUST_TYPE_MIT:
+            hits.append(f"{t.name} (realm trust, last changed {changed}, review)")
+        else:
+            severity = Severity.MEDIUM
+            hits.append(f"{t.name} (last changed {changed})")
+    if not hits:
+        return None
+    return _finding(
+        "AD-INF-016",
+        severity,
+        "A working trust between Windows domains changes its password about every 30 days, so "
+        "these partners are probably gone or unreachable. The secret of a dead trust stays "
+        "valid here and can be used to forge tickets.",
+        "Check that each partner still exists and can be reached. Remove the trust if not.",
+        sorted(hits),
+    )
+
+
+@check("AD-INF-017", "Forest trusts without Selective Authentication")
+def trust_selective_auth(snap: Snapshot) -> Finding | None:
+    hits = [
+        t.name
+        for t in snap.trusts
+        if t.trust_type == TRUST_TYPE_UPLEVEL
+        and t.attributes & TRUST_FOREST
+        and t.direction & TRUST_OUTBOUND
+        and not t.attributes & (TRUST_CROSS_ORGANIZATION | TRUST_WITHIN_FOREST)
+    ]
+    if not hits:
+        return None
+    return _finding(
+        "AD-INF-017",
+        Severity.MEDIUM,
+        "Every account of the trusted forest can authenticate to every computer here, which "
+        "gives an attacker in that forest a foothold for enumeration and lateral movement.",
+        "Set the trust to Selective Authentication and grant Allowed to Authenticate on the "
+        "computers that need it, after checking who uses the trust.",
         sorted(hits),
     )
 
@@ -1267,6 +1365,12 @@ def seamless_sso(snap: Snapshot) -> Finding | None:
 DC_SERVICES = ("ldap", "cifs", "host", "http", "gc", "rpcss", "wsman", "dns")
 
 
+def _spn_parts(spn: str) -> tuple[str, str]:
+    """Service class and host of an SPN (service/host[:port][/name]), in lower case."""
+    service, _, rest = spn.lower().partition("/")
+    return service, rest.split(":", 1)[0].split("/", 1)[0].rstrip(".")
+
+
 @check("AD-DEL-004", "Delegation that reaches domain controllers or krbtgt")
 def delegation_to_dcs(snap: Snapshot) -> Finding | None:
     dcs = [a for a in snap.accounts if a.is_dc]
@@ -1278,9 +1382,8 @@ def delegation_to_dcs(snap: Snapshot) -> Finding | None:
         if not a.enabled:
             continue
         for spn in a.allowed_to_delegate_to:
-            service, _, rest = spn.partition("/")
-            host = rest.split(":", 1)[0].split("/", 1)[0].lower()
-            if (service.lower() in DC_SERVICES and host in dc_names) or service.lower() == "krbtgt":
+            service, host = _spn_parts(spn)
+            if (service in DC_SERVICES and host in dc_names) or service == "krbtgt":
                 hits.append(f"{a.sam} -> {spn}")
         if a.rbcd and (a.is_dc or a.sam.lower() == "krbtgt"):
             hits.append(f"{a.sam} (resource-based delegation configured on it)")
@@ -1292,6 +1395,67 @@ def delegation_to_dcs(snap: Snapshot) -> Finding | None:
         "Whoever controls these accounts can impersonate any user, including domain admins, to "
         "a domain controller service.",
         "Remove the delegation; DCs and krbtgt must never be delegation targets.",
+        sorted(set(hits)),
+    )
+
+
+def _spn_aliases(snap: Snapshot) -> dict[str, str]:
+    """Service class -> the class that answers for it, from sPNMappings."""
+    aliases: dict[str, str] = {}
+    for mapping in snap.spn_mappings:
+        target, _, names = mapping.lower().partition("=")
+        aliases.update({n.strip(): target.strip() for n in names.split(",") if n.strip()})
+    return aliases
+
+
+@check("AD-DEL-005", "Constrained delegation to SPNs no account holds")
+def ghost_spn_delegation(snap: Snapshot) -> Finding | None:
+    held = {spn.lower() for a in snap.accounts for spn in a.spns}
+    hosts = {_spn_parts(spn)[1] for spn in held}
+    for a in snap.accounts:
+        if a.is_computer or a.managed:
+            hosts |= {a.sam.rstrip("$").lower(), (a.dns_host or "").lower()}
+    aliases = _spn_aliases(snap)
+    suffix = "." + snap.domain.lower()
+    severity = Severity.LOW
+    hits = []
+    for a in snap.accounts:
+        if not a.enabled:
+            continue
+        for spn in a.allowed_to_delegate_to:
+            service, host = _spn_parts(spn)
+            rest = spn.lower().partition("/")[2]
+            mapped = aliases.get(service)
+            # krbtgt is AD-DEL-004's; the KDC finds it by name, not by an SPN
+            if spn.lower() in held or service == "krbtgt":
+                continue
+            if mapped and {f"{mapped}/{rest}", f"{mapped}/{host}"} & held:
+                continue
+            short = host.removesuffix(suffix)
+            if not host:
+                hits.append(f"{a.sam} -> {spn} (cannot be parsed, review)")
+            elif host in hosts or short in hosts:
+                if aliases:
+                    hits.append(f"{a.sam} -> {spn} (no account holds it, the host exists)")
+            elif "." in short:
+                hits.append(f"{a.sam} -> {spn} (not in this domain's snapshot, review)")
+            elif a.has(UAC.TRUSTED_TO_AUTH_FOR_DELEGATION):
+                severity = Severity.HIGH
+                hits.append(f"{a.sam} -> {spn} (no computer object, protocol transition)")
+            else:
+                severity = max(severity, Severity.MEDIUM)
+                hits.append(f"{a.sam} -> {spn} (no computer object)")
+    if not hits:
+        return None
+    return _finding(
+        "AD-DEL-005",
+        severity,
+        "No account the scan can see holds these delegation targets. Whoever controls the "
+        "delegating account and can write servicePrincipalName on any account can register a "
+        "target there and impersonate users to that account (SPN-jacking). Targets marked "
+        "review need a check by hand.",
+        "Remove dead entries from msDS-AllowedToDelegateTo (Delegation tab of the account), "
+        "and confirm that targets in other domains still exist.",
         sorted(set(hits)),
     )
 

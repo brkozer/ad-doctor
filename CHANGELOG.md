@@ -7,6 +7,24 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-07
+
+### Added
+
+- **Trust hygiene: AD-INF-015, AD-INF-016, AD-INF-017.** `msDS-SupportedEncryptionTypes` and
+  `whenChanged` are now read on trusts. AD-INF-015 reports downlevel (NT4 style) trusts and
+  inbound trusts without AES, at low when AES is merely not set. AD-INF-016 reports trusts
+  unchanged for over 40 days, the limit of PingCastle's T-Inactive, at low for realm trusts.
+  AD-INF-017 reports outgoing forest trusts without Selective Authentication (DISA V-243485).
+  The Entra Kerberos trust is skipped. AD-INF-006 keeps SID filtering and TGT delegation, so
+  nothing is reported twice. An older snapshot says in a note what was not evaluated.
+- **AD-DEL-005: constrained delegation to SPNs no account holds.** A target counts as held
+  when an account has the exact SPN, or the SPN its class maps to through `sPNMappings`, which
+  is now collected. Otherwise the host decides: no computer object is medium, or high with
+  protocol transition; a host that exists is low; a host outside the scanned domain is low
+  with review wording. No DNS query is made. `redact` now also covers the hosts of SPNs and
+  delegation targets, which need not belong to a computer in the snapshot.
+
 ## [0.1.3] - 2026-11-07
 
 ### Added

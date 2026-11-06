@@ -1,0 +1,75 @@
+id = "AD-INF-017"
+aliases = ["selective-authentication", "forest-wide-authentication"]
+summary = "An outgoing forest trust uses forest-wide authentication, so every account of the other forest can authenticate to every computer here."
+severities = ["medium"]
+severity_logic = """
+Always **medium**, the grade of the matching DISA rule (V-243485).
+"""
+mitre = ["T1482"]
+data_sources = ["ldap"]
+attributes = ["trustPartner", "trustDirection", "trustType", "trustAttributes"]
+related = ["AD-INF-006", "AD-INF-015", "AD-INF-016"]
+since = "0.1.4"
+
+risk = """
+An outgoing trust means this forest trusts the other one. With forest-wide authentication,
+the default, every account there counts as authenticated here on every computer, and
+needs no further grant to reach anything open to Authenticated Users. One compromised
+account in the other forest can then read this directory and try lateral movement.
+
+With Selective Authentication an account of the other forest can use a computer here only
+if it holds *Allowed to Authenticate* on it. This is separate from
+[AD-INF-006](AD-INF-006.md): SID filtering limits what a ticket can claim, Selective
+Authentication limits who gets in at all.
+"""
+
+detection = """
+ad-doctor lists a `trustedDomain` object when all of this holds:
+
+- `trustType` is 2 (a Windows trust);
+- `TRUST_ATTRIBUTE_FOREST_TRANSITIVE` (0x8) is set, and `TRUST_ATTRIBUTE_WITHIN_FOREST`
+  (0x20) is not;
+- `trustDirection` is outbound or two-way;
+- `TRUST_ATTRIBUTE_CROSS_ORGANIZATION` (0x10) is off. That bit is what the Authentication
+  tab of the trust sets.
+
+External trusts can use Selective Authentication too, but the DISA rule covers forest
+trusts, and this check follows it.
+"""
+
+false_positives = """
+- **Both forests under the same administrators.** Forest-wide authentication is the default
+  and often a deliberate choice between forests of one organization. Accept the finding
+  with that reason ([accepted risks](../ci.md#accepted-risks)).
+"""
+
+remediation = """
+1. **Find out who crosses the trust** before changing it: logon events 4624 on the servers
+   show accounts of the other forest. Turning this on without grants locks them out.
+2. **Grant *Allowed to Authenticate*** on the computer objects those accounts need. Without
+   it they are refused, and that includes domain controllers.
+3. **Turn it on.** `netdom trust` has no dry-run mode; without a value the option only
+   displays the current state:
+
+    ```
+    netdom trust corp.example /domain:partner.example /selectiveauth
+    netdom trust corp.example /domain:partner.example /selectiveauth:yes
+    ```
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-017"
+
+[[references]]
+title = "DISA Active Directory Domain STIG V-243485"
+url = "https://cyber.trackr.live/stig/Active_Directory_Domain/3/6"
+kind = "vendor"
+
+[[references]]
+title = "[MS-ADTS]: trustAttributes"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/e9a2d23c-c31e-4a6f-88a0-6646fdb51a3c"
+kind = "spec"
+
+[[references]]
+title = "Netdom trust"
+url = "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/netdom-trust"
+kind = "vendor"

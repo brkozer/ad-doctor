@@ -7,7 +7,7 @@
 Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
-(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 95
+(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 99
 checks for what attackers look for first: roastable accounts, risky delegation,
 exploitable certificate templates and CA settings (ESC1–9, 11, 13–17), DCSync and other takeover rights,
 shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync accounts,
@@ -94,6 +94,7 @@ against a live DC.
 | | AD-DEL-002 | Constrained delegation with protocol transition | medium |
 | | AD-DEL-003 | Resource-based constrained delegation configured | low |
 | | AD-DEL-004 | Delegation to DC services or krbtgt, RBCD on DCs | high |
+| | AD-DEL-005 | Constrained delegation to SPNs no account holds (ghost SPNs, HOST aliases and `sPNMappings` resolved) | low/medium/high |
 | Accounts | AD-ACC-001 | Enabled accounts allowed an empty password (`PASSWD_NOTREQD`) | medium |
 | | AD-ACC-002 | Reversible password encryption | high |
 | | AD-ACC-003 | Privileged accounts whose password never expires | medium |
@@ -137,6 +138,9 @@ against a live DC.
 | | AD-INF-012 | RODCs that may cache privileged credentials | medium |
 | | AD-INF-013 | Domain controllers the probes could not reach | low |
 | | AD-INF-014 | Rogue DC candidates: DC flag without an NTDS Settings object | medium/high |
+| | AD-INF-015 | Trusts limited to old protocols: downlevel, or no AES | low/medium |
+| | AD-INF-016 | Trusts unchanged for over 40 days | low/medium |
+| | AD-INF-017 | Forest trusts without Selective Authentication | medium |
 | Certificate services | AD-ADCS-001 | ESC1: enrollee-supplied subject on an authentication template | high |
 | | AD-ADCS-002 | ESC2: any-purpose or no-EKU template | high |
 | | AD-ADCS-003 | ESC3: enrollment agent template open to broad groups | high |
@@ -383,7 +387,8 @@ narrow or turn them off; [SECURITY.md](SECURITY.md) lists every probe.
   instead of assuming the default policy applies to admins.
 - Some checks cannot be reproduced in a single lab DC and are covered by unit tests only:
   krbtgt, Seamless SSO and admin password age, the password and DC parts of AD-KRB-005,
-  SID history, trusts, RODCs, SMB signing
+  SID history, trust SID filtering, the age of a trust (AD-INF-016 needs 40 days to pass;
+  the lab test moves the snapshot's date instead), RODCs, SMB signing
   off on a DC, the spooler and the high grade of AD-CHAIN-002 and -003 on Server Core 2025
   (which ships without it), the Entra Kerberos object and
   `unixUserPassword` (confidential on 2025).
@@ -400,7 +405,7 @@ flowchart LR
     P --> S
     S -- "collect -o / redact" --> F[(snapshot.json)]
     F --> A
-    S --> A[checks.py + paths.py<br/>95 pure functions]
+    S --> A[checks.py + paths.py<br/>99 pure functions]
     A --> I[invariants.py<br/>accept.py]
     I --> R[report.py<br/>text, JSON, Markdown,<br/>SARIF, JUnit]
     I --> W[viewer.py<br/>offline HTML viewer]

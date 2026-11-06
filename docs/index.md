@@ -9,7 +9,7 @@ Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
 (plus SYSVOL and a few cheap probes of every DC over SMB, LDAP, HTTP and the CA registry)
-and runs 95 checks for what attackers look for first: roastable accounts, risky delegation,
+and runs 99 checks for what attackers look for first: roastable accounts, risky delegation,
 exploitable certificate templates and CA settings (ESC1-9, 11, 13-17), DCSync and other takeover
 rights, shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync
 accounts, editable GPOs on domain controllers, local admin and remote logon rights handed
@@ -22,7 +22,7 @@ and legacy configuration. It then finds every control path from a non-admin to t
 <div class="grid cards" markdown>
 
 - **[Quick start](quickstart.md)**: install and run your first scan.
-- **[Check catalog](checks/index.md)**: what each of the 95 checks and 5 invariants looks for and how to fix it.
+- **[Check catalog](checks/index.md)**: what each of the 99 checks and 5 invariants looks for and how to fix it.
 - **[CI integration](ci.md)**: SARIF, JUnit, baselines and accepted risks.
 - **[Permissions needed](permissions.md)**: an enabled domain user, nothing more.
 

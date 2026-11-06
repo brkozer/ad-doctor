@@ -135,6 +135,11 @@ class Redactor:
                 words.update([a["dns_host"], *a["dns_host"].split(".")])
             if a.get("sync_host") and a["sync_host"] != UNKNOWN_SYNC_HOST:
                 words.add(a["sync_host"])
+            # label by label: a delegation target's host need not be a computer in the
+            # snapshot, and AD-DEL-005 tells other domains by the dots that stay
+            for spn in [*a.get("spns", []), *a.get("allowed_to_delegate_to", [])]:
+                rest = spn.partition("/")[2]
+                words.update(p for p in re.split(r"[.:/]", rest) if not p.isdigit())
         for d in data.get("probes", {}).get("dcs", []):
             words.update([d["name"], *d["name"].split(".")])
         for c in data.get("probes", {}).get("ca_configs", []):

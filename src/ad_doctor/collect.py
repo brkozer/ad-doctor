@@ -407,6 +407,8 @@ class Collector:
             principals=self._resolve(domain_dn, trustees, objects),
             gpp_passwords=sysvol_result.gpp_passwords,
             trusts=self._trusts(domain_dn),
+            trust_details_checked=True,
+            spn_mappings=self._spn_mappings(config_dn),
             gpos=gpos,
             oid_group_links=self._oid_links(pks),
             ca_hosts=self.ca_hosts,
@@ -1025,13 +1027,19 @@ class Collector:
     # --- domain-wide settings --------------------------------------------------------
 
     def _trusts(self, domain_dn: str) -> list[Trust]:
-        return [
+        trusts = [
             Trust(
                 name=_first(e, "trustPartner"),
                 direction=_int(e, "trustDirection"),
                 trust_type=_int(e, "trustType"),
                 attributes=_int(e, "trustAttributes"),
                 sid=sid_to_str(e["securityidentifier"][0]) if e.get("securityidentifier") else "",
+                enc_types=(
+                    _int(e, "msDS-SupportedEncryptionTypes")
+                    if e.get("msds-supportedencryptiontypes")
+                    else None
+                ),
+                when_changed=_generalized_time(_first(e, "whenChanged")),
             )
             for e in self.optional(
                 f"CN=System,{domain_dn}",
@@ -1042,9 +1050,31 @@ class Collector:
                     "trustType",
                     "trustAttributes",
                     "securityIdentifier",
+                    "msDS-SupportedEncryptionTypes",
+                    "whenChanged",
                 ],
             )
         ]
+        for t in trusts:
+            if t.when_changed is None:
+                self.notes.append(
+                    f"whenChanged of trust {t.name} not readable: AD-INF-016 not judged"
+                )
+        return trusts
+
+    def _spn_mappings(self, config_dn: str) -> list[str]:
+        entry = self.optional(
+            f"CN=Directory Service,CN=Windows NT,CN=Services,{config_dn}",
+            "(objectClass=*)",
+            ["sPNMappings"],
+            scope=ldap3.BASE,
+        )
+        values = _str(entry[0].get("spnmappings", [])) if entry else []
+        if not values:
+            self.notes.append(
+                "sPNMappings not readable: AD-DEL-005 not judged for targets on hosts that exist"
+            )
+        return values
 
     def _ds_heuristics(self, config_dn: str) -> str:
         entry = self.optional(

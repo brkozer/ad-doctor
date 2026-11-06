@@ -175,6 +175,10 @@ class Trust:
     trust_type: int  # 1 downlevel, 2 uplevel (AD), 3 MIT
     attributes: int
     sid: str = ""  # the partner domain's SID (securityIdentifier); "" when not read
+    # msDS-SupportedEncryptionTypes; None when not set, which LDAP cannot tell from unreadable
+    enc_types: int | None = None
+    # whenChanged; None when not read
+    when_changed: datetime | None = None
 
     @property
     def within_forest(self) -> bool:
@@ -400,6 +404,10 @@ class Snapshot:
     principals: dict[str, str] = field(default_factory=dict)
     gpp_passwords: list[GppPassword] = field(default_factory=list)
     trusts: list[Trust] = field(default_factory=list)
+    # False in older snapshots: encryption types and change dates of trusts were not read
+    trust_details_checked: bool = False
+    # sPNMappings values ("host=cifs,http,..."); empty in older snapshots and when not readable
+    spn_mappings: list[str] = field(default_factory=list)
     gpos: list[Gpo] = field(default_factory=list)
     # issuance policy OID -> group DN (msDS-OIDToGroupLink)
     oid_group_links: dict[str, str] = field(default_factory=dict)
@@ -536,7 +544,12 @@ class Snapshot:
             acls={k: _aces(v) for k, v in data.get("acls", {}).items()},
             principals=data.get("principals", {}),
             gpp_passwords=[GppPassword(**g) for g in data.get("gpp_passwords", [])],
-            trusts=[Trust(**t) for t in data.get("trusts", [])],
+            trusts=[
+                Trust(**{**t, "when_changed": _dt(t.get("when_changed"))})
+                for t in data.get("trusts", [])
+            ],
+            trust_details_checked=data.get("trust_details_checked", False),
+            spn_mappings=data.get("spn_mappings", []),
             gpos=[
                 Gpo(
                     **{
@@ -689,6 +702,8 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
             ("key_credentials_checked", "the key credential part of AD-ACC-013"),
             ("channel_policy_collected", "AD-GPO-008 (Netlogon allow list)"),
             ("tier0_members_checked", "AD-PRIV-012 (unreadable tier-0 members)"),
+            ("trust_details_checked", "AD-INF-016 and the AES part of AD-INF-015 (trust details)"),
+            ("spn_mappings", "the part of AD-DEL-005 about hosts that exist (SPN aliases)"),
         )
         if key not in data
     ]

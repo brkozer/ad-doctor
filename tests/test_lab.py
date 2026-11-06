@@ -5,7 +5,9 @@ Run with: AD_DOCTOR_LAB_HOST=... AD_DOCTOR_LAB_USER=... AD_DOCTOR_PASSWORD=... p
 
 from __future__ import annotations
 
+import dataclasses
 import os
+from datetime import timedelta
 
 import pytest
 
@@ -18,7 +20,7 @@ pytestmark = pytest.mark.lab
 
 # Every misconfiguration seed.ps1 plants. Covered by the unit tests only: AD-KRB-001,
 # AD-ACC-005, AD-ACC-011 and AD-KRB-006 (need time to pass), AD-ACC-007 and AD-INF-006
-# (need a second domain), AD-INF-012 (needs an RODC), AD-ACC-009 (confidential on 2025),
+# (need a real second domain), AD-INF-012 (needs an RODC), AD-ACC-009 (confidential on 2025),
 # AD-INF-008 (DCs require SMB signing), AD-INF-009 and the high grade of AD-CHAIN-002/003
 # (no spooler on Server Core 2025) and AD-INF-011 (needs a week without backup).
 EXPECTED = {
@@ -108,6 +110,18 @@ EXPECTED = {
         "ROGUE01$ (primary group Domain Controllers, but not a DC)",
     },
     "AD-INF-014": {"ROGUE01$"},
+    "AD-INF-015": {
+        "forest.partner.test (AES not set on the trust)",
+        "nt4.partner.test (downlevel, NT4 style)",
+        "rc4.partner.test (no AES, encryption types 0x4)",
+    },
+    "AD-INF-017": {"forest.partner.test"},
+    "AD-DEL-005": {
+        "svc_ghost -> MSSQLSvc/fs01.adlab.test:1433 (no account holds it, the host exists)",
+        "svc_ghost -> cifs/files.partner.test (not in this domain's snapshot, review)",
+        "svc_ghost -> cifs/oldfs.adlab.test (no computer object)",
+        "svc_ghost_pt -> http/oldweb.adlab.test (no computer object, protocol transition)",
+    },
     "AD-PRIV-008": {"Backup Operators: op_user"},
     "AD-PRIV-009": {"helpdesk"},
     "AD-PRIV-010": {"adm_bob"},
@@ -191,6 +205,27 @@ def test_gpo_reach_through_ou_and_site_links(snap: Snapshot) -> None:
     # the block on OU=Isolated stops LabOuReach: only the enforced GPO gets through
     lab = next(n for n, name in g.names.items() if name == "computers under Lab")
     assert "WS03$" not in {g.name(d) for d, _ in g.edges[lab]}
+
+
+def test_plain_user_reads_trust_details_and_spn_mappings(snap: Snapshot) -> None:
+    assert snap.trust_details_checked
+    assert {t.name for t in snap.trusts} == {
+        "forest.partner.test",
+        "nt4.partner.test",
+        "rc4.partner.test",
+        "selective.partner.test",
+    }
+    assert all(t.when_changed for t in snap.trusts)
+    assert {t.name: t.enc_types for t in snap.trusts}["selective.partner.test"] == 0x18
+    assert any("cifs" in m.split(",") for m in snap.spn_mappings)
+
+
+def test_trusts_go_stale_once_40_days_pass(snap: Snapshot) -> None:
+    newest = max(t.when_changed for t in snap.trusts if t.when_changed)
+    later = dataclasses.replace(snap, collected_at=newest + timedelta(days=41))
+    stale = next(f for f in run_all(later) if f.check_id == "AD-INF-016")
+    assert stale.severity is Severity.MEDIUM
+    assert len(stale.objects) == 4
 
 
 def test_every_dc_probed(snap: Snapshot) -> None:
@@ -349,6 +384,9 @@ def test_clean_and_default_objects_not_flagged(findings: dict[str, set[str]]) ->
         "AD-ACL-008",
         "AD-DEL-001",
         "AD-DEL-004",
+        "AD-DEL-005",
+        "AD-INF-015",
+        "AD-INF-017",
         "AD-GPP-002",
         "AD-PRIV-007",
         "AD-GPO-005",

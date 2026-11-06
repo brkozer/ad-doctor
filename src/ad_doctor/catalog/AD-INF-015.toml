@@ -1,0 +1,103 @@
+id = "AD-INF-015"
+aliases = ["trust-aes", "downlevel-trust"]
+summary = "A trust is a downlevel, NT4-style trust, or does not declare AES, so its referral tickets can be encrypted with RC4."
+severities = ["low", "medium"]
+severity_logic = """
+**Medium** for a downlevel trust and for a trust whose encryption types are set and leave
+AES out. **Low** when AES is simply not set on the trust: that is the default, and whether
+it still means RC4 depends on the DCs (see below).
+"""
+mitre = ["T1558"]
+data_sources = ["ldap"]
+attributes = ["trustPartner", "trustDirection", "trustType", "trustAttributes", "msDS-SupportedEncryptionTypes"]
+related = ["AD-INF-006", "AD-INF-016", "AD-KRB-005"]
+since = "0.1.4"
+
+risk = """
+A Kerberos ticket that crosses a trust is a referral, encrypted with the key the two
+domains share. Without AES that can be RC4, the algorithm Microsoft is phasing out, and the
+trust key protects every ticket that crosses. KB5073381 changes the KDC default for
+accounts; its FAQ says the trust and referral flow with other domain controllers is not
+affected, so trusts need their own look.
+
+A downlevel trust (`trustType` 1) is the form made for domains that do not run Active
+Directory, such as NT4. Unless the partner really is one, the trust should not exist in
+this form.
+"""
+
+detection = """
+ad-doctor reads the `trustedDomain` objects under `CN=System`:
+
+| Trust | Reported when | Grade |
+| --- | --- | --- |
+| `trustType` 1, any direction | always | medium |
+| Inbound or two-way | `msDS-SupportedEncryptionTypes` set, without AES (0x8 or 0x10) | medium |
+| Inbound or two-way | the attribute is not set, and `TRUST_ATTRIBUTE_TRUST_USES_AES_KEYS` (0x100) is off | low |
+
+Outbound-only trusts are skipped, as in PingCastle's T-AlgsAES: this domain's KDC issues
+referrals only over trusts its own users can cross. The trust with Microsoft Entra
+Kerberos (`trustType` 5, or the partner `kerberos.microsoftonline.com`) is not judged.
+
+Each object is the partner name with the reason, for example
+`partner.example (AES not set on the trust)`.
+
+LDAP returns nothing both for an attribute that is not set and for one the account cannot
+read, so the low grade covers both. A normal domain user could read it in the lab. An
+older snapshot has no encryption types: that part is not evaluated, and a note says so.
+"""
+
+false_positives = """
+- **AES not set, on patched DCs.** Microsoft's article on Kerberos encryption types says
+  the November 2022 update made setting AES on trusts unnecessary, and its author later
+  wrote in a comment that the update changed session keys and not the ticket encryption.
+  Check event 4769 on your DCs for what is really used, and accept the finding if it is AES.
+- **Trusts inside the forest** are listed too, as in PingCastle. The low grade applies
+  to them as to any other trust.
+- **A real NT4-era or third-party partner.** Plan to remove it. Accept the finding until then.
+"""
+
+remediation = """
+1. **Look at each trust's current setting**, without changing anything:
+
+    ```
+    ksetup /getenctypeattr partner.example
+    ```
+
+2. **Add AES and keep RC4** until both sides are proven. The Active Directory Domains and
+   Trusts checkbox *The other domain supports Kerberos AES Encryption* turns RC4 off across
+   the trust; `ksetup` does not. Do the same on the partner's side:
+
+    ```
+    ksetup /setenctypeattr partner.example RC4-HMAC-MD5 AES128-CTS-HMAC-SHA1-96 AES256-CTS-HMAC-SHA1-96
+    ```
+
+3. **Recreate downlevel trusts** as forest or external trusts, using the DNS name of the
+   partner, or remove them if nothing needs them.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-015"
+
+[[references]]
+title = "[MS-ADTS]: trustAttributes"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/e9a2d23c-c31e-4a6f-88a0-6646fdb51a3c"
+kind = "spec"
+
+[[references]]
+title = "Decrypting the selection of supported Kerberos encryption types (Microsoft)"
+url = "https://techcommunity.microsoft.com/blog/coreinfrastructureandsecurityblog/decrypting-the-selection-of-supported-kerberos-encryption-types/1628797"
+kind = "vendor"
+
+[[references]]
+title = "KB5073381: Kerberos KDC usage of RC4 (CVE-2026-20833)"
+url = "https://support.microsoft.com/help/5073381"
+kind = "vendor"
+
+[[references]]
+title = "PingCastle T-AlgsAES"
+url = "https://raw.githubusercontent.com/netwrix/pingcastle/master/PingCastleCommon/Healthcheck/Rules/HeatlcheckRuleTrustAES.cs"
+kind = "tool"
+
+[[references]]
+title = "PingCastle T-Downlevel"
+url = "https://raw.githubusercontent.com/netwrix/pingcastle/master/PingCastleCommon/Healthcheck/Rules/HeatlcheckRuleTrustDownlevel.cs"
+kind = "tool"

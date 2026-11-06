@@ -1,0 +1,81 @@
+id = "AD-INF-016"
+aliases = ["stale-trust", "inactive-trust"]
+summary = "A trust object has not changed for over 40 days although trust passwords change every 30, so the partner is probably gone."
+severities = ["low", "medium"]
+severity_logic = """
+**Medium** for a trust between Windows domains. **Low** when every listed trust is a
+Kerberos realm trust: those have no Netlogon secure channel, so their age says little.
+"""
+mitre = ["T1558"]
+data_sources = ["ldap"]
+attributes = ["trustPartner", "trustType", "whenChanged"]
+related = ["AD-INF-006", "AD-INF-015", "AD-INF-017"]
+since = "0.1.4"
+
+risk = """
+Domains in a trust share a password, kept in the trusted domain object. As part of account
+maintenance the trusting side changes it every 30 days, which needs a secure channel to the
+other side. A trust object that has not changed for much longer than that usually means
+the partner was decommissioned, or cannot be reached.
+
+A trust nobody removed is not harmless. The secret stays valid here, and whoever got it
+from the old partner, or from one of its backups, can forge inter-realm tickets. PingCastle
+calls this a backdoor.
+"""
+
+detection = """
+ad-doctor reads `whenChanged` of each `trustedDomain` object and lists the trust when it
+is more than 40 days older than the snapshot. That is PingCastle's T-Inactive rule: 30
+days of rotation plus a margin. Each object shows the date, for example
+`partner.example (last changed 2026-03-02)`, so a finding keeps its fingerprint from
+scan to scan.
+
+The trust with Microsoft Entra Kerberos (`trustType` 5, or the partner
+`kerberos.microsoftonline.com`) is skipped. A realm trust (`trustType` 3) is listed with
+the word `review`.
+
+If `whenChanged` cannot be read, a note names the trust and it is not judged. An older
+snapshot has no dates: the check does not run, and a note says so.
+"""
+
+false_positives = """
+- **Partner down for a while.** A long outage looks the same as a dead partner.
+- **Realm trusts** to MIT Kerberos have no rotation by Netlogon. Change the key by hand on
+  a schedule, and accept the finding with that schedule as the reason.
+- **False negatives.** `whenChanged` moves with any write to the object, such as an
+  administrator editing the trust, so a recent date does not prove the partner is alive.
+"""
+
+remediation = """
+1. **Test the trust**, which only reads its state:
+
+    ```
+    nltest /sc_query:partner.example
+    ```
+
+2. **If the partner still exists**, fix DNS, firewalls or the secure channel, and watch
+   `whenChanged` move on the next rotation.
+3. **If it is gone, remove the trust**, on both sides if a side is left. `netdom trust` has
+   no dry-run mode, so read the command before running it:
+
+    ```
+    netdom trust corp.example /domain:partner.example /remove
+    ```
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-016"
+
+[[references]]
+title = "How trusts work: TDO password changes (Microsoft)"
+url = "https://learn.microsoft.com/en-us/entra/identity/domain-services/concepts-forest-trust"
+kind = "vendor"
+
+[[references]]
+title = "PingCastle T-Inactive"
+url = "https://raw.githubusercontent.com/netwrix/pingcastle/master/PingCastleCommon/Healthcheck/Rules/HeatlcheckRuleTrustInactive.cs"
+kind = "tool"
+
+[[references]]
+title = "Netdom trust"
+url = "https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/netdom-trust"
+kind = "vendor"

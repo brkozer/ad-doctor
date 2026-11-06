@@ -669,6 +669,76 @@ foreach ($name in 'LabDisabledLink', 'LabComputerOff', 'LabFilteredOut') {
     Set-GPPermission -Name $name -TargetName gpo_ctl -TargetType User -PermissionLevel GpoEdit | Out-Null
 }
 
+# AD-DEL-005: delegation targets no account holds. svc_iis's cifs/fs01 is the control: the
+# class maps to HOST through sPNMappings, and FS01 holds the HOST SPNs a joined computer has.
+Set-ADComputer FS01 -DNSHostName fs01.adlab.test
+Set-ADObject (Get-ADComputer FS01) -Replace @{ servicePrincipalName = @('HOST/FS01', 'HOST/fs01.adlab.test') }
+Set-ADComputer FS01 -KerberosEncryptionType AES128, AES256
+Ensure-User svc_ghost
+Set-ADUser svc_ghost -Replace @{ 'msDS-AllowedToDelegateTo' = @(
+    'cifs/oldfs.adlab.test', 'cifs/fs01.adlab.test', 'MSSQLSvc/fs01.adlab.test:1433',
+    'cifs/files.partner.test') }
+Ensure-User svc_ghost_pt
+Set-ADAccountControl svc_ghost_pt -TrustedToAuthForDelegation $true
+Set-ADUser svc_ghost_pt -Replace @{ 'msDS-AllowedToDelegateTo' = 'http/oldweb.adlab.test' }
+
+# AD-INF-015, -017: local halves of trusts, through LSA because LDAP refuses the system-owned
+# attributes of trustedDomain. No partner and no password: none of these trusts works.
+# selective.partner.test is the clean control.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class LabTrust {
+    [StructLayout(LayoutKind.Sequential)]
+    struct Str { public ushort Length; public ushort Max; [MarshalAs(UnmanagedType.LPWStr)] public string Buffer; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct Attrs { public int Length; public IntPtr Root; public IntPtr Name; public int Flags; public IntPtr Sd; public IntPtr Qos; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct Info { public Str Name; public Str Flat; public IntPtr Sid; public int Direction; public int Type; public int Attributes; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct Auth { public int InCount; public IntPtr InNew; public IntPtr InOld; public int OutCount; public IntPtr OutNew; public IntPtr OutOld; }
+    [DllImport("advapi32.dll")] static extern int LsaOpenPolicy(IntPtr system, ref Attrs attrs, int access, out IntPtr policy);
+    [DllImport("advapi32.dll")] static extern int LsaCreateTrustedDomainEx(IntPtr policy, ref Info info, ref Auth auth, int access, out IntPtr domain);
+    [DllImport("advapi32.dll")] static extern int LsaClose(IntPtr handle);
+    [DllImport("advapi32.dll")] static extern int LsaNtStatusToWinError(int status);
+    static Str S(string v) { return new Str { Length = (ushort)(v.Length * 2), Max = (ushort)(v.Length * 2), Buffer = v }; }
+    public static int Create(string name, string flat, byte[] sid, int direction, int type, int attributes) {
+        Attrs attrs = new Attrs(); attrs.Length = Marshal.SizeOf(typeof(Attrs));
+        IntPtr policy;
+        int status = LsaOpenPolicy(IntPtr.Zero, ref attrs, 0xF0FFF, out policy);
+        if (status != 0) return LsaNtStatusToWinError(status);
+        IntPtr raw = Marshal.AllocHGlobal(sid.Length);
+        Marshal.Copy(sid, 0, raw, sid.Length);
+        Info info = new Info { Name = S(name), Flat = S(flat), Sid = raw, Direction = direction, Type = type, Attributes = attributes };
+        Auth auth = new Auth();
+        IntPtr domain;
+        status = LsaCreateTrustedDomainEx(policy, ref info, ref auth, 0xF007F, out domain);
+        if (status == 0) LsaClose(domain);
+        LsaClose(policy);
+        Marshal.FreeHGlobal(raw);
+        return LsaNtStatusToWinError(status);
+    }
+}
+'@
+function Ensure-Trust($Name, $Type, $Attributes, $Enc, $Rid) {
+    $system = "CN=System,$dn"
+    $filter = "objectClass -eq 'trustedDomain' -and trustPartner -eq '$Name'"
+    if (-not (Get-ADObject -Filter $filter -SearchBase $system)) {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-21-1000-2000-$Rid"
+        $bytes = New-Object byte[] $sid.BinaryLength
+        $sid.GetBinaryForm($bytes, 0)
+        $flat = ($Name -split '\.')[0].ToUpper()
+        $code = [LabTrust]::Create($Name, $flat, $bytes, 3, $Type, $Attributes)
+        if ($code) { throw "trust $Name`: Windows error $code" }
+    }
+    # LDAP refuses this attribute on a trust too
+    if ($Enc) { ksetup /setenctypeattr $Name @Enc | Out-Null }
+}
+Ensure-Trust forest.partner.test 2 0x8 $null 3001         # AD-INF-015 low, AD-INF-017
+Ensure-Trust rc4.partner.test 2 0x4 @('RC4-HMAC-MD5') 3002         # AD-INF-015 medium
+Ensure-Trust nt4.partner.test 1 0x4 $null 3003         # AD-INF-015 medium, downlevel
+Ensure-Trust selective.partner.test 2 0x18 @('AES128-CTS-HMAC-SHA1-96', 'AES256-CTS-HMAC-SHA1-96') 3004    # clean
+
 # SDProp copies the AdminSDHolder ACL onto protected objects now instead of within the hour
 $rootDse = [ADSI]'LDAP://RootDSE'
 $rootDse.Put('runProtectAdminGroupsTask', 1)

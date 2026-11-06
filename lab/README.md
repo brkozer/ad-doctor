@@ -113,6 +113,10 @@ uv run ad-doctor scan dc01.adlab.test --ldaps --port 10636 --smb-port 10445 --ht
   tell them apart without authenticating, so AD-ADCS-019 lists both.
 - The seeded Guest account changes what IIS does with an unknown user: NTLM falls back to
   Guest. Do not read a made-up user's result here as what a domain with Guest off would show.
+- `seed.ps1` creates four trusts through `LsaCreateTrustedDomainEx`, since LDAP refuses the
+  system-owned attributes of `trustedDomain`. They have no partner and no password, so none
+  works, and they leave disabled trust accounts such as `FOREST$`. Their `whenChanged` is the
+  seeding date until 40 days pass, so the live test of AD-INF-016 moves the snapshot's date.
 - With one DC, the every-DC probes cover the scanned DC only; the multi-DC paths are
   unit-tested.
 - The evaluation licence runs for 180 days. Rebuild from scratch rather than extend it.
