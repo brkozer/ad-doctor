@@ -15,7 +15,7 @@
   const KIND_LABEL = {
     user: "User", computer: "Computer", gmsa: "gMSA", group: "Group", ou: "OU",
     container: "Container", gpo: "GPO", domain: "Domain", template: "Template",
-    pki: "PKI object", ca: "CA", principal: "Principal",
+    pki: "PKI object", ca: "CA", principal: "Principal", scope: "GPO scope",
   };
   const ATTRIBUTE = new RegExp(
     "^(class|id|role|tabindex|title|type|for|name|value|lang|hidden|disabled|readonly|scope|rows|accept|" +

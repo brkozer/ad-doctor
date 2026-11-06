@@ -119,6 +119,7 @@ const CORE = (function () {
   function blastRadius(G, a) {
     const sids = identity(G, a);
     const R = reachable(G, startNodes(G, sids));
+    R.order = R.order.filter((n) => kindOf(G, n) !== "scope"); // not controlled objects
     const tier0 = R.order.filter((n) => G.tier0[n]).map((n) => pathTo(G, R, n));
     tier0.sort((x, y) => x.steps.length - y.steps.length); // stable, like Python's sorted
     if (a.node >= 0 && G.tier0[a.node]) {
@@ -200,7 +201,7 @@ const CORE = (function () {
   // The family of a paths.build edge label.
   function edgeKind(how) {
     const h = String(how);
-    if (/ via GPO /.test(h) || h.startsWith("linked to ")) return "gpo";
+    if (/ via GPO /.test(h) || h.startsWith("linked to ") || h.startsWith("GPO ")) return "gpo";
     if (h.startsWith("member of")) return "membership";
     if (h === "owns") return "owner";
     if (h === "contains") return "contains";

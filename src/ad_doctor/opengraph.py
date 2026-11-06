@@ -46,6 +46,9 @@ EDGE_KINDS = {
     "can RDP": "CanRDP",
     "can PSRemote": "CanPSRemote",
     "DCOM": "ExecuteDCOM",
+    "GPO applies to": "GPOAppliesTo",
+    "GPO inherited by": "GPOInheritedBy",
+    "GPO reaches": "GPOReaches",
 }
 INHERITED = " (inherited)"
 VIA_GPO = " via GPO "

@@ -159,6 +159,7 @@ def subject(c: Indexed, starts: list[str], name: str, kind: str, **extra: Any) -
     depth: dict[int, int] = {}
     for d in order:
         depth[d] = depth.get(prev[d], 0) + 1
+    order = [d for d in order if c.kind[d] != "scope"]  # not controlled objects
     tier0: list[dict[str, Any]] = []
     for end in sorted((d for d in order if c.tier0[d]), key=depth.__getitem__):
         root, steps = c.steps(prev, via, end)

@@ -24,7 +24,8 @@ DC seeded with one instance of every misconfiguration that a single domain can h
 ## What sets it apart
 
 - **Attack paths without a graph database.** `AD-PATH-001` builds the control graph
-  (group membership, takeover ACEs, ownership, DCSync, GPO links, exploitable templates,
+  (group membership, takeover ACEs, ownership, DCSync, GPO links and what those GPOs reach
+  through OUs and sites, exploitable templates,
   gMSA readers, local admin rights that Group Policy hands out, an Entra Connect server
   holding its sync account) from the snapshot and reports the shortest path from every non-tier-0
   principal to tier 0, plus the share of users that have one. `ad-doctor blast-radius`
@@ -319,6 +320,12 @@ narrow or turn them off; [SECURITY.md](SECURITY.md) lists every probe.
   HTTPS web enrollment, and host settings beyond what the DC probes see, remain out of
   scope: local group membership that Group Policy sets is covered, changes made directly
   in a computer's local SAM are not.
+- GPO reach in the control graph uses the links, Enforced, Block Inheritance, the user and
+  computer side flags and security filtering described below. An empty GPO counts,
+  because its writer fills it in. Not evaluated: WMI filters (assumed to match, with a
+  caveat), Deny ACEs, loopback processing, and whether a user in scope ever logs on. With
+  more than one site, a site link is followed only to the domain controllers of that site
+  (noted), so paths through member computers there are missed.
 - Group Policy scope for local groups (AD-GPO-005 to -007 and the graph edges) is worked
   out offline and errs toward over-reporting. Links, Block Inheritance, Enforced, disabled
   links, the GPO status, an empty computer version or a missing client-side extension, and
@@ -487,14 +494,14 @@ thousands of rows are drawn as they scroll into view.
 
 `scripts/bench.py` builds a synthetic enterprise domain (an OU tree of 8 regions, 80
 sites and 480 departments, nested groups, delegated OU permissions that inherit, default
-DACLs on every object, GPOs and templates) and times each stage. On one core of an Intel
+DACLs on every object, linked and filtered GPOs and templates) and times each stage. On one core of an Intel
 Xeon Gold 6138 (2017), Python 3.12:
 
 | Domain | Snapshot | Load | All checks + paths | OpenGraph export | Peak memory |
 |---|---|---|---|---|---|
-| 10,000 users, 3,300 computers, 19,000 ACEs | 13 MB | 0.4 s | 0.8 s | 0.6 s | 0.2 GB |
-| 100,000 users, 33,000 computers, 127,000 ACEs | 123 MB | 3.4 s | 7.2 s | 6.1 s | 1.8 GB |
-| 250,000 users, 83,000 computers, 308,000 ACEs | 306 MB | 9.4 s | 18.6 s | 16.9 s | 4.5 GB |
+| 10,000 users, 3,300 computers, 19,000 ACEs | 13 MB | 0.4 s | 1.1 s | 0.7 s | 0.2 GB |
+| 100,000 users, 33,000 computers, 127,000 ACEs | 123 MB | 3.6 s | 12.5 s | 7.8 s | 1.9 GB |
+| 250,000 users, 83,000 computers, 308,000 ACEs | 306 MB | 9.4 s | 32.9 s | 18.3 s | 4.8 GB |
 
 Analysis grows linearly with the size of the domain. Collection time is set by the DC:
 the snapshot comes from a few paged LDAP searches, so it scales with the number of objects

@@ -10,6 +10,10 @@ the shortest path from any other principal.
 
 Remote logon rights a GPO grants (RDP, WinRM, DCOM) are kept apart as logon edges: they
 are exported, but logon is not control, so the path search does not follow them.
+
+Whoever can write a GPO controls what it applies to. That reach runs through scope nodes
+(gpo_scope.Reach), not through OU nodes: an OU's contains edges stand for ACL inheritance.
+Scope nodes are plumbing, so they count as neither controlled objects nor tier 0.
 """
 
 from __future__ import annotations
@@ -39,6 +43,9 @@ from .checks import (
 from .model import WELL_KNOWN_SIDS, Account, Finding, Severity, Snapshot
 
 Edge = tuple[str, str]  # (target node, label)
+GPO_APPLIES = "GPO applies to"  # GPO to the scope of a link
+GPO_INHERITED = "GPO inherited by"  # scope to the scope of a child OU
+GPO_REACHES = "GPO reaches"  # scope to an account
 UNESCAPED_COMMA = gpo_scope.RDN_SEPARATOR
 
 
@@ -96,6 +103,7 @@ NODE_PREFIX_KINDS = (
     ("tier0:PKI:", "pki"),
     ("tier0:ca:", "ca"),
     ("tier0:dc-ou", "ou"),
+    ("gpo-scope:", "scope"),
 )
 # Everyone, Anonymous Logon, Authenticated Users, Enterprise Domain Controllers
 WELL_KNOWN_GROUPS = {"S-1-1-0", "S-1-5-7", "S-1-5-11", "S-1-5-9"}
@@ -260,19 +268,38 @@ def build(snap: Snapshot) -> Graph:
                 if rights:
                     add(principal(ace.sid), node, f"{', '.join(rights)} (inherited)")
 
-    # GPOs reach what they are linked to
+    logon_edges: dict[str, list[Edge]] = {}
+    edge_props: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    # GPOs reach what they are linked to. A link to the domain or the DC OU counts as
+    # control of tier 0 only if the GPO gets to a DC (older snapshots hold no links; a
+    # snapshot without DCs cannot tell)
+    reach = gpo_scope.reach(snap)
+    gpo_nodes: dict[str, str] = {}
+    has_dcs = any(a.is_registered_dc for a in snap.accounts)
     for g in snap.gpos:
         gpo_node = node_of(f"CN={g.guid},CN=Policies,CN=System,{snap.domain_dn}")
+        gpo_nodes[g.guid.upper()] = gpo_node
         names.setdefault(gpo_node, f"GPO {g.name}")
         kinds[gpo_node] = "gpo"
+        if g.links and has_dcs and g.guid.upper() not in reach.dc_gpos:
+            continue
         for where in g.linked_to:
             add(gpo_node, domain_node if where == "domain" else "tier0:dc-ou", f"linked to {where}")
+    names.update(reach.names)
+    for g, scope, caveats in reach.applies:
+        src = gpo_nodes[g.guid.upper()]
+        add(src, scope, GPO_APPLIES)
+        if caveats:
+            edge_props[(src, scope, GPO_APPLIES)] = {"gpo": g.name, "caveats": list(caveats)}
+    for scope, below_it in reach.inherits:
+        add(scope, below_it, GPO_INHERITED)
+    for scope, account in reach.holds:
+        add(scope, _sid_node(account.sid), GPO_REACHES)
 
     # local groups set by Group Policy: an admin-equivalent group makes the member SYSTEM on
     # the computer, so it becomes the computer account; a domain group rewritten through
     # the DCs is plain membership
-    logon_edges: dict[str, list[Edge]] = {}
-    edge_props: dict[tuple[str, str, str], dict[str, Any]] = {}
     for grant in gpo_scope.grants(snap):
         member = principal(grant.item.member_sid)
         via = f" via GPO {grant.gpo.name}"
@@ -423,7 +450,8 @@ def blast_radius(g: Graph, starts: list[str]) -> tuple[dict[str, Path], list[Pat
     """What the identity `starts` (identity_nodes) controls, and its paths into tier 0:
     the tier-0 objects it reaches, shortest first, led by the account itself when it (or
     one of its implicit groups) is tier 0 already. The viewer's JavaScript ports this."""
-    controlled = reachable(g, starts)
+    found = reachable(g, starts)
+    controlled = {n: p for n, p in found.items() if g.kind(n) != "scope"}
     tier0 = sorted((p for n, p in controlled.items() if n in g.tier0), key=lambda p: len(p.steps))
     if starts and starts[0] in g.tier0:  # the account itself is tier 0
         tier0.insert(0, Path(starts[0], []))

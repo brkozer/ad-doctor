@@ -580,6 +580,26 @@ if (-not (Get-ADUser -Filter "SamAccountName -eq 'veiled_admin'")) {
 Add-ADGroupMember 'Domain Admins' veiled_admin
 dsacls "OU=Veiled,$ou" /D 'ADLAB\adreader:LC' | Out-Null
 
+# GPO reach in the control graph (AD-PATH-001). Edit rights on a GPO linked to OU=Lab and on
+# one linked to the site are paths to tier 0; gpo_ctl can edit only GPOs that reach nothing:
+# a disabled link, the computer side off over an OU of computers, filtered to nobody.
+Ensure-User gpo_editor
+Ensure-User gpo_site_editor
+Ensure-User gpo_ctl
+Ensure-Gpo LabOuReach | Out-Null
+Ensure-Link LabOuReach $ou
+Set-GPPermission -Name LabOuReach -TargetName gpo_editor -TargetType User -PermissionLevel GpoEdit | Out-Null
+$gSite = Ensure-Gpo LabSiteReach
+$site = "CN=Default-First-Site-Name,CN=Sites,CN=Configuration,$dn"
+# Get-GPInheritance, so Ensure-Link, does not take a site
+if ((Get-ADObject $site -Properties gPLink).gPLink -notmatch $gSite.Id) {
+    New-GPLink -Name LabSiteReach -Target $site | Out-Null
+}
+Set-GPPermission -Name LabSiteReach -TargetName gpo_site_editor -TargetType User -PermissionLevel GpoEdit | Out-Null
+foreach ($name in 'LabDisabledLink', 'LabComputerOff', 'LabFilteredOut') {
+    Set-GPPermission -Name $name -TargetName gpo_ctl -TargetType User -PermissionLevel GpoEdit | Out-Null
+}
+
 # SDProp copies the AdminSDHolder ACL onto protected objects now instead of within the hour
 $rootDse = [ADSI]'LDAP://RootDSE'
 $rootDse.Put('runProtectAdminGroupsTask', 1)

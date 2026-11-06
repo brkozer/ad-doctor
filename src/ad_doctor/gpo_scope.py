@@ -1,4 +1,4 @@
-"""Which computers the local group settings in GPOs reach, worked out from a snapshot.
+"""Which computers GPO settings reach and, for the control graph, what a GPO's writer controls.
 
 Scope follows Group Policy processing for the computer side: links on the site, the
 domain and each OU above the computer, Block Inheritance and Enforced, disabled links,
@@ -27,16 +27,28 @@ Approximations, each of which can only over-report:
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import itertools
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import sd
-from .model import Account, DirObject, Gpo, GpoLocalGroup, Snapshot, well_known_sid
+from .model import (
+    Account,
+    DirObject,
+    GpLink,
+    Gpo,
+    GpoLocalGroup,
+    Snapshot,
+    well_known_sid,
+)
 
 CSE_SECURITY = "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}"  # Restricted Groups, user rights
 CSE_GROUPS = "{17D89FEC-5C44-4972-B12D-241CAEF74509}"  # GPP Local Users and Groups
 CSE_OF_SOURCE = {"restricted": CSE_SECURITY, "gpp": CSE_GROUPS}
+GPO_USER_DISABLED = 0x1
 GPO_COMPUTER_DISABLED = 0x2
+SIDES = (("computer", GPO_COMPUTER_DISABLED), ("user", GPO_USER_DISABLED))
 
 EVERYONE = "S-1-1-0"
 AUTHENTICATED_USERS = "S-1-5-11"
@@ -50,6 +62,7 @@ REMOTE_LOGON_RIGHT = "SeRemoteInteractiveLogonRight"
 RDN_SEPARATOR = re.compile(r"(?<!\\)(?:\\\\)*,")
 ILT_CAVEAT = "item-level targeting not evaluated"
 UNRESOLVED_LOGON = "remote logon right holders not resolved"
+MAX_FILTER_NAMES = 3  # groups named on a filtered scope node
 
 
 @dataclass(frozen=True)
@@ -179,14 +192,15 @@ class _Resolver:
         return list(found.values())
 
     def token(self, a: Account) -> set[str]:
-        """SIDs in the computer's token: its own, the well-known ones, the primary group
+        """SIDs in the account's token: its own, the well-known ones, the primary group
         and every group that holds any of them, through nesting and through the
         foreignSecurityPrincipal objects that stand for well-known SIDs."""
-        if a.dn.lower() in self._tokens:
-            return self._tokens[a.dn.lower()]
+        known = self._tokens.get(a.dn.lower())
+        if known is not None:
+            return known
         dom = self.snap.domain_sid
         sids = {a.sid, EVERYONE, AUTHENTICATED_USERS, THIS_ORGANIZATION}
-        sids.add(f"{dom}-{a.primary_group or 515}")
+        sids.add(f"{dom}-{a.primary_group or (515 if a.is_computer else 513)}")
         if a.is_dc:
             sids |= {ENTERPRISE_DCS, f"{dom}-{521 if a.is_rodc else 516}"}
         sids.discard("")
@@ -213,12 +227,8 @@ class _Resolver:
         for g, caveats in self.linked(a):
             if not computer_side_applies(g, source):
                 continue
-            allowed = security_filter(g, self.token(a))
-            if allowed is False:
-                continue
-            extra = ("security filtering not readable",) if allowed is None else ()
-            wmi = (f"WMI filter {g.wmi_filter}",) if g.wmi_filter else ()
-            out.append((g, caveats + extra + wmi))
+            if security_filter(g, self.token(a)) is not False:
+                out.append((g, caveats + _gpo_caveats(g)))
         return out
 
     def remote_logon(self, a: Account, member_sid: str) -> tuple[bool, bool]:
@@ -241,6 +251,11 @@ class _Resolver:
             return True, False
         unresolved = any(not h.startswith("S-1-") for h in holders)
         return unresolved, unresolved
+
+
+def _gpo_caveats(g: Gpo) -> tuple[str, ...]:
+    unread = ("security filtering not readable",) if not g.aces else ()
+    return unread + ((f"WMI filter {g.wmi_filter}",) if g.wmi_filter else ())
 
 
 def _holder(value: str) -> str:
@@ -465,6 +480,242 @@ def resolve(snap: Snapshot) -> Scope:
             "Windows ignores them there: " + ", ".join(sorted(gpp_on_dcs))
         )
     return Scope(out, list(clears.values()), notes)
+
+
+@dataclass
+class Reach:
+    """What a GPO controls, as scope nodes for the control graph.
+
+    A scope node stands for the accounts of one side (computers or users) at and below an
+    OU or the domain head that pass one security filter. So the graph grows with accounts,
+    OUs, links and distinct filters, not with GPOs times accounts: GPO -> scope of each
+    linked OU -> scope of each child OU the GPO is inherited by -> the accounts held there.
+
+    Scopes are separate from OU nodes: an OU's contains edges mean ACL inheritance, which
+    also leads to groups and through Block Inheritance, where Group Policy does not go.
+    """
+
+    names: dict[str, str] = field(default_factory=dict)  # scope ID -> display name
+    applies: list[tuple[Gpo, str, tuple[str, ...]]] = field(default_factory=list)
+    inherits: list[tuple[str, str]] = field(default_factory=list)
+    holds: list[tuple[str, Account]] = field(default_factory=list)
+    dc_gpos: set[str] = field(default_factory=set)  # upper-case GUIDs that reach some DC
+
+
+@dataclass
+class _Tree:
+    """Accounts of one side that pass one filter, by the OU or head that holds them."""
+
+    side: str
+    tag: str  # "" for no filter
+    title: str  # "computers", or "users"
+    filter_name: str  # "" for no filter
+    direct: dict[str, list[Account]] = field(default_factory=dict)
+    children: dict[str, set[str]] = field(default_factory=dict)
+    block_below: dict[str, bool] = field(default_factory=dict)
+
+
+FilterKey = tuple[frozenset[str], frozenset[str]]  # SIDs with Apply, SIDs with Read
+
+
+def _filter_key(g: Gpo) -> FilterKey | None:
+    """The SIDs the GPO's security filter depends on; None when it leaves nobody out (any
+    token passes) or was not read."""
+    if security_filter(g, {EVERYONE, AUTHENTICATED_USERS, THIS_ORGANIZATION}) is not False:
+        return None
+    read = sd.READ_PROPERTY | sd.GENERIC_READ | sd.GENERIC_ALL
+    return (
+        frozenset(a.sid for a in g.aces if a.extended_right(sd.APPLY_GROUP_POLICY)),
+        frozenset(a.sid for a in g.aces if a.mask & read),
+    )
+
+
+class _ReachBuilder:
+    def __init__(self, snap: Snapshot) -> None:
+        self.snap = snap
+        self.r = _Resolver(snap)
+        self.out = Reach()
+        users = [
+            a for a in snap.accounts if not a.is_computer and a.enabled and not a.managed and a.sid
+        ]
+        # each account with the OUs above it, worked out once for every tree
+        chains: dict[str, list[str]] = {}
+        self.placed: dict[str, list[tuple[Account, list[str]]]] = {}
+        for side, accounts in (("computer", _computers(snap)), ("user", users)):
+            self.placed[side] = []
+            for a in accounts:
+                parent = a.dn.lower().split(",", 1)[-1]
+                if parent not in chains:
+                    chains[parent] = containers(a.dn, snap.domain_dn)
+                if chains[parent]:
+                    self.placed[side].append((a, chains[parent]))
+        self.trees: dict[tuple[str, FilterKey | None], _Tree] = {}
+        self.ou_dns: dict[str, str] = {}  # as written, for display
+
+    def passes(self, key: FilterKey | None, a: Account) -> bool:
+        """security_filter for a key: this runs once per account and filter."""
+        if key is None:
+            return True
+        token = self.r.token(a)
+        return not (key[0].isdisjoint(token) or key[1].isdisjoint(token))
+
+    def tree(self, side: str, key: FilterKey | None) -> _Tree:
+        found = self.trees.get((side, key))
+        if found is not None:
+            return found
+        tag = ""
+        filter_name = ""
+        if key is not None:
+            text = repr((sorted(key[0]), sorted(key[1])))
+            tag = hashlib.sha1(text.encode(), usedforsecurity=False).hexdigest()[:10]
+            names = sorted({self.snap.name_of(s) for s in key[0]})
+            more = (
+                f" +{len(names) - MAX_FILTER_NAMES} more" if len(names) > MAX_FILTER_NAMES else ""
+            )
+            filter_name = ", ".join(names[:MAX_FILTER_NAMES]) + more
+        t = _Tree(side, tag, f"{side}s", filter_name)
+        for a, chain in self.placed[side]:
+            if self.passes(key, a):
+                t.direct.setdefault(chain[0], []).append(a)
+                for c in chain:
+                    self.ou_dns.setdefault(c, a.dn[-len(c) :])
+                for child, parent in itertools.pairwise(chain):
+                    t.children.setdefault(parent, set()).add(child)
+        self.trees[(side, key)] = t
+        return t
+
+    def blocked_below(self, t: _Tree, c: str) -> bool:
+        """Any OU strictly below c that blocks inheritance and holds accounts of t."""
+        if c not in t.block_below:
+            t.block_below[c] = any(
+                child in self.r.blocked or self.blocked_below(t, child)
+                for child in t.children.get(c, ())
+            )
+        return t.block_below[c]
+
+    def where(self, c: str) -> str:
+        """An OU as a path from the domain head; the head as the domain's name."""
+        head = self.snap.domain_dn.lower()
+        if c == head:
+            return self.snap.domain
+        dn = self.ou_dns.get(c, c)[: -len(head) - 1]
+        return "/".join(p.split("=", 1)[-1] for p in reversed(RDN_SEPARATOR.split(dn)))
+
+    def name(self, t: _Tree, place: str, enforced: bool) -> str:
+        suffix = f" filtered to {t.filter_name}" if t.filter_name else ""
+        return f"{t.title} under {place}{' (enforced)' if enforced else ''}{suffix}"
+
+    def scope(self, t: _Tree, c: str, enforced: bool = False) -> str:
+        """The scope of a link at c. An enforced link goes through Block Inheritance; it
+        needs its own node only where some OU below c blocks."""
+        base = f"gpo-scope:{t.side}:{t.tag}:{c}"
+        if enforced and self.blocked_below(t, c):
+            node = base + ":enforced"
+            if node not in self.out.names:
+                self.out.names[node] = self.name(t, self.where(c), True)
+                self.out.inherits.append((node, self.scope(t, c)))
+                for child in sorted(t.children.get(c, ())):
+                    if child in self.r.blocked or self.blocked_below(t, child):
+                        self.out.inherits.append((node, self.scope(t, child, True)))
+            return node
+        if base not in self.out.names:
+            self.out.names[base] = self.name(t, self.where(c), False)
+            self.out.holds += [(base, a) for a in t.direct.get(c, [])]
+            for child in sorted(t.children.get(c, ())):
+                if child not in self.r.blocked:
+                    self.out.inherits.append((base, self.scope(t, child)))
+        return base
+
+    def site_scope(self, t: _Tree, key: FilterKey | None, link: GpLink) -> str | None:
+        """Domain controllers known to be in the site (the only computers an ordinary user
+        can place); Block Inheritance anywhere above a DC stops an unenforced site link."""
+        site = link.container.lower()
+        node = f"gpo-scope:site:{t.tag}:{site}{':enforced' if link.enforced else ''}"
+        if node not in self.out.names:
+            dcs = [
+                a
+                for a, chain in self.placed["computer"]
+                if a.is_dc
+                and self.snap.dc_sites.get(a.dn.lower(), "").lower() == site
+                and self.passes(key, a)
+                and (link.enforced or not any(c in self.r.blocked for c in chain))
+            ]
+            if not dcs:
+                return None
+            place = RDN_SEPARATOR.split(link.container)[0].split("=", 1)[-1]
+            title = f"domain controllers in site {place}"
+            suffix = f" filtered to {t.filter_name}" if t.filter_name else ""
+            self.out.names[node] = f"{title}{' (enforced)' if link.enforced else ''}{suffix}"
+            self.out.holds += [(node, a) for a in dcs]
+        return node
+
+    def entry(self, t: _Tree, key: FilterKey | None, link: GpLink) -> str | None:
+        """Where a link enters the tree; None when it reaches no account of this side."""
+        c = link.container.lower()
+        if link.kind == "site":
+            if self.snap.site_count > 1:
+                return self.site_scope(t, key, link) if t.side == "computer" else None
+            # one site: its links act like links above the domain head
+            c = self.snap.domain_dn.lower()
+            if c in self.r.blocked and not link.enforced:
+                return None
+        if c not in t.direct and c not in t.children:
+            return None
+        return self.scope(t, c, link.enforced)
+
+    def build(self) -> Reach:
+        for g in self.snap.gpos:
+            key = _filter_key(g)
+            caveats = _gpo_caveats(g)
+            seen: set[str] = set()
+            for side, disabled in SIDES:
+                if g.flags & disabled:
+                    continue
+                for link in g.links:
+                    if link.enabled:
+                        node = self.entry(self.tree(side, key), key, link)
+                        if node is not None and node not in seen:
+                            seen.add(node)
+                            self.out.applies.append((g, node, caveats))
+        for a in _dcs(self.snap):
+            for g, _ in self.r.linked(a):
+                if g.flags & GPO_COMPUTER_DISABLED:
+                    continue
+                if security_filter(g, self.r.token(a)) is not False:
+                    self.out.dc_gpos.add(g.guid.upper())
+        return self.out
+
+
+def reach(snap: Snapshot) -> Reach:
+    """Where each GPO reaches, for anyone who can write it.
+
+    Links, Enforced, Block Inheritance, disabled links, the GPO's user and computer side
+    flags and security filtering count, as in `_Resolver`. The computer version and the
+    client-side extensions do not: a GPO that is empty today is what its writer fills in.
+    Disabled accounts and gMSAs process no policy and are left out. With more than one site
+    a site link reaches only the domain controllers of that site (see `site_note`).
+
+    Not evaluated: WMI filters (assumed to match, with a caveat), Deny ACEs (as in the
+    module docstring), and loopback processing, which brings user settings to users outside
+    the GPO's scope. User-side reach assumes the user logs on somewhere.
+    """
+    return _ReachBuilder(snap).build()
+
+
+def site_note(snap: Snapshot) -> list[str]:
+    """Paths through site links the graph cannot show, for the report's notes."""
+    if snap.site_count <= 1:
+        return []
+    names = sorted(
+        {g.name for g in snap.gpos if any(x.kind == "site" and x.enabled for x in g.links)}
+    )
+    if not names:
+        return []
+    return [
+        "GPOs linked to sites reach member computers and users too, but an ordinary user "
+        "cannot place those in a site: the control graph follows these links to domain "
+        "controllers only (" + ", ".join(names) + ")"
+    ]
 
 
 def grants(snap: Snapshot) -> list[Grant]:

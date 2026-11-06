@@ -35,13 +35,18 @@ Every edge carries a `traversable` property. It is ad-doctor's own marker for yo
 queries, not a BloodHound setting, and BloodHound ignores it for pathfinding.
 
 It is `true` on the control edges ad-doctor's path search follows: group membership, takeover
-ACEs, ownership, DCSync, GPO links, exploitable templates, gMSA readers, `ADD_AdminTo`,
+ACEs, ownership, DCSync, GPO links, GPO reach (`ADD_GPOAppliesTo`, `ADD_GPOInheritedBy`,
+`ADD_GPOReaches`), exploitable templates, gMSA readers, `ADD_AdminTo`,
 `ADD_LocalBackupOperator`, `ADD_HyperVAdmin`, `ADD_MemberOfViaGPO`, `ADD_HostsSyncAccount`,
 and the ESC7 edges `ADD_ManageCA` / `ADD_ManageCertificates`.
 
 It is `false` on the remote-logon rights that GPOs grant: `ADD_CanRDP`, `ADD_CanPSRemote`,
 `ADD_ExecuteDCOM`. A remote logon is a foothold, not control, so ad-doctor's path search does
 not follow them. Edges carry `gpo` and `caveats` properties where they apply.
+
+GPO reach goes through `ADD_Object` scope nodes, one per OU or site, side (computers or
+users) and security filter, such as `COMPUTERS UNDER LAB/SERVERS`. ad-doctor applies Block
+Inheritance and filtering when it builds these edges, so a query can follow them as they are.
 
 ## Removing the data again
 

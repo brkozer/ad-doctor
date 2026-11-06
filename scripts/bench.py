@@ -28,6 +28,7 @@ from ad_doctor.model import (
     CertTemplate,
     DirObject,
     DomainPolicy,
+    GpLink,
     Gpo,
     Snapshot,
 )
@@ -154,12 +155,32 @@ def build(users: int, seed: int) -> Snapshot:
         o.owner = f"{SID}-512"
 
     head = DirObject(DN, "bench.test", "domain")
-    gpos = [
-        Gpo(f"Policy {i}", f"{{{i:08X}-0000-0000-0000-000000000000}}",
-            ["domain"] if i < 3 else [],
-            [sd.Ace(rng.choice(groups).sid, sd.GENERIC_WRITE)] if i % 40 == 0 else [])
-        for i in range(300)
-    ]  # fmt: skip
+    # most GPOs apply to everyone; every tenth to Domain Computers or one group. Links
+    # go to the head, to OUs at every level, and one OU in ten blocks inheritance
+    gpos = []
+    for i in range(300):
+        where = DN if i < 3 else ous[i % len(ous)].dn
+        kind = "domain" if i < 3 else "ou"
+        who = "S-1-5-11"
+        if i % 10 == 5:
+            who = f"{SID}-515" if i % 20 == 5 else groups[i % len(groups)].sid
+        aces = [
+            sd.Ace(who, read),
+            sd.Ace(who, sd.CONTROL_ACCESS, sd.APPLY_GROUP_POLICY),
+        ]
+        if i % 40 == 0:
+            aces.append(sd.Ace(rng.choice(groups).sid, sd.GENERIC_WRITE))
+        gpos.append(
+            Gpo(
+                f"Policy {i}",
+                f"{{{i:08X}-0000-0000-0000-000000000000}}",
+                ["domain"] if i < 3 else [],
+                aces,
+                links=[GpLink(where, kind, True, i % 30 == 7, 0)],
+            )
+        )
+    for ou in ous[::10]:
+        ou.gp_blocked = True
     templates = [
         CertTemplate(f"Tmpl{i}", i % 3 == 0, i == 7, False, 0, ["1.3.6.1.5.5.7.3.2"],
                      [sd.Ace("S-1-5-21-1000-2000-3000-513", sd.CONTROL_ACCESS, sd.CERT_ENROLL)])

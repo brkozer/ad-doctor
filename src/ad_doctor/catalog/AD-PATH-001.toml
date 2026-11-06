@@ -51,7 +51,8 @@ A -> B means A controls B or can become B:
 | `owns`, takeover rights (`full control`, `write/WriteDacl/WriteOwner`, `write msDS-KeyCredentialLink`, reset password, ...) | owner and ACEs on users, computers, groups, OUs and the domain head |
 | `... (inherited)`, `contains` | inheritable ACEs on OUs and containers, and control of a container over what is below it; AdminSDHolder-protected objects are excluded |
 | `DCSync` | both replication rights on the domain head |
-| `link GPOs`, `linked to domain` | write access to `gPLink`, and GPO links to the domain or the Domain Controllers OU |
+| `link GPOs`, `linked to domain` | write access to `gPLink`, and GPO links to the domain or the Domain Controllers OU for a GPO that reaches a DC |
+| `GPO applies to`, `GPO inherited by`, `GPO reaches` | whoever can write a GPO controls what it applies to: from the GPO through its links on OUs, the domain head and sites, down the OU tree to computers and users |
 | `admin to via GPO ...` | local administrator (or equivalent) groups set by Group Policy; admin on a computer becomes that computer account |
 | `hosts sync account` | an Entra Connect server holds its sync account's password |
 | `enroll (ESC1-3)`, `write template (ESC4)`, `full control` on PKI objects, `ManageCA (ESC7)` | certificate templates, PKI containers and CA permissions |
@@ -69,6 +70,16 @@ Domain Users -[enroll (ESC1-3)]-> template LabESC1
 LabServerAdmins -[admin to via GPO LabLocalAdmins]-> ENTRA01$ -[hosts sync account]-> MSOL_0a1b2c3d4e5f -[DCSync]-> corp.example
 ```
 
+GPO reach follows Group Policy, not containment. Disabled links, Block Inheritance,
+Enforced and security filtering count, and a GPO with its computer or user side disabled
+reaches only the other side. A GPO reaches computers and users, not groups or the OU
+itself, and it does reach objects with inheritance disabled. The steps between the GPO
+and the account are scope nodes such as `users under Lab`:
+
+```text
+gpo_editor -[full control]-> LabOuReach -[GPO applies to]-> users under Lab -[GPO reaches]-> svc_sql
+```
+
 Members who only inherit a path through a group are counted in the detail ("19 of 20
 enabled users (95%) have a path") instead of being listed. Remote logon rights a GPO grants
 (RDP, WinRM, DCOM) are exported to BloodHound but not followed, because logon is not
@@ -82,6 +93,12 @@ false_positives = """
   [accepted-risk file](../ci.md#accepted-risks).
 - **Local accounts and local groups** on servers are invisible over LDAP, so paths through
   them are missed rather than over-reported; the same goes for sessions and logons.
+- **GPO reach** assumes WMI filters match (the edge carries a caveat), ignores Deny ACEs
+  on the GPO, and assumes a user in scope logs on somewhere. Empty GPOs count, because
+  the writer fills them in. It can also miss: a writer may be able to re-enable a
+  disabled side or change the filter, loopback processing is not modelled, and with more
+  than one site, site links are followed only to the domain controllers of that site (the
+  scan says so in a note).
 - **Deny ACEs** that cancel an allow are not modelled; a reported ACL step may be blocked
   in practice. Confirm with the steps below before removing a right in a hurry.
 """

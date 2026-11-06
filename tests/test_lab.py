@@ -91,7 +91,14 @@ EXPECTED = {
         "LabDCPolicy: LmCompatibilityLevel 1 (LM/NTLMv1 allowed)",
         "LabDCPolicy: SeDebugPrivilege granted to Authenticated Users",
     },
-    "AD-GPO-004": {"LabUserPolicy (helpdesk)"},
+    "AD-GPO-004": {
+        "LabUserPolicy (helpdesk)",
+        "LabOuReach (gpo_editor)",
+        "LabSiteReach (gpo_site_editor)",
+        "LabDisabledLink (gpo_ctl)",
+        "LabComputerOff (gpo_ctl)",
+        "LabFilteredOut (gpo_ctl)",
+    },
     "AD-GPP-002": {r"scripts\map.bat:1 (net use with a password)"},
     "AD-INF-007": {"Lab: ou_admin"},
     "AD-INF-010": {"DC01.adlab.test"},
@@ -164,6 +171,25 @@ def snap() -> Snapshot:
 @pytest.fixture(scope="module")
 def findings(snap: Snapshot) -> dict[str, set[str]]:
     return {f.check_id: set(f.objects) for f in run_all(snap)}
+
+
+def test_gpo_reach_through_ou_and_site_links(snap: Snapshot) -> None:
+    g = paths.build(snap)
+
+    def own_reach(sam: str) -> tuple[set[str], int]:
+        found = paths.reachable(g, paths.identity_nodes(snap, sam)[:1])
+        names = {g.name(n) for n in found if g.kind(n) == "computer"}
+        return names, sum(n in g.tier0 for n in found)
+
+    computers, tier0 = own_reach("gpo_editor")
+    assert {"ENTRA01$", "EXCH01$", "WS02$"} <= computers and tier0
+    computers, tier0 = own_reach("gpo_site_editor")
+    assert {"DC01$", "ROGUE01$", "WS02$"} <= computers and tier0
+    # a disabled link, the computer side off, a filter that matches nobody
+    assert own_reach("gpo_ctl") == (set(), 0)
+    # the block on OU=Isolated stops LabOuReach: only the enforced GPO gets through
+    lab = next(n for n, name in g.names.items() if name == "computers under Lab")
+    assert "WS03$" not in {g.name(d) for d, _ in g.edges[lab]}
 
 
 def test_every_dc_probed(snap: Snapshot) -> None:

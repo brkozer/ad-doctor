@@ -22,6 +22,9 @@ test("edge families", () => {
     "full control": "acl",
     "write members, reset password (inherited)": "acl",
     "write altSecurityIdentities (ESC14)": "acl",
+    "GPO applies to": "gpo",
+    "GPO inherited by": "gpo",
+    "GPO reaches": "gpo",
   };
   for (const [how, kind] of Object.entries(cases)) assert.equal(CORE.edgeKind(how), kind, how);
 });

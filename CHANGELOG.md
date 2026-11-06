@@ -7,6 +7,42 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-07
+
+### Added
+
+- **GPO reach in the control graph.** Whoever can write a GPO now controls what it
+  applies to: from the GPO through its links on OUs, the domain head and sites, down the
+  OU tree to computers and users. New edges `GPO applies to`, `GPO inherited by` and `GPO
+  reaches` (`ADD_GPOAppliesTo`, `ADD_GPOInheritedBy`, `ADD_GPOReaches` in the OpenGraph
+  export), in the viewer's Group Policy edge filter. Links, Enforced, Block Inheritance,
+  disabled links, the GPO's user and computer side flags and security filtering count,
+  through the same logic as `gpo_scope.py`. Reach runs through scope nodes rather than OU
+  nodes, because an OU's `contains` edges stand for ACL inheritance: they lead to groups
+  and through Block Inheritance, where Group Policy does not go, and they skip protected
+  objects, where it does. Scope nodes are not counted as controlled objects. The graph
+  grows with accounts, OUs, links and distinct security filters, not with GPOs times
+  accounts: on the 250,000-user bench the new edges add 14%. With more than one site, a
+  site link is followed only to the domain controllers of that site, since an ordinary
+  user cannot place member computers or users in a site, and the scan says so in a note.
+
+### Changed
+
+- **AD-PATH-001 results change.** Principals that can write a GPO linked to an OU or a
+  site now have a path when that GPO reaches a tier-0 account, so new objects can appear
+  in a diff, the exposure figure can rise, an existing path can take another route, and
+  blast radius counts and chokepoints can grow. Fingerprints are unchanged: a path is still
+  identified by the principal it starts from.
+- `scripts/bench.py` gives its GPOs links, filters and Block Inheritance, so the figures
+  in the README now include GPO reach.
+
+### Fixed
+
+- A `linked to domain` or `linked to Domain Controllers OU` edge no longer counts as
+  control of tier 0 when the GPO cannot reach a domain controller: its computer side is
+  disabled, its security filter leaves every DC out, or Block Inheritance stops it. Such a
+  path was false. Snapshots that hold no links keep the edge.
+
 ## [0.1.0] - 2026-11-06
 
 First public release: 93 checks and 5 invariants, the control-path engine with

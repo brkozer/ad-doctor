@@ -424,6 +424,7 @@ class Collector:
         snap.ldap_signing_required = self.scanned_ldap_signing
         snap.probes.ca_configs = ca_configs
         snap.notes += gpo_scope.resolve(snap).notes
+        snap.notes += gpo_scope.site_note(snap)
         snap.notes += _channel_notes(snap)
         if self.pwd_unread:
             shown = ", ".join(sorted(self.pwd_unread)[:5])
