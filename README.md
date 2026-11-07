@@ -1,6 +1,7 @@
 # ad-doctor
 
 [![ci](https://github.com/brkozer/ad-doctor/actions/workflows/ci.yml/badge.svg)](https://github.com/brkozer/ad-doctor/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/ad-doctor)](https://pypi.org/project/ad-doctor/)
 [![release](https://img.shields.io/github/v/release/brkozer/ad-doctor)](https://github.com/brkozer/ad-doctor/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -218,7 +219,7 @@ SARIF rules carry the explanation and a `helpUri` so code-scanning alerts show i
 ## Usage
 
 ```bash
-uv tool install git+https://github.com/brkozer/ad-doctor          # or: ... ad-doctor[kerberos]
+uv tool install ad-doctor        # or: pipx install ad-doctor; ad-doctor[kerberos] adds Kerberos
 
 # scan (password from AD_DOCTOR_PASSWORD or a prompt)
 ad-doctor scan dc01.corp.example --ldaps -u 'CORP\auditor'
@@ -269,7 +270,7 @@ LDAP binds, so use `--ldaps`.
 ### In CI
 
 ```yaml
-- run: uvx --from git+https://github.com/brkozer/ad-doctor ad-doctor scan "$DC" --ldaps -u "$AD_USER" -f sarif -o ad.sarif --baseline last.json --fail-on high
+- run: uvx ad-doctor scan "$DC" --ldaps -u "$AD_USER" -f sarif -o ad.sarif --baseline last.json --fail-on high
   env: { AD_DOCTOR_PASSWORD: "${{ secrets.AD_PASSWORD }}" }
 - uses: github/codeql-action/upload-sarif@v3
   if: always()

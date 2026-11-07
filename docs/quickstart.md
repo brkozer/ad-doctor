@@ -1,7 +1,7 @@
 # Quick start
 
 ```bash
-uv tool install git+https://github.com/brkozer/ad-doctor     # or: ... ad-doctor[kerberos]
+uv tool install ad-doctor   # or: pipx install ad-doctor; ad-doctor[kerberos] adds Kerberos
 ad-doctor scan dc01.corp.example --ldaps -u 'CORP\auditor'
 ```
 

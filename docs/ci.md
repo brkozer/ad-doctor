@@ -1,7 +1,7 @@
 # CI integration
 
 ```yaml
-- run: uvx --from git+https://github.com/brkozer/ad-doctor ad-doctor scan "$DC" --ldaps -u "$AD_USER" -f sarif -o ad.sarif --baseline last.json --fail-on high
+- run: uvx ad-doctor scan "$DC" --ldaps -u "$AD_USER" -f sarif -o ad.sarif --baseline last.json --fail-on high
   env: { AD_DOCTOR_PASSWORD: "${{ secrets.AD_PASSWORD }}" }
 - uses: github/codeql-action/upload-sarif@v3
   if: always()
