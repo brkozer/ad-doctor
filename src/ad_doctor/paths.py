@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import sys
 from collections import Counter, deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import gpo_scope, sd
 from .checks import (
@@ -43,6 +43,9 @@ from .checks import (
 )
 from .model import WELL_KNOWN_SIDS, Account, DirObject, Finding, Severity, Snapshot
 
+if TYPE_CHECKING:
+    from .provenance import Provenance
+
 Edge = tuple[str, str]  # (target node, label)
 GPO_APPLIES = "GPO applies to"  # GPO to the scope of a link
 GPO_INHERITED = "GPO inherited by"  # scope to the scope of a child OU
@@ -61,6 +64,8 @@ class Graph:
     edge_props: dict[tuple[str, str, str], dict[str, Any]] = field(default_factory=dict)
     # node -> object class where the snapshot says it (user, computer, group, ou, ...)
     kinds: dict[str, str] = field(default_factory=dict)
+    # what-if: the removable fact behind each edge (build(snap, provenance=True))
+    prov: Provenance | None = None
 
     def name(self, node: str) -> str:
         """The node's directory name; a well-known SID the snapshot holds no object for
@@ -159,14 +164,20 @@ CLASS_OF_KIND = {
 }
 
 
-def build(snap: Snapshot) -> Graph:
+def build(snap: Snapshot, provenance: bool = False) -> Graph:
+    """The control graph. With `provenance`, Graph.prov also records the removable fact
+    behind every edge (what-if); the graph itself is the same either way."""
     edges: dict[str, list[Edge]] = {}
     names: dict[str, str] = {}
     kinds: dict[str, str] = {}
+    rec: Provenance | None = None
 
-    def add(src: str, dst: str, how: str) -> None:
+    # `why` is `rec and rec.<reason>(...)`: None (and not worked out) without provenance
+    def add(src: str, dst: str, how: str, why: Any = None) -> None:
         if src != dst:
             edges.setdefault(src, []).append((dst, how))
+            if rec is not None:
+                rec.push(src, why)
 
     # DN -> node: objects with a SID are addressed by SID; the domain head is one node
     # whatever ACEs, links or the tier-0 set refer to it by
@@ -200,6 +211,11 @@ def build(snap: Snapshot) -> Graph:
         names.setdefault(node, snap.name_of(sid))
         return node
 
+    if provenance:
+        from .provenance import FIXED, Provenance
+
+        rec = Provenance(snap, node_of, domain_node)
+
     key_admins = {f"{snap.domain_sid}-526", f"{snap.domain_sid}-527"}
     skip = {PRINCIPAL_SELF, CREATOR_OWNER}
 
@@ -219,24 +235,25 @@ def build(snap: Snapshot) -> Graph:
         if o.kind == "group":
             target = node_of(o.dn)
             for m in o.members:
-                add(node_of(m), target, "member of")
+                source = node_of(m)
+                add(source, target, "member of", rec and rec.member(o, m, target, source))
 
     # ACEs and owners
     for o in snap.objects:
         target = node_of(o.dn)
         if o.owner and o.owner not in skip:
-            add(principal(o.owner), target, "owns")
+            add(principal(o.owner), target, "owns", rec and rec.owner(o))
         for ace in o.aces:
             if ace.sid not in skip:
                 rights = object_rights(ace, o.kind)
                 if rights:
-                    add(principal(ace.sid), target, ", ".join(rights))
+                    add(principal(ace.sid), target, ", ".join(rights), rec and rec.ace(o, ace))
         if o.kind == "domain":
             # DCSync is normally two ACEs, one per replication right
             get = {a.sid for a in o.aces if a.extended_right(sd.DS_REPL_GET_CHANGES)}
             get_all = {a.sid for a in o.aces if a.extended_right(sd.DS_REPL_GET_CHANGES_ALL)}
             for sid in sorted((get & get_all) - skip):
-                add(principal(sid), target, "DCSync")
+                add(principal(sid), target, "DCSync", rec and rec.dcsync(o, sid))
 
     # Containers reach what is below them. Whoever controls an OU can make any ACE inherit
     # into it; ACEs that already inherit give their rights on matching children directly.
@@ -265,14 +282,15 @@ def build(snap: Snapshot) -> Graph:
     for parent, kids in zip(parents, below, strict=True):
         parent_node = node_of(parent.dn)
         for node, kind in kids:
-            add(parent_node, node, "contains")
+            add(parent_node, node, "contains", rec and FIXED["contains"])
             for ace in parent.inheritable:
                 applies = ace.inherited_object_type in (None, CLASS_OF_KIND.get(kind))
                 if ace.sid in skip or not applies:
                     continue
                 rights = object_rights(ace, kind)
                 if rights:
-                    add(principal(ace.sid), node, f"{', '.join(rights)} (inherited)")
+                    how = f"{', '.join(rights)} (inherited)"
+                    add(principal(ace.sid), node, how, rec and rec.ace(parent, ace))
 
     logon_edges: dict[str, list[Edge]] = {}
     edge_props: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -296,8 +314,8 @@ def build(snap: Snapshot) -> Graph:
             for where in g.linked_to
         ]
         if not (g.links and has_dcs) or guid in reach.dc_gpos:
-            for target, how in targets:
-                add(gpo_node, target, how)
+            for (target, how), where in zip(targets, g.linked_to, strict=True):
+                add(gpo_node, target, how, rec and rec.dc_link(guid, where))
                 if reach.dc_gpos.get(guid):
                     edge_props[(gpo_node, target, how)] = {
                         "gpo": g.name,
@@ -312,9 +330,10 @@ def build(snap: Snapshot) -> Graph:
             names[unfiltered] = f"GPO {g.name} with its filter changed"
             kinds[unfiltered] = "gpo"
             for sid, how in rewriters.items():
-                add(principal(sid), unfiltered, how)
+                gpo_object = gpo_objects[dn.lower()]
+                add(principal(sid), unfiltered, how, rec and rec.rewriter(gpo_object, sid))
             for scope, caveats in wide:
-                add(unfiltered, scope, GPO_APPLIES)
+                add(unfiltered, scope, GPO_APPLIES, rec and FIXED["filter-node"])
                 if caveats:
                     edge_props[(unfiltered, scope, GPO_APPLIES)] = {
                         "gpo": g.name,
@@ -322,17 +341,18 @@ def build(snap: Snapshot) -> Graph:
                     }
             if guid in reach.dc_widened:
                 for target, how in targets:
-                    add(unfiltered, target, how)
+                    add(unfiltered, target, how, rec and FIXED["filter-node"])
     names.update(reach.names)
     for g, scope, caveats in reach.applies:
         src = gpo_nodes[g.guid.upper()]
-        add(src, scope, GPO_APPLIES)
+        why = rec and rec.applies(g.guid, scope, GPO_APPLIES, reach.entered_by)
+        add(src, scope, GPO_APPLIES, why)
         if caveats:
             edge_props[(src, scope, GPO_APPLIES)] = {"gpo": g.name, "caveats": list(caveats)}
     for scope, below_it in reach.inherits:
-        add(scope, below_it, GPO_INHERITED)
+        add(scope, below_it, GPO_INHERITED, rec and FIXED["gpo-scope"])
     for scope, account in reach.holds:
-        add(scope, _sid_node(account.sid), GPO_REACHES)
+        add(scope, _sid_node(account.sid), GPO_REACHES, rec and FIXED["gpo-scope"])
 
     # local groups set by Group Policy: an admin-equivalent group makes the member SYSTEM on
     # the computer, so it becomes the computer account; a domain group rewritten through
@@ -343,14 +363,16 @@ def build(snap: Snapshot) -> Graph:
         if grant.computer is None:
             target, how = _sid_node(grant.item.group_sid), "member of" + via
             names.setdefault(target, snap.name_of(grant.item.group_sid))
-            add(member, target, how)
+            add(member, target, how, rec and rec.grant(grant))
         else:
             group = gpo_scope.LOCAL_GROUPS[grant.item.group_sid]
             target, how = _sid_node(grant.computer.sid), group.verb + via
             if group.admin:
-                add(member, target, how)
+                add(member, target, how, rec and rec.grant(grant))
             elif grant.effective:
                 logon_edges.setdefault(member, []).append((target, how))
+                if rec is not None:
+                    rec.push_logon(member, rec.grant(grant))
             else:
                 continue
         props: dict[str, Any] = {"gpo": grant.gpo.name}
@@ -360,7 +382,8 @@ def build(snap: Snapshot) -> Graph:
     # the ADSync service keeps the sync account's password on its server
     for account in _sync_accounts(snap):
         for server in _sync_servers(snap, account):
-            add(_sid_node(server.sid), _sid_node(account.sid), "hosts sync account")
+            server_node, account_node = _sid_node(server.sid), _sid_node(account.sid)
+            add(server_node, account_node, "hosts sync account", rec and FIXED["sync-host"])
 
     # exploitable certificate templates turn enrollment into tier 0 (ESC1-3), and write
     # access to any published template makes it exploitable (ESC4)
@@ -379,9 +402,10 @@ def build(snap: Snapshot) -> Graph:
                 continue
             enrolls = ace.extended_right(sd.CERT_ENROLL) or ace.extended_right(sd.CERT_AUTOENROLL)
             if esc and enrolls:
-                add(principal(ace.sid), node, "enroll (ESC1-3)")
+                add(principal(ace.sid), node, "enroll (ESC1-3)", rec and rec.enroll(t, ace.sid))
             if ace.takeover:
-                add(principal(ace.sid), node, "write template (ESC4)")
+                how = "write template (ESC4)"
+                add(principal(ace.sid), node, how, rec and rec.template_ace(t, ace.sid))
         names[node] = f"template {t.name}"
     # PKI object control (ESC5)
     for key, aces in snap.acls.items():
@@ -390,7 +414,7 @@ def build(snap: Snapshot) -> Graph:
             names[node] = key.removeprefix("PKI:")
             for ace in aces:
                 if ace.takeover and ace.sid != f"{snap.domain_sid}-517":
-                    add(principal(ace.sid), node, "full control")
+                    add(principal(ace.sid), node, "full control", rec and rec.pki(key, ace.sid))
     # managing a CA controls a tier-0 server (ESC7); ManageCertificates alone only when a
     # published template lets the requester name the subject
     hosts = {a.dns_host.lower(): _sid_node(a.sid) for a in snap.accounts if a.dns_host and a.sid}
@@ -403,7 +427,9 @@ def build(snap: Snapshot) -> Graph:
         ca_nodes.add(ca_node)
         names.setdefault(ca_node, f"CA {c.name}")
         kinds.setdefault(ca_node, "ca")
-        add(principal(sid), ca_node, f"{right} (ESC7)")
+        add(principal(sid), ca_node, f"{right} (ESC7)", rec and rec.ca_right(c.name, sid, right))
+        if rec is not None and principal(sid) != ca_node:
+            rec.note_ca_edge(principal(sid), ca_node)
 
     # gMSA password readers become the gMSA
     for gm in snap.gmsas:
@@ -411,25 +437,39 @@ def build(snap: Snapshot) -> Graph:
         names.setdefault(target, gm.name)
         kinds.setdefault(target, "gmsa")
         for sid in gm.readers:
-            add(principal(sid), target, "read gMSA password")
+            add(principal(sid), target, "read gMSA password", rec and rec.gmsa(gm.dn, sid))
 
-    # tier-0 nodes
+    tier0 = tier0_nodes(snap, node_of, domain_node, ca_nodes, names, snap.tier0_dns())
+    names["tier0:dc-ou"] = "Domain Controllers OU"
+    names[domain_node] = snap.domain
+    kinds[domain_node] = "domain"
+    return Graph(edges, names, tier0, logon_edges, edge_props, kinds, rec)
+
+
+def tier0_nodes(
+    snap: Snapshot,
+    node_of: Callable[[str], str],
+    domain_node: str,
+    ca_nodes: Iterable[str],
+    names: Iterable[str],
+    tier0_dns: Iterable[str],
+) -> set[str]:
+    """Tier-0 groups and accounts, the domain head, the DC OU, AdminSDHolder, CA servers,
+    CA nodes that an ESC7 edge reaches, and the tier0: nodes among `names` (templates,
+    PKI objects). What-if calls it again after a change to group membership."""
     tier0 = {_sid_node(s) for s in _tier0_group_sids(snap)}
-    tier0 |= {node_of(dn) for dn in snap.tier0_dns()}
-    tier0 |= {domain_node, "tier0:dc-ou"} | ca_nodes
+    tier0 |= {node_of(dn) for dn in tier0_dns}
+    tier0 |= {domain_node, "tier0:dc-ou"} | set(ca_nodes)
     tier0 |= {n for n in names if n.startswith("tier0:")}
     for o in snap.objects:
         dn = o.dn.lower()
         if dn.startswith("cn=adminsdholder,") or dn.startswith("ou=domain controllers,"):
             tier0.add(node_of(o.dn))
-    names["tier0:dc-ou"] = "Domain Controllers OU"
-    names[domain_node] = snap.domain
-    kinds[domain_node] = "domain"
     for ca in snap.ca_hosts:  # CA servers sign logons for anyone: tier 0
         for a in snap.accounts:
             if a.sam.upper() == ca.upper() and a.sid:
                 tier0.add(_sid_node(a.sid))
-    return Graph(edges, names, tier0, logon_edges, edge_props, kinds)
+    return tier0
 
 
 def _dacl_writers(o: DirObject | None, skip: set[str]) -> dict[str, str]:

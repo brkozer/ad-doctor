@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 ACCESS_ALLOWED = 0x00
 ACCESS_ALLOWED_OBJECT = 0x05
 INHERIT_ONLY = 0x08
+INHERITED_ACE = 0x10
 ACE_OBJECT_TYPE_PRESENT = 0x1
 
 # Access mask bits as Active Directory uses them.
@@ -89,6 +90,9 @@ class Ace:
     object_type: str | None = None
     # for inheritable ACEs: the only child class that inherits it (None = every class)
     inherited_object_type: str | None = None
+    # the ACE came from a parent (INHERITED_ACE); False in older snapshots, which did not
+    # keep the flag (Snapshot.ace_inheritance_checked tells which)
+    inherited: bool = False
 
     def grants(self, bits: int) -> bool:
         return bool(self.mask & bits)
@@ -234,7 +238,8 @@ def parse_dacl(raw: bytes, inheritable: bool = False) -> list[Ace]:
                     inherited_type = str(uuid.UUID(bytes_le=raw[cursor : cursor + 16]))
                     cursor += 16
             sid, _ = sid_from_bytes(raw, cursor)
-            aces.append(Ace(sid, mask, object_type, inherited_type if inheritable else None))
+            inherited_type = inherited_type if inheritable else None
+            aces.append(Ace(sid, mask, object_type, inherited_type, bool(flags & INHERITED_ACE)))
         pos += size
     return aces
 

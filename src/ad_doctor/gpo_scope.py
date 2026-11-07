@@ -546,6 +546,8 @@ class Reach:
     # for whoever can rewrite a filtered GPO's DACL: GUID -> where it goes with no filter
     widened: dict[str, list[tuple[str, tuple[str, ...]]]] = field(default_factory=dict)
     dc_widened: set[str] = field(default_factory=set)  # GUIDs a filter keeps away from the DCs
+    # (GUID, scope ID) -> lower-cased containers of the links that enter there, for what-if
+    entered_by: dict[tuple[str, str], list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -772,6 +774,10 @@ class _ReachBuilder:
                         continue
                     if side == "computer" or self.computers_read(key):
                         node = self.entry(self.tree(side, key), key, link)
+                        if node is not None:
+                            where = self.out.entered_by.setdefault((g.guid.upper(), node), [])
+                            if link.container.lower() not in where:
+                                where.append(link.container.lower())
                         if node is not None and node not in seen:
                             seen.add(node)
                             site = (SITE_CAVEAT,) if node in self.site_assumed else ()

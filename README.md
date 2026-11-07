@@ -515,6 +515,19 @@ before that. Encryption adds under half a second to the build (0.36 s on the lab
 at 10,000 users). Object lists with
 thousands of rows are drawn as they scroll into view.
 
+## What-if (engine)
+
+The control graph now records, for every edge, the removable fact behind it: the ACEs of
+one trustee on one object, a membership, a GPO link or a Restricted Groups entry, a
+template right or flag, a CA right, a gMSA reader. On that, the what-if engine evaluates a
+set of removals on a snapshot (paths closed, rerouted or still open, exposure, findings
+that would clear or appear) and computes the cheapest set that closes every path, with the
+condition under which it is the minimum, a lower bound when it is not, the sources no
+removal can close, and an order that is labelled as a heuristic. SDProp copies go with the
+AdminSDHolder ACE, inherited copies with the OU they come from. It never touches AD. The
+`whatif` and `plan` commands are not in this version yet; see
+[docs/whatif.md](docs/whatif.md) for the model and its limits.
+
 ## Performance
 
 `scripts/bench.py` builds a synthetic enterprise domain (an OU tree of 8 regions, 80

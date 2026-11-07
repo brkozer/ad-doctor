@@ -442,6 +442,7 @@ class Collector:
             dc_sites=dc_sites,
             site_count=site_count,
             notes=self.notes,
+            ace_inheritance_checked=True,
         )
         snap.ldap_signing_required = self.scanned_ldap_signing
         snap.probes.ca_configs = ca_configs

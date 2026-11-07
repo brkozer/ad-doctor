@@ -7,6 +7,28 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+### Added
+
+- **What-if engine (no command yet).** `paths.build(snap, provenance=True)` records the
+  removable fact behind every edge where the edge is made; the graph is the same either
+  way, and `analyze` and `paths` output is byte for byte that of 0.1.5. On it,
+  `ad_doctor.whatif` masks a set of changes in the graph (or rebuilds when a change can move
+  GPO scope), classifies each AD-PATH-001 holder as closed, rerouted or open, takes the
+  changes out of the snapshot in place, runs every check again and stops on any difference
+  between the two levels. `ad_doctor.cut` builds a flow network on the path subgraph and
+  finds the cheapest closing set (exact when every change joins no routes that do not
+  exist), a lower bound, the sources no removal can close, and an order by a greedy that
+  says it is a heuristic, with or without a budget. SDProp copies go with the AdminSDHolder
+  ACE, inherited copies with the OU they come from, the Entra sync account's DCSync is kept
+  by default. Provenance costs 4.6 s and 270 MB more at 250,000 users. See
+  `docs/whatif.md`.
+
+### Changed
+
+- **Snapshots keep the INHERITED_ACE flag** (`Ace.inherited`, and
+  `ace_inheritance_checked` on the snapshot). Older snapshots still load; there an
+  inherited copy cannot be told from an explicit ACE.
+
 ## [0.1.5] - 2026-11-07
 
 ### Changed

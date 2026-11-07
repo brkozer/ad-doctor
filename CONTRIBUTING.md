@@ -55,6 +55,11 @@ The unit tests build snapshots in memory and need no domain. `tests/test_lab.py`
 against the seeded lab DC in [`lab/`](lab/README.md) and is skipped unless the
 `AD_DOCTOR_LAB_*` variables are set.
 
+The what-if tests compare the masked graph with one built from the changed snapshot for
+every change of the fixtures. `AD_DOCTOR_WHATIF_SNAPSHOTS` (snapshot files, separated
+like `PATH`) adds every single change and 200 random sets on each of those snapshots, and
+`uv run pytest -m slow` runs the 10,000-user sample, which takes minutes.
+
 ## Adding a check
 
 1. **Pick an ID** in the right area (`AD-ACL-009`, `AD-KRB-007`, ...). IDs are never

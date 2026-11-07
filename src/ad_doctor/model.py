@@ -470,6 +470,9 @@ class Snapshot:
     site_count: int = 0
     # parts of the collection that could not run (no AD CS, SYSVOL unreachable, ...)
     notes: list[str] = field(default_factory=list)
+    # False in older snapshots: Ace.inherited was not kept, so an inherited copy looks
+    # like an explicit ACE
+    ace_inheritance_checked: bool = False
 
     @property
     def has_2025(self) -> bool:
@@ -487,10 +490,12 @@ class Snapshot:
     def object_by_dn(self) -> dict[str, DirObject]:
         return {o.dn.lower(): o for o in self.objects}
 
-    def tier0_dns(self) -> set[str]:
-        """Lower-cased DNs of tier-0 accounts, groups and domain controllers."""
+    def tier0_dns(self, privileged: dict[str, list[str]] | None = None) -> set[str]:
+        """Lower-cased DNs of tier-0 accounts, groups and domain controllers; what-if
+        passes the privileged lists as they would be after a membership change."""
         tier0 = self.tier0_sids()
-        dns = self.privileged_dns()
+        lists = self.privileged if privileged is None else privileged
+        dns = {dn.lower() for members in lists.values() for dn in members}
         dns |= {a.dn.lower() for a in self.accounts if a.is_dc or a.sam.lower() == "krbtgt"}
         dns |= {o.dn.lower() for o in self.objects if o.sid in tier0}
         return dns
@@ -614,6 +619,7 @@ class Snapshot:
             recycle_bin=data.get("recycle_bin"),
             ldap_signing_required=data.get("ldap_signing_required"),
             notes=[*data.get("notes", []), *_older_snapshot_notes(data)],
+            ace_inheritance_checked=data.get("ace_inheritance_checked", False),
         )
 
 
