@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import sys
 from collections import Counter, deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -639,8 +640,27 @@ class Analysis:
         return (100 * self.exposed // self.users) if self.users else 0
 
 
-def analyze(snap: Snapshot) -> Analysis:
-    g = build(snap)
+# (snapshot, graph built from it): what-if lends its graph to the checks it runs on the
+# snapshot as collected, so AD-PATH-001 does not build the same graph again
+_LENT: tuple[Snapshot, Graph] | None = None
+
+
+@contextmanager
+def lend(snap: Snapshot, g: Graph) -> Iterator[None]:
+    """While active, analyze(snap) uses `g`, which must be built from `snap` as it is."""
+    global _LENT
+    _LENT = (snap, g)
+    try:
+        yield
+    finally:
+        _LENT = None
+
+
+def analyze(snap: Snapshot, g: Graph | None = None) -> Analysis:
+    """`g`: a graph already built from this snapshot (with provenance, say)."""
+    if g is None and _LENT is not None and _LENT[0] is snap:
+        g = _LENT[1]
+    g = build(snap) if g is None else g
     found = paths_to_tier0(g)
     # principals that hold a right themselves; members who only inherit it through a group
     # are counted in the exposure figure instead of being listed one by one

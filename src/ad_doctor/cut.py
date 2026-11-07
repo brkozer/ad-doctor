@@ -161,6 +161,11 @@ class Model:
     source_arcs: dict[str, int] = field(default_factory=dict)
     # enabled users: (own node, implicit group nodes), for the exposure count
     users: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
+    where: changes.Where | None = None  # built when a step title needs names
+    # nodes that reach tier 0 before any change in the plan: no change adds one, so every
+    # evaluation stays inside this set
+    r0: set[str] = field(default_factory=set)
+    rev0: dict[str, list[str]] | None = None  # reverse adjacency inside r0, built once
 
     def prim_cap(self, p: int) -> int:
         n1 = self.scale
@@ -358,7 +363,7 @@ def build_model(
             rev_inf.setdefault(v, []).append(u)
             route.setdefault(u, (v, how))
     sink_like = set(tier0)
-    queue = deque(t for t in tier0 if t in fwd)
+    queue = deque(sorted(t for t in tier0 if t in fwd))  # sorted: the same route every run
     via: dict[str, tuple[str, str]] = {}
     while queue:
         x = queue.popleft()
@@ -496,7 +501,9 @@ def build_model(
         scale,
         node_ids,
         source_arcs,
-        _users(snap),
+        [u for u in _users(snap) if u[0] in reach or any(n in reach for n in u[1])],
+        None,
+        reach,
     )
 
 
@@ -517,7 +524,7 @@ def _route_label(g: Graph, prov: Provenance, u: str, v: str, keeps: dict[int, st
             continue
         w = why[i]
         if w < 0 and (u, i) not in prov.extra:
-            return f"{how} (fixed: {fixed_reason(w)})"
+            return f"{how} (cannot be removed: {fixed_reason(w)})"
         prims, _ = _instances(prov, u, i, w)
         kept = [keeps[p] for p in prims if p in keeps]
         if kept:
@@ -577,22 +584,36 @@ def closes(m: Model, removed: Iterable[int]) -> bool:
     """Whether the changes close every closable source in the masked graph (exact, no
     network)."""
     view = masked(m.g, m.snap, removed, m.tier0 - m.g.tier0)
-    reach = _reach_to(view, m.sink_like)
+    reach = _reach_to(m, view, m.sink_like)
     return not any(s in reach for s in m.sources)
 
 
-def _reach_to(g: Graph, targets: set[str]) -> set[str]:
-    reverse: dict[str, list[str]] = {}
-    for src, outs in g.edges.items():
-        if src in targets:
-            continue
-        for dst, _ in outs:
-            reverse.setdefault(dst, []).append(src)
+def _reach_to(m: Model, g: Graph, targets: set[str]) -> set[str]:
+    """Nodes of m.r0 with a path to `targets` in `g`, a masked view of m.g. The reverse
+    adjacency of m.r0 is built once; only the sources whose edges the mask changed are
+    read again."""
+    if m.rev0 is None:
+        m.rev0 = {}
+        for src in m.r0:
+            for dst, _ in m.g.edges.get(src, ()):
+                if dst in m.r0:
+                    m.rev0.setdefault(dst, []).append(src)
+    base = m.g.edges
+    changed = {src for src in m.r0 if g.edges.get(src) is not base.get(src)}
+    extra: dict[str, list[str]] = {}
+    for src in changed:
+        for dst, _ in g.edges.get(src, ()):
+            if dst in m.r0:
+                extra.setdefault(dst, []).append(src)
     seen = set(targets)
     queue = deque(targets)
     while queue:
         x = queue.popleft()
-        for src in reverse.get(x, ()):
+        for src in m.rev0.get(x, ()):
+            if src not in seen and src not in changed:
+                seen.add(src)
+                queue.append(src)
+        for src in extra.get(x, ()):
             if src not in seen:
                 seen.add(src)
                 queue.append(src)
@@ -681,11 +702,12 @@ class Numbers:
     routes: int
 
 
-def numbers(m: Model, removed: Iterable[int]) -> Numbers:
-    """Exposure, holders and routes after the changes (exact, on the masked graph)."""
+def numbers(m: Model, removed: Iterable[int], with_routes: bool = True) -> Numbers:
+    """Exposure, holders and routes after the changes (exact, on the masked graph).
+    Without `with_routes`, routes is -1 (the maximum flow is the slow part)."""
     gone = list(removed)
     view = masked(m.g, m.snap, gone, m.tier0 - m.g.tier0)
-    reach = reaching(view)
+    reach = _reach_to(m, view, view.tier0)
     exposed = 0
     for own, implicit in m.users:
         if own in view.tier0:
@@ -698,7 +720,7 @@ def numbers(m: Model, removed: Iterable[int]) -> Numbers:
             continue
         if any(how != "member of" and dst in reach for dst, how in view.edges.get(node, ())):
             holders += 1
-    return Numbers(exposed, holders, routes(m, gone))
+    return Numbers(exposed, holders, routes(m, gone) if with_routes else -1)
 
 
 def _bundle(m: Model, start: str, allowed: set[int], applied: set[int]) -> list[int]:
@@ -798,17 +820,26 @@ def order(
                 bundle = _bundle(m, v, bundle_from, set(applied))
                 if bundle:
                     cands.setdefault(tuple(bundle), bundle)
-        best: tuple[tuple[Fraction, Fraction, Fraction], list[int], Numbers] | None = None
+        # users and holders first for every candidate; routes (a maximum flow) only for
+        # the candidates still tied on both, which gives the same pick
+        firsts: list[tuple[tuple[Fraction, Fraction], list[int], int]] = []
         for chosen in cands.values():
             if budget is not None and len(applied) + len(chosen) > budget:
                 continue
-            after = numbers(m, applied + chosen)
+            quick = numbers(m, applied + chosen, with_routes=False)
             c = sum(m.cost[p] for p in chosen)
-            score = (
-                Fraction(current.exposed - after.exposed, c),
-                Fraction(current.holders - after.holders, c),
-                Fraction(current.routes - after.routes, c),
+            first = (
+                Fraction(current.exposed - quick.exposed, c),
+                Fraction(current.holders - quick.holders, c),
             )
+            firsts.append((first, chosen, c))
+        top_first = max((f for f, _, _ in firsts), default=None)
+        best: tuple[tuple[Fraction, Fraction, Fraction], list[int], Numbers] | None = None
+        for first, chosen, c in firsts:
+            if first != top_first:
+                continue
+            after = numbers(m, applied + chosen)
+            score = (*first, Fraction(current.routes - after.routes, c))
             if best is None or _better(m, score, chosen, best[0], best[1]):
                 best = (score, chosen, after)
         if best is None:
@@ -852,46 +883,27 @@ def _better(
 
 
 def _title(m: Model, chosen: list[int]) -> str:
-    if len(chosen) == 1:
-        return label(m.snap, m.prov.prims[chosen[0]])
-    return f"{len(chosen)} changes"
+    prims = [m.prov.prims[p] for p in chosen]
+    if len(prims) == 1:
+        return label(m, prims[0])
+    trustees = {changes.trustee_of(p) for p in prims}
+    if len(trustees) == 1 and "" not in trustees:
+        if m.where is None:
+            m.where = changes.Where(m.snap, m.prov)
+        who = m.where.who(m.snap, next(iter(trustees)))
+        if {p[0] for p in prims} == {"template-ace"}:
+            names = sorted(p[1] for p in prims)
+            shown = ", ".join(names[:3]) + (f" and {len(names) - 3} more" if len(names) > 3 else "")
+            return f"remove the ACEs of {who} on templates {shown}"
+        return f"take {len(prims)} rights away from {who}"
+    return f"{len(prims)} changes"
 
 
-def label(snap: Snapshot, prim: tuple[str, ...]) -> str:
+def label(m: Model, prim: tuple[str, ...]) -> str:
     """A short description of a change for people."""
-    f = changes.fields(prim)
-    kind = f["kind"]
-
-    def rdn(field_name: str) -> str:
-        return f[field_name].split(",", 1)[0].split("=", 1)[-1]
-
-    def who(field_name: str) -> str:
-        return snap.name_of(f[field_name])
-
-    if kind in ("ace", "inherited-ace"):
-        what = "inheritable ACEs" if kind == "inherited-ace" else "ACEs"
-        return f"remove the {what} of {who('trustee')} on {rdn('object')}"
-    if kind == "adminsdholder-ace":
-        return f"remove the ACEs of {who('trustee')} on AdminSDHolder"
-    if kind == "owner":
-        return f"give {rdn('object')} a tier-0 owner"
-    if kind == "member":
-        return f"remove {rdn('member')} from {rdn('group')}"
-    if kind == "gplink":
-        return f"unlink GPO {f['gpo']} from {rdn('container')}"
-    if kind == "gpo-entry":
-        return f"remove {who('member')} from {who('group')} in GPO {f['gpo']}"
-    if kind == "template-ace":
-        return f"remove the ACEs of {who('trustee')} on template {f['template']}"
-    if kind == "template-flag":
-        return f"template {f['template']}: turn off {f['flag']}"
-    if kind == "pki-ace":
-        return f"remove the ACEs of {who('trustee')} on {f['object']}"
-    if kind == "ca-right":
-        return f"remove {f['right']} of {who('trustee')} on CA {f['ca']}"
-    if kind == "gmsa-reader":
-        return f"remove {who('reader')} from the password readers of {rdn('gmsa')}"
-    return f"remove {f['what']} delegation of {rdn('account')}"
+    if m.where is None:
+        m.where = changes.Where(m.snap, m.prov)
+    return changes.describe(m.snap, prim, m.where)
 
 
 # -- the whole reverse what-if -------------------------------------------------------------
@@ -908,6 +920,7 @@ def plan(
     tier0_extra: Iterable[str] = (),
     accepted: Iterable[str] = (),
     max_changes: int | None = None,
+    where: changes.Where | None = None,
 ) -> Plan:
     """The cheapest closing set for the goal, pruned, with its lower bound and an order
     (heuristic). `g` is built with provenance."""
@@ -920,10 +933,14 @@ def plan(
     view = masked(g, snap, (), extra)
     srcs = sources_for(snap, view, goal, names, accepted_holders(g, accepted))
     m = build_model(snap, g, srcs, all_keeps, extra)
+    m.where = where
     _, cut = min_cut(m, near)
     _, other = min_cut(m, "source" if near == "tier0" else "tier0")
     alternatives = sorted(other) != sorted(cut)
-    cut = prune(m, cut)
+    if m.inexact:
+        # an exact cut costs the true minimum, so no change in it can go: prune only
+        # when the network could join routes
+        cut = prune(m, cut)
     lb = lower_bound(m)
     cost = sum(m.cost[p] for p in cut)
     exact = m.inexact == 0

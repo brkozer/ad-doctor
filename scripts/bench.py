@@ -20,7 +20,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from ad_doctor import opengraph, paths, sd
+from ad_doctor import cut, opengraph, paths, sd
 from ad_doctor.checks import run_all
 from ad_doctor.model import (
     UAC,
@@ -186,6 +186,20 @@ def build(users: int, seed: int) -> Snapshot:
                      [sd.Ace("S-1-5-21-1000-2000-3000-513", sd.CONTROL_ACCESS, sd.CERT_ENROLL)])
         for i in range(60)
     ]  # fmt: skip
+    # the collector lists transitive members, so nested admins are tier 0 as in a real
+    # collection
+    by_dn = {g.dn: g for g in groups}
+    admin_dns: set[str] = set()
+    todo, seen = list(da.members), set()
+    while todo:
+        dn = todo.pop()
+        if dn in seen:
+            continue
+        seen.add(dn)
+        if dn in by_dn:
+            todo += by_dn[dn].members
+        else:
+            admin_dns.add(dn)
     return Snapshot(
         domain="bench.test",
         domain_dn=DN,
@@ -193,7 +207,7 @@ def build(users: int, seed: int) -> Snapshot:
         collected_at=NOW,
         policy=DomainPolicy(12, True, 10, 365, 10, 10),
         accounts=accounts,
-        privileged={"Domain Admins": [a.dn for a in admins]},
+        privileged={"Domain Admins": sorted(admin_dns)},
         protected_users=[],
         templates=templates,
         acls={"domain": []},
@@ -224,20 +238,31 @@ def main() -> None:
     g = timed("build control graph", lambda: paths.build(snap), rows)
     timed("paths to tier 0", lambda: paths.paths_to_tier0(g), rows)
     graph = timed("OpenGraph export", lambda: opengraph.export(snap, g=g), rows)
+    edges = sum(len(v) for v in g.edges.values())
+    opengraph_edges = len(graph["graph"]["edges"])
+    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    snapshot_mb = round(len(text) / 2**20, 1)
+    text, graph = "", {}  # let go of the big ones before the what-if stage
+    g.edges.clear()
+    gp = timed("control graph with provenance", lambda: paths.build(snap, provenance=True), rows)
+    plan = timed("plan (what-if, paths only)", lambda: cut.plan(snap, gp), rows)
+    plan_peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
     aces = sum(len(o.aces) + len(o.inheritable) for o in snap.objects)
-    edges = sum(len(v) for v in g.edges.values())
-    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     summary = {
         "users": sum(1 for a in snap.accounts if not a.is_computer),
         "computers": sum(1 for a in snap.accounts if a.is_computer),
         "objects": len(snap.objects),
         "aces": aces,
-        "snapshot_mb": round(len(text) / 2**20, 1),
+        "snapshot_mb": snapshot_mb,
         "graph_edges": edges,
-        "opengraph_edges": len(graph["graph"]["edges"]),
+        "opengraph_edges": opengraph_edges,
         "findings": len(findings),
+        "plan_changes": len(plan.changes),
+        "plan_cost": plan.cost,
+        "plan_proven": plan.proven,
         "peak_rss_mb": round(peak_mb),
+        "peak_rss_mb_with_plan": round(plan_peak_mb),
         "seconds": {label: round(sec, 2) for label, sec in rows},
     }
     if args.json:

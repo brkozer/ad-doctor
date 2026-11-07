@@ -16,12 +16,12 @@ sync account's DCSync by default, accepted risks, invariants) is never proposed 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 
 from . import sd
 from .checks import CA_RIGHTS, _sync_accounts
-from .model import EXCHANGE_GROUPS, UAC, Snapshot
+from .model import EXCHANGE_GROUPS, UAC, GpLink, GpoLocalGroup, Snapshot
 from .provenance import TEMPLATE_FLAGS, Prim, Provenance
 
 # Identity fields of each kind, in the order of the primitive tuple after the kind.
@@ -98,6 +98,238 @@ def fields(prim: Prim) -> dict[str, str]:
     return {"kind": kind, **dict(zip(FIELDS[kind], values, strict=True))}
 
 
+def prim_of(values: Mapping[str, object]) -> Prim:
+    """The primitive tuple from a kind and its identity fields (a plan file entry)."""
+    kind = str(values.get("kind", ""))
+    if kind not in FIELDS:
+        raise ValueError(f"unknown change kind {kind!r}")
+    missing = [n for n in FIELDS[kind] if not isinstance(values.get(n), str)]
+    if missing:
+        raise ValueError(f"a {kind} change needs {', '.join(missing)}")
+    return (kind, *(str(values[n]) for n in FIELDS[kind]))
+
+
+class Where:
+    """DN (lower case) -> the DN as written, a display name and the ACE lists of an object,
+    a GPO, the domain head or AdminSDHolder: what fix lines and resolution need."""
+
+    def __init__(self, snap: Snapshot, prov: Provenance) -> None:
+        self.dn: dict[str, str] = {}
+        self.name: dict[str, str] = {}
+        self.kind: dict[str, str] = {}
+        self.lists: dict[str, list[list[sd.Ace]]] = {}
+        self.objects: dict[str, object] = {}
+        self.sid_name: dict[str, str] = dict(snap.principals)
+        for a in snap.accounts:
+            if a.sid:
+                self.sid_name.setdefault(a.sid, a.sam)
+        for o in snap.objects:
+            if o.sid:
+                self.sid_name.setdefault(o.sid, o.name)
+        for o in snap.objects:
+            key = o.dn.lower()
+            self.dn.setdefault(key, o.dn)
+            self.name.setdefault(key, o.name)
+            self.kind.setdefault(key, o.kind)
+            self.lists.setdefault(key, []).extend([o.aces, o.inheritable])
+            self.objects.setdefault(key, o)
+        for a in snap.accounts:
+            key = a.dn.lower()
+            self.dn.setdefault(key, a.dn)
+            self.name.setdefault(key, a.sam)
+            self.kind.setdefault(key, "computer" if a.is_computer else "user")
+        for gm in snap.gmsas:
+            key = gm.dn.lower()
+            self.dn.setdefault(key, gm.dn)
+            self.name.setdefault(key, gm.name)
+            self.kind.setdefault(key, "gmsa")
+        for g in snap.gpos:
+            key = prov.gpo_dns[g.guid.upper()]
+            self.dn[key] = f"CN={g.guid},CN=Policies,CN=System,{snap.domain_dn}"
+            self.name[key] = g.name
+            self.kind[key] = "gpo"
+            self.lists.setdefault(key, []).append(g.aces)
+        domain = snap.domain_dn.lower()
+        self.dn.setdefault(domain, snap.domain_dn)
+        self.name[domain] = snap.domain
+        self.kind.setdefault(domain, "domain")
+        if "domain" in snap.acls:
+            self.lists.setdefault(domain, []).append(snap.acls["domain"])
+        holder = prov.holder_dn
+        self.dn.setdefault(holder, f"CN=AdminSDHolder,CN=System,{snap.domain_dn}")
+        self.name.setdefault(holder, "AdminSDHolder")
+        self.kind.setdefault(holder, "container")
+        if "AdminSDHolder" in snap.acls and holder not in self.lists:
+            self.lists[holder] = [snap.acls["AdminSDHolder"]]
+
+    def aces(self, dn: str) -> list[sd.Ace]:
+        """Every ACE entry of the object (both lists; an AD ACE can sit in two)."""
+        return [a for aces in self.lists.get(dn, []) for a in aces]
+
+    def who(self, snap: Snapshot, sid: str) -> str:
+        """A principal's name: the snapshot's, else a well-known one, else the SID."""
+        return self.sid_name.get(sid) or snap.name_of(sid)
+
+    def display(self, dn: str) -> str:
+        return self.name.get(dn) or dn.split(",", 1)[0].split("=", 1)[-1]
+
+
+def describe(snap: Snapshot, prim: Prim, where: Where | None = None) -> str:
+    """A short description of a change for people."""
+    f = fields(prim)
+    kind = f["kind"]
+
+    def obj(field_name: str) -> str:
+        dn = f[field_name]
+        if where is not None:
+            return where.display(dn)
+        return dn.split(",", 1)[0].split("=", 1)[-1]
+
+    def who(field_name: str) -> str:
+        if where is not None:
+            return where.who(snap, f[field_name])
+        return snap.name_of(f[field_name])
+
+    if kind in ("ace", "inherited-ace"):
+        what = "inheritable ACEs" if kind == "inherited-ace" else "ACEs"
+        return f"remove the {what} of {who('trustee')} on {obj('object')}"
+    if kind == "adminsdholder-ace":
+        return f"remove the ACEs of {who('trustee')} on AdminSDHolder"
+    if kind == "owner":
+        return f"give {obj('object')} a tier-0 owner"
+    if kind == "member":
+        return f"remove {obj('member')} from {obj('group')}"
+    gpo = {g.guid.upper(): g.name for g in snap.gpos}.get(f.get("gpo", ""), f.get("gpo", ""))
+    if kind == "gplink":
+        return f"unlink GPO {gpo} from {obj('container')}"
+    if kind == "gpo-entry":
+        return f"remove {who('member')} from {who('group')} in GPO {gpo}"
+    if kind == "template-ace":
+        return f"remove the ACEs of {who('trustee')} on template {f['template']}"
+    if kind == "template-flag":
+        return f"template {f['template']}: turn off {f['flag']}"
+    if kind == "pki-ace":
+        return f"remove the ACEs of {who('trustee')} on {f['object'].removeprefix('PKI:')}"
+    if kind == "ca-right":
+        return f"remove {f['right']} of {who('trustee')} on CA {f['ca']}"
+    if kind == "gmsa-reader":
+        return f"remove {who('reader')} from the password readers of {obj('gmsa')}"
+    return f"remove {f['what']} delegation of {obj('account')}"
+
+
+@dataclass
+class Facts:
+    """What fix and rollback lines need to know about one change, from the snapshot as
+    it was before any change."""
+
+    prim: Prim
+    label: str
+    dn: str = ""  # the object, group, container, gMSA or account, as written
+    aces: list[sd.Ace] = field(default_factory=list)  # the ACEs it removes there
+    copies: int = 0  # other objects holding a copy (SDProp, inherited)
+    member_dn: str = ""
+    owner: str = ""  # the current owner SID
+    readers: list[str] = field(default_factory=list)  # gMSA readers that stay
+    gpo_name: str = ""
+    entry: GpoLocalGroup | None = None
+    link: GpLink | None = None
+    inheritance_known: bool = True
+
+
+def facts(snap: Snapshot, prov: Provenance, where: Where, prims: Iterable[int]) -> dict[int, Facts]:
+    """Facts of the changes, with one pass over the snapshot's ACEs for the copies."""
+    wanted = list(dict.fromkeys(prims))
+    out = {p: Facts(prov.prims[p], describe(snap, prov.prims[p], where)) for p in wanted}
+    sids = {prov.prims[p][-1] for p in wanted if prov.prims[p][0] in ACE_KINDS}
+    by_key = {prov.prims[p]: p for p in wanted}
+    holders: dict[int, set[str]] = {}
+    if sids:
+        for dn, lists in where.lists.items():
+            for aces in lists:
+                for a in aces:
+                    if a.sid not in sids:
+                        continue
+                    p = by_key.get(prov.ace_prim_key(dn, a))
+                    if p is None:
+                        continue
+                    holders.setdefault(p, set()).add(dn)
+    gpos = {g.guid.upper(): g for g in snap.gpos}
+    for p, f in out.items():
+        kind, *_ = f.prim
+        f.inheritance_known = snap.ace_inheritance_checked
+        if kind in ACE_KINDS:
+            anchor = prov.holder_dn if kind == "adminsdholder-ace" else f.prim[1]
+            f.dn = where.dn.get(anchor, anchor)
+            f.aces = _unique(
+                a
+                for a in where.aces(anchor)
+                if a.sid == f.prim[-1]
+                and not a.inherited
+                and prov.ace_prim_key(anchor, a) == f.prim
+            )
+            f.copies = len(holders.get(p, set()) - {anchor})
+        elif kind == "owner":
+            f.dn = where.dn.get(f.prim[1], f.prim[1])
+            o = where.objects.get(f.prim[1])
+            f.owner = str(getattr(o, "owner", "") or "")
+        elif kind == "member":
+            f.dn = where.dn.get(f.prim[1], f.prim[1])
+            f.member_dn = where.dn.get(f.prim[2], f.prim[2])
+        elif kind in ("gplink", "gpo-entry"):
+            g = gpos.get(f.prim[1])
+            f.gpo_name = g.name if g else f.prim[1]
+            if kind == "gplink":
+                f.dn = where.dn.get(f.prim[2], f.prim[2])
+                f.link = next(
+                    (x for x in (g.links if g else []) if x.container.lower() == f.prim[2]), None
+                )
+            else:
+                f.entry = next(
+                    (
+                        x
+                        for x in snap.gpo_local_groups
+                        if x.gpo.upper() == f.prim[1]
+                        and x.group_sid.upper() == f.prim[2]
+                        and x.member_sid.upper() == f.prim[3]
+                    ),
+                    None,
+                )
+        elif kind == "template-ace":
+            t = next((t for t in snap.templates if t.name == f.prim[1]), None)
+            f.aces = _unique(a for a in (t.aces if t else []) if a.sid == f.prim[2])
+        elif kind == "pki-ace":
+            f.aces = _unique(a for a in snap.acls.get(f.prim[1], []) if a.sid == f.prim[2])
+        elif kind == "gmsa-reader":
+            gm = next((x for x in snap.gmsas if x.dn.lower() == f.prim[1]), None)
+            f.dn = gm.dn if gm else f.prim[1]
+            f.readers = [s for s in (gm.readers if gm else []) if s != f.prim[2]]
+        elif kind == "delegation":
+            f.dn = where.dn.get(f.prim[1], f.prim[1])
+    return out
+
+
+def _unique(aces: Iterable[sd.Ace]) -> list[sd.Ace]:
+    """One entry per (mask, object type): the same AD ACE can sit in two lists."""
+    out: dict[tuple[int, str | None], sd.Ace] = {}
+    for a in aces:
+        out.setdefault((a.mask, a.object_type), a)
+    return list(out.values())
+
+
+def trustee_of(prim: Prim) -> str:
+    """The SID holding the right a change removes ("" for kinds without one)."""
+    kind = prim[0]
+    if kind in ("ace", "inherited-ace", "pki-ace", "template-ace", "adminsdholder-ace"):
+        return prim[-1]
+    if kind in ("gmsa-reader",):
+        return prim[2]
+    if kind == "ca-right":
+        return prim[2]
+    if kind == "gpo-entry":
+        return prim[3]
+    return ""
+
+
 @dataclass(frozen=True)
 class Assessment:
     cls: str  # "removable" or "warn"
@@ -129,11 +361,7 @@ def assess(snap: Snapshot, prim: Prim, tier0: set[str], ctx: Context | None = No
         return Assessment(
             "warn", WARN_COST, "changes what the template issues: check who enrolls in it"
         )
-    trustee = ""
-    if kind in ("ace", "inherited-ace", "pki-ace", "template-ace", "adminsdholder-ace"):
-        trustee = prim[-1]
-    elif kind in ("gmsa-reader", "ca-right"):
-        trustee = prim[2]
+    trustee = "" if kind == "gpo-entry" else trustee_of(prim)
     if trustee:
         if trustee in ctx.exchange:
             return Assessment("warn", WARN_COST, "breaks Exchange provisioning (see AD-ACL-007)")

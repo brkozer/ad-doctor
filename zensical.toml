@@ -20,7 +20,7 @@ nav = [
     { "CI integration" = "ci.md" },
     { "Snapshots and redaction" = "snapshots.md" },
     { "Invariants (policy as code)" = "invariants.md" },
-    { "What-if engine" = "whatif.md" },
+    { "What-if and plan" = "whatif.md" },
     { "BloodHound export" = "bloodhound.md" },
   ] },
   { "Checks" = "checks/index.md" },

@@ -9,25 +9,37 @@ logic or severity between versions, but an ID is never reused for something else
 
 ### Added
 
-- **What-if engine (no command yet).** `paths.build(snap, provenance=True)` records the
-  removable fact behind every edge where the edge is made; the graph is the same either
-  way, and `analyze` and `paths` output is byte for byte that of 0.1.5. On it,
-  `ad_doctor.whatif` masks a set of changes in the graph (or rebuilds when a change can move
-  GPO scope), classifies each AD-PATH-001 holder as closed, rerouted or open, takes the
-  changes out of the snapshot in place, runs every check again and stops on any difference
-  between the two levels. `ad_doctor.cut` builds a flow network on the path subgraph and
-  finds the cheapest closing set (exact when every change joins no routes that do not
-  exist), a lower bound, the sources no removal can close, and an order by a greedy that
-  says it is a heuristic, with or without a budget. SDProp copies go with the AdminSDHolder
-  ACE, inherited copies with the OU they come from, the Entra sync account's DCSync is kept
-  by default. Provenance costs 4.6 s and 270 MB more at 250,000 users. See
-  `docs/whatif.md`.
+- **`ad-doctor plan` and `ad-doctor whatif`.** `plan` computes the cheapest set of
+  removals that closes every control path ad-doctor sees (a minimum cut of a flow network
+  on the path subgraph), says "proven minimum" only when the model is exact or a lower
+  bound meets it, reports the sources no removal can close with the suggestion to treat
+  the node as tier 0, and orders the changes by a greedy that says it is a heuristic, with
+  or without `--max-changes`. `whatif` evaluates removals named by change ID, finding
+  fingerprint, path step, edge, chokepoint ID or typed spec: paths closed, rerouted or
+  open, exposure, blast radius per `--account`, and the findings that would clear or
+  appear, rechecked on the snapshot changed in memory; a disagreement between the graph and
+  the recheck stops the run. Output as text, JSON, Markdown with a rollback line per change,
+  a TOML plan file and PowerShell fix lines (`RemoveAccessRuleSpecific`, `Set-Acl -WhatIf`,
+  never `dsacls /R`). The plan file tracks each change as done, open, overdue, stale or
+  ineffective against a newer snapshot; `--check` exits 2 when its `[expect]` block fails
+  and 3 on plan rot. The Entra sync account's DCSync, `[[keep]]` entries, accepted findings
+  and declared invariants are never proposed. Nothing opens a connection to a directory.
+  See `docs/whatif.md`.
+- **What-if engine.** `paths.build(snap, provenance=True)` records the removable fact
+  behind every edge where the edge is made; the graph is the same either way, and
+  `analyze` and `paths` text output is byte for byte that of 0.1.5. SDProp copies go with
+  the AdminSDHolder ACE, inherited copies with the OU they come from. Provenance costs
+  4.6 s and 270 MB more at 250,000 users.
+- **`paths -f json`** gives each step the IDs of the changes that remove it, and each
+  `--chokepoints` edge row an `id`, both accepted by `whatif --remove`.
 
 ### Changed
 
 - **Snapshots keep the INHERITED_ACE flag** (`Ace.inherited`, and
   `ace_inheritance_checked` on the snapshot). Older snapshots still load; there an
-  inherited copy cannot be told from an explicit ACE.
+  inherited copy cannot be told from an explicit ACE, and what-if output says so.
+- **`scripts/bench.py`** lists nested Domain Admins members as tier 0, as a collection
+  does, and times a plan. The benchmark rows in the README are measured again.
 
 ## [0.1.5] - 2026-11-07
 

@@ -174,9 +174,41 @@ def cmd_diff(args: argparse.Namespace) -> int:
     return 2 if _fails(new_findings, args.fail_on) else 0
 
 
+def _step_changes(g: paths.Graph, p: paths.Path) -> list[list[str]]:
+    """Per step of a path, the IDs of the changes that remove that edge (empty when it
+    cannot be removed), for `whatif --remove`."""
+    from .changes import change_id
+    from .cut import _instances
+
+    prov = g.prov
+    assert prov is not None
+    out = []
+    src = p.start
+    for dst, how in p.steps:
+        ids: dict[str, None] = {}
+        why = prov.why.get(src)
+        for i, (d, label) in enumerate(g.edges.get(src, ())):
+            if d == dst and label == how and why is not None:
+                for c in _instances(prov, src, i, why[i])[0]:
+                    ids[change_id(prov.prims[c])] = None
+        out.append(list(ids))
+        src = dst
+    return out
+
+
+def _path_json(g: paths.Graph, p: paths.Path) -> dict[str, Any]:
+    rec = p.record(g)
+    for step, ids in zip(rec["steps"], _step_changes(g, p), strict=True):
+        step["changes"] = ids
+    return rec
+
+
 def cmd_paths(args: argparse.Namespace) -> int:
+    from .resolve import edge_id
+
     snap = Snapshot.from_json(_load_json(args.snapshot))
-    a = paths.analyze(snap)
+    json_out = args.format == "json"
+    a = paths.analyze(snap, paths.build(snap, provenance=json_out and not args.chokepoints))
     g = a.graph
     if args.chokepoints:
         points = paths.chokepoints(a.paths, args.minimum)
@@ -187,6 +219,7 @@ def cmd_paths(args: argparse.Namespace) -> int:
                     "kind": "edge" if c.is_edge else "node",
                     **({"from": g.name(c.source), "how": c.how} if c.source is not None else {}),
                     "node": g.name(c.target),
+                    **({"id": edge_id(c.source, c.target, c.how)} if c.source is not None else {}),
                 }
                 for c in points
             ]
@@ -210,7 +243,7 @@ def cmd_paths(args: argparse.Namespace) -> int:
                     "domain": snap.domain,
                     "exposed_users": a.exposed,
                     "enabled_users": a.users,
-                    "paths": [p.record(g) for p in a.paths],
+                    "paths": [_path_json(g, p) for p in a.paths],
                 },
                 indent=2,
             )
@@ -225,6 +258,70 @@ def cmd_paths(args: argparse.Namespace) -> int:
         for p in a.paths:
             print(f"  {len(p.steps)} hop{'s' if len(p.steps) != 1 else ' '}  {p.render(g)}")
     return 0
+
+
+def _whatif_output(args: argparse.Namespace, doc: dict[str, Any], plan: Any = None) -> None:
+    from . import planfile, whatif_render
+
+    fmt = args.format
+    if fmt == "toml":
+        text = planfile.dumps(plan)
+    elif fmt == "json":
+        text = whatif_render.render_json(doc)
+    elif fmt == "markdown":
+        text = whatif_render.render_markdown(doc)
+    elif fmt == "ps1":
+        text = whatif_render.render_ps1(doc)
+    else:
+        text = whatif_render.render_text(doc)
+    if args.output:
+        _write_private(args.output, text)
+    else:
+        sys.stdout.write(text)
+
+
+def _whatif_errors() -> tuple[type[BaseException], ...]:
+    from .planfile import PlanError
+    from .resolve import SpecError
+    from .whatif import ModelMismatch
+
+    return (*ERRORS, SpecError, PlanError, ModelMismatch)
+
+
+def cmd_whatif(args: argparse.Namespace) -> int:
+    from . import whatif_cmd
+    from .whatif import ModelMismatch
+
+    try:
+        doc, code = whatif_cmd.run_whatif(args)
+        _whatif_output(args, doc)
+    except _whatif_errors() as exc:
+        bug = (
+            " (a bug in ad-doctor's model: please report it)"
+            if isinstance(exc, ModelMismatch)
+            else ""
+        )
+        print(f"ad-doctor: {exc}{bug}", file=sys.stderr)
+        return 1
+    return code
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    from . import whatif_cmd
+    from .whatif import ModelMismatch
+
+    try:
+        doc, code, plan = whatif_cmd.run_plan(args)
+        _whatif_output(args, doc, plan)
+    except _whatif_errors() as exc:
+        bug = (
+            " (a bug in ad-doctor's model: please report it)"
+            if isinstance(exc, ModelMismatch)
+            else ""
+        )
+        print(f"ad-doctor: {exc}{bug}", file=sys.stderr)
+        return 1
+    return code
 
 
 def cmd_blast_radius(args: argparse.Namespace) -> int:
@@ -588,12 +685,124 @@ def main(argv: list[str] | None = None) -> int:
     p_paths.add_argument(
         "--chokepoints",
         action="store_true",
-        help="rank the edges and nodes that the most paths share (break those first)",
+        help="rank the edges and nodes that the most paths share (break those first; "
+        "`ad-doctor plan` computes the cheapest set of changes)",
     )
     p_paths.add_argument(
         "--minimum", type=int, default=2, metavar="N", help="with --chokepoints: shared by N+"
     )
     p_paths.add_argument("-f", "--format", choices=["text", "json", "mermaid"], default="text")
+
+    def whatif_common(p: argparse.ArgumentParser) -> None:
+        p.add_argument("snapshot", type=Path)
+        p.add_argument(
+            "--tier0",
+            action="append",
+            metavar="NAME",
+            help="treat this node as tier 0 (an assumption, not a change; repeatable)",
+        )
+        p.add_argument("--accept", type=Path, metavar="TOML", help="accepted-risk file")
+        p.add_argument(
+            "--invariants", type=Path, metavar="TOML", help="declared state (policy as code)"
+        )
+        p.add_argument(
+            "--paths-only",
+            action="store_true",
+            help="paths and exposure only; do not recheck the findings",
+        )
+        p.add_argument("-o", "--output", type=Path, help="write to a file")
+
+    p_whatif = sub.add_parser(
+        "whatif",
+        help="what removing rights, memberships or links would change (on the snapshot)",
+        description="Evaluate changes on a snapshot, never on AD: the tier-0 paths that close "
+        "or are rerouted, exposure, findings that would clear or appear. Name a change by ID "
+        '(c:...), finding (fp:...), path step (path:"Domain Users"#1), edge, or typed spec '
+        '(member:"Domain Admins":alice, ace:"<DN>":helpdesk, adminsdholder:helpdesk, ...). '
+        "Exit codes: 0 ok, 1 error, 2 a gate failed, 3 plan rot under --check.",
+    )
+    whatif_common(p_whatif)
+    p_whatif.add_argument(
+        "--remove", action="append", metavar="SPEC", help="a change to evaluate (repeatable)"
+    )
+    p_whatif.add_argument("--plan", type=Path, metavar="TOML", help="evaluate a plan file")
+    p_whatif.add_argument(
+        "--account",
+        action="append",
+        metavar="NAME",
+        help="show this account's blast radius before and after (repeatable)",
+    )
+    p_whatif.add_argument(
+        "--strict", action="store_true", help="a change absent in this snapshot is an error"
+    )
+    p_whatif.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 3 on plan rot (stale, ineffective, edited IDs, another domain), 2 when the "
+        "plan's [expect] block fails",
+    )
+    p_whatif.add_argument(
+        "--fail-if-exposed",
+        type=int,
+        metavar="N",
+        help="exit 2 when more than N users are exposed after the changes",
+    )
+    p_whatif.add_argument(
+        "--fail-on",
+        choices=[str(s) for s in Severity],
+        help="exit 2 when a finding at this severity or above would appear",
+    )
+    p_whatif.add_argument(
+        "-f", "--format", choices=["text", "json", "markdown", "ps1"], default="text"
+    )
+
+    p_plan = sub.add_parser(
+        "plan",
+        help="the cheapest set of changes that closes the tier-0 paths (on the snapshot)",
+        description="Compute the cheapest set of removals that closes every path ad-doctor "
+        "sees (a minimum cut), says when it is a proven minimum, orders it (a heuristic) and "
+        "writes it as text, JSON, Markdown, a plan file or fix lines. Never touches AD.",
+    )
+    whatif_common(p_plan)
+    p_plan.add_argument(
+        "--goal",
+        choices=["exposure", "all-paths"],
+        default="exposure",
+        help="exposure: enabled users outside tier 0 (default); all-paths: every AD-PATH-001 "
+        "holder",
+    )
+    p_plan.add_argument(
+        "--from",
+        dest="sources",
+        action="append",
+        metavar="NAME",
+        help="close the paths of these principals only (repeatable)",
+    )
+    p_plan.add_argument(
+        "--max-changes", type=int, metavar="K", help="a budget of K changes (heuristic)"
+    )
+    p_plan.add_argument(
+        "--near",
+        choices=["tier0", "source"],
+        default="tier0",
+        help="of equal-cost cuts, the one nearest tier 0 (default) or the sources",
+    )
+    p_plan.add_argument(
+        "--allow",
+        action="append",
+        metavar="KIND|warn",
+        help="warn: also propose the Entra sync account's DCSync; a change kind: propose "
+        "only kinds named this way (repeatable)",
+    )
+    p_plan.add_argument(
+        "--keep", action="append", metavar="SPEC", help="never propose this change (repeatable)"
+    )
+    p_plan.add_argument(
+        "--plan", type=Path, metavar="TOML", help="a plan file whose keeps and [assume] apply"
+    )
+    p_plan.add_argument(
+        "-f", "--format", choices=["text", "json", "markdown", "toml", "ps1"], default="text"
+    )
 
     p_view = sub.add_parser(
         "view", help="write the interactive report: one offline HTML file, no server"
@@ -668,6 +877,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "explain":
         return _explain(args.check, args.format, args.web)
+    if args.cmd == "whatif":
+        return cmd_whatif(args)
+    if args.cmd == "plan":
+        return cmd_plan(args)
 
     if args.cmd == "checks":
         rows: list[dict[str, Any]] = []

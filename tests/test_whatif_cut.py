@@ -199,7 +199,7 @@ def test_unclosable_sources_are_reported_not_cut() -> None:
     snap, g = toy(edges, {"T0"})
     m = model(snap, g, ["s", "u"])
     assert [x.node for x in m.unclosable] == ["s"]
-    assert "fixed" in m.unclosable[0].why and "tier 0" in m.unclosable[0].suggest
+    assert "cannot be removed" in m.unclosable[0].why and "tier 0" in m.unclosable[0].suggest
     assert names(g, cut.min_cut(m)[1]) == ["cn=c1"]
 
 

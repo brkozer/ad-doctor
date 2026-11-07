@@ -60,6 +60,12 @@ every change of the fixtures. `AD_DOCTOR_WHATIF_SNAPSHOTS` (snapshot files, sepa
 like `PATH`) adds every single change and 200 random sets on each of those snapshots, and
 `uv run pytest -m slow` runs the 10,000-user sample, which takes minutes.
 
+What-if output follows a few wording rules, which `tests/test_whatif_cli.py` checks on the
+rendered text and on `docs/whatif.md`: "closes in the snapshot", "would clear",
+"rerouted" when a path remains, "proven minimum (for paths ad-doctor sees)" only when it
+is proven, "heuristic" on every ordering or budget claim, and never "fixed", "resolved",
+"secure" or "safe". Every fix line runs with `-WhatIf` or is a comment.
+
 ## Adding a check
 
 1. **Pick an ID** in the right area (`AD-ACL-009`, `AD-KRB-007`, ...). IDs are never

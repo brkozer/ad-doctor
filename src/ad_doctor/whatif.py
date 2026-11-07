@@ -14,7 +14,7 @@ must match; a difference is a bug in the model and raises ModelMismatch.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -289,6 +289,10 @@ class Result:
     new: list[dict[str, str]] = field(default_factory=list)
     changed: list[dict[str, str]] = field(default_factory=list)
     accounts: list[dict[str, Any]] = field(default_factory=list)
+    findings_before: list[Finding] = field(default_factory=list)
+    findings_after: list[Finding] = field(default_factory=list)
+    tier0_extra: list[str] = field(default_factory=list)
+    applied: dict[int, int] | None = None  # set once the snapshot holds the changes
 
 
 def classify(before: State, after: State) -> tuple[list[str], list[str], list[str]]:
@@ -321,9 +325,12 @@ def run(
     paths_only: bool = False,
     tier0_extra: Iterable[str] = (),
     baseline: list[Finding] | None = None,
+    recheck: Callable[[Snapshot], list[Finding]] = run_all,
 ) -> Result:
     """Forward what-if. `g` is `paths.build(snap, provenance=True)`. Without
-    `paths_only` the snapshot is changed in place (level 2); keep a copy on disk."""
+    `paths_only` the snapshot is changed in place (level 2); keep a copy on disk.
+    `recheck` runs the checks (the CLI adds invariants); `baseline` is its result on the
+    snapshot before any change."""
     prov = g.prov
     assert prov is not None
     gone = sorted(set(removed))
@@ -334,7 +341,7 @@ def run(
     blast_before = {a: _blast(snap, base_graph, a) for a in accounts}
     findings_before: list[Finding] = []
     if not paths_only:
-        findings_before = baseline if baseline is not None else run_all(snap)
+        findings_before = baseline if baseline is not None else recheck(snap)
     if ok:
         after = state(snap, masked(g, snap, gone, extra))
         counts = None
@@ -352,20 +359,51 @@ def run(
         after = state(snap, rebuilt)
     closed, rerouted, still = classify(before, after)
     result = Result(gone, [], ok, before, after, closed, rerouted, still)
+    result.tier0_extra, result.applied = extra, counts
     result.accounts = [
         {"account": a, "before": blast_before[a], "after": _blast(snap, after.graph, a)}
         for a in accounts
     ]
     if paths_only:
         return result
-    if counts is None:
-        counts = changes.apply(snap, prov, gone)
-    result.absent = [p for p in gone if counts.get(p, 0) == 0]
-    findings_after = run_all(snap)
-    result.findings_rechecked = True
-    check_level2(after, findings_after, extra)
-    result.cleared, result.new, result.changed = diff(findings_before, findings_after)
+    finish(result, snap, prov, findings_before, recheck)
     return result
+
+
+def finish(
+    result: Result,
+    snap: Snapshot,
+    prov: Provenance,
+    findings_before: list[Finding],
+    recheck: Callable[[Snapshot], list[Finding]] = run_all,
+) -> None:
+    """Level 2 after a level-1 run: take the changes out of the snapshot (unless the
+    rebuild did already), run every check again, compare with level 1 and diff. Needs
+    nothing of the graph, so a caller can let the graph go first."""
+    counts = result.applied
+    if counts is None:
+        counts = result.applied = changes.apply(snap, prov, result.removed)
+    result.absent = [p for p in result.removed if counts.get(p, 0) == 0]
+    findings_after = recheck(snap)
+    result.findings_rechecked = True
+    result.findings_before, result.findings_after = findings_before, findings_after
+    check_level2(result.after, findings_after, result.tier0_extra)
+    result.cleared, result.new, result.changed = diff(findings_before, findings_after)
+
+
+def release(*graphs: Graph) -> None:
+    """Empty the graphs (and their provenance arrays) in place, so their memory goes even
+    while other objects still refer to them. The change table stays for `finish`."""
+    for g in graphs:
+        g.edges.clear()
+        g.logon_edges.clear()
+        g.edge_props.clear()
+        if g.prov is not None:
+            g.prov.why.clear()
+            g.prov.seq.clear()
+            g.prov.logon_why.clear()
+            g.prov.extra.clear()
+            g.prov.__dict__.pop("_mask_index", None)
 
 
 def check_level2(after: State, findings: list[Finding], tier0_extra: list[str]) -> None:

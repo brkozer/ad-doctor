@@ -66,6 +66,11 @@ latest additions, so the counts in them are lower than a scan shows today.
 - **Accepted risks with owners and expiry.** Expired acceptances turn back into findings,
   acceptances that no longer match anything are reported as stale, and the ones expiring
   within 30 days are listed.
+- **A remediation plan with a proof.** `ad-doctor plan` finds the cheapest set of
+  removals that closes the control paths and says when it is a proven minimum;
+  `ad-doctor whatif` shows what given removals would close, reroute or leave open, and
+  which findings would clear or appear, on the snapshot, never on AD
+  ([details](#what-if-and-plan)).
 - **A fix script you can review.** `--fixes fix.ps1` writes the PowerShell for each
   finding with `-WhatIf` on every change (commented out where there is no dry-run), so it
   is safe to run as-is.
@@ -515,18 +520,49 @@ before that. Encryption adds under half a second to the build (0.36 s on the lab
 at 10,000 users). Object lists with
 thousands of rows are drawn as they scroll into view.
 
-## What-if (engine)
+## What-if and plan
 
-The control graph now records, for every edge, the removable fact behind it: the ACEs of
-one trustee on one object, a membership, a GPO link or a Restricted Groups entry, a
-template right or flag, a CA right, a gMSA reader. On that, the what-if engine evaluates a
-set of removals on a snapshot (paths closed, rerouted or still open, exposure, findings
-that would clear or appear) and computes the cheapest set that closes every path, with the
-condition under which it is the minimum, a lower bound when it is not, the sources no
-removal can close, and an order that is labelled as a heuristic. SDProp copies go with the
-AdminSDHolder ACE, inherited copies with the OU they come from. It never touches AD. The
-`whatif` and `plan` commands are not in this version yet; see
-[docs/whatif.md](docs/whatif.md) for the model and its limits.
+`ad-doctor plan` computes the cheapest set of removals that closes every control path
+ad-doctor sees, says whether it is a proven minimum, orders it and writes it as text,
+JSON, Markdown for tickets, a plan file or fix lines. `ad-doctor whatif` evaluates given
+removals, or a plan file against a newer snapshot. Both work on a snapshot and never touch
+AD.
+
+```bash
+ad-doctor plan snap.json                              # ranked steps, proven minimum or not
+ad-doctor plan snap.json -f toml -o plan.toml         # keep the plan in the repository
+ad-doctor plan snap.json -f ps1 -o plan.ps1           # fix lines, every one -WhatIf
+ad-doctor whatif snap.json --remove adminsdholder:helpdesk --account alice
+ad-doctor whatif new.json --plan plan.toml --check    # CI: 2 gate failed, 3 plan rot
+```
+
+On the lab, 25 of 26 users have a path to tier 0. The plan is 15 changes (cost 17), a
+proven minimum: the three ESC templates Domain Users enrolls in go first as one step,
+helpdesk's ACE on AdminSDHolder is one change (SDProp removes its 20 copies), and the one
+user left reaches tier 0 only through the Entra sync account, whose DCSync is kept on
+purpose; the plan reports it with the suggestion to treat the sync server as tier 0 rather
+than break sync.
+
+- **A change is what an admin edits**: the ACEs of one trustee on one object, a
+  membership, a GPO link or Restricted Groups entry, a template right or flag, a CA right,
+  a gMSA reader. SDProp copies go with the AdminSDHolder ACE and inherited copies with the
+  OU they come from, so a plan never lists a change that would come back.
+- **Named the way the report names things**: change IDs, finding fingerprints, path steps
+  (`path:"Domain Users"#1`), edges, chokepoint IDs from `paths --chokepoints -f json`, or
+  typed (`member:"Domain Admins":grp171`, `ace:"<DN>":helpdesk`).
+- **Honest numbers.** The cut is exact under a checked condition and the output says
+  "proven minimum (for paths ad-doctor sees)" only then, or when a lower bound meets it.
+  The step order and the `--max-changes` budget are labelled heuristics. Findings are
+  rechecked on the changed snapshot, including the ones that would appear (AD-ACC-006
+  after a member leaves a protected group), and a disagreement with the graph stops the
+  run as a model mismatch.
+- **A remediation tracker.** Each planned change is done, open, overdue, stale or
+  ineffective against a newer snapshot; `[expect]` and `--check` make it a CI gate.
+- **Fix lines that remove only the planned ACEs** (`RemoveAccessRuleSpecific` keyed by
+  SID, rights and object type, `Set-Acl -WhatIf`), never `dsacls /R`.
+
+See [docs/whatif.md](docs/whatif.md) for the forms, the plan file, the model and its
+limits.
 
 ## Performance
 
@@ -535,11 +571,16 @@ sites and 480 departments, nested groups, delegated OU permissions that inherit,
 DACLs on every object, linked and filtered GPOs and templates) and times each stage. On one core of an Intel
 Xeon Gold 6138 (2017), Python 3.12:
 
-| Domain | Snapshot | Load | All checks + paths | OpenGraph export | Peak memory |
-|---|---|---|---|---|---|
-| 10,000 users, 3,300 computers, 19,000 ACEs | 13 MB | 0.4 s | 0.8 s | 0.6 s | 0.1 GB |
-| 100,000 users, 33,000 computers, 127,000 ACEs | 126 MB | 3.9 s | 8.5 s | 6.8 s | 0.8 GB |
-| 250,000 users, 83,000 computers, 308,000 ACEs | 314 MB | 9.5 s | 22.7 s | 18.1 s | 2.1 GB |
+| Domain | Snapshot | Load | All checks + paths | OpenGraph export | Plan | Peak memory |
+|---|---|---|---|---|---|---|
+| 10,000 users, 3,300 computers, 19,000 ACEs | 14 MB | 0.4 s | 0.8 s | 0.6 s | 1.9 s | 0.1 GB |
+| 100,000 users, 33,000 computers, 127,000 ACEs | 128 MB | 3.9 s | 8.7 s | 6.9 s | 5.6 s | 0.8 GB |
+| 250,000 users, 83,000 computers, 308,000 ACEs | 319 MB | 9.2 s | 22.5 s | 18.0 s | 11.4 s | 2.1 GB |
+
+Plan is `cut.plan` on a graph built with provenance (another 0.6 s, 7.0 s and 20.1 s to
+build), paths only; the plan stage stays under the peak of the earlier ones. The
+generator lists nested Domain Admins members as tier 0, as a collection does, so the
+paths, and these rows, differ from earlier versions.
 
 Analysis grows linearly with the size of the domain. Collection time is set by the DC:
 the snapshot comes from a few paged LDAP searches, so it scales with the number of objects
