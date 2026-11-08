@@ -25,7 +25,14 @@ logic or severity between versions, but an ID is never reused for something else
   AD-KRB-007 reports the age of the Entra Kerberos key and objects that only have its name. What
   an ordinary user cannot read is stated in a note and not reported as passing. `redact` now
   covers `userPrincipalName` and the new fields, and gives a computer's own host name the
-  computer's token, so host name tokens differ from those of earlier versions.
+  computer's token, so host name tokens differ from those of earlier versions. A snapshot
+  redacted by an earlier version skips the `dNSHostName` part of AD-ACC-016, with a note.
+
+### Changed
+
+- **CI output says what was not judged.** In JUnit, a check that a collection note marks as
+  not fully judged is skipped with that note as the message, instead of passing, and all notes
+  are in `system-out`. SARIF carries them in `toolConfigurationNotifications`.
 
 ## [0.2.1] - 2026-11-09
 

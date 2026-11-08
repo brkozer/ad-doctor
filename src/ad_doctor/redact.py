@@ -382,4 +382,6 @@ def redact(data: dict[str, Any], key: bytes) -> dict[str, Any]:
     for before, after in zip(data.get("subnets", []), out.get("subnets", []), strict=True):
         after["name"] = r.token(before["name"])
     out["redacted"] = True
+    # read from the input: redacting an old redacted file again cannot relate its tokens
+    out["host_names_comparable"] = model.host_names_comparable(data)
     return out

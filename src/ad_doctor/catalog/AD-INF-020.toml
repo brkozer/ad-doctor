@@ -30,7 +30,9 @@ From the Configuration partition (`CN=Sites`), readable by an ordinary user:
   site.
 
 A subnet or site that comes back without attributes makes the whole check not judged, because
-"empty" could not be told from "hidden". Site links that cannot be read skip only that test.
+"empty" could not be told from "hidden". So does a `CN=Subnets` container that is reported as
+missing: every forest has it. Site links that cannot be read skip only that test, and so does a
+missing `CN=Inter-Site Transports`.
 The report says so in each case. Whether a DC's address falls inside its site's subnets is not
 checked: DC addresses are not in the directory.
 

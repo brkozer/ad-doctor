@@ -30,8 +30,23 @@ class UAC(IntEnum):
 
 
 _FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=UTC)
-# draw nothing, though Unicode files them under letters, marks or symbols
-_BLANK_CODE_POINTS = {0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180E, 0x2800, 0x3164, 0xFFA0}
+# Unicode's Default_Ignorable_Code_Point set, assigned or not, and the blank braille cell:
+# they draw nothing, though Unicode files many of them under letters, marks or symbols
+_BLANK_CODE_POINTS = frozenset(
+    {0x00AD, 0x034F, 0x061C, 0x2800, 0x3164, 0xFEFF, 0xFFA0}.union(
+        range(0x115F, 0x1161),
+        range(0x17B4, 0x17B6),
+        range(0x180B, 0x1810),
+        range(0x200B, 0x2010),
+        range(0x202A, 0x202F),
+        range(0x2060, 0x2070),
+        range(0xFE00, 0xFE10),
+        range(0xFFF0, 0xFFF9),
+        range(0x1BCA0, 0x1BCA4),
+        range(0x1D173, 0x1D17B),
+        range(0xE0000, 0xE1000),
+    )
+)
 
 
 def invisible_chars(text: str) -> str:
@@ -43,7 +58,7 @@ def invisible_chars(text: str) -> str:
 
 def _is_invisible(char: str) -> bool:
     code = ord(char)
-    if code in _BLANK_CODE_POINTS or 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF:
+    if code in _BLANK_CODE_POINTS:
         return True
     category = unicodedata.category(char)
     return category in ("Cc", "Cf", "Zl", "Zp") or (category == "Zs" and char != " ")
@@ -548,6 +563,9 @@ class Snapshot:
     dmsas_checked: bool = False
     # False in older snapshots and when no account returned a userPrincipalName
     upn_checked: bool = False
+    # False when an earlier version redacted the snapshot: it gave dNSHostName and
+    # sAMAccountName unrelated tokens, so comparing them says nothing
+    host_names_comparable: bool = True
     # False in older snapshots: msDS-KrbTgtLink was not kept
     krbtgt_links_checked: bool = False
     # local group membership set by Restricted Groups and GPP Local Groups
@@ -729,6 +747,7 @@ class Snapshot:
             ],
             dmsas_checked=data.get("dmsas_checked", False),
             upn_checked=data.get("upn_checked", False),
+            host_names_comparable=host_names_comparable(data),
             krbtgt_links_checked=data.get("krbtgt_links_checked", False),
             gpo_local_groups=[GpoLocalGroup(**x) for x in data.get("gpo_local_groups", [])],
             local_groups_collected=data.get("local_groups_collected", False),
@@ -850,6 +869,12 @@ def exchange_members(objects: list[DirObject]) -> set[str]:
     return seen - {dn for dn in groups if groups[dn].name.lower() in EXCHANGE_GROUPS}
 
 
+def host_names_comparable(data: dict[str, Any]) -> bool:
+    """Whether a snapshot's dNSHostName and sAMAccountName can be compared; False only for
+    one redacted before redaction recorded that it keeps them comparable."""
+    return bool(data.get("host_names_comparable", not data.get("redacted")))
+
+
 def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
     missing = [
         text
@@ -872,6 +897,8 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
         )
         if key not in data
     ]
+    if not host_names_comparable(data):
+        missing.append("the dNSHostName part of AD-ACC-016 (redacted host names)")
     if any("interval_days" not in g for g in data.get("gmsas", [])):
         missing.append("AD-ACC-015 (gMSA password interval)")
     cas = data.get("probes", {}).get("ca_configs", [])

@@ -73,6 +73,13 @@ SEARCH_MISSED = "readable by its DN but missing from the searches"
 PRE2K_SID = "S-1-5-32-554"
 # BASE reads of the groups fine-grained password policies are linked to
 MAX_PSO_LINK_READS = 500
+# all mandatory on the class, so one that does not come back could not be read
+PSO_SETTINGS = (
+    "msDS-MinimumPasswordLength",
+    "msDS-PasswordComplexityEnabled",
+    "msDS-LockoutThreshold",
+    "msDS-PasswordReversibleEncryptionEnabled",
+)
 GROUP_TYPE_GLOBAL = 0x2
 GROUP_TYPE_SECURITY = 0x80000000
 # the fixed RDNs Windows gives the SYSVOL subscriptions under a DC's computer object
@@ -291,13 +298,17 @@ class Collector:
             return []
 
     def attempt(
-        self, base: str, flt: str, attrs: list[str], **kw: Any
+        self, base: str, flt: str, attrs: list[str], must_exist: bool = False, **kw: Any
     ) -> list[dict[str, Any]] | None:
         """optional(), but None when the search was refused: "nothing there" and "could
-        not ask" differ for a check that must not report an unread part as clean."""
+        not ask" differ for a check that must not report an unread part as clean. With
+        must_exist the base is in every forest, so "no such object" can only mean hidden."""
         try:
             return self.search(base, flt, attrs, **kw)
         except LDAPNoSuchObjectResult:
+            if must_exist:
+                self.notes.append(f"{base} is not visible to this account")
+                return None
             return []
         except LDAPOperationResult as exc:
             self.notes.append(f"search {flt} under {base} failed: {exc.description}")
@@ -529,6 +540,8 @@ class Collector:
             )
         snap.notes += self._keys_note()
         snap.notes += _machine_age_notes(accounts)
+        snap.notes += _blank_name_notes(accounts)
+        snap.notes += _sysvol_unseen_notes(snap)
         snap.notes += _entra_kerberos_notes(accounts)
         if snap.has_2025 and not snap.dmsa_visible:
             snap.notes.append(
@@ -902,12 +915,14 @@ class Collector:
             f"CN=Subnets,{base}",
             "(objectClass=subnet)",
             ["objectClass", "siteObject"],
+            must_exist=True,
             scope=ldap3.LEVEL,
         )
         links = self.attempt(
             f"CN=Inter-Site Transports,{base}",
             "(objectClass=siteLink)",
             ["objectClass", "siteList"],
+            must_exist=True,
         )
         if not found or servers is None or subnets is None:
             self.notes.append(f"sites, servers or subnets not readable: {not_judged}")
@@ -1305,10 +1320,7 @@ class Collector:
             [
                 "name",
                 "msDS-PasswordSettingsPrecedence",
-                "msDS-MinimumPasswordLength",
-                "msDS-PasswordComplexityEnabled",
-                "msDS-LockoutThreshold",
-                "msDS-PasswordReversibleEncryptionEnabled",
+                *PSO_SETTINGS,
                 "msDS-PSOAppliesTo",
             ],
         )
@@ -1325,6 +1337,13 @@ class Collector:
             self.notes.append(
                 f"{unread} fine-grained password policy object(s) came back without their "
                 "settings: AD-POL-003 not judged for them"
+            )
+        # kept in the list: a weak setting that was read is still a weak setting
+        partial = sum(not all(e.get(a.lower()) for a in PSO_SETTINGS) for e in readable)
+        if partial:
+            self.notes.append(
+                f"{partial} fine-grained password policy object(s) came back with only part of "
+                "their settings: AD-POL-003 did not judge the missing ones"
             )
         links = sorted({dn for e in readable for dn in _str(e.get("msds-psoappliesto", []))})
         not_global = self._non_global_groups(links)
@@ -1727,6 +1746,35 @@ def _entra_kerberos_notes(accounts: list[Account]) -> list[str]:
         if key is None or key.password_changed is None:
             notes.append(f"key age of the Entra Kerberos object {a.sam} not readable: AD-KRB-007")
     return notes
+
+
+def _blank_name_notes(accounts: list[Account]) -> list[str]:
+    """Accounts with no readable sAMAccountName: an unknown name is not a shared name."""
+    blank = sum(not a.sam for a in accounts)
+    if not blank:
+        return []
+    return [
+        f"{blank} account(s) came back without a sAMAccountName: AD-INF-021 did not compare "
+        "their names and AD-ACC-016 did not judge their host names"
+    ]
+
+
+def _sysvol_unseen_notes(snap: Snapshot) -> list[str]:
+    """Registered DCs with neither subscription visible, when the migration state does not
+    already answer for the domain: a hidden subscription looks the same as none."""
+    if not snap.sysvol_replication_checked or snap.sysvol_dfsr_flags in (16, 32, 48):
+        return []
+    seen = {dn.lower() for dn in [*snap.sysvol_frs_dcs, *snap.sysvol_dfsr_dcs]}
+    unseen = sum(
+        a.is_computer and a.is_registered_dc and not a.entra_kerberos and a.dn.lower() not in seen
+        for a in snap.accounts
+    )
+    if not unseen:
+        return []
+    return [
+        f"{unseen} registered DC(s) show neither an FRS nor a DFS Replication SYSVOL "
+        "subscription: AD-INF-019 not judged for them"
+    ]
 
 
 def _machine_age_notes(accounts: list[Account]) -> list[str]:

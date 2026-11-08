@@ -41,6 +41,9 @@ From the LDAP snapshot:
   says when the label is the name of another computer.
 
 If no account returned a `userPrincipalName`, the report says so and the UPN part is not judged.
+The host name part is not judged for an account with no readable `sAMAccountName`, nor in a
+snapshot redacted by version 0.2.1 or earlier, which gave the two names unrelated tokens. A note
+says so in both cases.
 """
 
 false_positives = """

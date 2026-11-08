@@ -119,6 +119,7 @@ STALE_AFTER = timedelta(days=90)
 DC_PASSWORD_REVIEW = timedelta(days=45)
 DC_PASSWORD_OLD = timedelta(days=180)
 GMSA_INTERVAL_REVIEW_DAYS = 90
+SYSVOL_START = 0
 SYSVOL_PREPARED = 16
 SYSVOL_REDIRECTED = 32
 SYSVOL_ELIMINATED = 48
@@ -2534,6 +2535,16 @@ def sysvol_frs(snap: Snapshot) -> Finding | None:
             _names(frs_only),
         )
     both = [a for a in dcs if a.dn.lower() in frs & dfsr]
+    if both and flags == SYSVOL_START:
+        return _finding(
+            "AD-INF-019",
+            Severity.MEDIUM,
+            "The FRS to DFS Replication migration is in the Start state, so FRS still serves "
+            "SYSVOL, although these DCs also hold a DFS Replication subscription.",
+            "Review the state with dfsrmig /getmigrationstate, then migrate with dfsrmig; the "
+            "migration is one-way.",
+            _names(both),
+        )
     if both:
         return _finding(
             "AD-INF-019",
@@ -2590,7 +2601,8 @@ def conflict_objects(snap: Snapshot) -> Finding | None:
     for a in snap.accounts:
         if a.sid:
             by_sid.setdefault(a.sid, []).append(a.sam)
-        by_sam.setdefault(a.sam.lower(), []).append(a.dn)
+        if a.sam:
+            by_sam.setdefault(a.sam.lower(), []).append(a.dn)
     shared_sids = {sid: sams for sid, sams in by_sid.items() if len(sams) > 1}
     objects += [
         f"sAMAccountName {sam}: {'; '.join(sorted(dns))}"
@@ -2633,6 +2645,8 @@ def identity_collisions(snap: Snapshot) -> Finding | None:
             and not a.managed
             and not a.entra_kerberos
             and a.dns_host
+            and a.sam
+            and snap.host_names_comparable
             and not dns_host_matches(a.dns_host, a.sam)
         ):
             owner = computers.get(a.dns_host.split(".", 1)[0].lower())
@@ -2770,9 +2784,12 @@ def _dmsa_controllers(
 
 @check("AD-ACL-009", "Control over dMSAs that replace another account")
 def dmsa_control(snap: Snapshot) -> Finding | None:
-    tier0 = _tier0_group_sids(snap)
     by_dn = snap.by_dn()
     privileged = snap.tier0_dns()
+    # the members of the tier-0 groups are tier 0 too, not only the groups
+    tier0 = _tier0_group_sids(snap)
+    tier0 |= {a.sid for a in snap.accounts if a.sid and a.dn.lower() in privileged}
+    tier0 |= {o.sid for o in snap.objects if o.sid and o.dn.lower() in privileged}
     objects = []
     severity = Severity.LOW
     for d in snap.dmsas:
@@ -2790,7 +2807,8 @@ def dmsa_control(snap: Snapshot) -> Finding | None:
         control = any(right != DMSA_USE_RIGHT for right in held.values())
         if control and d.state == DMSA_MIGRATED and link in privileged:
             severity = Severity.MEDIUM
-    known = {d.dn.lower() for d in snap.dmsas}
+    # only a dMSA judged above: one whose link or descriptor did not come back was not
+    known = {d.dn.lower() for d in snap.dmsas if d.preceded_by and d.acl_read}
     for a in snap.accounts:
         link = (a.superseded_by or "").lower()
         if link and link not in known:

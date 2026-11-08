@@ -34,7 +34,7 @@ covers who controls one that **already exists**, which no longer needs any creat
 
 detection = """
 For every dMSA the scan account can read that has `msDS-ManagedAccountPrecededByLink`, this check
-lists the principals outside tier 0 that are:
+lists the principals outside tier 0 (the tier-0 groups and their members) that are:
 
 - the owner;
 - holders of a takeover right (`GenericAll`, `GenericWrite`, `WriteDacl`, `WriteOwner` or write to all
@@ -49,7 +49,8 @@ Other control over a tier-0 account is reported by [AD-ACL-004](AD-ACL-004.md).
 **An ordinary user normally cannot see dMSAs.** The check then relies on the link stored on the old
 account, and reports it with the words "who controls it is unknown". With neither visible, the report
 has a note, and no finding does not mean nobody controls one. Run the scan with an account that can
-read dMSAs to cover this.
+read dMSAs to cover this. A dMSA that comes back without its link or its security descriptor is
+treated the same way when the old account points at it.
 """
 
 false_positives = """

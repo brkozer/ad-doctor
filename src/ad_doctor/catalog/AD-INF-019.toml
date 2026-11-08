@@ -3,8 +3,9 @@ aliases = ["sysvol-frs", "frs"]
 summary = "SYSVOL still relies on the File Replication Service, or its migration to DFS Replication was left unfinished."
 severities = ["low", "medium"]
 severity_logic = """
-**Medium** while FRS serves SYSVOL: the domain is in the Prepared state, or a DC has only an
-FRS subscription and no migration is recorded. **Low**, worded as a review, when DFS
+**Medium** while FRS serves SYSVOL: the domain is in the Prepared state, a DC has only an
+FRS subscription and no migration is recorded, or the state is Start and a DC has both
+subscriptions. **Low**, worded as a review, when DFS
 Replication already serves SYSVOL (Redirected), or when a DC has both subscriptions and the
 state cannot be read.
 """
@@ -31,7 +32,9 @@ From the LDAP snapshot, two pieces of evidence:
 
 With the state unset or 0, a registered DC that has an FRS subscription and no DFSR one is
 reported. If the state is 0 or absent and neither subscription can be seen, the check does
-not judge the domain and the report says so.
+not judge the domain and the report says so. A DC holding both subscriptions is reported too.
+When the state is 0 or absent and only some registered DCs show a subscription, the others are
+counted in a note and not judged.
 """
 
 false_positives = """

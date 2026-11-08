@@ -49,7 +49,8 @@ counts only when every tied policy is weak.
 
 **An ordinary user normally cannot read these objects.** In that case the check stays silent and
 the report has a note saying so. No finding does not mean the policies are fine: run the scan with
-an account that can read them. Policies that come back without their settings are counted in a note.
+an account that can read them. Policies that come back without their settings, or with only part
+of them, are counted in a note; the settings that were read are still judged.
 """
 
 false_positives = """

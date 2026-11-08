@@ -27,6 +27,7 @@ From the LDAP snapshot:
 - accounts whose `sAMAccountName` is `$DUPLICATE-<RID>`;
 - accounts of the snapshot that share a `sAMAccountName` or an `objectSid`.
 
+An account whose `sAMAccountName` did not come back is not compared, and a note counts them.
 Only objects the scan account can see are searched. The DNS application partitions and the
 schema are not searched. If a search is refused, this check does not judge the conflict
 objects and the report says so.

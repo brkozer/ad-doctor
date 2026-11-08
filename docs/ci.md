@@ -12,8 +12,14 @@ Each SARIF rule carries the check's summary as `fullDescription`, its remediatio
 references as `help.markdown`, and a `helpUri` to its [catalog page](checks/index.md), so
 GitHub code-scanning alerts show the full explanation even for rules that did not fire. The
 JUnit format writes one test case per check (failed when it found something, skipped when
-accepted) and the Markdown report links each finding to its docs page; the HTML viewer
-links nowhere and shows the URL as text to copy.
+accepted or when a collection note says it could not judge everything it covers) and the
+Markdown report links each finding to its docs page; the HTML viewer links nowhere and shows
+the URL as text to copy.
+
+Collection notes are also in the machine formats: JUnit `system-out`, and SARIF
+`invocations[0].toolConfigurationNotifications`, where a note about a check has the level
+`warning` and lists the check IDs under `properties.notJudged`. A note that names no check
+(for example "SYSVOL not checked") does not change any test case.
 
 ## Exit codes and `--fail-on`
 

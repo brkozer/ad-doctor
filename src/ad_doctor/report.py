@@ -211,6 +211,21 @@ _BACKTICKS = re.compile("`+")
 _XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
 
+# A note that names a check says the check could not judge all it covers. Two forms only
+# state what a check is for: "AD-POL-001 judges the default ..." and a closing "(AD-GPO-008)".
+CHECK_IN_NOTE = re.compile(r"(?<!\()\bAD-[A-Z]+-\d+\b(?! judges )")
+
+
+def not_judged(r: Report) -> dict[str, list[str]]:
+    """Check ID -> the notes that say it could not judge everything it covers. The IDs in
+    the notes are the only record that exists in snapshots from every version."""
+    out: dict[str, list[str]] = {}
+    for note in r.snap.notes:
+        for check_id in dict.fromkeys(CHECK_IN_NOTE.findall(note)):
+            out.setdefault(check_id, []).append(note)
+    return out
+
+
 def _xml_safe(text: str) -> str:
     return _XML_ILLEGAL.sub(lambda m: f"\\x{ord(m.group(0)):02x}", text)
 
@@ -347,6 +362,21 @@ def _sarif_help(e: docs.Entry, f: Finding | None) -> dict[str, str]:
     return {"text": f"{e.summary}\n\nFix: {fix}", "markdown": md}
 
 
+def _sarif_notifications(r: Report) -> list[dict[str, Any]]:
+    """The collection notes; one that names checks says which were not fully judged."""
+    out: list[dict[str, Any]] = []
+    for note in r.snap.notes:
+        checks = sorted(set(CHECK_IN_NOTE.findall(note)))
+        item: dict[str, Any] = {
+            "level": "warning" if checks else "note",
+            "message": {"text": note},
+        }
+        if checks:
+            item["properties"] = {"notJudged": checks}
+        out.append(item)
+    return out
+
+
 def render_sarif(r: Report) -> str:
     by_id = {f.check_id: f for f in r.findings}
     rules: list[dict[str, Any]] = []
@@ -407,6 +437,12 @@ def render_sarif(r: Report) -> str:
                         "rules": rules,
                     }
                 },
+                "invocations": [
+                    {
+                        "executionSuccessful": True,
+                        "toolConfigurationNotifications": _sarif_notifications(r),
+                    }
+                ],
                 "results": results,
             }
         ],
@@ -418,9 +454,11 @@ def render_sarif(r: Report) -> str:
 
 
 def render_junit(r: Report, ran: list[str] | None = None) -> str:
-    """One test case per check: failed when it found something, skipped when accepted."""
+    """One test case per check: failed when it found something, skipped when accepted or
+    when a note says it could not judge everything it covers."""
     by_id = {f.check_id: f for f in r.findings}
     accepted = {a.check_id for a in r.accepted}
+    unjudged = not_judged(r)
     checks = catalog(r)
     registered = {c.id for c in REGISTRY}
     # checks that ran, plus findings that do not come from a registered check (invariants)
@@ -446,13 +484,22 @@ def render_junit(r: Report, ran: list[str] | None = None) -> str:
                 f'  <testcase classname="ad-doctor" name={name}>'
                 '<skipped message="accepted risk"/></testcase>'
             )
+        elif check_id in unjudged:
+            why = quoteattr(_xml_safe("not judged: " + "; ".join(unjudged[check_id])))
+            cases.append(
+                f'  <testcase classname="ad-doctor" name={name}><skipped message={why}/></testcase>'
+            )
         else:
             cases.append(f'  <testcase classname="ad-doctor" name={name}/>')
     failures = sum(1 for i in ids if i in by_id)
-    skipped = sum(1 for i in ids if i in accepted and i not in by_id)
+    skipped = sum(1 for i in ids if (i in accepted or i in unjudged) and i not in by_id)
     suite = quoteattr(_xml_safe(f"ad-doctor {r.snap.domain}"))
     header = (
         f'<testsuite name={suite} tests="{len(cases)}" failures="{failures}" '
         f'skipped="{skipped}" errors="0">'
     )
-    return "\n".join(['<?xml version="1.0" encoding="UTF-8"?>', header, *cases, "</testsuite>"])
+    notes = xml_escape(_xml_safe("\n".join(r.snap.notes)))
+    out = ['<?xml version="1.0" encoding="UTF-8"?>', header, *cases]
+    if notes:
+        out.append(f"  <system-out>{notes}</system-out>")
+    return "\n".join([*out, "</testsuite>"])
