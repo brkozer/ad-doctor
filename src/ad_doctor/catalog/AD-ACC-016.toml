@@ -1,0 +1,77 @@
+id = "AD-ACC-016"
+aliases = ["identity-collision", "upn-collision"]
+summary = "A UPN equal to another account's sAMAccountName, invisible Unicode in an SPN, or a dNSHostName that is not the computer's own name: leftovers of Kerberos identity attacks, to review."
+severities = ["low"]
+severity_logic = """
+Always **low**, worded as a review. Each pattern is what a known attack leaves behind, but a rename,
+an appliance or a migration script can produce the same value.
+"""
+mitre = ["T1098"]
+data_sources = ["ldap"]
+attributes = ["userPrincipalName", "sAMAccountName", "servicePrincipalName", "dNSHostName"]
+related = ["AD-INF-021", "AD-DEL-005"]
+since = "0.3.0"
+
+risk = """
+Kerberos finds an account by more than one name, and the names are not all checked against each other.
+
+- **UPN equal to another account's `sAMAccountName`.** Semperis describes an attacker who can write
+  their own UPN setting it to the bare name of a target, with no `@domain`. The value passes the
+  uniqueness check, because it is not the target's real UPN, and is then used to reset the target's
+  password (CVE-2026-27912).
+- **Invisible Unicode in an SPN.** Some characters cannot be matched in an LDAP filter, so an SPN
+  that looks identical to a real one gets past the uniqueness check. Tickets for the service are
+  then encrypted with the wrong key. This causes a denial of service, pushes clients to NTLM, and
+  can redirect delegation (CVE-2026-25177).
+- **`dNSHostName` that is not the computer's name.** This is the artifact behind Certifried
+  (CVE-2022-26923), where a computer took the DNS name of a domain controller to get its certificate.
+
+The updates stop the attacks. They do not remove a value that was already written.
+"""
+
+detection = """
+From the LDAP snapshot:
+
+- an account whose whole `userPrincipalName` equals the `sAMAccountName` of a different account,
+  ignoring case. `alice@corp.example` is not compared by its first part: the attack needs the bare name;
+- an SPN holding a control or format character, a space other than U+0020, or a character that draws
+  nothing. The report shows each one as `<U+200B>`;
+- an enabled computer whose `dNSHostName` has a first label that differs from its `sAMAccountName`
+  without the `$`. Managed service accounts and the Entra Kerberos object are skipped. The finding
+  says when the label is the name of another computer.
+
+If no account returned a `userPrincipalName`, the report says so and the UPN part is not judged.
+"""
+
+false_positives = """
+- **Computer names longer than 15 characters** are not reported: `sAMAccountName` keeps only the
+  first 15, so a host label that starts with them counts as a match.
+- **Non-Windows and renamed machines** can keep an old `dNSHostName`. Correct it, or accept the finding.
+- **A UPN set by a provisioning script** to a bare logon name collides with nothing unless another
+  account really has that name.
+"""
+
+remediation = """
+1. **Find out who wrote the value and when**: Event 5136 if auditing is on, and
+   `repadmin /showobjmeta` for the time.
+2. **Correct it** (the `-WhatIf` shows the change without making it):
+
+    ```powershell
+    Set-ADUser svc_app -UserPrincipalName 'svc_app@corp.example' -WhatIf
+    Set-ADComputer PC01 -DNSHostName 'pc01.corp.example' -WhatIf
+    ```
+
+3. **Install the Kerberos updates** of March and April 2026 on every domain controller.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-016"
+
+[[references]]
+title = "Identity Crisis: novel vulnerabilities leading to Kerberos downgrade, DoS and full domain takeover (Semperis)"
+url = "https://www.semperis.com/blog/identity-crisis-novel-vulnerabilities-leading-to-kerberos-downgrade-dos-and-full-domain-takeover/"
+kind = "research"
+
+[[references]]
+title = "CVE-2022-26923: Active Directory Domain Services elevation of privilege"
+url = "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2022-26923"
+kind = "vendor"

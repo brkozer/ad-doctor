@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime, timedelta
 from enum import IntEnum
@@ -29,6 +30,31 @@ class UAC(IntEnum):
 
 
 _FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=UTC)
+# draw nothing, though Unicode files them under letters, marks or symbols
+_BLANK_CODE_POINTS = {0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180E, 0x2800, 0x3164, 0xFFA0}
+
+
+def invisible_chars(text: str) -> str:
+    """The characters of a value that show nothing on screen, in order; "" for most values."""
+    if text.isascii() and text.isprintable():
+        return ""
+    return "".join(c for c in text if _is_invisible(c))
+
+
+def _is_invisible(char: str) -> bool:
+    code = ord(char)
+    if code in _BLANK_CODE_POINTS or 0xFE00 <= code <= 0xFE0F or 0xE0100 <= code <= 0xE01EF:
+        return True
+    category = unicodedata.category(char)
+    return category in ("Cc", "Cf", "Zl", "Zp") or (category == "Zs" and char != " ")
+
+
+def dns_host_matches(dns_host: str, sam: str) -> bool:
+    """Whether the first label of a dNSHostName is the computer's own name. A
+    sAMAccountName keeps only the 15 characters of a NetBIOS name; the DNS name keeps more."""
+    name = sam.removesuffix("$").lower()
+    label = dns_host.split(".", 1)[0].lower()
+    return label == name or (len(name) >= 15 and label.startswith(name))
 
 
 def filetime_to_datetime(value: int) -> datetime | None:
@@ -108,6 +134,12 @@ class Account:
     pwd_must_change: bool = False
     # the logical RODC object of Microsoft Entra Kerberos: no server behind it, by design
     entra_kerberos: bool = False
+    # userPrincipalName; None when not set, and in older snapshots
+    upn: str | None = None
+    # msDS-KrbTgtLink: the krbtgt account of an RODC or of the Entra Kerberos object
+    krbtgt_link: str | None = None
+    # the dMSA that replaces this account, from the link on the account's own side
+    superseded_by: str | None = None
 
     def has(self, flag: UAC) -> bool:
         return bool(self.uac & flag)
@@ -298,6 +330,41 @@ class Gmsa:
 
 
 @dataclass
+class Pso:
+    """A fine-grained password policy whose settings could be read."""
+
+    name: str
+    dn: str
+    precedence: int
+    min_length: int | None = None
+    complexity: bool | None = None
+    lockout_threshold: int | None = None
+    reversible: bool | None = None
+    # msDS-PSOAppliesTo: users and groups (DNs)
+    applies_to: list[str] = field(default_factory=list)
+    # linked groups that are not global security groups: a PSO has no effect through them
+    not_global: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Dmsa:
+    """A delegated managed service account, as far as the scan account can read it."""
+
+    name: str
+    dn: str
+    # msDS-ManagedAccountPrecededByLink: the account it replaces
+    preceded_by: str | None = None
+    # msDS-DelegatedMSAState: 1 migrating, 2 migration complete, 3 standalone
+    state: int | None = None
+    # SIDs in msDS-GroupMSAMembership: who may use the account
+    readers: list[str] = field(default_factory=list)
+    owner: str | None = None
+    aces: list[Ace] = field(default_factory=list)
+    # False: it came back without a security descriptor, so who controls it is unknown
+    acl_read: bool = False
+
+
+@dataclass
 class Site:
     dn: str
     # server objects under the site: domain controllers, or leftovers of ones that left
@@ -471,6 +538,18 @@ class Snapshot:
     # whether any dMSA came back; a plain user normally sees none, even when they exist.
     # None in older snapshots, which did not record it.
     dmsa_visible: bool | None = False
+    # readable fine-grained password policies, and how many came back without their settings
+    psos: list[Pso] = field(default_factory=list)
+    psos_unreadable: int = 0
+    # False in older snapshots: the settings of fine-grained password policies were not read
+    psos_checked: bool = False
+    # readable dMSAs; False in older snapshots and when the search was refused
+    dmsas: list[Dmsa] = field(default_factory=list)
+    dmsas_checked: bool = False
+    # False in older snapshots and when no account returned a userPrincipalName
+    upn_checked: bool = False
+    # False in older snapshots: msDS-KrbTgtLink was not kept
+    krbtgt_links_checked: bool = False
     # local group membership set by Restricted Groups and GPP Local Groups
     gpo_local_groups: list[GpoLocalGroup] = field(default_factory=list)
     # False in older snapshots and when SYSVOL was not read: "not collected", not "clean"
@@ -641,6 +720,16 @@ class Snapshot:
             backup_checked=data.get("backup_checked", False),
             psos_visible=data.get("psos_visible", False),
             dmsa_visible=data.get("dmsa_visible"),
+            psos=[Pso(**x) for x in data.get("psos", [])],
+            psos_unreadable=data.get("psos_unreadable", 0),
+            psos_checked=data.get("psos_checked", False),
+            dmsas=[
+                Dmsa(**{**x, "aces": _aces(x.get("aces", []), seen_aces)})
+                for x in data.get("dmsas", [])
+            ],
+            dmsas_checked=data.get("dmsas_checked", False),
+            upn_checked=data.get("upn_checked", False),
+            krbtgt_links_checked=data.get("krbtgt_links_checked", False),
             gpo_local_groups=[GpoLocalGroup(**x) for x in data.get("gpo_local_groups", [])],
             local_groups_collected=data.get("local_groups_collected", False),
             ntlm_policy_collected=data.get("ntlm_policy_collected", False),
@@ -776,6 +865,10 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
             ("site_topology_checked", "AD-INF-020 (sites and subnets)"),
             ("sysvol_replication_checked", "AD-INF-019 (SYSVOL replication)"),
             ("conflicts_checked", "the conflict object part of AD-INF-021"),
+            ("upn_checked", "the UPN part of AD-ACC-016"),
+            ("psos_checked", "AD-POL-003 (fine-grained password policy settings)"),
+            ("dmsas_checked", "AD-ACL-009 (control over dMSAs)"),
+            ("krbtgt_links_checked", "AD-KRB-007 (Entra Kerberos objects)"),
         )
         if key not in data
     ]

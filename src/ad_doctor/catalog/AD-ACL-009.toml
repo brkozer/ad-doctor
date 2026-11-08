@@ -1,0 +1,94 @@
+id = "AD-ACL-009"
+aliases = ["ouroboros", "dmsa-control"]
+summary = "Principals outside tier 0 control a dMSA that replaces another account, and so may gain that account's access. Where the dMSA cannot be read, the report says control is unknown."
+severities = ["low", "medium"]
+severity_logic = """
+**Medium** when a completed migration (`msDS-DelegatedMSAState` 2) replaced a tier-0 account and a
+principal outside tier 0 owns the dMSA or holds a right to change it. **Low**, worded as a review,
+in every other case, including a principal that is only listed as allowed to use it and a dMSA that
+cannot be read. It does not go higher because the exact conditions of
+the published technique could not be confirmed from the sources ad-doctor relies on.
+"""
+mitre = ["T1098", "T1078.002"]
+data_sources = ["ldap"]
+attributes = [
+    "nTSecurityDescriptor",
+    "msDS-ManagedAccountPrecededByLink",
+    "msDS-ManagedAccountPrecededByLinkBL",
+    "msDS-SupersededManagedAccountLink",
+    "msDS-DelegatedMSAState",
+    "msDS-GroupMSAMembership",
+]
+related = ["AD-INF-007", "AD-ACL-004", "AD-ACL-006"]
+since = "0.3.0"
+
+risk = """
+After a migration a delegated managed service account has access to everything the old account
+could reach. Control over the dMSA is therefore control over that access. Akamai describes
+Ouroboros as an account takeover and persistence primitive: a user with enough rights over a dMSA
+can take over the dMSA and the privileges of the account it replaced.
+
+[AD-INF-007](AD-INF-007.md) covers who can **create** a dMSA and pair it with an account. This check
+covers who controls one that **already exists**, which no longer needs any creation right.
+"""
+
+detection = """
+For every dMSA the scan account can read that has `msDS-ManagedAccountPrecededByLink`, this check
+lists the principals outside tier 0 that are:
+
+- the owner;
+- holders of a takeover right (`GenericAll`, `GenericWrite`, `WriteDacl`, `WriteOwner` or write to all
+  properties);
+- able to write `msDS-GroupMSAMembership` or `msDS-ManagedAccountPrecededByLink`;
+- listed in `msDS-GroupMSAMembership`, unless the entry is a computer account: the hosts that
+  run the service belong there.
+
+While a migration runs (state 1) the old account holds rights on its dMSA by design, so those are skipped.
+Other control over a tier-0 account is reported by [AD-ACL-004](AD-ACL-004.md).
+
+**An ordinary user normally cannot see dMSAs.** The check then relies on the link stored on the old
+account, and reports it with the words "who controls it is unknown". With neither visible, the report
+has a note, and no finding does not mean nobody controls one. Run the scan with an account that can
+read dMSAs to cover this.
+"""
+
+false_positives = """
+- **A delegated service team** may own its dMSAs on purpose. If the replaced account is not tier 0,
+  the finding is a low review; accept it after checking.
+- **Deny ACEs** are not read, which can only over-report.
+"""
+
+remediation = """
+1. **List who holds rights on the dMSA** (read-only):
+
+    ```powershell
+    (Get-Acl 'AD:CN=dmsa01,CN=Managed Service Accounts,DC=corp,DC=example').Access |
+        Where-Object { $_.ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner|WriteProperty' }
+    ```
+
+2. **Remove the rights** that are not needed, and give ownership back to Domain Admins.
+3. **Limit who may use it** to the hosts that run the service:
+
+    ```powershell
+    Set-ADServiceAccount dmsa01 -PrincipalsAllowedToRetrieveManagedPassword 'APP01$' -WhatIf
+    ```
+
+4. **Roll back or finish** migrations that have stopped halfway.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-009"
+
+[[references]]
+title = "The Ouroboros technique: how it fits dMSA's security model (Akamai)"
+url = "https://www.akamai.com/blog/security-research/2026/may/ouroboros-technique-how-fits-dmsas-security-model"
+kind = "research"
+
+[[references]]
+title = "Delegated Managed Service Accounts overview"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/delegated-managed-service-accounts/delegated-managed-service-accounts-overview"
+kind = "vendor"
+
+[[references]]
+title = "[MS-ADA2]: Attribute msDS-ManagedAccountPrecededByLink"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-ada2/6ce9e113-5c1e-4ba3-8078-419dd4e33561"
+kind = "spec"

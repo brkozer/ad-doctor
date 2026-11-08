@@ -1,0 +1,89 @@
+id = "AD-POL-003"
+aliases = ["fine-grained-password-policy", "pso"]
+summary = "A fine-grained password policy the scan account can read is weaker than the bar of AD-POL-001, and may be the policy in force for privileged users."
+severities = ["low", "medium"]
+severity_logic = """
+**Medium** when a weak policy is in force for at least one enabled privileged user and every policy
+that came back could be read. **Low**, worded as a review, when no privileged user is known to use
+it, or when a policy that could not be read might take precedence.
+"""
+mitre = ["T1110"]
+data_sources = ["ldap"]
+attributes = [
+    "msDS-PasswordSettingsPrecedence",
+    "msDS-MinimumPasswordLength",
+    "msDS-PasswordComplexityEnabled",
+    "msDS-LockoutThreshold",
+    "msDS-PasswordReversibleEncryptionEnabled",
+    "msDS-PSOAppliesTo",
+    "groupType",
+    "primaryGroupID",
+]
+related = ["AD-POL-001", "AD-ACC-011"]
+since = "0.3.0"
+
+risk = """
+A fine-grained password policy overrides the default domain policy for the users it applies to.
+[AD-POL-001](AD-POL-001.md) reads only the default, so a strong default says nothing about an
+administrator whose own policy allows a short password or has no lockout. Reversible encryption is
+worse: the password can be recovered from the directory database.
+"""
+
+detection = """
+ad-doctor reads the objects in `CN=Password Settings Container,CN=System`. A policy is weak when:
+
+| Setting | Reported when |
+|---|---|
+| `msDS-MinimumPasswordLength` | below 12 |
+| `msDS-PasswordComplexityEnabled` | false |
+| `msDS-LockoutThreshold` | 0 |
+| `msDS-PasswordReversibleEncryptionEnabled` | true |
+
+A policy with no link has no effect and is not reported, and neither is one linked only to groups
+that are not global security groups, because such a link does nothing.
+
+For each enabled privileged user it then works out the policy in force. A policy linked to the user
+beats one linked to a global group the user is in, nested and primary groups included, and the
+lowest precedence wins. Windows breaks a tie on precedence by GUID, which is not read, so a user
+counts only when every tied policy is weak.
+
+**An ordinary user normally cannot read these objects.** In that case the check stays silent and
+the report has a note saying so. No finding does not mean the policies are fine: run the scan with
+an account that can read them. Policies that come back without their settings are counted in a note.
+"""
+
+false_positives = """
+- **Service accounts with long random passwords** may be given a policy with no lockout on purpose.
+  Narrow the link to those accounts.
+- **Links in other domains** are not followed.
+"""
+
+remediation = """
+1. **See what applies to an account** (read-only):
+
+    ```powershell
+    Get-ADUserResultantPasswordPolicy -Identity admin1
+    Get-ADFineGrainedPasswordPolicy -Filter * | Select-Object Name, Precedence, MinPasswordLength, AppliesTo
+    ```
+
+2. **Raise the settings** of the reported policy:
+
+    ```powershell
+    Set-ADFineGrainedPasswordPolicy 'Admins' -MinPasswordLength 14 -ComplexityEnabled $true `
+        -LockoutThreshold 5 -ReversibleEncryptionEnabled $false -WhatIf
+    ```
+
+3. **Change the password** of any account that used reversible encryption.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-POL-003"
+
+[[references]]
+title = "Configure fine grained password policies for AD DS"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/get-started/adac/fine-grained-password-policies"
+kind = "vendor"
+
+[[references]]
+title = "AD DS: Fine-Grained Password and Account Lockout Policy step-by-step"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2008-R2-and-2008/cc770842(v=ws.10)"
+kind = "vendor"

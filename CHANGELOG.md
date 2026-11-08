@@ -17,6 +17,15 @@ logic or severity between versions, but an ID is never reused for something else
   replication conflict objects (`CNF:`), `$DUPLICATE-` accounts and accounts that share a name
   or SID. Each check says in a note when it could not read its data, and older snapshots load
   with those parts marked as not evaluated. New snapshot fields are redacted.
+- **Identity, password policy, dMSA and Entra Kerberos checks.** AD-ACC-016 asks for review of a
+  UPN equal to another account's `sAMAccountName`, invisible Unicode in SPNs, and a
+  `dNSHostName` that is not the computer's name. AD-POL-003 judges the fine-grained password
+  policies the scan account can read, and works out which one is in force for privileged
+  users. AD-ACL-009 reports who outside tier 0 controls a dMSA that replaces another account.
+  AD-KRB-007 reports the age of the Entra Kerberos key and objects that only have its name. What
+  an ordinary user cannot read is stated in a note and not reported as passing. `redact` now
+  covers `userPrincipalName` and the new fields, and gives a computer's own host name the
+  computer's token, so host name tokens differ from those of earlier versions.
 
 ## [0.2.1] - 2026-11-09
 

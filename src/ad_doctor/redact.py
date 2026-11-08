@@ -63,6 +63,8 @@ KEEP = {
     "dc", "cn",
     # the Entra Kerberos realm is the same everywhere, and the checks skip it by name
     "kerberos.microsoftonline.com",
+    # fixed names of the Entra Kerberos objects, which AD-KRB-007 reads
+    "azureadkerberos", "azureadkerberos$", "krbtgt_azuread", "krbtgt-azuread",
     # service classes the checks read, and those of a default sPNMappings
     "host", "ldap", "gc", "wsman", "alerter", "appmgmt", "cisvc", "clipsrv", "browser",
     "dhcp", "dnscache", "replicator", "eventlog", "eventsystem", "policyagent", "oakley",
@@ -103,7 +105,7 @@ FIXED_KEYS = {
                 model.Gmsa, model.Rodc, model.Trust, model.Gpo, model.GppPassword,
                 model.ScriptSecret, model.GpoLocalGroup, model.GpLink,
                 model.UnreadableMember, model.KeyCredential, model.Site, model.Subnet,
-                model.ConflictObject)
+                model.ConflictObject, model.Pso, model.Dmsa)
     for f in dataclasses.fields(cls)
 } | {"domain", "AdminSDHolder", "sid", "mask", "object_type", "inherited_object_type"}  # fmt: skip
 # values from a fixed list, which the checks compare: never data, whatever the names around
@@ -155,11 +157,25 @@ class Redactor:
     def collect(self, data: dict[str, Any]) -> None:
         """Learn which words are sensitive: account, object, host, file and domain names."""
         words: set[str] = {data["domain"], *data["domain"].split(".")}
+        # a host name that is the computer's own takes the computer's token, so AD-ACC-016
+        # compares the same two things after redaction
+        own_hosts: dict[str, str] = {}
         for a in data["accounts"]:
             words.add(a["sam"])
             words.update(_dn_values(a["dn"]))
             if a.get("dns_host"):
                 words.update([a["dns_host"], *a["dns_host"].split(".")])
+                if a.get("is_computer") and model.dns_host_matches(a["dns_host"], a["sam"]):
+                    own_hosts[a["dns_host"].lower()] = a["sam"].removesuffix("$")
+            if a.get("upn"):
+                # in parts: a bare UPN must keep the token of the sAMAccountName it equals
+                local, at, suffix = a["upn"].rpartition("@")
+                words.add(local if at else suffix)
+                if at:
+                    words.update([suffix, *suffix.split(".")])
+            for dn in (a.get("krbtgt_link"), a.get("superseded_by")):
+                if dn:
+                    words.update(_dn_values(dn))
             if a.get("sync_host") and a["sync_host"] != UNKNOWN_SYNC_HOST:
                 words.add(a["sync_host"])
             # label by label: a delegation target's host need not be a computer in the
@@ -195,6 +211,14 @@ class Redactor:
             words.update(_dn_values(dn))
         for conflict in data.get("conflicts", []):
             words.update(_dn_values(conflict["dn"]))
+        for pso in data.get("psos", []):
+            words.update([pso["name"], *_dn_values(pso["dn"])])
+            for dn in [*pso["applies_to"], *pso["not_global"]]:
+                words.update(_dn_values(dn))
+        for dmsa in data.get("dmsas", []):
+            words.update([dmsa["name"], *_dn_values(dmsa["dn"])])
+            if dmsa.get("preceded_by"):
+                words.update(_dn_values(dmsa["preceded_by"]))
         for o in data.get("objects", []):
             words.add(o["name"])
             words.update(_dn_values(o["dn"]))
@@ -235,7 +259,7 @@ class Redactor:
         for w in words:
             if w and w.lower() not in KEEP and not GUID_LIKE.match(w) and not SID_TOKEN.match(w):
                 # an escaped DN value and its plain form are one name, with one token
-                token = self.token(DN_ESCAPE.sub(r"\1", w))
+                token = self.token(own_hosts.get(w.lower()) or DN_ESCAPE.sub(r"\1", w))
                 self.names[w.lower()] = token
                 first = NAME_RUN.match(w)
                 if first is None:
@@ -326,11 +350,25 @@ def _url_words(url: str) -> list[str]:
     return [p for p in found if len(p) > 1 and not p.isdigit()]
 
 
+def _keep_invisible(original: str, redacted: str) -> str:
+    """The invisible characters of an SPN, moved to its end: a name token drops them, and
+    AD-ACC-016 must still see that they were there. They identify nobody."""
+    hidden = model.invisible_chars(original)
+    if not hidden:
+        return redacted
+    return "".join(c for c in redacted if c not in hidden) + hidden
+
+
 def redact(data: dict[str, Any], key: bytes) -> dict[str, Any]:
     r = Redactor(key)
     r.collect(data)
     out: dict[str, Any] = r.walk(data)
     for before, after in zip(data["accounts"], out["accounts"], strict=True):
+        if before.get("spns"):
+            after["spns"] = [
+                _keep_invisible(spn, kept)
+                for spn, kept in zip(before["spns"], after["spns"], strict=True)
+            ]
         if before.get("alt_security_identities"):
             after["alt_security_identities"] = [
                 r.mapping(m) for m in before["alt_security_identities"]

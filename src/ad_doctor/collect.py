@@ -29,6 +29,7 @@ from .model import (
     ConflictObject,
     DcProbe,
     DirObject,
+    Dmsa,
     DomainPolicy,
     Gmsa,
     GpLink,
@@ -36,6 +37,7 @@ from .model import (
     GpoLocalGroup,
     GpoSettings,
     Probes,
+    Pso,
     Rodc,
     Site,
     Snapshot,
@@ -69,6 +71,10 @@ NOT_RETURNED = "not returned: hidden, or this account has no right to see it"
 NO_ATTRIBUTES = "returned without attributes: this account cannot read it"
 SEARCH_MISSED = "readable by its DN but missing from the searches"
 PRE2K_SID = "S-1-5-32-554"
+# BASE reads of the groups fine-grained password policies are linked to
+MAX_PSO_LINK_READS = 500
+GROUP_TYPE_GLOBAL = 0x2
+GROUP_TYPE_SECURITY = 0x80000000
 # the fixed RDNs Windows gives the SYSVOL subscriptions under a DC's computer object
 FRS_SYSVOL = re.compile(r"^cn=domain system volume \(sysvol share\),", re.IGNORECASE)
 DFSR_SYSVOL = re.compile(
@@ -137,7 +143,10 @@ ACCOUNT_ATTRS = [
     "description",
     "info",
     "msDS-ManagedAccountPrecededByLink",
+    "msDS-ManagedAccountPrecededByLinkBL",
+    "msDS-SupersededManagedAccountLink",
     "msDS-KrbTgtLink",
+    "userPrincipalName",
     "msDS-RevealOnDemandGroup",
     "msDS-NeverRevealGroup",
     *PASSWORD_ATTRIBUTES,
@@ -195,6 +204,16 @@ def _int(entry: dict[str, list[Any]], attr: str, default: int = 0) -> int:
 def _first(entry: dict[str, list[Any]], attr: str, default: str = "") -> str:
     values = entry.get(attr.lower())
     return _str(values)[0] if values else default
+
+
+def _optional_int(entry: dict[str, list[Any]], attr: str) -> int | None:
+    return _int(entry, attr) if entry.get(attr.lower()) else None
+
+
+def _optional_bool(entry: dict[str, list[Any]], attr: str) -> bool | None:
+    """An LDAP Boolean, which comes back as the text TRUE or FALSE; None when absent."""
+    value = _first(entry, attr).upper()
+    return value == "TRUE" if value else None
 
 
 def _generalized_time(value: str) -> datetime | None:
@@ -405,6 +424,9 @@ class Collector:
         trustees |= {a.sid for o in objects for a in o.aces} | {o.owner for o in objects if o.owner}
         gmsas = self._gmsas(domain_dn)
         trustees |= {s for g in gmsas for s in g.readers}
+        dmsas, dmsas_checked = self._dmsas(domain_dn)
+        trustees |= {s for d in dmsas for s in d.readers}
+        trustees |= {a.sid for d in dmsas for a in d.aces} | {d.owner for d in dmsas if d.owner}
         trustees |= {a.sid for c in ca_configs for a in c.aces}
         trustees |= {c.owner for c in ca_configs if c.owner}
 
@@ -417,6 +439,13 @@ class Collector:
         trustees |= _channel_trustees(gpo_settings, domain_sid, root_sid)
         # one value per attribute; dSASignature changes on every backup
         metadata = "".join(_str(h.get("msds-replattributemetadata", [])))
+        psos, psos_unreadable, psos_visible = self._psos(domain_dn)
+        upn_checked = any(a.upn for a in accounts)
+        if not upn_checked:
+            self.notes.append(
+                "no userPrincipalName came back (none set, or this account cannot read them): "
+                "the UPN part of AD-ACC-016 not judged"
+            )
         snap = Snapshot(
             domain=domain,
             domain_dn=domain_dn,
@@ -451,7 +480,14 @@ class Collector:
             rodcs=[Rodc(a.sam, a_reveal, a_never) for a, a_reveal, a_never in self.rodc_policies],
             last_backup=_last_backup(metadata),
             backup_checked="dSASignature" in metadata,
-            psos_visible=self._psos_visible(domain_dn),
+            psos_visible=psos_visible,
+            psos=psos,
+            psos_unreadable=psos_unreadable,
+            psos_checked=True,
+            dmsas=dmsas,
+            dmsas_checked=dmsas_checked,
+            upn_checked=upn_checked,
+            krbtgt_links_checked=True,
             dmsa_visible=self.dmsa_seen,
             gpo_local_groups=local_groups,
             local_groups_collected=sysvol_result.scanned,
@@ -493,10 +529,12 @@ class Collector:
             )
         snap.notes += self._keys_note()
         snap.notes += _machine_age_notes(accounts)
+        snap.notes += _entra_kerberos_notes(accounts)
         if snap.has_2025 and not snap.dmsa_visible:
             snap.notes.append(
                 "no dMSA visible (none exist, or this account cannot read them; by default "
-                "ordinary users cannot): AD-INF-007 did not check existing dMSA links"
+                "ordinary users cannot): AD-INF-007 did not check existing dMSA links and "
+                "AD-ACL-009 did not check who controls them"
             )
         return snap
 
@@ -1258,18 +1296,119 @@ class Collector:
         features = _str(entry[0].get("msds-enabledfeature", []))
         return any(f.lower().startswith("cn=recycle bin feature,") for f in features)
 
-    def _psos_visible(self, domain_dn: str) -> bool:
-        psos = self.optional(
+    def _psos(self, domain_dn: str) -> tuple[list[Pso], int, bool]:
+        """The fine-grained password policies whose settings came back, how many came back
+        without them, and whether any was visible at all."""
+        found = self.optional(
             f"CN=Password Settings Container,CN=System,{domain_dn}",
             "(objectClass=msDS-PasswordSettings)",
-            ["name"],
+            [
+                "name",
+                "msDS-PasswordSettingsPrecedence",
+                "msDS-MinimumPasswordLength",
+                "msDS-PasswordComplexityEnabled",
+                "msDS-LockoutThreshold",
+                "msDS-PasswordReversibleEncryptionEnabled",
+                "msDS-PSOAppliesTo",
+            ],
         )
-        if not psos:
+        if not found:
             self.notes.append(
                 "no fine-grained password policy visible (none exist, or this account cannot "
-                "read them); AD-POL-001 judges the default domain policy only"
+                "read them); AD-POL-001 judges the default domain policy only and AD-POL-003 "
+                "not judged"
             )
-        return bool(psos)
+            return [], 0, False
+        readable = [e for e in found if e.get("msds-passwordsettingsprecedence")]
+        unread = len(found) - len(readable)
+        if unread:
+            self.notes.append(
+                f"{unread} fine-grained password policy object(s) came back without their "
+                "settings: AD-POL-003 not judged for them"
+            )
+        links = sorted({dn for e in readable for dn in _str(e.get("msds-psoappliesto", []))})
+        not_global = self._non_global_groups(links)
+        psos = []
+        for e in readable:
+            applies = _str(e.get("msds-psoappliesto", []))
+            psos.append(
+                Pso(
+                    name=_first(e, "name") or _rdn_value(e["distinguishedname"][0]),
+                    dn=e["distinguishedname"][0],
+                    precedence=_int(e, "msDS-PasswordSettingsPrecedence"),
+                    min_length=_optional_int(e, "msDS-MinimumPasswordLength"),
+                    complexity=_optional_bool(e, "msDS-PasswordComplexityEnabled"),
+                    lockout_threshold=_optional_int(e, "msDS-LockoutThreshold"),
+                    reversible=_optional_bool(e, "msDS-PasswordReversibleEncryptionEnabled"),
+                    applies_to=applies,
+                    not_global=[dn for dn in applies if dn.lower() in not_global],
+                )
+            )
+        return psos, unread, True
+
+    def _non_global_groups(self, links: list[str]) -> set[str]:
+        """Lower-cased DNs of the linked groups that are not global security groups. A
+        group whose type cannot be read is left out: its link then counts as working."""
+        out: set[str] = set()
+        if len(links) > MAX_PSO_LINK_READS:
+            self.notes.append(
+                f"{len(links)} fine-grained password policy links: only the first "
+                f"{MAX_PSO_LINK_READS} checked for their group type"
+            )
+        for dn in links[:MAX_PSO_LINK_READS]:
+            entry = self.optional(dn, "(objectClass=group)", ["groupType"], scope=ldap3.BASE)
+            if entry and entry[0].get("grouptype"):
+                kind = _int(entry[0], "groupType")
+                if not (kind & GROUP_TYPE_GLOBAL and kind & GROUP_TYPE_SECURITY):
+                    out.add(dn.lower())
+        return out
+
+    def _dmsas(self, domain_dn: str) -> tuple[list[Dmsa], bool]:
+        """Every dMSA this account can see, with owner, DACL and migration state. None
+        visible is not "none exist": the note in snapshot() says so."""
+        if not self.dmsa_seen:
+            return [], True
+        found = self.attempt(
+            domain_dn,
+            "(objectClass=msDS-DelegatedManagedServiceAccount)",
+            [
+                "sAMAccountName",
+                "msDS-ManagedAccountPrecededByLink",
+                "msDS-DelegatedMSAState",
+                "msDS-GroupMSAMembership",
+                "nTSecurityDescriptor",
+            ],
+            controls=OWNER_AND_DACL,
+        )
+        if found is None:
+            self.notes.append("dMSA search refused: AD-ACL-009 not judged")
+            return [], False
+        out = []
+        for e in found:
+            raw_sd = e.get("ntsecuritydescriptor")
+            desc = sd.parse(raw_sd[0]) if raw_sd else sd.Descriptor(None, False, [])
+            membership = e.get("msds-groupmsamembership")
+            out.append(
+                Dmsa(
+                    name=_first(e, "sAMAccountName") or e["distinguishedname"][0],
+                    dn=e["distinguishedname"][0],
+                    preceded_by=_first(e, "msDS-ManagedAccountPrecededByLink") or None,
+                    state=_optional_int(e, "msDS-DelegatedMSAState"),
+                    readers=sorted({a.sid for a in sd.parse_dacl(membership[0])})
+                    if membership
+                    else [],
+                    owner=desc.owner,
+                    aces=desc.aces,
+                    acl_read=bool(raw_sd),
+                )
+            )
+        unread = sum(not d.acl_read for d in out)
+        if unread:
+            self.notes.append(
+                f"security descriptor not readable for {unread} dMSA(s): AD-ACL-009 not judged "
+                "for them"
+            )
+        return out, True
 
     def _resolve(self, domain_dn: str, sids: set[str], objects: list[DirObject]) -> dict[str, str]:
         known = {o.sid: o.name for o in objects if o.sid}
@@ -1543,6 +1682,13 @@ class Collector:
             entra_kerberos=is_entra_kerberos(
                 e["distinguishedname"][0], uac, _first(e, "msDS-KrbTgtLink")
             ),
+            upn=_first(e, "userPrincipalName") or None,
+            krbtgt_link=_first(e, "msDS-KrbTgtLink") or None,
+            superseded_by=(
+                _first(e, "msDS-SupersededManagedAccountLink")
+                or _first(e, "msDS-ManagedAccountPrecededByLinkBL")
+                or None
+            ),
         )
         if account.is_rodc:
             self.rodc_policies.append(
@@ -1568,6 +1714,19 @@ def mark_rogue_dcs(accounts: list[Account], registered: set[str]) -> None:
         a.rogue_dc = (
             a.is_computer and a.is_dc and not a.entra_kerberos and a.dn.lower() not in registered
         )
+
+
+def _entra_kerberos_notes(accounts: list[Account]) -> list[str]:
+    """An Entra Kerberos object whose key account cannot be read: unknown is not clean."""
+    by_dn = {a.dn.lower(): a for a in accounts}
+    notes = []
+    for a in accounts:
+        if not a.entra_kerberos:
+            continue
+        key = by_dn.get((a.krbtgt_link or "").lower())
+        if key is None or key.password_changed is None:
+            notes.append(f"key age of the Entra Kerberos object {a.sam} not readable: AD-KRB-007")
+    return notes
 
 
 def _machine_age_notes(accounts: list[Account]) -> list[str]:

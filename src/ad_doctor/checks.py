@@ -20,12 +20,16 @@ from .model import (
     Account,
     CaConfig,
     CertTemplate,
+    Dmsa,
     Finding,
     KeyCredential,
+    Pso,
     Severity,
     Snapshot,
     Trust,
+    dns_host_matches,
     exchange_members,
+    invisible_chars,
 )
 
 CheckFn = Callable[[Snapshot], Finding | None]
@@ -118,6 +122,16 @@ GMSA_INTERVAL_REVIEW_DAYS = 90
 SYSVOL_PREPARED = 16
 SYSVOL_REDIRECTED = 32
 SYSVOL_ELIMINATED = 48
+# the same bar as AD-POL-001
+PSO_MIN_LENGTH = 12
+# Microsoft sets no interval and says to rotate it on the schedule of the other krbtgt keys
+ENTRA_KEY_REVIEW = KRBTGT_MAX_AGE
+DMSA_MIGRATING = 1
+DMSA_MIGRATED = 2
+DMSA_USE_RIGHT = "allowed to use it"
+# the names Microsoft gives the Entra Kerberos objects; a name alone proves nothing
+ENTRA_KERBEROS_COMPUTER = "azureadkerberos$"
+ENTRA_KERBEROS_USERS = ("krbtgt_azuread", "krbtgt-azuread")
 
 
 @check("AD-KRB-001", "krbtgt password not rotated recently")
@@ -2594,6 +2608,243 @@ def conflict_objects(snap: Snapshot) -> Finding | None:
         + (" Accounts sharing a SID hold the same access." if shared_sids else ""),
         "Compare each pair (whenCreated, group membership), delete the unwanted object, and "
         "rename the survivor if needed.",
+        sorted(objects),
+    )
+
+
+def _show_invisible(value: str) -> str:
+    hidden = set(invisible_chars(value))
+    return "".join(f"<U+{ord(c):04X}>" if c in hidden else c for c in value)
+
+
+@check("AD-ACC-016", "Identity collisions to review: UPN, SPN and host name")
+def identity_collisions(snap: Snapshot) -> Finding | None:
+    objects = []
+    by_sam = {a.sam.lower(): a for a in snap.accounts}
+    computers = {a.sam.removesuffix("$").lower(): a for a in snap.accounts if a.is_computer}
+    for a in snap.accounts:
+        other = by_sam.get(a.upn.lower()) if a.upn and snap.upn_checked else None
+        if other is not None and other is not a:
+            objects.append(f"{a.sam}: UPN {a.upn} is the sAMAccountName of {other.sam}")
+        objects += [f"{a.sam}: SPN {_show_invisible(s)}" for s in a.spns if invisible_chars(s)]
+        if (
+            a.is_computer
+            and a.enabled
+            and not a.managed
+            and not a.entra_kerberos
+            and a.dns_host
+            and not dns_host_matches(a.dns_host, a.sam)
+        ):
+            owner = computers.get(a.dns_host.split(".", 1)[0].lower())
+            taken = f" (the name of {owner.sam})" if owner is not None and owner is not a else ""
+            objects.append(f"{a.sam}: dNSHostName {a.dns_host}{taken}")
+    if not objects:
+        return None
+    return _finding(
+        "AD-ACC-016",
+        Severity.LOW,
+        "Review these. A UPN equal to another account's sAMAccountName, an SPN with invisible "
+        "characters and a dNSHostName that is not the computer's own name are the leftovers of "
+        "known Kerberos identity attacks, but renames and appliances can look the same.",
+        "Confirm who set each value and when (Event 5136, replication metadata), then correct "
+        "the value. Install the 2026 Kerberos updates (CVE-2026-25177, CVE-2026-27912).",
+        sorted(objects),
+    )
+
+
+def _pso_weaknesses(p: Pso) -> list[str]:
+    out = []
+    if p.min_length is not None and p.min_length < PSO_MIN_LENGTH:
+        out.append(f"minimum length {p.min_length}")
+    if p.complexity is False:
+        out.append("complexity off")
+    if p.lockout_threshold == 0:
+        out.append("no lockout")
+    if p.reversible:
+        out.append("reversible encryption on")
+    return out
+
+
+def _winning_psos(snap: Snapshot) -> dict[str, list[Pso]]:
+    """Enabled privileged user (sAMAccountName) -> the PSOs in force for it: those linked to
+    the user beat those linked to its global groups, then the lowest precedence wins. Two
+    PSOs tied on precedence stay both: Windows breaks the tie by GUID, which is not read."""
+    privileged = snap.privileged_dns()
+    users = [a for a in _enabled_users(snap) if a.dn.lower() in privileged]
+    groups = [o for o in snap.objects if o.kind == "group"]
+    parents: dict[str, list[str]] = {}
+    for g in groups:
+        for member in g.members:
+            parents.setdefault(member.lower(), []).append(g.dn.lower())
+    by_sid = {g.sid: g.dn.lower() for g in groups if g.sid}
+    linked = [(p, {dn.lower() for dn in p.applies_to}) for p in snap.psos]
+    no_effect = {id(p): {dn.lower() for dn in p.not_global} for p in snap.psos}
+    out: dict[str, list[Pso]] = {}
+    for user in users:
+        dn = user.dn.lower()
+        candidates = [p for p, links in linked if dn in links]
+        if not candidates:
+            seen: set[str] = set()
+            primary = by_sid.get(f"{snap.domain_sid}-{user.primary_group}")
+            todo = [*parents.get(dn, []), *([primary] if primary else [])]
+            while todo:
+                group = todo.pop()
+                if group not in seen:
+                    seen.add(group)
+                    todo += parents.get(group, [])
+            candidates = [p for p, links in linked if (links - no_effect[id(p)]) & seen]
+        if candidates:
+            lowest = min(p.precedence for p in candidates)
+            out[user.sam] = [p for p in candidates if p.precedence == lowest]
+    return out
+
+
+@check("AD-POL-003", "Weak fine-grained password policies")
+def weak_psos(snap: Snapshot) -> Finding | None:
+    if not snap.psos:
+        return None
+    in_force: dict[str, list[str]] = {}
+    for sam, winners in _winning_psos(snap).items():
+        if all(_pso_weaknesses(p) for p in winners):
+            for p in winners:
+                in_force.setdefault(p.name, []).append(sam)
+    objects = []
+    keys = {}
+    for p in sorted(snap.psos, key=lambda x: x.name):
+        weak = _pso_weaknesses(p)
+        if not weak or not set(map(str.lower, p.applies_to)) - set(map(str.lower, p.not_global)):
+            continue
+        text = f"{p.name}: {', '.join(weak)}"
+        admins = sorted(in_force.get(p.name, []))
+        if admins:
+            more = f" (+{len(admins) - 5} more)" if len(admins) > 5 else ""
+            text += f"; in force for {', '.join(admins[:5])}{more}"
+        objects.append(text)
+        keys[text] = p.name
+    if not objects:
+        return None
+    sure = bool(in_force) and not snap.psos_unreadable
+    finding = _finding(
+        "AD-POL-003",
+        Severity.MEDIUM if sure else Severity.LOW,
+        "These password policies are weaker than the bar of AD-POL-001: an account they apply "
+        "to can have a password that is cheap to guess or crack."
+        + (
+            " Privileged accounts use them."
+            if sure
+            else " Review them: no privileged account is known to use them."
+            if not in_force
+            else " Review them: a policy that could not be read may take precedence."
+        ),
+        "Raise the settings of each policy, or remove the link, and check the result with "
+        "Get-ADUserResultantPasswordPolicy.",
+        objects,
+    )
+    finding.keys = keys
+    return finding
+
+
+def _dmsa_controllers(
+    snap: Snapshot, dmsa: Dmsa, tier0: set[str], superseded: str
+) -> dict[str, str]:
+    """Who outside tier 0 controls one dMSA, each with the right that gives it. The account
+    being migrated holds rights on its dMSA until the migration completes, by design."""
+    held: dict[str, str] = {}
+    if dmsa.owner and dmsa.owner not in tier0:
+        held[dmsa.owner] = "owner"
+    machines = {a.sid for a in snap.accounts if a.is_computer}
+    for ace in dmsa.aces:
+        skip = ace.sid in tier0 or ace.sid in (PRINCIPAL_SELF, CREATOR_OWNER)
+        if skip or (dmsa.state == DMSA_MIGRATING and ace.sid == superseded):
+            continue
+        if ace.takeover:
+            held.setdefault(ace.sid, "control")
+        elif ace.writes(sd.GROUP_MSA_MEMBERSHIP) or ace.writes(sd.MANAGED_ACCOUNT_PRECEDED_BY):
+            held.setdefault(ace.sid, "writes its links")
+    for sid in dmsa.readers:
+        # the machines that run the service are meant to be listed here
+        if sid not in tier0 | machines and not (dmsa.state == DMSA_MIGRATING and sid == superseded):
+            held.setdefault(sid, DMSA_USE_RIGHT)
+    return held
+
+
+@check("AD-ACL-009", "Control over dMSAs that replace another account")
+def dmsa_control(snap: Snapshot) -> Finding | None:
+    tier0 = _tier0_group_sids(snap)
+    by_dn = snap.by_dn()
+    privileged = snap.tier0_dns()
+    objects = []
+    severity = Severity.LOW
+    for d in snap.dmsas:
+        if not d.preceded_by or not d.acl_read:
+            continue
+        link = d.preceded_by.lower()
+        old = by_dn.get(link)
+        held = _dmsa_controllers(snap, d, tier0, old.sid if old else "")
+        if not held:
+            continue
+        who = [f"{snap.name_of(sid)} ({right})" for sid, right in sorted(held.items())]
+        target = old.sam if old else _rdn_value(d.preceded_by)
+        objects.append(f"{d.name}: replaces {target}; held by {', '.join(who)}")
+        # a group of hosts in the use list is ordinary; only a right over the object counts
+        control = any(right != DMSA_USE_RIGHT for right in held.values())
+        if control and d.state == DMSA_MIGRATED and link in privileged:
+            severity = Severity.MEDIUM
+    known = {d.dn.lower() for d in snap.dmsas}
+    for a in snap.accounts:
+        link = (a.superseded_by or "").lower()
+        if link and link not in known:
+            objects.append(
+                f"{a.sam}: replaced by {_rdn_value(a.superseded_by or '')}; dMSA not readable, "
+                "who controls it is unknown"
+            )
+    if not objects:
+        return None
+    return _finding(
+        "AD-ACL-009",
+        severity,
+        "A dMSA receives the access of the account it replaces, so whoever controls the dMSA "
+        "may gain that access. Review who holds these rights: the exact conditions of the "
+        "published technique could not be confirmed.",
+        "Remove the listed rights so that only tier 0 and the hosts running the service hold "
+        "them. Finish or roll back migrations that are not in use.",
+        sorted(objects),
+    )
+
+
+@check("AD-KRB-007", "Entra Kerberos objects to review: key age and look-alikes")
+def entra_kerberos_objects(snap: Snapshot) -> Finding | None:
+    if not snap.krbtgt_links_checked:
+        return None
+    by_dn = snap.by_dn()
+    objects = []
+    ages = []
+    linked = set()
+    for a in snap.accounts:
+        key = by_dn.get((a.krbtgt_link or "").lower()) if a.entra_kerberos else None
+        if key is None:
+            continue
+        linked.add(key.dn.lower())
+        changed = key.password_changed
+        if changed is not None and snap.collected_at - changed > ENTRA_KEY_REVIEW:
+            ages.append(f"{key.sam} {(snap.collected_at - changed).days}")
+            objects.append(f"{key.sam}: key of the Entra Kerberos object {a.sam}")
+    for a in snap.accounts:
+        if a.is_computer and a.sam.lower() == ENTRA_KERBEROS_COMPUTER and not a.entra_kerberos:
+            objects.append(f"{a.sam}: named like the Entra Kerberos object, not built like it")
+        elif a.sam.lower() in ENTRA_KERBEROS_USERS and a.dn.lower() not in linked:
+            objects.append(f"{a.sam}: named like its key account, linked from no such object")
+    if not objects:
+        return None
+    return _finding(
+        "AD-KRB-007",
+        Severity.LOW,
+        (f"Key age in days: {', '.join(ages)}. " if ages else "")
+        + "Review these. The key account protects tickets Microsoft Entra issues for this "
+        "domain, and Microsoft says to rotate it on the schedule of the other krbtgt keys. "
+        "An object that only has the name may be a leftover or may be meant to pass for it.",
+        "Rotate with Set-AzureADKerberosServer -RotateServerKey. Look-alikes: find who "
+        "created them, then remove them if nobody needs them.",
         sorted(objects),
     )
 

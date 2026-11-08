@@ -21,7 +21,8 @@ pytestmark = pytest.mark.lab
 # Every misconfiguration seed.ps1 plants. Covered by the unit tests only: AD-KRB-001,
 # AD-ACC-005, AD-ACC-011 and AD-KRB-006 (need time to pass), AD-ACC-007 and AD-INF-006
 # (need a real second domain), AD-ACC-014 and AD-INF-018 (need time to pass), AD-ACC-015,
-# AD-INF-019, AD-INF-020 and AD-INF-021 (not in the lab, read in the test below), AD-INF-012
+# AD-INF-019, AD-INF-020 and AD-INF-021 (not in the lab, read in the test below), AD-ACC-016,
+# AD-POL-003, AD-ACL-009 and AD-KRB-007 (not in the lab or not readable by adreader), AD-INF-012
 # (needs an RODC), AD-ACC-009 (confidential on 2025),
 # AD-INF-008 (DCs require SMB signing), AD-INF-009 and the high grade of AD-CHAIN-002/003
 # (no spooler on Server Core 2025), AD-INF-011 (needs a week without backup), AD-INF-003 (a
@@ -183,7 +184,7 @@ def snap() -> Snapshot:
     snap = collect(target)
     assert snap.domain == "adlab.test"
     # an ordinary user cannot see fine-grained password policies or dMSAs; nothing else may fail
-    ok = ("fine-grained", "dMSA", "by choice")
+    ok = ("fine-grained", "dMSA", "by choice", "userPrincipalName")
     assert [n for n in snap.notes if not any(word in n for word in ok)] == []
     return snap
 
@@ -242,6 +243,16 @@ def test_plain_user_reads_the_health_data(snap: Snapshot) -> None:
     assert not snap.sysvol_frs_dcs and len(snap.sysvol_dfsr_dcs) == 1
     assert snap.conflicts_checked and snap.conflicts == []
     assert [g.interval_days for g in snap.gmsas] == [30]
+
+
+def test_plain_user_cannot_read_psos_or_dmsas(snap: Snapshot) -> None:
+    # the lab sets no UPN: no value proves nothing, and the note says so
+    assert not snap.upn_checked and any("AD-ACC-016" in n for n in snap.notes)
+    assert snap.krbtgt_links_checked
+    assert snap.psos_checked and snap.psos == [] and not snap.psos_visible
+    assert any("AD-POL-003" in n for n in snap.notes)
+    assert snap.dmsas_checked and snap.dmsas == []
+    assert any("AD-ACL-009" in n for n in snap.notes)
 
 
 def test_every_dc_probed(snap: Snapshot) -> None:

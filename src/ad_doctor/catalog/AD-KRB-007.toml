@@ -1,0 +1,68 @@
+id = "AD-KRB-007"
+aliases = ["cloud-kerberos", "entra-kerberos", "azureadkerberos"]
+summary = "The key of the Microsoft Entra Kerberos object has not changed in over 180 days, or an object has the name of the Entra Kerberos objects without being built like them."
+severities = ["low"]
+severity_logic = """
+Always **low**, worded as a review. Microsoft sets no fixed interval for this key, and an object
+that only has the right name may be a harmless leftover.
+"""
+mitre = ["T1558"]
+data_sources = ["ldap"]
+attributes = ["msDS-KrbTgtLink", "userAccountControl", "pwdLastSet", "sAMAccountName"]
+related = ["AD-KRB-001", "AD-KRB-006", "AD-INF-014"]
+since = "0.3.0"
+
+risk = """
+Microsoft Entra Kerberos, used for cloud Kerberos trust and FIDO2 sign-in to on-premises resources,
+adds a logical read-only domain controller called `AzureADKerberos` and a key account for it. The
+shared key protects the tickets Microsoft Entra issues for the domain, so it deserves the care of a
+`krbtgt` key. Microsoft says to rotate it on the same schedule as the other `krbtgt` keys.
+
+Anything else carrying those names is not that object. It may be a leftover, or something meant to
+be passed over in a review because the name looks familiar.
+"""
+
+detection = """
+The object is recognised by structure, never by name alone: the fixed location
+`CN=AzureADKerberos,OU=Domain Controllers`, read-only DC flags without the writable-DC bit, and a
+`msDS-KrbTgtLink` to its key account. The check then reports:
+
+- the key account named by that link when its password is over 180 days old, the threshold of
+  [AD-KRB-001](AD-KRB-001.md);
+- a computer named `AzureADKerberos$` that does not have that structure;
+- an account named `krbtgt_AzureAD` or `krbtgt-AzureAD` that no Entra Kerberos object links to.
+
+`pwdLastSet` of the key account stands for the age of the key. The version held by Microsoft Entra
+is not visible from the directory: compare `KeyUpdatedOn` and `CloudKeyUpdatedOn` from
+`Get-AzureADKerberosServer`. If the key account cannot be read, the report says so in a note.
+"""
+
+false_positives = """
+- **Rotation done recently but not yet replicated** clears on the next scan.
+- **A leftover after `Remove-AzureADKerberosServer`** is reported as a look-alike. Remove it if
+  nobody uses it.
+"""
+
+remediation = """
+1. **Check both sides** (read-only):
+
+    ```powershell
+    Get-AzureADKerberosServer -Domain corp.example -UserPrincipalName admin@corp.example
+    ```
+
+2. **Rotate the key** in a maintenance window, with the cmdlet Microsoft says must be used for this
+   key, since it updates both sides:
+
+    ```powershell
+    Set-AzureADKerberosServer -Domain corp.example -UserPrincipalName admin@corp.example -RotateServerKey
+    ```
+
+3. **Look-alikes:** find who created the object and when, then remove it if nobody needs it.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-KRB-007"
+
+[[references]]
+title = "Configure Microsoft Entra Kerberos trust: rotate the Kerberos key"
+url = "https://learn.microsoft.com/en-us/entra/identity/authentication/kerberos-server-key-rotation"
+kind = "vendor"

@@ -8,7 +8,7 @@
 Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
-(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 105
+(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 109
 checks for what attackers look for first: roastable accounts, risky delegation,
 exploitable certificate templates and CA settings (ESC1–9, 11, 13–17), DCSync and other takeover rights,
 shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync accounts,
@@ -97,6 +97,7 @@ against a live DC.
 | | AD-KRB-004 | Accounts limited to DES | medium |
 | | AD-KRB-005 | RC4 readiness: RC4-only values, reliance on the default, suspected missing AES keys, DC values (reads configuration, not keys) | low/medium |
 | | AD-KRB-006 | Seamless SSO (`AZUREADSSOACC$`) key not rolled over in 30 days | medium |
+| | AD-KRB-007 | Entra Kerberos objects to review: key age and look-alikes | low |
 | Delegation | AD-DEL-001 | Unconstrained delegation outside domain controllers | high |
 | | AD-DEL-002 | Constrained delegation with protocol transition | medium |
 | | AD-DEL-003 | Resource-based constrained delegation configured | low |
@@ -117,6 +118,7 @@ against a live DC.
 | | AD-ACC-013 | Key credentials or strong certificate mappings on tier-0 accounts | low/medium/high |
 | | AD-ACC-014 | Stale enabled computer accounts | low |
 | | AD-ACC-015 | gMSA passwords with a long rotation interval | low |
+| | AD-ACC-016 | Identity collisions to review: UPN, SPN and host name | low |
 | Privileged access | AD-PRIV-001 | Tier-0 groups with more than 5 members | low |
 | | AD-PRIV-002 | Privileged accounts that can be delegated | medium |
 | | AD-PRIV-003 | Schema Admins or Enterprise Admins not empty | low |
@@ -131,6 +133,7 @@ against a live DC.
 | | AD-PRIV-012 | Tier-0 group members the scanning account cannot read | high |
 | Policy | AD-POL-001 | Weak default password policy | medium |
 | | AD-POL-002 | `ms-DS-MachineAccountQuota` above 0 | medium |
+| | AD-POL-003 | Weak fine-grained password policies | low/medium |
 | Hardening | AD-SEC-001 | Windows computers without LAPS | medium |
 | | AD-SEC-002 | LAPS passwords readable by the scanning account | high |
 | Infrastructure | AD-INF-001 | Computers on unsupported Windows versions; high for DCs | medium/high |
@@ -181,6 +184,7 @@ against a live DC.
 | | AD-ACL-006 | gMSA passwords readable outside tier 0 | high |
 | | AD-ACL-007 | Exchange groups with WriteDacl over the domain (PrivExchange); medium when only inherited | medium/high |
 | | AD-ACL-008 | Entra Connect sync account or server controllable outside tier 0 | high |
+| | AD-ACL-009 | Control over dMSAs that replace another account | low/medium |
 | Group Policy | AD-GPO-001 | GPOs linked to the domain or DC OU editable outside tier 0 | high |
 | | AD-GPO-002 | Non-tier-0 principals can link GPOs to the domain or DCs | high |
 | | AD-GPO-003 | NTLMv1/LM, LM hashes, reversible encryption or dangerous privileges in those GPOs | medium/high |
@@ -408,12 +412,23 @@ ports. A CES URL is reached on the port it names; only a URL with no port follow
 - AD-PRIV-012 compares `member` values with search results. A group whose `member`
   attribute is denied looks empty, and groups of other domains are not read.
 - An ordinary user cannot read fine-grained password policies; the report says so
-  instead of assuming the default policy applies to admins.
+  instead of assuming the default policy applies to admins, and AD-POL-003 stays silent.
+  With an account that can read them, a tie on precedence is not broken (Windows uses the
+  GUID): a privileged user counts only when every tied policy is weak.
+- An ordinary user cannot see dMSAs, so AD-ACL-009 normally reports only a link on the
+  replaced account's side, and says who controls the dMSA is unknown. The exact conditions
+  of the Ouroboros technique could not be confirmed, so the check tops out at medium.
+- AD-KRB-007 takes `pwdLastSet` of the key account as the age of the key; the key version
+  held by Microsoft Entra is not visible from the directory. AD-ACC-016 treats a host name
+  whose first label starts with a 15-character computer name as matching.
 - Some checks do not fire on the lab DC and are covered by unit tests only: stale accounts
   (AD-ACC-005 and AD-ACC-014 need 90 days to pass), an old DC password (AD-INF-018 needs 45
   days), a gMSA with a long interval (AD-ACC-015: the lab's has 30 days), FRS (AD-INF-019:
   the lab is DFS Replication only), sites and subnets (AD-INF-020: one site, no subnets),
-  conflict objects and duplicates (AD-INF-021), a missing backup (AD-INF-011 needs a week), a domain
+  conflict objects and duplicates (AD-INF-021), identity collisions (AD-ACC-016),
+  password policy settings (AD-POL-003: `adreader` cannot read them), dMSA control
+  (AD-ACL-009: `adreader` cannot see the dMSA and the lab has no migration), key age and
+  look-alikes (AD-KRB-007), a missing backup (AD-INF-011 needs a week), a domain
   below level 2016 (AD-INF-003: a 2025 DC needs that level), a DC or CA the probes cannot
   read (AD-INF-013, AD-ADCS-016), large tier-0 groups (AD-PRIV-001, not seeded),
   krbtgt, Seamless SSO and admin password age, the password and DC parts of AD-KRB-005,
@@ -435,7 +450,7 @@ flowchart LR
     P --> S
     S -- "collect -o / redact" --> F[(snapshot.json)]
     F --> A
-    S --> A[checks.py + paths.py<br/>105 pure functions]
+    S --> A[checks.py + paths.py<br/>109 pure functions]
     A --> I[invariants.py<br/>accept.py]
     I --> R[report.py<br/>text, JSON, Markdown,<br/>SARIF, JUnit]
     I --> W[viewer.py<br/>offline HTML viewer]

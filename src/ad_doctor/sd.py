@@ -45,6 +45,9 @@ MEMBER = "bf9679c0-0de6-11d0-a285-00aa003049e2"
 SERVICE_PRINCIPAL_NAME = "f3a64788-5306-11d1-a9c5-0000f80367c1"  # targeted Kerberoasting
 ALT_SECURITY_IDENTITIES = "00fbf30c-91fe-11d1-aebc-0000f80367c1"  # ESC14
 GP_LINK = "f30e3bbe-9ff0-11d1-b603-0000f80367c1"
+# who may use a dMSA or gMSA, and which account a dMSA supersedes
+GROUP_MSA_MEMBERSHIP = "888eedd6-ce04-df40-b462-b8a50e41ba38"
+MANAGED_ACCOUNT_PRECEDED_BY = "a0945b2b-57a2-43bd-b327-4d112a4e8bd1"
 APPLY_GROUP_POLICY = "edacfd8f-ffb3-11d1-b41d-00a0c968f939"
 # Classes
 DMSA_CLASS = "0feb936f-47b3-49f2-9386-1dedc2c23765"  # msDS-DelegatedManagedServiceAccount
