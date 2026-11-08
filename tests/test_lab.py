@@ -20,7 +20,9 @@ pytestmark = pytest.mark.lab
 
 # Every misconfiguration seed.ps1 plants. Covered by the unit tests only: AD-KRB-001,
 # AD-ACC-005, AD-ACC-011 and AD-KRB-006 (need time to pass), AD-ACC-007 and AD-INF-006
-# (need a real second domain), AD-INF-012 (needs an RODC), AD-ACC-009 (confidential on 2025),
+# (need a real second domain), AD-ACC-014 and AD-INF-018 (need time to pass), AD-ACC-015,
+# AD-INF-019, AD-INF-020 and AD-INF-021 (not in the lab, read in the test below), AD-INF-012
+# (needs an RODC), AD-ACC-009 (confidential on 2025),
 # AD-INF-008 (DCs require SMB signing), AD-INF-009 and the high grade of AD-CHAIN-002/003
 # (no spooler on Server Core 2025), AD-INF-011 (needs a week without backup), AD-INF-003 (a
 # 2025 DC needs level 2016), AD-INF-013 and AD-ADCS-016 (need a host the probes cannot read)
@@ -230,6 +232,16 @@ def test_trusts_go_stale_once_40_days_pass(snap: Snapshot) -> None:
     stale = next(f for f in run_all(later) if f.check_id == "AD-INF-016")
     assert stale.severity is Severity.MEDIUM
     assert len(stale.objects) == 4
+
+
+def test_plain_user_reads_the_health_data(snap: Snapshot) -> None:
+    assert snap.site_topology_checked
+    assert [(s.servers, s.linked) for s in snap.sites] == [(1, True)]
+    assert snap.subnets == []
+    assert snap.sysvol_replication_checked and snap.sysvol_dfsr_flags == 48
+    assert not snap.sysvol_frs_dcs and len(snap.sysvol_dfsr_dcs) == 1
+    assert snap.conflicts_checked and snap.conflicts == []
+    assert [g.interval_days for g in snap.gmsas] == [30]
 
 
 def test_every_dc_probed(snap: Snapshot) -> None:

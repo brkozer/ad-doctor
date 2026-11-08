@@ -143,6 +143,7 @@ FIXES: dict[str, Fix] = {
     "AD-ACC-003": _per_object("Set-ADUser {o} -PasswordNeverExpires $false -WhatIf"),
     "AD-ACC-004": _per_object("Disable-ADAccount {o} -WhatIf"),
     "AD-ACC-005": _per_object("Disable-ADAccount {o} -WhatIf"),
+    "AD-ACC-014": _per_object("Disable-ADAccount {o} -WhatIf"),
     "AD-ACC-006": _per_object("Set-ADUser {o} -Clear adminCount -WhatIf"),
     "AD-ACC-007": _per_object("Set-ADUser {o} -Clear sIDHistory -WhatIf"),
     "AD-PRIV-002": _per_object("Set-ADAccountControl {o} -AccountNotDelegated $true -WhatIf"),

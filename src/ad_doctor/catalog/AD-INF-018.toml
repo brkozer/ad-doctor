@@ -1,0 +1,58 @@
+id = "AD-INF-018"
+aliases = ["dc-machine-password"]
+summary = "A domain controller's machine password has not changed for over 45 days, when the default rotation is 30."
+severities = ["low", "medium"]
+severity_logic = """
+**Low** from 45 days: worded as a review, since an offline DC or a late rotation looks the
+same. **Medium** from 180 days, six times the default interval.
+"""
+mitre = ["T1078.002"]
+data_sources = ["ldap"]
+attributes = ["pwdLastSet", "msDS-ReplAttributeMetaData", "userAccountControl"]
+related = ["AD-INF-014", "AD-KRB-001", "AD-ACC-014"]
+since = "0.3.0"
+
+risk = """
+A DC's machine account can replicate the directory, so its password is a tier-0 credential.
+Anyone who holds an old copy of it keeps that power until the password changes. An old
+password can also mean something is wrong: rotation turned off, a DC that is failing, or a
+DC restored from an old copy.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled, registered** domain controller (read-only DCs
+included) whose password changed more than **45 days** before the scan time. The time is the
+older of `pwdLastSet` and the `unicodePwd` entry of its replication metadata, because
+`pwdLastSet` can be moved forward without a password change.
+
+Skipped: rogue DC objects ([AD-INF-014](AD-INF-014.md)) and the Microsoft Entra Kerberos
+object. A DC with neither time readable is not judged, and the report says so.
+
+Objects are `sAMAccountName`s; the detail line gives the age of each.
+"""
+
+false_positives = """
+- **A DC that was switched off, or restored,** reports the age of its last rotation until it
+  has run for a while.
+"""
+
+remediation = """
+1. **Look at the DC**: is it online and replicating? `repadmin /showrepl` and the System log
+   tell.
+2. **Check the policy.** *Domain member: Disable machine account password changes* and
+   Netlogon's `DisablePasswordChange` and `RefusePasswordChange` values stop rotation.
+3. **Rotate** if it does not recover by itself, on the DC, with `netdom resetpwd` (it has no
+   dry-run mode, so read Microsoft's steps first).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-018"
+
+[[references]]
+title = "Domain member: Maximum machine account password age"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/domain-member-maximum-machine-account-password-age"
+kind = "vendor"
+
+[[references]]
+title = "Machine Account Password Process"
+url = "https://techcommunity.microsoft.com/t5/Ask-the-Directory-Services-Team/Machine-Account-Password-Process/ba-p/396026"
+kind = "vendor"

@@ -1,0 +1,76 @@
+id = "AD-ACC-014"
+aliases = ["stale-computers"]
+summary = "Enabled computer accounts with no logon, password change or creation for 90 days: an unwatched machine identity that still works."
+severities = ["low"]
+severity_logic = """
+Always **low**, as for stale users ([AD-ACC-005](AD-ACC-005.md)): a dormant computer account
+is hygiene and a possible foothold, not an attack path by itself.
+"""
+mitre = ["T1078.002"]
+data_sources = ["ldap"]
+attributes = ["lastLogonTimestamp", "pwdLastSet", "whenCreated", "userAccountControl"]
+related = ["AD-ACC-005", "AD-INF-001", "AD-INF-018"]
+since = "0.3.0"
+
+risk = """
+A computer account that nobody uses keeps its membership in Domain Computers and whatever
+groups and delegations it was given. If its password or the machine itself ends up in
+someone else's hands, the account still authenticates and nobody is watching it.
+"""
+
+detection = """
+From the LDAP snapshot: every **enabled computer** whose newest date among
+`lastLogonTimestamp`, `pwdLastSet` and `whenCreated` is more than **90 days** before the scan
+time. A machine that is on the network changes its password every 30 days by default, so
+the newest date counts rather than the logon alone.
+
+Skipped: domain controllers ([AD-INF-018](AD-INF-018.md) covers them, and rogue DC objects
+remain reported here), gMSA, sMSA and dMSA accounts, and `AZUREADSSOACC$`, which never logs
+on ([AD-KRB-006](AD-KRB-006.md)). A computer with none of the three dates is not judged, and
+the report says how many there were.
+
+`lastLogonTimestamp` updates only every 9 to 14 days. Treat the 90 days as approximate.
+"""
+
+false_positives = """
+- **Cluster name objects and appliances.** A cluster's virtual computer objects and some
+  appliances do not log on or change their password the way a Windows member does.
+- **Machines that stay powered off** (spares, seasonal kiosks) look the same as machines that
+  are gone. Accept them with an [accepted-risk file](../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **List them** (read-only):
+
+    ```powershell
+    Search-ADAccount -AccountInactive -ComputersOnly -TimeSpan 90.00:00:00 |
+        Where-Object Enabled | Select-Object Name, LastLogonDate, DistinguishedName
+    ```
+
+2. **Confirm** with the owner of the machine that it is gone.
+
+3. **Disable** the account. This is what `ad-doctor fix` generates:
+
+    ```powershell
+    Disable-ADAccount 'WS01$' -WhatIf
+    ```
+
+4. **Delete** after a grace period, with the AD Recycle Bin on ([AD-INF-002](AD-INF-002.md)).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-014"
+
+[[references]]
+title = "The LastLogonTimeStamp attribute: what it was designed for and how it works"
+url = "https://techcommunity.microsoft.com/blog/askds/the-lastlogontimestamp-attribute---what-it-was-designed-for-and-how-it-works/396204"
+kind = "vendor"
+
+[[references]]
+title = "Machine Account Password Process"
+url = "https://techcommunity.microsoft.com/t5/Ask-the-Directory-Services-Team/Machine-Account-Password-Process/ba-p/396026"
+kind = "vendor"
+
+[[references]]
+title = "Search-ADAccount"
+url = "https://learn.microsoft.com/en-us/powershell/module/activedirectory/search-adaccount?view=windowsserver2025-ps"
+kind = "vendor"

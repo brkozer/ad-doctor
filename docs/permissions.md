@@ -8,7 +8,7 @@ the directory.
 
 - users, computers, groups, OUs, GPOs and trusts
 - AD CS certificate templates, enrollment services and issuance-policy OIDs
-- gMSAs and their password-read permissions
+- gMSAs, their password-read permissions and password interval
 - the replication metadata of the domain head (for the last backup date) and of tier-0
   accounts (for the last real password change, and key credentials that cannot be read)
 - `msDS-KeyCredentialLink` of tier-0 accounts, CA servers and Entra Connect sync accounts
@@ -16,6 +16,7 @@ the directory.
 - `sPNMappings` on `CN=Directory Service`, to tell which SPNs `HOST/` answers for
 - the owners and DACLs of the security-critical objects
 - `server` and `nTDSDSA` objects under `CN=Sites`, and `crossRef` objects under `CN=Partitions`
+- `site`, `server`, `subnet` and `siteLink` objects under `CN=Sites`; `msDFSR-Flags` of `CN=DFSR-GlobalSettings,CN=System` and the FRS and DFS Replication SYSVOL subscriptions under each DC; objects whose name holds `CNF:` and accounts named `$DUPLICATE-*`
 - one BASE read of each `member` value of a tier-0 group that no search returned, at most 500
   per scan
 

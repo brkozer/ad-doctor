@@ -111,6 +111,13 @@ MITRE: Mapping[str, tuple[str, ...]] = _Mitre()
 
 KRBTGT_MAX_AGE = timedelta(days=180)
 STALE_AFTER = timedelta(days=90)
+# a DC changes its machine password every 30 days by default
+DC_PASSWORD_REVIEW = timedelta(days=45)
+DC_PASSWORD_OLD = timedelta(days=180)
+GMSA_INTERVAL_REVIEW_DAYS = 90
+SYSVOL_PREPARED = 16
+SYSVOL_REDIRECTED = 32
+SYSVOL_ELIMINATED = 48
 
 
 @check("AD-KRB-001", "krbtgt password not rotated recently")
@@ -305,6 +312,52 @@ def stale_users(snap: Snapshot) -> Finding | None:
         f"{len(hits)} enabled users have not logged on in {STALE_AFTER.days}+ days.",
         "Disable, then delete after a grace period.",
         _names(hits),
+    )
+
+
+@check("AD-ACC-014", "Stale enabled computer accounts")
+def stale_computers(snap: Snapshot) -> Finding | None:
+    cutoff = snap.collected_at - STALE_AFTER
+    hits = []
+    for a in snap.accounts:
+        if not a.is_computer or not a.enabled or a.managed or a.is_registered_dc:
+            continue
+        if a.sam.upper() == "AZUREADSSOACC$":  # never logs on; AD-KRB-006 watches its key
+            continue
+        # a machine that is online changes its password, so the newest date counts
+        seen = [t for t in (a.last_logon, a.pwd_last_set, a.when_created) if t is not None]
+        if seen and max(seen) < cutoff:
+            hits.append(a)
+    if not hits:
+        return None
+    return _finding(
+        "AD-ACC-014",
+        Severity.LOW,
+        f"{len(hits)} enabled computers show no logon, password change or creation in the last "
+        f"{STALE_AFTER.days} days. Review them: appliances and cluster objects can look like this.",
+        "Confirm the machine is gone, disable the account, then delete it after a grace period.",
+        _names(hits),
+    )
+
+
+@check("AD-ACC-015", "gMSA passwords with a long rotation interval")
+def gmsa_long_interval(snap: Snapshot) -> Finding | None:
+    hits = sorted(
+        (g.name, g.interval_days)
+        for g in snap.gmsas
+        if g.interval_days is not None and g.interval_days > GMSA_INTERVAL_REVIEW_DAYS
+    )
+    if not hits:
+        return None
+    return _finding(
+        "AD-ACC-015",
+        Severity.LOW,
+        f"These gMSAs change their password less often than every {GMSA_INTERVAL_REVIEW_DAYS} "
+        "days (the default is 30), so a password that was read stays valid for that long. "
+        "Review whether the interval is intended.",
+        "The interval is set at creation only: create a new gMSA with a shorter one and move "
+        "the services to it.",
+        [f"{name} ({days} days)" for name, days in hits],
     )
 
 
@@ -2402,6 +2455,146 @@ def unprobed_dcs(snap: Snapshot) -> Finding | None:
         "Run the scan from a host that reaches every DC (TCP 389, 445 and 636), or scan each "
         "DC separately.",
         hits,
+    )
+
+
+@check("AD-INF-018", "Domain controllers with an old machine password")
+def dc_machine_password(snap: Snapshot) -> Finding | None:
+    aged = []
+    for a in snap.accounts:
+        changed = a.password_changed
+        if not a.is_computer or not a.enabled or not a.is_registered_dc or a.entra_kerberos:
+            continue
+        if changed is not None and snap.collected_at - changed > DC_PASSWORD_REVIEW:
+            aged.append((a.sam, (snap.collected_at - changed).days))
+    if not aged:
+        return None
+    aged.sort()
+    return _finding(
+        "AD-INF-018",
+        Severity.MEDIUM if any(days > DC_PASSWORD_OLD.days for _, days in aged) else Severity.LOW,
+        "Machine password age in days: "
+        + ", ".join(f"{sam} {days}" for sam, days in aged)
+        + ". A DC normally changes it every 30 days. Review it: rotation may be turned off, "
+        "the DC may be failing or offline, or it may have been restored from an old copy.",
+        "Check DisablePasswordChange and RefusePasswordChange in the Netlogon settings and the "
+        "DC's replication health, then reset the machine password if it does not change.",
+        [sam for sam, _ in aged],
+    )
+
+
+@check("AD-INF-019", "SYSVOL still replicated by FRS")
+def sysvol_frs(snap: Snapshot) -> Finding | None:
+    flags = snap.sysvol_dfsr_flags
+    if not snap.sysvol_replication_checked or flags == SYSVOL_ELIMINATED:
+        return None
+    if flags == SYSVOL_REDIRECTED:
+        return _finding(
+            "AD-INF-019",
+            Severity.LOW,
+            "The FRS to DFS Replication migration stopped in the Redirected state: DFS "
+            "Replication serves SYSVOL, but FRS still replicates the old copy.",
+            "Finish the migration: dfsrmig /setglobalstate 3, once every DC has reached state 2.",
+            [snap.domain],
+        )
+    if flags == SYSVOL_PREPARED:
+        return _finding(
+            "AD-INF-019",
+            Severity.MEDIUM,
+            "The FRS to DFS Replication migration stopped in the Prepared state: SYSVOL is "
+            "still served from the copy FRS replicates.",
+            "Continue the migration with dfsrmig /setglobalstate 2, then 3.",
+            [snap.domain],
+        )
+    frs = {dn.lower() for dn in snap.sysvol_frs_dcs}
+    dfsr = {dn.lower() for dn in snap.sysvol_dfsr_dcs}
+    dcs = [a for a in snap.accounts if a.is_computer and a.is_registered_dc]
+    frs_only = [a for a in dcs if a.dn.lower() in frs - dfsr]
+    if frs_only:
+        return _finding(
+            "AD-INF-019",
+            Severity.MEDIUM,
+            "These DCs have an FRS SYSVOL subscription and no DFS Replication one, and no "
+            "migration to DFS Replication has been recorded.",
+            "Migrate SYSVOL to DFS Replication with dfsrmig; the migration is one-way.",
+            _names(frs_only),
+        )
+    both = [a for a in dcs if a.dn.lower() in frs & dfsr]
+    if both:
+        return _finding(
+            "AD-INF-019",
+            Severity.LOW,
+            "These DCs hold both an FRS and a DFS Replication SYSVOL subscription, and the "
+            "migration state could not be read. Review the state with dfsrmig /getglobalstate.",
+            "If the migration is unfinished, complete it with dfsrmig.",
+            _names(both),
+        )
+    return None
+
+
+def _rdn_value(dn: str) -> str:
+    return gpo_scope.RDN_SEPARATOR.split(dn, maxsplit=1)[0].split("=", 1)[1]
+
+
+@check("AD-INF-020", "Sites and subnets that need review")
+def site_topology(snap: Snapshot) -> Finding | None:
+    if not snap.site_topology_checked:
+        return None
+    objects = [f"subnet {s.name}: maps to no site" for s in snap.subnets if not s.site]
+    used = {s.site.lower() for s in snap.subnets if s.site}
+    several = len(snap.sites) > 1
+    any_server = any(s.servers for s in snap.sites)
+    for site in snap.sites:
+        problems = []
+        if any_server and not site.servers:
+            problems.append("no domain controller")
+        if several and site.dn.lower() not in used:
+            problems.append("no subnet")
+        if several and site.servers and site.linked is False:
+            problems.append("in no site link")
+        if problems:
+            objects.append(f"site {_rdn_value(site.dn)}: {', '.join(problems)}")
+    if not objects:
+        return None
+    return _finding(
+        "AD-INF-020",
+        Severity.LOW,
+        "Review these. A client on an unmapped subnet picks any DC, possibly across a slow "
+        "link; a site with no DC relies on automatic site coverage; a site in no site link "
+        "gets no automatically built replication.",
+        "Map each subnet to a site, delete sites nobody uses, and put every site with a DC "
+        "in a site link.",
+        sorted(objects),
+    )
+
+
+@check("AD-INF-021", "Replication conflict objects and duplicate accounts")
+def conflict_objects(snap: Snapshot) -> Finding | None:
+    objects = [f"{c.dn} ({c.kind})" for c in snap.conflicts]
+    by_sid: dict[str, list[str]] = {}
+    by_sam: dict[str, list[str]] = {}
+    for a in snap.accounts:
+        if a.sid:
+            by_sid.setdefault(a.sid, []).append(a.sam)
+        by_sam.setdefault(a.sam.lower(), []).append(a.dn)
+    shared_sids = {sid: sams for sid, sams in by_sid.items() if len(sams) > 1}
+    objects += [
+        f"sAMAccountName {sam}: {'; '.join(sorted(dns))}"
+        for sam, dns in by_sam.items()
+        if len(dns) > 1
+    ]
+    objects += [f"SID {sid}: {', '.join(sorted(sams))}" for sid, sams in shared_sids.items()]
+    if not objects:
+        return None
+    return _finding(
+        "AD-INF-021",
+        Severity.MEDIUM if shared_sids else Severity.LOW,
+        "Conflicts created when two DCs write the same object before replicating. Review which "
+        "object is the real one; a leftover can keep group memberships and SIDs."
+        + (" Accounts sharing a SID hold the same access." if shared_sids else ""),
+        "Compare each pair (whenCreated, group membership), delete the unwanted object, and "
+        "rename the survivor if needed.",
+        sorted(objects),
     )
 
 

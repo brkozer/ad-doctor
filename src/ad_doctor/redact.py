@@ -102,7 +102,8 @@ FIXED_KEYS = {
                 model.DirObject, model.GpoSettings, model.Probes, model.DcProbe, model.CaConfig,
                 model.Gmsa, model.Rodc, model.Trust, model.Gpo, model.GppPassword,
                 model.ScriptSecret, model.GpoLocalGroup, model.GpLink,
-                model.UnreadableMember, model.KeyCredential)
+                model.UnreadableMember, model.KeyCredential, model.Site, model.Subnet,
+                model.ConflictObject)
     for f in dataclasses.fields(cls)
 } | {"domain", "AdminSDHolder", "sid", "mask", "object_type", "inherited_object_type"}  # fmt: skip
 # values from a fixed list, which the checks compare: never data, whatever the names around
@@ -186,6 +187,14 @@ class Redactor:
         for dc_dn, site_dn in data.get("dc_sites", {}).items():
             words.update(_dn_values(dc_dn))
             words.update(_dn_values(site_dn))
+        for site in data.get("sites", []):
+            words.update(_dn_values(site["dn"]))
+        for subnet in data.get("subnets", []):
+            words.update(_dn_values(subnet["site"]))
+        for dn in [*data.get("sysvol_frs_dcs", []), *data.get("sysvol_dfsr_dcs", [])]:
+            words.update(_dn_values(dn))
+        for conflict in data.get("conflicts", []):
+            words.update(_dn_values(conflict["dn"]))
         for o in data.get("objects", []):
             words.add(o["name"])
             words.update(_dn_values(o["dn"]))
@@ -331,5 +340,8 @@ def redact(data: dict[str, Any], key: bytes) -> dict[str, Any]:
                 credential["device_id"] = r.fake_guid(credential["device_id"])
             if credential.get("key_id"):
                 credential["key_id"] = r.fake_guid(credential["key_id"]).replace("-", "")[:16]
+    # an address block names the network; 0.0.0.0/24 would make every subnet the same one
+    for before, after in zip(data.get("subnets", []), out.get("subnets", []), strict=True):
+        after["name"] = r.token(before["name"])
     out["redacted"] = True
     return out

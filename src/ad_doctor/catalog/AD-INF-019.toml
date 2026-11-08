@@ -1,0 +1,59 @@
+id = "AD-INF-019"
+aliases = ["sysvol-frs", "frs"]
+summary = "SYSVOL still relies on the File Replication Service, or its migration to DFS Replication was left unfinished."
+severities = ["low", "medium"]
+severity_logic = """
+**Medium** while FRS serves SYSVOL: the domain is in the Prepared state, or a DC has only an
+FRS subscription and no migration is recorded. **Low**, worded as a review, when DFS
+Replication already serves SYSVOL (Redirected), or when a DC has both subscriptions and the
+state cannot be read.
+"""
+mitre = []
+data_sources = ["ldap"]
+attributes = ["msDFSR-Flags", "nTFRSSubscriber objects", "msDFSR-Subscription objects"]
+related = ["AD-INF-003"]
+since = "0.3.0"
+
+risk = """
+SYSVOL carries Group Policy and logon scripts, so what replicates it decides whether every DC
+applies the same policy. FRS is the mechanism of Windows 2000 and 2003; current Windows Server
+uses DFS Replication for domains at the Windows Server 2008 functional level or later.
+Microsoft documents the migration as a one-way process.
+"""
+
+detection = """
+From the LDAP snapshot, two pieces of evidence:
+
+- `msDFSR-Flags` on `CN=DFSR-GlobalSettings,CN=System,...`: 0 Start, 16 Prepared, 32
+  Redirected, 48 Eliminated. Eliminated is clean; Prepared and Redirected are reported.
+- SYSVOL subscriptions under each DC: `CN=Domain System Volume (SYSVOL share)` of class
+  `nTFRSSubscriber`, and `CN=SYSVOL Subscription` of class `msDFSR-Subscription`.
+
+With the state unset or 0, a registered DC that has an FRS subscription and no DFSR one is
+reported. If the state is 0 or absent and neither subscription can be seen, the check does
+not judge the domain and the report says so.
+"""
+
+false_positives = """
+- **A migration in progress.** Prepared and Redirected are normal for a short time; the check
+  is about one that stopped there.
+"""
+
+remediation = """
+1. **Read the state** (read-only): `dfsrmig /getglobalstate` and `dfsrmig /getmigrationstate`.
+2. **Migrate** through Prepared, Redirected and Eliminated, waiting for every DC at each step.
+   `dfsrmig` has no dry-run mode, so plan with Microsoft's guide; after Eliminated there is no
+   way back.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-019"
+
+[[references]]
+title = "Migrate SYSVOL replication from FRS to DFS Replication"
+url = "https://learn.microsoft.com/en-us/windows-server/storage/dfs-replication/migrate-sysvol-to-dfsr"
+kind = "vendor"
+
+[[references]]
+title = "Verifying the State of SYSVOL Migration"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2008-r2-and-2008/dd639789(v=ws.10)"
+kind = "vendor"

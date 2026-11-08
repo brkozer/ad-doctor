@@ -8,7 +8,7 @@
 Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
-(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 99
+(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 105
 checks for what attackers look for first: roastable accounts, risky delegation,
 exploitable certificate templates and CA settings (ESC1–9, 11, 13–17), DCSync and other takeover rights,
 shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync accounts,
@@ -115,6 +115,8 @@ against a live DC.
 | | AD-ACC-011 | Privileged passwords older than a year | medium |
 | | AD-ACC-012 | `pwdLastSet` newer than the real password change on tier-0 accounts | medium/high |
 | | AD-ACC-013 | Key credentials or strong certificate mappings on tier-0 accounts | low/medium/high |
+| | AD-ACC-014 | Stale enabled computer accounts | low |
+| | AD-ACC-015 | gMSA passwords with a long rotation interval | low |
 | Privileged access | AD-PRIV-001 | Tier-0 groups with more than 5 members | low |
 | | AD-PRIV-002 | Privileged accounts that can be delegated | medium |
 | | AD-PRIV-003 | Schema Admins or Enterprise Admins not empty | low |
@@ -148,6 +150,10 @@ against a live DC.
 | | AD-INF-015 | Trusts limited to old protocols: downlevel, or no AES | low/medium |
 | | AD-INF-016 | Trusts unchanged for over 40 days | low/medium |
 | | AD-INF-017 | Forest trusts without Selective Authentication | medium |
+| | AD-INF-018 | Domain controllers with an old machine password | low/medium |
+| | AD-INF-019 | SYSVOL still replicated by FRS | low/medium |
+| | AD-INF-020 | Sites and subnets that need review | low |
+| | AD-INF-021 | Replication conflict objects and duplicate accounts | low/medium |
 | Certificate services | AD-ADCS-001 | ESC1: enrollee-supplied subject on an authentication template | high |
 | | AD-ADCS-002 | ESC2: any-purpose or no-EKU template | high |
 | | AD-ADCS-003 | ESC3: enrollment agent template open to broad groups | high |
@@ -395,12 +401,19 @@ ports. A CES URL is reached on the port it names; only a URL with no port follow
 - AD-ADCS-018 reads the CA's audit filter only. Whether the Certification Services audit
   subcategory is on is not read, so 127 does not prove events are written. A CA where
   auditing was never configured has no such value, and is reported as not set.
+- AD-ACC-014 treats the newest of logon, password change and creation as last activity,
+  so a machine that stopped logging on but still rotates its password stays quiet. AD-INF-021
+  searches the domain and Configuration partitions, not DNS or the schema, and only finds
+  what the scan account can see. AD-INF-020 does not check DC addresses against subnets.
 - AD-PRIV-012 compares `member` values with search results. A group whose `member`
   attribute is denied looks empty, and groups of other domains are not read.
 - An ordinary user cannot read fine-grained password policies; the report says so
   instead of assuming the default policy applies to admins.
 - Some checks do not fire on the lab DC and are covered by unit tests only: stale accounts
-  (AD-ACC-005 needs 90 days to pass), a missing backup (AD-INF-011 needs a week), a domain
+  (AD-ACC-005 and AD-ACC-014 need 90 days to pass), an old DC password (AD-INF-018 needs 45
+  days), a gMSA with a long interval (AD-ACC-015: the lab's has 30 days), FRS (AD-INF-019:
+  the lab is DFS Replication only), sites and subnets (AD-INF-020: one site, no subnets),
+  conflict objects and duplicates (AD-INF-021), a missing backup (AD-INF-011 needs a week), a domain
   below level 2016 (AD-INF-003: a 2025 DC needs that level), a DC or CA the probes cannot
   read (AD-INF-013, AD-ADCS-016), large tier-0 groups (AD-PRIV-001, not seeded),
   krbtgt, Seamless SSO and admin password age, the password and DC parts of AD-KRB-005,
@@ -422,7 +435,7 @@ flowchart LR
     P --> S
     S -- "collect -o / redact" --> F[(snapshot.json)]
     F --> A
-    S --> A[checks.py + paths.py<br/>99 pure functions]
+    S --> A[checks.py + paths.py<br/>105 pure functions]
     A --> I[invariants.py<br/>accept.py]
     I --> R[report.py<br/>text, JSON, Markdown,<br/>SARIF, JUnit]
     I --> W[viewer.py<br/>offline HTML viewer]

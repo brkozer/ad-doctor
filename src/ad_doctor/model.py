@@ -293,6 +293,31 @@ class Gmsa:
     dn: str
     # SIDs allowed to retrieve the password (msDS-GroupMSAMembership)
     readers: list[str]
+    # msDS-ManagedPasswordInterval in days; None when absent or not readable
+    interval_days: int | None = None
+
+
+@dataclass
+class Site:
+    dn: str
+    # server objects under the site: domain controllers, or leftovers of ones that left
+    servers: int = 0
+    # False: no siteLink lists the site. None: the site links could not be read
+    linked: bool | None = None
+
+
+@dataclass
+class Subnet:
+    # the object's RDN, 10.0.0.0/24 or 2001:db8::/32
+    name: str
+    # DN of its site (siteObject); empty when it maps to none
+    site: str = ""
+
+
+@dataclass
+class ConflictObject:
+    dn: str
+    kind: str  # "cnf" (mangled RDN) or "duplicate-sam" ($DUPLICATE-<rid>)
 
 
 @dataclass
@@ -468,6 +493,21 @@ class Snapshot:
     # DC computer DN (lower case) -> DN of its site
     dc_sites: dict[str, str] = field(default_factory=dict)
     site_count: int = 0
+    sites: list[Site] = field(default_factory=list)
+    subnets: list[Subnet] = field(default_factory=list)
+    # False in older snapshots and when the Sites container could not be read
+    site_topology_checked: bool = False
+    # msDFSR-Flags of DFSR-GlobalSettings (0, 16, 32, 48); None when absent or not readable
+    sysvol_dfsr_flags: int | None = None
+    # DNs of the computers holding a SYSVOL subscription of FRS, and of DFS Replication
+    sysvol_frs_dcs: list[str] = field(default_factory=list)
+    sysvol_dfsr_dcs: list[str] = field(default_factory=list)
+    # False in older snapshots and when no evidence of either could be read
+    sysvol_replication_checked: bool = False
+    # replication conflict objects and $DUPLICATE- accounts
+    conflicts: list[ConflictObject] = field(default_factory=list)
+    # False in older snapshots and when the searches failed
+    conflicts_checked: bool = False
     # parts of the collection that could not run (no AD CS, SYSVOL unreachable, ...)
     notes: list[str] = field(default_factory=list)
     # False in older snapshots: Ace.inherited was not kept, so an inherited copy looks
@@ -613,6 +653,15 @@ class Snapshot:
             tier0_members_checked=data.get("tier0_members_checked", False),
             dc_sites=data.get("dc_sites", {}),
             site_count=data.get("site_count", 0),
+            sites=[Site(**x) for x in data.get("sites", [])],
+            subnets=[Subnet(**x) for x in data.get("subnets", [])],
+            site_topology_checked=data.get("site_topology_checked", False),
+            sysvol_dfsr_flags=data.get("sysvol_dfsr_flags"),
+            sysvol_frs_dcs=data.get("sysvol_frs_dcs", []),
+            sysvol_dfsr_dcs=data.get("sysvol_dfsr_dcs", []),
+            sysvol_replication_checked=data.get("sysvol_replication_checked", False),
+            conflicts=[ConflictObject(**x) for x in data.get("conflicts", [])],
+            conflicts_checked=data.get("conflicts_checked", False),
             dns_admins=data.get("dns_admins", []),
             pre2k_members=data.get("pre2k_members", []),
             ds_heuristics=data.get("ds_heuristics", ""),
@@ -724,9 +773,14 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
             ("tier0_members_checked", "AD-PRIV-012 (unreadable tier-0 members)"),
             ("trust_details_checked", "AD-INF-016 and the AES part of AD-INF-015 (trust details)"),
             ("spn_mappings", "the part of AD-DEL-005 about hosts that exist (SPN aliases)"),
+            ("site_topology_checked", "AD-INF-020 (sites and subnets)"),
+            ("sysvol_replication_checked", "AD-INF-019 (SYSVOL replication)"),
+            ("conflicts_checked", "the conflict object part of AD-INF-021"),
         )
         if key not in data
     ]
+    if any("interval_days" not in g for g in data.get("gmsas", [])):
+        missing.append("AD-ACC-015 (gMSA password interval)")
     cas = data.get("probes", {}).get("ca_configs", [])
     if any("audit_checked" not in c for c in cas):
         missing.append("AD-ADCS-018 (CA audit filter)")

@@ -26,6 +26,7 @@ from .model import (
     Account,
     CaConfig,
     CertTemplate,
+    ConflictObject,
     DcProbe,
     DirObject,
     DomainPolicy,
@@ -36,7 +37,9 @@ from .model import (
     GpoSettings,
     Probes,
     Rodc,
+    Site,
     Snapshot,
+    Subnet,
     Trust,
     UnreadableMember,
     exchange_members,
@@ -66,6 +69,11 @@ NOT_RETURNED = "not returned: hidden, or this account has no right to see it"
 NO_ATTRIBUTES = "returned without attributes: this account cannot read it"
 SEARCH_MISSED = "readable by its DN but missing from the searches"
 PRE2K_SID = "S-1-5-32-554"
+# the fixed RDNs Windows gives the SYSVOL subscriptions under a DC's computer object
+FRS_SYSVOL = re.compile(r"^cn=domain system volume \(sysvol share\),", re.IGNORECASE)
+DFSR_SYSVOL = re.compile(
+    r"^cn=sysvol subscription,cn=domain system volume,cn=dfsr-localsettings,", re.IGNORECASE
+)
 DACL_ONLY = security_descriptor_control(sdflags=0x04)  # readable without admin rights
 OWNER_AND_DACL = security_descriptor_control(sdflags=0x05)
 
@@ -263,6 +271,19 @@ class Collector:
             self.notes.append(f"search {flt} under {base} failed: {exc.description}")
             return []
 
+    def attempt(
+        self, base: str, flt: str, attrs: list[str], **kw: Any
+    ) -> list[dict[str, Any]] | None:
+        """optional(), but None when the search was refused: "nothing there" and "could
+        not ask" differ for a check that must not report an unread part as clean."""
+        try:
+            return self.search(base, flt, attrs, **kw)
+        except LDAPNoSuchObjectResult:
+            return []
+        except LDAPOperationResult as exc:
+            self.notes.append(f"search {flt} under {base} failed: {exc.description}")
+            return None
+
     def snapshot(self) -> Snapshot:
         root = self.conn.server.info
         if root is None or not root.other.get("defaultNamingContext"):
@@ -373,6 +394,9 @@ class Collector:
         unreadable = self._unreadable_members(domain_dn, config_dn, domain_sid, accounts, objects)
         gpos = self._gpos(domain_dn, config_dn, h, objects)
         dc_sites, site_count = self._dc_sites(config_dn)
+        sites, subnets, topology_checked = self._site_topology(config_dn)
+        conflicts, conflicts_checked = self._conflicts(domain_dn, config_dn)
+        dfsr_flags, frs_dcs, dfsr_dcs, replication_checked = self._sysvol_replication(domain_dn)
         ca_configs = self._ca_configs(dc_dns_host)
 
         trustees = {a.sid for aces in acls.values() for a in aces}
@@ -441,6 +465,15 @@ class Collector:
             tier0_members_checked=unreadable is not None,
             dc_sites=dc_sites,
             site_count=site_count,
+            sites=sites,
+            subnets=subnets,
+            site_topology_checked=topology_checked,
+            sysvol_dfsr_flags=dfsr_flags,
+            sysvol_frs_dcs=frs_dcs,
+            sysvol_dfsr_dcs=dfsr_dcs,
+            sysvol_replication_checked=replication_checked,
+            conflicts=conflicts,
+            conflicts_checked=conflicts_checked,
             notes=self.notes,
             ace_inheritance_checked=True,
         )
@@ -459,6 +492,7 @@ class Collector:
                 + ": AD-ACC-012 not judged for them, and their age checks trust pwdLastSet"
             )
         snap.notes += self._keys_note()
+        snap.notes += _machine_age_notes(accounts)
         if snap.has_2025 and not snap.dmsa_visible:
             snap.notes.append(
                 "no dMSA visible (none exist, or this account cannot read them; by default "
@@ -818,6 +852,109 @@ class Collector:
         count = len(self.optional(sites, "(objectClass=site)", ["name"], scope=ldap3.LEVEL))
         return dc_sites, count
 
+    def _site_topology(self, config_dn: str) -> tuple[list[Site], list[Subnet], bool]:
+        """The sites, their server objects and site links, and the subnets. A subnet that
+        comes back without attributes is unknown, not unmapped, and then nothing is judged:
+        a site is called empty only when every subnet and server has been seen."""
+        base = f"CN=Sites,{config_dn}"
+        not_judged = "AD-INF-020 (sites and subnets) not judged"
+        found = self.attempt(base, "(objectClass=site)", ["objectClass"], scope=ldap3.LEVEL)
+        servers = self.attempt(base, "(objectClass=server)", ["objectClass"])
+        subnets = self.attempt(
+            f"CN=Subnets,{base}",
+            "(objectClass=subnet)",
+            ["objectClass", "siteObject"],
+            scope=ldap3.LEVEL,
+        )
+        links = self.attempt(
+            f"CN=Inter-Site Transports,{base}",
+            "(objectClass=siteLink)",
+            ["objectClass", "siteList"],
+        )
+        if not found or servers is None or subnets is None:
+            self.notes.append(f"sites, servers or subnets not readable: {not_judged}")
+            return [], [], False
+        hidden = [e for e in [*found, *servers, *subnets] if not e.get("objectclass")]
+        if hidden:
+            self.notes.append(f"{len(hidden)} site topology object(s) unreadable: {not_judged}")
+            return [], [], False
+        in_site = Counter(_parent(e["distinguishedname"][0], 2).lower() for e in servers)
+        # a link without attributes may list any site: "in no link" cannot be said then
+        linked: set[str] | None = None
+        if links is not None and all(e.get("objectclass") for e in links):
+            linked = {v.lower() for e in links for v in _str(e.get("sitelist", []))}
+        elif len(found) > 1:
+            self.notes.append("site links not readable: AD-INF-020 did not judge site links")
+        result = []
+        for e in found:
+            dn = e["distinguishedname"][0]
+            result.append(
+                Site(dn, in_site[dn.lower()], None if linked is None else dn.lower() in linked)
+            )
+        nets = [
+            Subnet(_rdn_value(e["distinguishedname"][0]), _first(e, "siteObject")) for e in subnets
+        ]
+        return result, nets, True
+
+    def _conflicts(self, domain_dn: str, config_dn: str) -> tuple[list[ConflictObject], bool]:
+        """Objects replication renamed: a mangled RDN (<name>\\0ACNF:<guid>) or a
+        sAMAccountName rewritten to $DUPLICATE-<rid>. The filter finds the literal text; the
+        line feed in the value tells a conflict from a name that merely says "CNF:"."""
+        out: list[ConflictObject] = []
+        ok = True
+        for base in (domain_dn, config_dn):
+            hits = self.attempt(base, "(name=*CNF:*)", ["name"])
+            if hits is None:
+                ok = False
+                continue
+            for e in hits:
+                if "\ncnf:" in _first(e, "name").lower():
+                    out.append(ConflictObject(e["distinguishedname"][0], "cnf"))
+        hits = self.attempt(domain_dn, "(sAMAccountName=$DUPLICATE-*)", ["sAMAccountName"])
+        if hits is None:
+            ok = False
+        else:
+            out += [ConflictObject(e["distinguishedname"][0], "duplicate-sam") for e in hits]
+        if not ok:
+            self.notes.append("conflict object searches refused: AD-INF-021 did not judge them")
+        return out, ok
+
+    def _sysvol_replication(self, domain_dn: str) -> tuple[int | None, list[str], list[str], bool]:
+        """The domain's migration state, and which DCs hold an FRS or DFSR SYSVOL
+        subscription. Flags of 0 or none with no subscription seen proves nothing, since a
+        hidden object looks the same as a missing one."""
+        settings = self.attempt(
+            f"CN=DFSR-GlobalSettings,CN=System,{domain_dn}",
+            "(objectClass=*)",
+            ["msDFSR-Flags"],
+            scope=ldap3.BASE,
+        )
+        flags = (
+            _int(settings[0], "msDFSR-Flags")
+            if settings and settings[0].get("msdfsr-flags")
+            else None
+        )
+        subscribers = self.attempt(
+            domain_dn,
+            "(|(objectClass=nTFRSSubscriber)(objectClass=msDFSR-Subscription))",
+            ["objectClass"],
+        )
+        frs: list[str] = []
+        dfsr: list[str] = []
+        for e in subscribers or []:
+            dn = e["distinguishedname"][0]
+            if FRS_SYSVOL.match(dn):
+                frs.append(_parent(dn, 2))
+            elif DFSR_SYSVOL.match(dn):
+                dfsr.append(_parent(dn, 3))
+        checked = flags in (16, 32, 48) or bool(frs or dfsr)
+        if not checked:
+            self.notes.append(
+                "SYSVOL replication state not readable (no migration state and no "
+                "subscription visible): AD-INF-019 not judged"
+            )
+        return flags, sorted(frs), sorted(dfsr), checked
+
     def _registered_dcs(self, config_dn: str) -> set[str] | None:
         """Lower-cased DNs of the computers that have a server object with an nTDSDSA
         child (read-only DCs included); None when the set cannot be trusted. A server whose
@@ -940,11 +1077,20 @@ class Collector:
         for e in self.search(
             domain_dn,
             "(objectClass=msDS-GroupManagedServiceAccount)",
-            ["sAMAccountName", "msDS-GroupMSAMembership"],
+            ["sAMAccountName", "msDS-GroupMSAMembership", "msDS-ManagedPasswordInterval"],
         ):
             raw = e.get("msds-groupmsamembership")
             readers = sorted({a.sid for a in sd.parse_dacl(raw[0])}) if raw else []
-            out.append(Gmsa(_first(e, "sAMAccountName"), e["distinguishedname"][0], readers))
+            interval = _int(e, "msDS-ManagedPasswordInterval") or None
+            out.append(
+                Gmsa(_first(e, "sAMAccountName"), e["distinguishedname"][0], readers, interval)
+            )
+        unread = sum(g.interval_days is None for g in out)
+        if unread:
+            self.notes.append(
+                f"password interval not readable for {unread} gMSA(s): AD-ACC-015 not judged "
+                "for them"
+            )
         return out
 
     # --- AD CS -----------------------------------------------------------------------
@@ -1424,6 +1570,29 @@ def mark_rogue_dcs(accounts: list[Account], registered: set[str]) -> None:
         )
 
 
+def _machine_age_notes(accounts: list[Account]) -> list[str]:
+    """Computers whose age the two machine checks could not read: unknown is not clean."""
+    notes = []
+    dcs = [a for a in accounts if a.is_computer and a.enabled and a.is_registered_dc]
+    unread = [a.sam for a in dcs if not a.entra_kerberos and a.password_changed is None]
+    if unread:
+        notes.append(f"password age not readable for {len(unread)} DC(s): AD-INF-018 not judged")
+    blank = [
+        a
+        for a in accounts
+        if a.is_computer
+        and a.enabled
+        and not a.managed
+        and not a.is_registered_dc
+        and not (a.last_logon or a.pwd_last_set or a.when_created)
+    ]
+    if blank:
+        notes.append(
+            f"no activity date readable for {len(blank)} computer(s): AD-ACC-014 not judged"
+        )
+    return notes
+
+
 def parse_gplink(container: str, kind: str, value: str) -> list[tuple[str, GpLink]]:
     """(GPO DN, link) for each entry of a gPLink value, disabled links included."""
     out = []
@@ -1439,6 +1608,10 @@ def parse_gplink(container: str, kind: str, value: str) -> list[tuple[str, GpLin
 def machine_extensions(value: str) -> list[str]:
     """CSE GUIDs (upper case) listed in gPCMachineExtensionNames."""
     return [g.upper() for g in CSE_GROUP.findall(value)]
+
+
+def _rdn_value(dn: str) -> str:
+    return gpo_scope.RDN_SEPARATOR.split(dn, maxsplit=1)[0].split("=", 1)[1]
 
 
 def _parent(dn: str, levels: int = 1) -> str:

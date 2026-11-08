@@ -1,0 +1,57 @@
+id = "AD-ACC-015"
+aliases = ["gmsa-interval"]
+summary = "A gMSA changes its password less often than every 90 days, so a password that was read stays valid longer than usual."
+severities = ["low"]
+severity_logic = """
+Always **low**: a long interval widens the window after a password is read, nothing more. It
+is worded as a review, because the interval can be a deliberate choice.
+"""
+mitre = ["T1078.002"]
+data_sources = ["ldap"]
+attributes = ["msDS-ManagedPasswordInterval"]
+related = ["AD-ACL-006"]
+since = "0.3.0"
+
+risk = """
+The domain rotates a gMSA password every `msDS-ManagedPasswordInterval` days (30 by default).
+Anyone who reads the password once ([AD-ACL-006](AD-ACL-006.md) lists who can) keeps it for
+the rest of the interval, without touching the directory again.
+"""
+
+detection = """
+From the LDAP snapshot: every gMSA whose `msDS-ManagedPasswordInterval` is greater than
+**90 days**. Microsoft does not publish a maximum; 90 days is this check's own line for
+"worth a second look". dMSAs are not covered.
+
+If the attribute did not come back, the gMSA is not judged and the report says so: an
+unreadable value and a missing one look the same over LDAP.
+"""
+
+false_positives = """
+- **Deliberately long intervals** for a service that cannot handle a rotation. Accept them with
+  an [accepted-risk file](../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. **List the intervals** (read-only):
+
+    ```powershell
+    Get-ADServiceAccount -Filter * -Properties msDS-ManagedPasswordInterval |
+        Select-Object Name, msDS-ManagedPasswordInterval
+    ```
+
+2. **Replace the gMSA.** The interval can only be set when the account is created, so create a
+   new one with `-ManagedPasswordIntervalInDays` and move the services to it.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-015"
+
+[[references]]
+title = "ms-DS-ManagedPasswordInterval attribute"
+url = "https://learn.microsoft.com/en-us/windows/win32/adschema/a-msds-managedpasswordinterval"
+kind = "spec"
+
+[[references]]
+title = "Manage Group Managed Service Accounts"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/group-managed-service-accounts/group-managed-service-accounts/manage-group-managed-service-accounts"
+kind = "vendor"

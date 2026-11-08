@@ -7,6 +7,17 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+### Added
+
+- **Domain controller and computer health checks.** AD-ACC-014 reports stale enabled computer
+  accounts (AD-ACC-005 covers users only). AD-ACC-015 reports gMSAs whose password interval is
+  over 90 days. AD-INF-018 reports DCs whose machine password is over 45 days old. AD-INF-019
+  reports SYSVOL still on FRS or a migration that stopped. AD-INF-020 reports subnets mapped to
+  no site, sites with no DC or no subnet, and DC sites in no site link. AD-INF-021 reports
+  replication conflict objects (`CNF:`), `$DUPLICATE-` accounts and accounts that share a name
+  or SID. Each check says in a note when it could not read its data, and older snapshots load
+  with those parts marked as not evaluated. New snapshot fields are redacted.
+
 ## [0.2.1] - 2026-11-09
 
 ### Fixed

@@ -1,0 +1,61 @@
+id = "AD-INF-021"
+aliases = ["cnf", "duplicate-objects"]
+summary = "Objects that replication renamed (CNF, $DUPLICATE-) and accounts sharing a sAMAccountName or SID."
+severities = ["low", "medium"]
+severity_logic = """
+**Low**, worded as a review, for conflict objects and shared names: most are leftovers.
+**Medium** when two accounts share a SID, since each then holds the access of the other.
+"""
+mitre = []
+data_sources = ["ldap"]
+attributes = ["name", "sAMAccountName", "objectSid"]
+related = ["AD-ACC-007"]
+since = "0.3.0"
+
+risk = """
+When two DCs create the same object before they replicate, Active Directory keeps both and
+renames one. Which one survives depends on replication details, so an administrator can end
+up working on the wrong object, while the other keeps its group memberships and rights. A
+renamed copy is easy to overlook, and it can keep the same `sAMAccountName` as the original.
+"""
+
+detection = """
+From the LDAP snapshot:
+
+- objects in the domain and Configuration partitions whose name holds the line feed and
+  `CNF:` marker of a mangled RDN (`<name>\\0ACNF:<objectGUID>`);
+- accounts whose `sAMAccountName` is `$DUPLICATE-<RID>`;
+- accounts of the snapshot that share a `sAMAccountName` or an `objectSid`.
+
+Only objects the scan account can see are searched. The DNS application partitions and the
+schema are not searched. If a search is refused, this check does not judge the conflict
+objects and the report says so.
+
+Objects are the DN and the kind (`cnf`, `duplicate-sam`), or the shared name or SID and the
+accounts that have it. After redaction the DNs are tokens, so the kind stays visible.
+"""
+
+false_positives = """
+- **Conflicts in empty containers** left by an old migration are often harmless, but delete
+  them anyway so they stop raising questions.
+"""
+
+remediation = """
+1. **Find both halves** (read-only): compare `whenCreated`, group membership and
+   `objectSid` of the renamed object and the one with the original name.
+2. **Keep the one in use**, and move anything that depends on the other.
+3. **Delete the leftover**, with the AD Recycle Bin on ([AD-INF-002](AD-INF-002.md)). Remove it
+   by hand and review first: a name-based bulk delete can hit the wrong object.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-021"
+
+[[references]]
+title = "Active Directory: Duplicate Object Name Resolution"
+url = "https://learn.microsoft.com/en-us/archive/technet-wiki/15435.active-directory-duplicate-object-name-resolution"
+kind = "vendor"
+
+[[references]]
+title = "Using conflicting objects in Active Directory to gain privileges"
+url = "https://medium.com/tenable-techblog/using-conflicting-objects-in-active-directory-to-gain-privileges-243ef6a27928"
+kind = "research"

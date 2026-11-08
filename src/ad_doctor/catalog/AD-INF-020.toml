@@ -1,0 +1,70 @@
+id = "AD-INF-020"
+aliases = ["sites-subnets"]
+summary = "Subnets that map to no site, sites with no domain controller or subnet, and DC sites outside every site link."
+severities = ["low"]
+severity_logic = """
+Always **low**, worded as a review: these are configuration that often has a reason, and
+none of it is an attack path.
+"""
+mitre = []
+data_sources = ["ldap"]
+attributes = ["siteObject", "siteList", "site, subnet and server objects"]
+related = ["AD-INF-013"]
+since = "0.3.0"
+
+risk = """
+Sites decide which DC a client uses and how DCs replicate. A client on a subnet with no site
+picks a DC with no sense of closeness, sometimes over a slow link. A site outside every site
+link has no automatically generated replication with the rest of the forest, and Group
+Policy and account changes reach it late or not at all.
+"""
+
+detection = """
+From the Configuration partition (`CN=Sites`), readable by an ordinary user:
+
+- a **subnet** with an empty `siteObject`;
+- a **site with no server object**, when at least one server was seen somewhere;
+- a **site with no subnet**, when the forest has more than one site. With exactly one site
+  subnets are optional, which is the state of a new forest;
+- a **site with a server that no `siteLink` lists** in `siteList`, again with more than one
+  site.
+
+A subnet or site that comes back without attributes makes the whole check not judged, because
+"empty" could not be told from "hidden". Site links that cannot be read skip only that test.
+The report says so in each case. Whether a DC's address falls inside its site's subnets is not
+checked: DC addresses are not in the directory.
+
+Objects read `subnet 10.0.0.0/24: maps to no site` or `site Branch: no subnet`.
+"""
+
+false_positives = """
+- **A site with no DC on purpose.** DCs linked to an empty site cover it through automatic
+  site coverage, and some designs rely on it.
+- **Replication through manual connection objects** can serve a site with no site link.
+"""
+
+remediation = """
+1. **Look at it** (read-only): `Get-ADReplicationSubnet -Filter *` and
+   `Get-ADReplicationSite -Filter *` show the mapping, and `dcdiag /test:Topology` the
+   replication topology.
+2. **Map subnets** to their sites in Active Directory Sites and Services, and watch
+   `NO_CLIENT_SITE` lines in `netlogon.log` for ranges still missing.
+3. **Delete** sites nobody uses, and add every site with a DC to a site link.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-020"
+
+[[references]]
+title = "Active Directory replication concepts"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/get-started/replication/active-directory-replication-concepts"
+kind = "vendor"
+
+[[references]]
+title = "Roaming AD Clients, with an Updated Script"
+url = "https://techcommunity.microsoft.com/blog/coreinfrastructureandsecurityblog/roaming-ad-clients-with-an-updated-script/255609"
+kind = "vendor"
+
+[[references]]
+title = "How Domain Controllers are Located Across Trusts"
+url = "https://techcommunity.microsoft.com/blog/coreinfrastructureandsecurityblog/how-domain-controllers-are-located-across-trusts/256180"
+kind = "vendor"
