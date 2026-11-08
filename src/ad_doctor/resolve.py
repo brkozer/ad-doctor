@@ -16,6 +16,7 @@ the resolution is printed:
     pki:NTAuthCertificates:helpdesk         ca:<CA>:<trustee>:ManageCertificates
     gmsa:<gMSA>:<reader>                    delegation:<account>:unconstrained
     rbcd:<computer>:<principal>             sid-history:<account>[:<SID>]
+    oid-link:<OID>                          ca-flag:<CA>:san-from-request|no-sid-extension
     all-rights-of:helpdesk[:tier0]          every change of that trustee
 
 Names are a sAMAccountName, a name, a DN or a SID. More than one match is an error that
@@ -32,7 +33,7 @@ from dataclasses import dataclass, field
 from . import changes, paths
 from .model import WELL_KNOWN_RIDS, WELL_KNOWN_SIDS, Finding, Snapshot
 from .paths import Graph, Path
-from .provenance import TEMPLATE_FLAGS, Prim, fixed_reason
+from .provenance import CA_FLAGS, TEMPLATE_FLAGS, Prim, fixed_reason
 from .report import fingerprint
 
 CHANGE_ID = re.compile(r"c:[0-9a-f]{12}")
@@ -382,6 +383,15 @@ class Resolver:
             if a is None:
                 return False
             return key[2] in ((a.rbcd_principals or []) if kind[0] == "r" else a.sid_history)
+        if kind == "oid-link":
+            return snap.oid_group_links.get(key[1], "").lower() == key[2]
+        if kind == "ca-flag":
+            from .checks import _esc6, _esc16
+
+            c = next((c for c in snap.probes.ca_configs if c.name == key[1]), None)
+            if c is None:
+                return False
+            return _esc6(c) if key[2] == "san-from-request" else _esc16(c)
         return False
 
     def _made_edges(self, key: Prim) -> bool:
@@ -426,6 +436,8 @@ class Resolver:
         kind = key[0]
         if kind == "template-flag" and key[2] not in TEMPLATE_FLAGS:
             return f"unknown template flag {key[2]!r} (flags: {', '.join(TEMPLATE_FLAGS)})"
+        if kind == "ca-flag" and key[2] not in CA_FLAGS:
+            return f"unknown CA flag {key[2]!r} (flags: {', '.join(CA_FLAGS)})"
         if kind == "ca-right" and key[3] not in {r for _, r in CA_RIGHTS}:
             return f"unknown CA right {key[3]!r}: a CA right is ManageCA or ManageCertificates"
         if kind == "delegation":
@@ -489,6 +501,10 @@ class Resolver:
             return any(x.dn.lower() == key[1] for x in snap.gmsas)
         if kind in ("delegation", "rbcd-principal", "sid-history"):
             return key[1] in self.where.dn
+        if kind == "oid-link":
+            return key[1] in snap.oid_group_links
+        if kind == "ca-flag":
+            return any(c.name == key[1] for c in snap.probes.ca_configs)
         return False
 
     # -- the forms ----------------------------------------------------------------------
@@ -659,6 +675,18 @@ class Resolver:
                     return [("sid-history", dn, principal(args[1]))], []
                 held = next((a for a in self.snap.accounts if a.dn.lower() == dn), None)
                 return [("sid-history", dn, s) for s in (held.sid_history if held else [])], []
+            if kind == "oid-link":
+                need(1, "oid-link:<OID>")
+                linked = self.snap.oid_group_links.get(args[0])
+                if linked is None:
+                    return [], [f"no issuance policy {args[0]!r} linked to a group"]
+                return [("oid-link", args[0], linked.lower())], []
+            if kind == "ca-flag":
+                need(2, f"ca-flag:<CA>:{'|'.join(CA_FLAGS)}")
+                flag = args[1].lower()
+                if flag not in CA_FLAGS:
+                    raise SpecError(f"a CA flag is one of: {', '.join(CA_FLAGS)}")
+                return [("ca-flag", args[0], flag)], []
         except _Absent as exc:
             return [], [str(exc)]
         raise SpecError(f"unknown kind of change {kind!r}")
@@ -1001,6 +1029,12 @@ def finding_specs(check: str, obj: str) -> list[str] | None:
         return [f"template:{_q(_bare(obj))}:enroll:{_q(t)}" for t in _list(who)]
     if check == "AD-ADCS-004":
         return [f"template:{_q(_bare(obj))}:{_q(t)}" for t in _list(_inside(obj))]
+    if check == "AD-ADCS-012":
+        return [f"ca-flag:{_q(obj)}:san-from-request"]
+    if check == "AD-ADCS-015":
+        return [f"ca-flag:{_q(obj)}:no-sid-extension"]
+    if check == "AD-CHAIN-004":  # either side closes it; the SAN flag has no other use
+        return [f"ca-flag:{_q(obj)}:san-from-request"]
     if check == "AD-ADCS-005":
         return [f"pki:{_q(_bare(obj))}:{_q(t)}" for t in _list(_inside(obj))]
     if check == "AD-ADCS-013":
@@ -1083,6 +1117,10 @@ def canonical(snap: Snapshot, prim: Prim, where: changes.Where) -> str:
         return f"rbcd:{dn('computer')}:{who('principal')}"
     if kind == "sid-history":
         return f"sid-history:{dn('account')}:{f['sid']}"
+    if kind == "oid-link":
+        return f"oid-link:{quote(f['oid'])}"
+    if kind == "ca-flag":
+        return f"ca-flag:{quote(f['ca'])}:{f['flag']}"
     return f"delegation:{dn('account')}:{f['what']}"
 
 

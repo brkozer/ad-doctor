@@ -39,7 +39,8 @@ ACEs, ownership, DCSync, GPO links, GPO reach (`ADD_GPOAppliesTo`, `ADD_GPOInher
 `ADD_GPOReaches`), exploitable templates, gMSA readers, `ADD_AdminTo`,
 `ADD_LocalBackupOperator`, `ADD_HyperVAdmin`, `ADD_MemberOfViaGPO`, `ADD_HostsSyncAccount`,
 the delegation and SID history edges `ADD_AllowedToDelegate`, `ADD_AllowedToAct` and
-`ADD_HasSIDHistory`, and the ESC7 edges `ADD_ManageCA` / `ADD_ManageCertificates`.
+`ADD_HasSIDHistory`, the certificate edges `ADD_EnrollIssuancePolicyGroup` (ESC13) and
+`ADD_EnrollAnySubject` (ESC6 with ESC16), and the ESC7 edges `ADD_ManageCA` / `ADD_ManageCertificates`.
 
 It is `false` on the remote-logon rights that GPOs grant: `ADD_CanRDP`, `ADD_CanPSRemote`,
 `ADD_ExecuteDCOM`. A remote logon is a foothold, not control, so ad-doctor's path search does

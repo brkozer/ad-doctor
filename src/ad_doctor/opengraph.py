@@ -36,6 +36,8 @@ EDGE_KINDS = {
     "contains": "Contains",
     "enroll (ESC1-3)": "EnrollExploitableTemplate",
     "write template (ESC4)": "WriteTemplate",
+    "enroll (ESC13)": "EnrollIssuancePolicyGroup",
+    "enroll (ESC6+ESC16)": "EnrollAnySubject",
     "read gMSA password": "ReadGMSAPassword",
     "constrained delegation (protocol transition)": "AllowedToDelegate",
     "resource-based delegation": "AllowedToAct",

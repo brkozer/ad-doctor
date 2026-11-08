@@ -3,8 +3,9 @@
 Nodes are principals (by SID) and objects without a SID (OUs, GPOs, PKI objects, the
 domain head). An edge A -> B means "A controls B or becomes B": group membership, an ACE
 that allows a takeover, ownership, DCSync, editing a GPO, enrolling in an exploitable
-certificate template, reading a gMSA password, local admin rights a GPO hands out (admin
-on a computer is SYSTEM there, so it becomes the computer account), a sync server holding
+certificate template or one whose issuance policy carries a group, reading a gMSA password,
+local admin rights a GPO hands out (admin on a computer is SYSTEM there, so it becomes the
+computer account), a sync server holding
 its sync account's password, delegation that lets an account impersonate an admin to a
 computer, a SID held in sIDHistory. A reverse breadth-first search from every tier-0
 node finds the shortest path from any other principal.
@@ -43,7 +44,9 @@ from .checks import (
     _tier0_group_sids,
     ca_control,
     check,
+    linked_policies,
     officer_templates,
+    san_ca,
 )
 from .model import UAC, WELL_KNOWN_SIDS, Account, DirObject, Finding, Severity, Snapshot
 
@@ -58,6 +61,8 @@ UNESCAPED_COMMA = gpo_scope.RDN_SEPARATOR
 CONSTRAINED = "constrained delegation (protocol transition)"
 RESOURCE_BASED = "resource-based delegation"
 SID_HISTORY = "SID history"
+ENROLL_ESC13 = "enroll (ESC13)"
+ENROLL_ESC6 = "enroll (ESC6+ESC16)"
 # a snapshot does not hold a member server's local groups
 LOCAL_ADMIN_CAVEAT = "assumes Domain Admins is in the local Administrators"
 
@@ -421,6 +426,28 @@ def build(snap: Snapshot, provenance: bool = False) -> Graph:
                 how = "write template (ESC4)"
                 add(principal(ace.sid), node, how, rec and rec.template_ace(t, ace.sid))
         names[node] = f"template {t.name}"
+    # An issuance policy linked to a group (ESC13) adds that group to the ticket of whoever
+    # logs on with the certificate. A CA with ESC6 and ESC16 issues a certificate for any
+    # user from any authentication template (AD-CHAIN-004). Both need the Enroll right
+    # itself: AutoEnroll alone cannot request a certificate.
+    ca = san_ca(snap)
+    for t in snap.templates:
+        if not _issuable(t) or not _authenticates(t):
+            continue
+        enrollers = list(
+            dict.fromkeys(
+                a.sid for a in t.aces if a.sid not in skip and a.extended_right(sd.CERT_ENROLL)
+            )
+        )
+        for oid in linked_policies(snap, t):
+            linked = snap.oid_group_links[oid]
+            target = node_of(linked)
+            for sid in enrollers:
+                add(principal(sid), target, ENROLL_ESC13, rec and rec.esc13(t, sid, oid, linked))
+        if ca is not None:
+            node = f"tier0:template:{t.name}"
+            for sid in enrollers:
+                add(principal(sid), node, ENROLL_ESC6, rec and rec.esc6(t, sid, ca.name))
     # PKI object control (ESC5)
     for key, aces in snap.acls.items():
         if key.startswith("PKI:"):

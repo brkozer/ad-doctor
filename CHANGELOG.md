@@ -9,6 +9,21 @@ logic or severity between versions, but an ID is never reused for something else
 
 ### Added
 
+- **ESC13 and ESC6 in the control graph.** Two new edges in AD-PATH-001, `blast-radius`, the
+  viewer and the BloodHound export: `enroll (ESC13)` from whoever holds the Enroll right on
+  a template whose issuance policy is linked to a group, to that group (AD-ADCS-007), and
+  `enroll (ESC6+ESC16)` from whoever enrolls in an authentication template on the CA that has
+  both flags of AD-CHAIN-004, to the template. Both need an issuable authentication
+  certificate and the Enroll right itself. The ESC6 edge needs the domain's only enterprise
+  CA (a snapshot does not say which CA publishes a template; with several CAs that is a note
+  and no edge) that does not hold every request for a manager. ESC6 without ESC16 is blocked
+  by strong mapping on a patched DC, ESC9 needs DCs out of full enforcement and ESC15 an
+  unpatched CA: a snapshot holds neither patch level, so they stay findings, not edges. What-if and `plan` can remove each one: the new
+  `oid-link` (`oid-link:<OID>`) and `ca-flag` (`ca-flag:<CA>:san-from-request|no-sid-extension`)
+  changes with `-WhatIf` fix and rollback lines, `template-ace`, and `template-flag` for
+  `require-approval` and `any-purpose-eku`. On the lab: Domain Computers gets a path through
+  ESC6+ESC16 (13 principals with a path, from 12), the plan is 16 changes (cost 20, proven
+  minimum), which now clears a CA flag, and the exposed users stay 25 of 26.
 - **Delegation and SID history in the control graph.** Three new edges in AD-PATH-001,
   `blast-radius`, the viewer and the BloodHound export: `constrained delegation (protocol
   transition)` from the account to the computer holding the SPN, `resource-based delegation`

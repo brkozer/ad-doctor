@@ -19,6 +19,8 @@ attributes = [
     "msDS-AllowedToDelegateTo and userAccountControl (protocol transition)",
     "msDS-AllowedToActOnBehalfOfOtherIdentity",
     "sIDHistory",
+    "msDS-OIDToGroupLink and msPKI-Certificate-Policy (ESC13)",
+    "the CA's EditFlags and DisableExtensionList, and each template's enrollment rights (ESC6 with ESC16)",
 ]
 related = [
     "AD-ACL-001",
@@ -28,7 +30,12 @@ related = [
     "AD-GPO-004",
     "AD-GPO-006",
     "AD-ADCS-001",
+    "AD-ADCS-006",
+    "AD-ADCS-007",
+    "AD-ADCS-008",
+    "AD-ADCS-012",
     "AD-ADCS-013",
+    "AD-CHAIN-004",
     "AD-ACL-006",
     "AD-DEL-002",
     "AD-DEL-003",
@@ -62,6 +69,8 @@ A -> B means A controls B or can become B:
 | `admin to via GPO ...` | local administrator (or equivalent) groups set by Group Policy; admin on a computer becomes that computer account |
 | `hosts sync account` | an Entra Connect server holds its sync account's password |
 | `enroll (ESC1-3)`, `write template (ESC4)`, `full control` on PKI objects, `ManageCA (ESC7)` | certificate templates, PKI containers and CA permissions |
+| `enroll (ESC13)` | Enroll on a template whose issuance policy is linked to a group (`msDS-OIDToGroupLink`), to that group |
+| `enroll (ESC6+ESC16)` | Enroll on an authentication template of a CA with both `EDITF_ATTRIBUTESUBJECTALTNAME2` and the SID extension disabled, to the template |
 | `read gMSA password` | `msDS-GroupMSAMembership` |
 | `constrained delegation (protocol transition)` | `msDS-AllowedToDelegateTo` of an account with protocol transition, to the computer that holds the SPN |
 | `resource-based delegation` | the principals in `msDS-AllowedToActOnBehalfOfOtherIdentity`, to the computer that carries the attribute |
@@ -123,6 +132,21 @@ what the source holds:
   Only domain SIDs count, not built-in ones. A foreign SID is an edge only to what that
   SID is granted in this domain, because a snapshot sees one domain.
 
+A certificate edge is drawn only for a step that works with what the enrollee holds:
+
+- **ESC13:** an issuable template valid for logon (no manager approval, no authorized
+  signature, an authentication EKU), the Enroll right (AutoEnroll alone requests nothing) and
+  an issuance policy linked to a group. The edge is to that group, so it only matters when the
+  group's own rights reach tier 0.
+- **ESC6 with ESC16** ([AD-CHAIN-004](AD-CHAIN-004.md)): an issuable authentication template on
+  a CA that sets the SAN flag and leaves out the SID extension, so the requester can name any
+  user in a SAN URL and domain controllers accept it even in full enforcement. Only with one
+  enterprise CA in the domain and a CA that does not hold every request for a manager.
+- **Left out, reported as findings instead:** ESC6 without ESC16 and ESC9 (they depend on
+  whether the domain controllers are patched or in full enforcement) and ESC15 (whether the CA
+  has the November 2024 update). The snapshot holds neither, so a path through them could be
+  wrong.
+
 Members who only inherit a path through a group are counted in the detail ("19 of 20
 enabled users (95%) have a path") instead of being listed. Remote logon rights a GPO grants
 (RDP, WinRM, DCOM) are exported to BloodHound but not followed, because logon is not
@@ -136,6 +160,10 @@ false_positives = """
   [accepted-risk file](../ci.md#accepted-risks).
 - **Local accounts and local groups** on servers are invisible over LDAP, so paths through
   them are missed rather than over-reported; the same goes for sessions and logons.
+- **Certificate paths** assume the CA lets the enrollee in (a CA's own Enroll right is not
+  read) and that the template's subject name requirements can be met; with more than one
+  enterprise CA the ESC6 edge is left out with a note, because a snapshot does not say which CA
+  publishes which template.
 - **Delegation paths** to a member server assume Domain Admins is in its local
   Administrators (the path shows the caveat). The edges left out are missed on purpose:
   unconstrained delegation, constrained delegation without protocol transition, delegation

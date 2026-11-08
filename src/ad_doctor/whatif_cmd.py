@@ -147,7 +147,8 @@ def caveats(snap: Snapshot, check_hint: str) -> list[str]:
         "Other domain controllers see a change after replication.",
         "Edges ad-doctor does not see stay: sessions, local admin outside Group Policy, "
         "unconstrained delegation, constrained delegation without protocol transition, "
-        "delegation to a service account, trusts, Deny ACEs.",
+        "delegation to a service account, certificate paths that need DC or CA patch levels "
+        "(ESC9, ESC15, ESC6 without ESC16), trusts, Deny ACEs.",
         "What an attacker already planted is not undone.",
         f"Collect again after the changes and run: {check_hint}",
     ]

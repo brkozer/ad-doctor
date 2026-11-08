@@ -22,6 +22,8 @@ test("edge families", () => {
     "SID history": "sidhistory",
     "hosts sync account": "sync",
     "enroll (ESC1-3)": "adcs",
+    "enroll (ESC13)": "adcs",
+    "enroll (ESC6+ESC16)": "adcs",
     "write template (ESC4)": "adcs",
     "ManageCA (ESC7)": "adcs",
     "full control": "acl",

@@ -21,6 +21,7 @@ from ldap3.core.exceptions import (
 from ldap3.protocol.microsoft import security_descriptor_control
 
 from . import gpo_scope, keycred, probes, sd, sysvol
+from .checks import san_note
 from .model import (
     TIER0_RIDS,
     UAC,
@@ -546,6 +547,7 @@ class Collector:
         snap.notes += _blank_name_notes(accounts)
         snap.notes += _sysvol_unseen_notes(snap)
         snap.notes += _entra_kerberos_notes(accounts)
+        snap.notes += san_note(snap)
         if snap.has_2025 and not snap.dmsa_visible:
             snap.notes.append(
                 "no dMSA visible (none exist, or this account cannot read them; by default "

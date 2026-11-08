@@ -13,8 +13,8 @@ from collections.abc import Callable
 from . import catalog
 from .changes import Facts, trustee_of
 from .checks import OLD_KEYS
-from .model import Finding, Snapshot
-from .sd import Ace
+from .model import DEFAULT_POLICY_MODULE, Finding, Snapshot
+from .sd import SZOID_NTDS_CA_SECURITY_EXT, Ace
 
 Fix = Callable[[Finding, Snapshot], list[str]]
 # Control characters, line breaks among them: object text comes from the directory (GPO
@@ -269,6 +269,23 @@ def _ace_rollback(change: Facts, sid: str) -> list[str]:
     return out
 
 
+def _ca_key(snap: Snapshot, ca: str) -> tuple[str, str]:
+    """The CA's policy registry key as a literal for the lines, and the CA's host."""
+    c = next((x for x in snap.probes.ca_configs if x.name == ca), None)
+    module = (c.policy_module if c else None) or DEFAULT_POLICY_MODULE
+    key = f"HKLM:\\SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\{ca}"
+    return _q(f"{key}\\PolicyModules\\{module}"), c.host if c else "<host>"
+
+
+def _oid_object(oid: str) -> str:
+    """A PowerShell expression for the DN of the msPKI-Enterprise-Oid object with this OID."""
+    search_base = f"{_q(f'CN=OID,{_PKS}')} + {_CONFIG}"
+    return (
+        f"(Get-ADObject -SearchBase ({search_base}) "
+        f"-LDAPFilter {_q(f'(msPKI-Cert-Template-OID={_ldap(oid)})')}).DistinguishedName"
+    )
+
+
 def change_lines(change: Facts, snap: Snapshot) -> list[str]:
     """Fix lines for one what-if change: every command that writes runs with -WhatIf,
     or is commented out when it has no dry run."""
@@ -337,6 +354,26 @@ def change_lines(change: Facts, snap: Snapshot) -> list[str]:
             f"# on the CA {change.prim[1]}: certsrv.msc > Properties > Security: take "
             f"{change.prim[3]} away from {snap.name_of(sid)} ({sid}); no dry run"
         )
+    elif kind == "oid-link":
+        out.append(
+            f"$dn = {_oid_object(change.prim[1])}; "
+            "Set-ADObject -Identity $dn -Clear 'msDS-OIDToGroupLink' -WhatIf"
+        )
+    elif kind == "ca-flag":
+        key, host = _ca_key(snap, change.prim[1])
+        if change.prim[2] == "san-from-request":
+            out.append(
+                f"$k = {key}; Set-ItemProperty -LiteralPath $k -Name EditFlags "
+                "-Value ((Get-ItemProperty -LiteralPath $k).EditFlags -band -bnot 0x40000) -WhatIf"
+            )
+        else:
+            ext = _q(SZOID_NTDS_CA_SECURITY_EXT)
+            out.append(
+                f"$k = {key}; Set-ItemProperty -LiteralPath $k -Name DisableExtensionList "
+                "-Value @((Get-ItemProperty -LiteralPath $k).DisableExtensionList | "
+                f"Where-Object {{ $_.Trim() -ne {ext} }}) -Type MultiString -WhatIf"
+            )
+        out.append(f"# run on the CA {host}, then Restart-Service certsvc")
     elif kind == "gmsa-reader":
         rest = ", ".join(_q(s) for s in change.readers) if change.readers else "$null"
         out.append(
@@ -424,6 +461,26 @@ def rollback_lines(change: Facts, snap: Snapshot) -> list[str]:
                 f"'msPKI-Certificate-Application-Policy' = {eku}; 'pKIExtendedKeyUsage' = {eku}}} "
                 "-WhatIf"
             )
+    elif kind == "oid-link":
+        out.append(
+            f"$dn = {_oid_object(change.prim[1])}; Set-ADObject -Identity $dn "
+            f"-Replace @{{'msDS-OIDToGroupLink' = {_q(change.dn)}}} -WhatIf"
+        )
+    elif kind == "ca-flag":
+        key, host = _ca_key(snap, change.prim[1])
+        if change.prim[2] == "san-from-request":
+            out.append(
+                f"$k = {key}; Set-ItemProperty -LiteralPath $k -Name EditFlags "
+                "-Value ((Get-ItemProperty -LiteralPath $k).EditFlags -bor 0x40000) -WhatIf"
+            )
+        else:
+            ext = _q(SZOID_NTDS_CA_SECURITY_EXT)
+            out.append(
+                f"$k = {key}; Set-ItemProperty -LiteralPath $k -Name DisableExtensionList "
+                f"-Value (@((Get-ItemProperty -LiteralPath $k).DisableExtensionList) + {ext}) "
+                "-Type MultiString -WhatIf"
+            )
+        out.append(f"# run on the CA {host}, then Restart-Service certsvc")
     elif kind == "gmsa-reader":
         everyone = ", ".join(_q(s) for s in [*change.readers, sid])
         out.append(

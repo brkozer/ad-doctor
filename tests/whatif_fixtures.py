@@ -15,7 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from ad_doctor import changes, paths, sd, whatif
-from ad_doctor.model import CaConfig, DirObject, Gmsa, Probes, Snapshot
+from ad_doctor.model import DEFAULT_POLICY_MODULE, CaConfig, DirObject, Gmsa, Probes, Snapshot
 from ad_doctor.sd import Ace
 
 from .test_acl_adcs import template
@@ -111,6 +111,59 @@ def kitchen_sink(inherited_bit: bool = True) -> Snapshot:
 
 
 FOREIGN = "S-1-5-21-7-7-7-1104"
+OID = "1.3.6.1.4.1.311.21.8.1.1.1"
+SERVER_AUTH = "1.3.6.1.5.5.7.3.1"
+CLIENT_AUTH = "1.3.6.1.5.5.7.3.2"
+
+
+def enroll(sid: str, right: str = sd.CERT_ENROLL) -> Ace:
+    return Ace(sid, sd.CONTROL_ACCESS, right)
+
+
+def adcs_snapshot() -> Snapshot:
+    """ESC13 and ESC6 (with ESC16) on a path to tier 0, and the facts that keep edges out."""
+    enrollee = user("esc_user", sid=f"{DOM}-3300")
+    other = user("esc_other", sid=f"{DOM}-3301")
+    esc6_user = user("esc6_user", sid=f"{DOM}-3302")
+    linked_group = DirObject(f"CN=Linked,{LAB}", "Linked", "group", sid=f"{DOM}-3400")
+    da = DirObject(
+        f"CN=Domain Admins,CN=Users,{HEAD}",
+        "Domain Admins",
+        "group",
+        sid=DA,
+        aces=[Ace(linked_group.sid, sd.GENERIC_ALL)],
+    )
+    return gsnap(
+        enrollee,
+        other,
+        esc6_user,
+        gpos=[],
+        entries=[],
+        objects=[da, linked_group],
+        privileged={"Domain Admins": []},
+        templates=[
+            template(
+                "LinkedA",
+                issuance_policies=[OID],
+                aces=[enroll(enrollee.sid), enroll(other.sid)],
+            ),
+            template("LinkedB", issuance_policies=[OID], aces=[enroll(other.sid)]),
+            template("Plain", aces=[enroll(esc6_user.sid)]),
+        ],
+        oid_group_links={OID: linked_group.dn},
+        ca_hosts=["CA01$"],
+        probes=Probes(
+            ca_configs=[
+                CaConfig(
+                    "lab-CA",
+                    "ca01.lab.test",
+                    policy_module=DEFAULT_POLICY_MODULE,
+                    edit_flags=sd.EDITF_ATTRIBUTESUBJECTALTNAME2,
+                    disabled_extensions=[sd.SZOID_NTDS_CA_SECURITY_EXT],
+                )
+            ]
+        ),
+    )
 
 
 def delegation_snapshot() -> Snapshot:

@@ -19,7 +19,7 @@ attributes = [
     "policy\\RequestDisposition",
     "PolicyModules\\Active",
 ]
-related = ["AD-ADCS-001", "AD-ADCS-015", "AD-CHAIN-004", "AD-ADCS-016"]
+related = ["AD-ADCS-001", "AD-ADCS-015", "AD-CHAIN-004", "AD-ADCS-016", "AD-PATH-001"]
 since = "unreleased"
 
 risk = """

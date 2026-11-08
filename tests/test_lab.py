@@ -214,6 +214,16 @@ def test_gpo_reach_through_ou_and_site_links(snap: Snapshot) -> None:
     assert "WS03$" not in {g.name(d) for d, _ in g.edges[lab]}
 
 
+def test_plain_user_gets_the_esc6_and_esc13_edges(snap: Snapshot) -> None:
+    g = paths.build(snap)
+    domain_users = f"sid:{snap.domain_sid}-513"
+    targets = {g.name(d) for d, how in g.edges[domain_users] if how == paths.ENROLL_ESC13}
+    assert targets == {"LabLinked"}
+    esc6 = {g.name(d) for d, how in g.edges[domain_users] if how == paths.ENROLL_ESC6}
+    assert {"template LabESC1", "template User"} <= esc6
+    assert "template EFS" not in esc6  # not valid for logon, so no way in with it
+
+
 def test_plain_user_reads_who_may_delegate_to_a_computer(snap: Snapshot) -> None:
     fs01 = next(a for a in snap.accounts if a.sam == "FS01$")
     app01 = next(a for a in snap.accounts if a.sam == "APP01$")

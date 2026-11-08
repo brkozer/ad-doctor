@@ -29,7 +29,8 @@ latest additions, so the counts in them are lower than a scan shows today.
   (group membership, takeover ACEs, ownership, DCSync, GPO links and what those GPOs reach
   through OUs and sites, exploitable templates,
   gMSA readers, local admin rights that Group Policy hands out, an Entra Connect server
-  holding its sync account, delegation to computers, SID history) from the snapshot and
+  holding its sync account, delegation to computers, SID history, issuance-policy groups
+  (ESC13), ESC6 with ESC16 on the CA) from the snapshot and
   reports the shortest path from every non-tier-0
   principal to tier 0, plus the share of users that have one. `ad-doctor blast-radius`
   answers "what does this account control if it is phished?".
@@ -565,8 +566,9 @@ ad-doctor whatif snap.json --remove adminsdholder:helpdesk --account alice
 ad-doctor whatif new.json --plan plan.toml --check    # CI: 2 gate failed, 3 plan rot
 ```
 
-On the lab, 25 of 26 users have a path to tier 0. The plan is 15 changes (cost 17), a
-proven minimum: the three ESC templates Domain Users enrolls in go first as one step,
+On the lab, 25 of 26 users have a path to tier 0. The plan is 16 changes (cost 20), a
+proven minimum: the three ESC templates Domain Users enrolls in and the CA's missing SID
+extension go first as one step,
 helpdesk's ACE on AdminSDHolder is one change (SDProp removes its 20 copies), and the one
 user left reaches tier 0 only through the Entra sync account, whose DCSync is kept on
 purpose; the plan reports it with the suggestion to treat the sync server as tier 0 rather

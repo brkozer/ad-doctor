@@ -33,19 +33,20 @@ Tier-0 paths:
                                 before       after
   exposed users               25 of 26       1 of 26
                                    96%          3%
-  principals with a path            12           4
-  routes (changes needed)           15           0
+  principals with a path            13           4
+  routes (changes needed)           16           0
 
 Steps (heuristic order; each closes in the snapshot what it says):
-   1. remove the ACEs of Domain Users on templates LabESC1, LabESC2, LabESC3  ->  exposed 8, ...
+   1. 4 changes  ->  exposed 8, principals 11, routes 12
         c:2abd2340d93c  remove the ACEs of Domain Users on template LabESC1  (cost 1)
         ...
+        c:e79a6dc99a15  CA adlab-CA: put the SID security extension back into certificates  (cost 3)
    8. take 6 rights away from helpdesk  ->  exposed 1, principals 4, routes 0
         c:798fc67fc112  remove the ACEs of helpdesk on AdminSDHolder  (cost 1)
           SDProp removes the copies on 20 protected objects at its next run (60 minutes)
         ...
 
-15 changes (cost 17): proven minimum (for paths ad-doctor sees).
+16 changes (cost 20): proven minimum (for paths ad-doctor sees).
 ...
 Cannot be closed by removing a right (needs a decision):
     MSOL_0a1b2c3d4e5f -[DCSync (kept: Entra Connect needs DCSync)]-> adlab.test
@@ -70,7 +71,7 @@ one became.
 | owner | `owner:"CN=Owned,OU=Lab,DC=lab,DC=test"` |
 | membership | `member:"Domain Admins":grp171` |
 | Group Policy | `gplink:"<GPO>":"<container DN>"`, `gpo-entry:"<GPO>":Administrators:"Domain Users"` |
-| AD CS | `template:LabESC1:enroll:"Domain Users"`, `template:LabESC1:enrollee-supplies-subject`, `pki:NTAuthCertificates:helpdesk`, `ca:<CA>:helpdesk:ManageCertificates` |
+| AD CS | `template:LabESC1:enroll:"Domain Users"`, `template:LabESC1:enrollee-supplies-subject`, `pki:NTAuthCertificates:helpdesk`, `ca:<CA>:helpdesk:ManageCertificates`, `oid-link:<OID>`, `ca-flag:<CA>:san-from-request` (or `no-sid-extension`) |
 | gMSA, delegation | `gmsa:<gMSA>:<reader>`, `delegation:<account>:unconstrained` (or `protocol-transition`, `rbcd`, `constrained:<SPN>`), `rbcd:<computer>:<principal>` |
 | SID history | `sid-history:<account>:<SID>`, `sid-history:<account>` (every SID the account holds) |
 | every right of a trustee | `all-rights-of:helpdesk`, `all-rights-of:helpdesk:tier0` (only those on a path) |
@@ -97,7 +98,7 @@ meets the plan; otherwise it says "plan of N changes" with the lower bound. The 
 the steps is a heuristic: each step takes the change or bundle that closes the most users
 per cost, then principals, then routes (changes still needed). A bundle is "close this
 node": the cheapest part of the plan that cuts one of the 20 nodes most paths run through,
-which is how the three ESC templates that Domain Users enrolls in go together.
+which is how the three ESC templates that Domain Users enrolls in and the CA flag go together.
 
 | Option | |
 |---|---|
@@ -223,10 +224,12 @@ at the place where the edge is made. The graph itself is the same with and witho
 | `member` | group, member | `member of` | 1, 5 into a tier-0 group |
 | `gplink` | GPO, container | `linked to ...` and `GPO applies to` from that link | 3 |
 | `gpo-entry` | GPO, group SID, member SID | `admin to via GPO`, `member of via GPO` | 2 |
-| `template-ace` | template, trustee | `enroll (ESC1-3)`, `write template (ESC4)` | 1 |
-| `template-flag` | template, flag | every `enroll (ESC1-3)` into the template when no other ESC condition is left | 10 (warn) |
+| `template-ace` | template, trustee | `enroll (ESC1-3)`, `enroll (ESC13)`, `enroll (ESC6+ESC16)`, `write template (ESC4)` | 1 |
+| `template-flag` | template, flag | every `enroll (ESC1-3)` into the template when no other ESC condition is left; `require-approval` and `any-purpose-eku` also close its ESC13 and ESC6+ESC16 edges when the template no longer issues on request or for logon | 10 (warn) |
 | `pki-ace` | PKI object, trustee | ESC5 `full control` | 1 |
 | `ca-right` | CA, trustee, right | ESC7 | 3 |
+| `oid-link` | OID, group | `enroll (ESC13)` into that group from every template of the policy (`msDS-OIDToGroupLink`) | 3 |
+| `ca-flag` | CA, flag (`san-from-request` is `EDITF_ATTRIBUTESUBJECTALTNAME2`, `no-sid-extension` the disabled SID extension) | every `enroll (ESC6+ESC16)` of the CA; a certsvc restart makes it take effect | 3 |
 | `gmsa-reader` | gMSA, reader | `read gMSA password` | 1 |
 | `delegation` | account, kind | `constrained:<SPN>`: the edge to the computer holding that SPN; `protocol-transition`: every constrained edge of the account; `rbcd`: every resource-based edge into the computer; `unconstrained`: no edge, only findings change | 1 |
 | `rbcd-principal` | computer, principal | `resource-based delegation` from that principal | 1 |
@@ -279,13 +282,15 @@ resolve through and what "expected to clear" in the output and fix lines come fr
 | `gpo-entry` | AD-GPO-005 to AD-GPO-007 | |
 | `template-ace` | AD-ADCS-001 to AD-ADCS-004, AD-ADCS-006 to AD-ADCS-008, AD-ADCS-017 for that template | |
 | `pki-ace` / `ca-right` | AD-ADCS-005 / AD-ADCS-013 | |
+| `oid-link` | AD-ADCS-007 for every template of that policy | |
+| `ca-flag` | AD-ADCS-012 (`san-from-request`) or AD-ADCS-015 (`no-sid-extension`); AD-CHAIN-004 with either | |
 | `member` | AD-PRIV-003, AD-PRIV-004, AD-PRIV-006, AD-PRIV-008, AD-PRIV-009, AD-INV-001 | AD-ACC-006 |
 | `delegation`, `rbcd-principal` | AD-DEL-001 to AD-DEL-005, AD-CHAIN-002 | |
 | `sid-history` | AD-ACC-007 when the account holds no other SID | |
 | any | AD-PATH-001 objects whose holder loses its path | AD-INV-* |
 
-Settings, probes, account hygiene, policies, trusts, CA registry flags and SYSVOL secrets
-are never cleared by a removal; `--remove fp:` on them says so.
+Settings, probes, account hygiene, policies, trusts, the other CA registry flags and SYSVOL
+secrets are never cleared by a removal; `--remove fp:` on them says so.
 
 ## Where the snapshot and AD differ
 
@@ -348,9 +353,9 @@ at a time under a 5 GB limit. Times are the whole command, loading included.
 
 | Snapshot | Plan | Plan, paths only | What-if with findings (the plan file) | Peak | Result |
 |---|---|---|---|---|---|
-| lab (49 accounts) | 0.6 s | | 0.6 s | 50 MB | 15 changes, cost 17, proven minimum; 25 -> 1 users exposed |
-| bench 10,000 users | 4.5 s | 3.4 s | 3.3 s | 0.13 GB | 29 changes, cost 29, proven minimum; 4,665 -> 0 users exposed |
-| bench 250,000 users | 80 s | 46 s | 77 s | 1.9 GB | 23 changes, cost 23, proven minimum; 6,735 -> 0 users exposed |
+| lab (49 accounts) | 0.6 s | | 0.6 s | 50 MB | 16 changes, cost 20, proven minimum; 25 -> 1 users exposed |
+| bench 10,000 users | 4.8 s | 3.7 s | 3.5 s | 0.14 GB | 29 changes, cost 29, proven minimum; 4,665 -> 0 users exposed |
+| bench 250,000 users | 85 s | 53 s | 84 s | 1.9 GB | 23 changes, cost 23, proven minimum; 6,735 -> 0 users exposed |
 
 At 250,000 users loading the snapshot and building the provenance graph take most of the
 paths-only time; with findings, every check runs twice (before and after the changes).
@@ -383,8 +388,16 @@ The commands work on the snapshot. What happens in AD after a change differs:
 - Other DCs see a change after replication.
 - Edges ad-doctor does not see stay: sessions, local admin outside Group Policy,
   unconstrained delegation, constrained delegation without protocol transition, delegation
-  to a service account or `krbtgt`, trusts, Deny ACEs. See [AD-PATH-001](checks/AD-PATH-001.md)
-  for when a delegation edge is drawn.
+  to a service account or `krbtgt`, trusts, Deny ACEs, and these certificate paths:
+  ESC9 (needs domain controllers out of full certificate binding enforcement and a write on a
+  victim's UPN), ESC15 (needs a CA without the November 2024 update) and ESC6 without ESC16
+  (needs a domain controller without the KB5014754 updates, or a service that maps by name).
+  A snapshot holds neither patch level, so they stay findings (AD-ADCS-006, AD-ADCS-008,
+  AD-ADCS-012). ESC6 with ESC16 gets an edge only on a domain with one enterprise CA, as a
+  snapshot does not say which CA publishes which template, and never for a CA that holds every
+  request for a manager; a template that requires a subject the enrollee cannot supply, and a
+  CA's own Enroll right, are not read, so those edges can exist for someone a CA would refuse.
+  See [AD-PATH-001](checks/AD-PATH-001.md) for when a delegation or certificate edge is drawn.
 - Clearing `sIDHistory` cannot be undone with a Set command: it takes a migration tool
   or a restore, so the rollback line for it is a comment.
 - What an attacker already planted (shadow credentials, added SPNs, other persistence) is

@@ -81,6 +81,9 @@ TEMPLATE_FLAGS = (
     "any-purpose-eku",
     "request-agent-eku",
 )
+# template flags that can take the authentication condition of ESC6 and ESC13 away
+AUTH_FLAGS = ("require-approval", "any-purpose-eku")
+CA_FLAGS = ("san-from-request", "no-sid-extension")
 
 
 def fixed_reason(why: int) -> str:
@@ -110,7 +113,9 @@ class Gate:
     requester supplies the subject of an authentication certificate. A gate in
     FACT_GATES is one fact of an account: "same-source" when its edges all leave one
     node (protocol transition), "same-target" when they all reach one (the RBCD
-    attribute); the side tells the flow network where its arc goes."""
+    attribute); the side tells the flow network where its arc goes. "esc13" is enrollment
+    in one template for one linked group, "esc6" in one template on the one CA whose flags
+    make it a certificate for any user: they read the template facts too."""
 
     kind: str
     template: str  # "" for officer, the account's DN for a fact gate
@@ -119,8 +124,10 @@ class Gate:
 
 Why = int | Options | Gated
 FACT_GATES = ("same-source", "same-target")
+# gates the flow network arcs on the side their edges all share (the rest end in tier 0)
+SIDED_GATES = (*FACT_GATES, "esc13")
 # kinds of change that can close a gate
-GATE_KINDS = {"template-flag", "delegation"}
+GATE_KINDS = {"template-flag", "delegation", "oid-link", "ca-flag"}
 
 
 @dataclass
@@ -191,6 +198,13 @@ def esc_open(f: TemplateFacts) -> bool:
         or EKU_ANY in f.ekus
         or EKU_REQUEST_AGENT in f.ekus
     )
+
+
+def auth_open(f: TemplateFacts) -> bool:
+    """Issued without a human in the loop and valid for logon: the template half of the
+    ESC6 and ESC13 edges."""
+    issuable = f.published and not f.manager_approval and f.authorized_signatures == 0
+    return issuable and _authenticates(f)
 
 
 def officer_open(f: TemplateFacts) -> bool:
@@ -478,6 +492,34 @@ class Provenance:
     def enroll(self, t: CertTemplate, sid: str) -> Gated:
         return Gated(self.template_ace(t, sid), self._gate("esc", t.name))
 
+    def esc13(self, t: CertTemplate, sid: str, oid: str, group: str) -> Gated:
+        """Enrollment gives the policy's group: the ACE, the link and the template's
+        authentication condition."""
+        gate = self._cert_gate("esc13", t.name, oid, ("oid-link", oid, group.lower()))
+        return Gated(self.template_ace(t, sid), gate)
+
+    def esc6(self, t: CertTemplate, sid: str, ca: str) -> Gated:
+        """Enrollment on the CA with ESC6 and ESC16: the ACE, the two CA flags and the
+        template's authentication condition."""
+        flags = [("ca-flag", ca, flag) for flag in CA_FLAGS]
+        return Gated(self.template_ace(t, sid), self._cert_gate("esc6", t.name, ca, *flags))
+
+    def _cert_gate(self, kind: str, template: str, detail: str, *facts: Prim) -> int:
+        key = (kind, f"{template}\0{detail}")
+        found = self._gate_of.get(key)
+        if found is not None:
+            return found
+        flags = [self.prim(fact) for fact in facts]
+        f = self.templates[template]
+        flags += [
+            self.prim(("template-flag", template, flag))
+            for flag in AUTH_FLAGS
+            if flag_active(f, flag)
+        ]
+        found = self._gate_of[key] = len(self.gates)
+        self.gates.append(Gate(kind, template, tuple(flags)))
+        return found
+
     def pki(self, key: str, sid: str) -> int:
         return self.prim(("pki-ace", key, sid))
 
@@ -544,6 +586,11 @@ class Provenance:
         g = self.gates[gate]
         if g.kind in FACT_GATES:
             return not any(p in removed for p in g.flags)
+        if g.kind in ("esc13", "esc6"):
+            taken = [self.prims[p] for p in g.flags if p in removed]
+            if any(key[0] != "template-flag" for key in taken):
+                return False  # the policy link or a CA flag is gone
+            return auth_open(without_flags(self.templates[g.template], [k[2] for k in taken]))
         gone: dict[str, list[str]] = {}
         for p in g.flags:
             if p in removed:

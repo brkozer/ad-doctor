@@ -29,7 +29,7 @@ from fractions import Fraction
 from . import changes, paths
 from .model import Snapshot
 from .paths import Graph
-from .provenance import FACT_GATES, Gated, Options, Provenance, fixed_reason
+from .provenance import SIDED_GATES, Gated, Options, Provenance, fixed_reason
 from .whatif import masked, reaching
 
 INF = 1 << 100
@@ -317,6 +317,13 @@ def build_model(
     # gates: which flags can close each one, as arcs the network can hold
     gates_used = sorted({gt for _, _, _, gt, _ in inst if gt is not None})
     kills = {gi: prov.gate_kills(gi) for gi in gates_used}
+    for gi, ks in kills.items():
+        # a CA flag closes every ESC6 gate of the CA for less than a template flag closes one:
+        # a minimum cut never takes the template flag while a CA flag is free to choose
+        if ks and prov.gates[gi].kind == "esc6":
+            ca = [k for k in ks if all(prov.prims[f][0] == "ca-flag" for f in k)]
+            if any(next(iter(k)) not in keeps for k in ca):
+                kills[gi] = ca
     inexact_gates = 0
     gate_plan: dict[int, tuple[list[int], list[int]]] = {}  # gate -> (series, parallel)
     appear: dict[int, int] = {}
@@ -336,12 +343,20 @@ def build_model(
             inexact_gates += 1
             multis = multis[:0]
         group = multis[0] if multis else []
-        shared = [f for f in singles if appear.get(f, 0) > 1]
+        everywhere = [f for f in singles if appear.get(f, 0) > 1]
+        # the two flags of the CA come in every gate of its templates, in this order: a chain
+        # that joins no routes
+        chain = sorted(f for f in everywhere if prov.prims[f][0] == "ca-flag")
+        shared = [f for f in everywhere if prov.prims[f][0] != "ca-flag"]
         private = [f for f in singles if appear.get(f, 0) <= 1]
         if (group and shared) or len(shared) > 1:
             inexact_gates += 1  # a shared flag can only end a gate: drop the rest
             shared = shared[:0] if group else shared[:1]
-        series = private + shared  # a shared flag last
+        if prov.gates[gi].kind == "esc13" and any(
+            prov.prims[f][0] == "template-flag" for f in shared
+        ):
+            inexact_gates += 1  # its arcs reach the group, so a shared flag joins routes
+        series = private + chain + shared  # a shared flag last
         gate_plan[gi] = (series, group)
     for gi, (series, group) in gate_plan.items():
         if all(f in keeps for f in series) and (not group or any(f in keeps for f in group)):
@@ -460,12 +475,16 @@ def build_model(
         if u in sink_like:
             continue  # part of the sink already
         a = nid(u)
-        if gate is not None and prov.gates[gate].kind in FACT_GATES:
+        if gate is not None and prov.gates[gate].kind in SIDED_GATES:
             # one arc on the side all the fact's edges share, so it joins no routes
             target = nid(v)
-            for f in gate_plan[gate][0]:
+            same_source = prov.gates[gate].kind == "same-source"
+            series = gate_plan[gate][0]
+            for f in series if same_source else reversed(series):  # a shared flag nearest v
+                if not finite(f):
+                    continue
                 fin, fout = split(f)
-                if prov.gates[gate].kind == "same-source":
+                if same_source:
                     if (a, fin) not in linked:
                         linked.add((a, fin))
                         net.arc(a, fin, INF)

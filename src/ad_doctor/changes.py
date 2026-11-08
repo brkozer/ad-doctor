@@ -41,6 +41,8 @@ FIELDS = {
     "delegation": ("account", "what"),
     "rbcd-principal": ("computer", "principal"),
     "sid-history": ("account", "sid"),
+    "oid-link": ("oid", "group"),
+    "ca-flag": ("ca", "flag"),
 }
 # fields that hold a DN (lower-cased in IDs) and a SID (upper-cased)
 DN_FIELDS = {"object", "group", "container", "gmsa", "account", "computer"}
@@ -60,6 +62,8 @@ COST = {
     "gpo-entry": 2,
     "gplink": 3,
     "ca-right": 3,
+    "oid-link": 3,
+    "ca-flag": 3,
 }
 TIER0_MEMBER_COST = 5  # taking a member out of a tier-0 group
 WARN_COST = 10
@@ -72,6 +76,8 @@ KIND_ORDER = (
     "template-flag",
     "pki-ace",
     "ca-right",
+    "oid-link",
+    "ca-flag",
     "owner",
     "gmsa-reader",
     "gpo-entry",
@@ -82,6 +88,10 @@ KIND_ORDER = (
     "sid-history",
 )
 DELEGATIONS = ("unconstrained", "protocol-transition", "rbcd")  # and "constrained:<SPN>"
+CA_FLAG_TEXT = {
+    "san-from-request": "take no SAN from request attributes (EDITF_ATTRIBUTESUBJECTALTNAME2)",
+    "no-sid-extension": "put the SID security extension back into certificates",
+}
 PRE2K = "S-1-5-32-554"
 
 
@@ -224,6 +234,10 @@ def describe(snap: Snapshot, prim: Prim, where: Where | None = None) -> str:
         return f"stop {who('principal')} delegating to {obj('computer')}"
     if kind == "sid-history":
         return f"remove {who('sid')} from the SID history of {obj('account')}"
+    if kind == "oid-link":
+        return f"unlink issuance policy {f['oid']} from {obj('group')}"
+    if kind == "ca-flag":
+        return f"CA {f['ca']}: {CA_FLAG_TEXT.get(f['flag'], f['flag'])}"
     return f"remove {f['what']} delegation of {obj('account')}"
 
 
@@ -316,6 +330,8 @@ def facts(snap: Snapshot, prov: Provenance, where: Where, prims: Iterable[int]) 
             gm = next((x for x in snap.gmsas if x.dn.lower() == f.prim[1]), None)
             f.dn = gm.dn if gm else f.prim[1]
             f.readers = [s for s in (gm.readers if gm else []) if s != f.prim[2]]
+        elif kind == "oid-link":
+            f.dn = snap.oid_group_links.get(f.prim[1], f.prim[2])
         elif kind in ("delegation", "rbcd-principal", "sid-history"):
             f.dn = where.dn.get(f.prim[1], f.prim[1])
             if kind == "rbcd-principal" or f.prim[2] == "rbcd":
@@ -564,6 +580,26 @@ def apply(snap: Snapshot, prov: Provenance, removed: Iterable[int]) -> dict[int,
                 else:
                     left.append(ace)
             c.aces = left
+
+    def hit_flag(ca: str, which: str) -> bool:
+        flag = "san-from-request" if which == "san" else "no-sid-extension"
+        return ("ca-flag", ca, flag) in by_kind.get("ca-flag", ()) and hit(("ca-flag", ca, flag))
+
+    if by_kind.get("oid-link"):
+        snap.oid_group_links = {
+            oid: group
+            for oid, group in snap.oid_group_links.items()
+            if not hit(("oid-link", oid, group.lower()))
+        }
+    if by_kind.get("ca-flag"):
+        for c in snap.probes.ca_configs:
+            bit = sd.EDITF_ATTRIBUTESUBJECTALTNAME2
+            if c.edit_flags is not None and c.edit_flags & bit and hit_flag(c.name, "san"):
+                c.edit_flags &= ~bit
+            ext = sd.SZOID_NTDS_CA_SECURITY_EXT
+            listed = c.disabled_extensions or []
+            if any(e.strip() == ext for e in listed) and hit_flag(c.name, "no-sid"):
+                c.disabled_extensions = [e for e in listed if e.strip() != ext]
     if by_kind.get("gmsa-reader"):
         for gm in snap.gmsas:
             gm.readers = [s for s in gm.readers if not hit(("gmsa-reader", gm.dn.lower(), s))]

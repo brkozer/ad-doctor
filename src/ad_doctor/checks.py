@@ -708,7 +708,7 @@ def esc13(snap: Snapshot) -> Finding | None:
         "Logging on with a certificate from these templates adds the linked group to the "
         "token, so every enrollee gets that group's rights.",
         "Remove the msDS-OIDToGroupLink or restrict enrollment to the group's members.",
-        lambda t: _authenticates(t) and any(p in snap.oid_group_links for p in t.issuance_policies),
+        lambda t: _authenticates(t) and bool(linked_policies(snap, t)),
     )
 
 
@@ -727,6 +727,12 @@ def esc15(snap: Snapshot) -> Finding | None:
 
 def _authenticates(t: CertTemplate) -> bool:
     return not t.ekus or EKU_ANY in t.ekus or bool(EKU_CLIENT_AUTH & set(t.ekus))
+
+
+def linked_policies(snap: Snapshot, t: CertTemplate) -> list[str]:
+    """The template's issuance policies that msDS-OIDToGroupLink ties to a group: a logon
+    with its certificate adds that group to the ticket (ESC13)."""
+    return [p for p in t.issuance_policies if p in snap.oid_group_links]
 
 
 # --- Group Policy --------------------------------------------------------------------
@@ -3400,6 +3406,29 @@ def chain_esc6_esc16(snap: Snapshot) -> Finding | None:
         "Fix either side: clear EDITF_ATTRIBUTESUBJECTALTNAME2, or remove "
         f"{sd.SZOID_NTDS_CA_SECURITY_EXT} from DisableExtensionList.",
     )
+
+
+def san_ca(snap: Snapshot) -> CaConfig | None:
+    """The CA of AD-CHAIN-004 as a path: the domain's only enterprise CA, because a
+    snapshot does not say which CA publishes which template, and one that does not hold
+    every request for a manager. None when the CA configuration was not read."""
+    configs = snap.probes.ca_configs
+    if len(snap.ca_hosts) != 1 or len(configs) != 1:
+        return None
+    c = configs[0]
+    return c if _esc6(c) and _esc16(c) and not _pending(c) else None
+
+
+def san_note(snap: Snapshot) -> list[str]:
+    """A note when AD-CHAIN-004 holds but the graph cannot place it on a template."""
+    hits = [c.name for c in snap.probes.ca_configs if _esc6(c) and _esc16(c)]
+    if not hits or (len(snap.ca_hosts) == 1 and len(snap.probes.ca_configs) == 1):
+        return []
+    return [
+        f"{', '.join(sorted(hits))} has ESC6 and ESC16, but this domain has more than one "
+        "enterprise CA and a snapshot does not say which CA publishes which template: "
+        "AD-PATH-001 has no ESC6 edge for it (AD-CHAIN-004 reports the CA)"
+    ]
 
 
 # --- Round 5: local group membership set by Group Policy -----------------------------
