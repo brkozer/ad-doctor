@@ -35,11 +35,13 @@ def _rich_snapshot() -> Snapshot:
 
 def _without_default_inherited(value: Any) -> Any:
     """asdict's output as the snapshot writes it: an ACE holds `inherited` only when
-    it is set."""
+    it is set, an account `rbcd_principals` only when the attribute is."""
     if isinstance(value, dict):
         out = {k: _without_default_inherited(v) for k, v in value.items()}
         if "mask" in out and out.get("inherited") is False:
             del out["inherited"]
+        if out.get("rbcd_principals", "") is None and not out.get("rbcd"):
+            del out["rbcd_principals"]
         return out
     if isinstance(value, list):
         return [_without_default_inherited(v) for v in value]

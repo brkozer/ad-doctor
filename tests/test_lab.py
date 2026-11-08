@@ -214,6 +214,12 @@ def test_gpo_reach_through_ou_and_site_links(snap: Snapshot) -> None:
     assert "WS03$" not in {g.name(d) for d, _ in g.edges[lab]}
 
 
+def test_plain_user_reads_who_may_delegate_to_a_computer(snap: Snapshot) -> None:
+    fs01 = next(a for a in snap.accounts if a.sam == "FS01$")
+    app01 = next(a for a in snap.accounts if a.sam == "APP01$")
+    assert fs01.rbcd and fs01.rbcd_principals == [app01.sid]
+
+
 def test_plain_user_reads_trust_details_and_spn_mappings(snap: Snapshot) -> None:
     assert snap.trust_details_checked
     assert {t.name for t in snap.trusts} == {

@@ -20,7 +20,7 @@ from ad_doctor.sd import Ace
 
 from .test_acl_adcs import template
 from .test_checks import user
-from .test_gpo_local import ADMINS, GUID_A, LAB, entry, gpo, gsnap, host, link
+from .test_gpo_local import ADMINS, DC_OU, GUID_A, LAB, entry, gpo, gsnap, host, link
 
 DOM = "S-1-5-21-1-2-3"
 HEAD = "DC=lab,DC=test"
@@ -108,6 +108,71 @@ def kitchen_sink(inherited_bit: bool = True) -> Snapshot:
         principals={HELPDESK: "helpdesk", OPS: "ops", OWNER: "owner", READER: "reader"},
     )
     return snap
+
+
+FOREIGN = "S-1-5-21-7-7-7-1104"
+
+
+def delegation_snapshot() -> Snapshot:
+    """Every delegation and SID history edge, each on a path to tier 0, and the facts that
+    keep other edges out."""
+    admin = user("admin1", sid=f"{DOM}-3100")
+    shielded = user("admin2", sid=f"{DOM}-3101")
+    dc01 = host("DC02", DC_OU, 1000, 0x2000, spns=["HOST/dc02.lab.test", "ldap/dc02.lab.test"])
+    app = host("APP01", rid=2100, spns=["HOST/app01.lab.test"], sid_history=[DA])
+    app.rbcd = True
+    kcd = user(
+        "svc_kcd",
+        0x200 | 0x1000000,  # protocol transition
+        sid=f"{DOM}-3102",
+        spns=["http/svc.lab.test"],
+        allowed_to_delegate_to=["cifs/app01.lab.test", "ldap/dc02.lab.test"],
+    )
+    kerberos_only = user(
+        "svc_krb",
+        sid=f"{DOM}-3103",
+        spns=["http/krb.lab.test"],
+        allowed_to_delegate_to=["cifs/app01.lab.test"],
+    )
+    rbcd_user = user("svc_rbcd", sid=f"{DOM}-3104", spns=["http/rbcd.lab.test"])
+    in_group = user("svc_grp", sid=f"{DOM}-3105", spns=["http/grp.lab.test"])
+    migrated = user("migrated", sid=f"{DOM}-3106", sid_history=[DA])
+    old = user("oldname", sid=f"{DOM}-3107", sid_history=[FOREIGN])
+    group = DirObject(f"CN=Rbcd,{LAB}", "Rbcd", "group", sid=f"{DOM}-3200", members=[in_group.dn])
+    app.rbcd_principals = [rbcd_user.sid, group.sid]
+    da = DirObject(
+        f"CN=Domain Admins,CN=Users,{HEAD}",
+        "Domain Admins",
+        "group",
+        sid=DA,
+        members=[admin.dn, shielded.dn],
+        aces=[Ace(FOREIGN, sd.GENERIC_ALL)],
+    )
+    protected = DirObject(
+        f"CN=Protected Users,CN=Users,{HEAD}",
+        "Protected Users",
+        "group",
+        sid=f"{DOM}-525",
+        members=[shielded.dn],
+    )
+    return gsnap(
+        admin,
+        shielded,
+        dc01,
+        app,
+        kcd,
+        kerberos_only,
+        rbcd_user,
+        in_group,
+        migrated,
+        old,
+        gpos=[],
+        entries=[],
+        objects=[da, group, protected],
+        privileged={"Domain Admins": [admin.dn, shielded.dn]},
+        protected_users=[shielded.dn],
+        spn_mappings=["host=cifs,http"],
+    )
 
 
 def lab_snapshots() -> list[Path]:

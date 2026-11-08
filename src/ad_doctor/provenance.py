@@ -105,16 +105,22 @@ class Gated:
 
 @dataclass(frozen=True)
 class Gate:
-    """Template flags that decide whether edges exist at all: "esc" for enrollment in one
-    template (ESC1-3), "officer" for ManageCertificates (ESC7), which needs some template
-    whose requester supplies the subject of an authentication certificate."""
+    """Facts that decide whether edges exist at all: "esc" for enrollment in one template
+    (ESC1-3), "officer" for ManageCertificates (ESC7), which needs some template whose
+    requester supplies the subject of an authentication certificate. A gate in
+    FACT_GATES is one fact of an account: "same-source" when its edges all leave one
+    node (protocol transition), "same-target" when they all reach one (the RBCD
+    attribute); the side tells the flow network where its arc goes."""
 
     kind: str
-    template: str  # "" for officer
+    template: str  # "" for officer, the account's DN for a fact gate
     flags: tuple[int, ...]  # template-flag primitives that can close it
 
 
 Why = int | Options | Gated
+FACT_GATES = ("same-source", "same-target")
+# kinds of change that can close a gate
+GATE_KINDS = {"template-flag", "delegation"}
 
 
 @dataclass
@@ -264,6 +270,8 @@ class Provenance:
         # CA right holders ca_control leaves out because they are tier 0 (set by
         # paths.build): a membership change can bring their ESC7 edge into the graph
         self.hidden_ca: set[str] = set()
+        # groups whose members decide whether a delegation edge exists (set by paths.build)
+        self.condition_groups: set[str] = set()
         self._lower: dict[int, str] = {}
         self.templates = {t.name: template_facts(t) for t in snap.templates}
         # SIDs whose membership a GPO security filter reads: a change there moves GPO scope
@@ -485,6 +493,30 @@ class Provenance:
     def gmsa(self, dn: str, sid: str) -> int:
         return self.prim(("gmsa-reader", dn.lower(), sid))
 
+    def constrained(self, dn: str, spn: str) -> Gated:
+        """A constrained delegation edge: the SPN entry, and protocol transition."""
+        key = dn.lower()
+        p = self.prim(("delegation", key, f"constrained:{spn}"))
+        return Gated(p, self._fact_gate("same-source", key, "protocol-transition"))
+
+    def rbcd(self, dn: str, sid: str) -> Gated:
+        """A resource-based edge: the listed principal, and the attribute that lists it."""
+        key = dn.lower()
+        return Gated(
+            self.prim(("rbcd-principal", key, sid)),
+            self._fact_gate("same-target", key, "rbcd"),
+        )
+
+    def sid_history(self, dn: str, sid: str) -> int:
+        return self.prim(("sid-history", dn.lower(), sid))
+
+    def _fact_gate(self, kind: str, dn: str, what: str) -> int:
+        found = self._gate_of.get((kind, dn))
+        if found is None:
+            found = self._gate_of[(kind, dn)] = len(self.gates)
+            self.gates.append(Gate(kind, dn, (self.prim(("delegation", dn, what)),)))
+        return found
+
     def _gate(self, kind: str, template: str) -> int:
         key = (kind, template)
         found = self._gate_of.get(key)
@@ -510,6 +542,8 @@ class Provenance:
     def gate_open(self, gate: int, removed: set[int] | frozenset[int]) -> bool:
         """Whether the gate stays open after the removals (exact, from the facts)."""
         g = self.gates[gate]
+        if g.kind in FACT_GATES:
+            return not any(p in removed for p in g.flags)
         gone: dict[str, list[str]] = {}
         for p in g.flags:
             if p in removed:
@@ -542,11 +576,15 @@ class Provenance:
 
     def needs_rebuild(self, p: int) -> bool:
         """Whether the masked graph can miss what removing the primitive does: GPO scope
-        moves, or a membership change takes a CA right holder out of tier 0, which brings
-        its ESC7 edge (left out while it is tier 0) into the graph."""
+        moves, a membership change takes a CA right holder out of tier 0, which brings
+        its ESC7 edge (left out while it is tier 0) into the graph, or a membership
+        change decides whether a delegation edge exists."""
         if self.scope_sensitive(p):
             return True
-        return bool(self.hidden_ca) and self.prims[p][0] == "member"
+        key = self.prims[p]
+        if key[0] != "member":
+            return False
+        return bool(self.hidden_ca) or key[1] in self.condition_groups
 
     def scope_sensitive(self, p: int) -> bool:
         """Whether removing the primitive can move GPO scope (links, security filters),

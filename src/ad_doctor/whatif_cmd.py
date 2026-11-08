@@ -145,8 +145,9 @@ def caveats(snap: Snapshot, check_hint: str) -> list[str]:
         "Kerberos tickets keep their group memberships until they expire (10 hours by default).",
         "Certificates already issued stay valid until they expire or are revoked.",
         "Other domain controllers see a change after replication.",
-        "Edges ad-doctor does not see stay: sessions, local admin outside Group Policy, RBCD and "
-        "unconstrained delegation as paths, trusts, Deny ACEs.",
+        "Edges ad-doctor does not see stay: sessions, local admin outside Group Policy, "
+        "unconstrained delegation, constrained delegation without protocol transition, "
+        "delegation to a service account, trusts, Deny ACEs.",
         "What an attacker already planted is not undone.",
         f"Collect again after the changes and run: {check_hint}",
     ]
@@ -657,7 +658,8 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     notes = list(ctx.notes)
     if not ok:
         notes.append(
-            "a change can move GPO scope: paths come from a rebuilt graph, routes from the "
+            "a change can move GPO scope or who can be impersonated: paths come from a rebuilt "
+            "graph, routes from the "
             "flow model on the masked graph"
         )
     if args.paths_only:
@@ -875,7 +877,10 @@ def run_plan(args: argparse.Namespace) -> tuple[dict[str, Any], int, planfile.Pl
     if args.paths_only:
         notes.append("--paths-only: findings were not rechecked")
     if not res.maskable:
-        notes.append("a change can move GPO scope, so the paths after it come from a rebuilt graph")
+        notes.append(
+            "a change can move GPO scope or who can be impersonated, so the paths after it "
+            "come from a rebuilt graph"
+        )
     doc["notes"] = notes
     doc["caveats"] = caveats(ctx.snap, "ad-doctor whatif NEW.json --plan plan.toml --check")
     out = planfile.PlanFile(

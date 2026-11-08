@@ -9,6 +9,23 @@ logic or severity between versions, but an ID is never reused for something else
 
 ### Added
 
+- **Delegation and SID history in the control graph.** Three new edges in AD-PATH-001,
+  `blast-radius`, the viewer and the BloodHound export: `constrained delegation (protocol
+  transition)` from the account to the computer holding the SPN, `resource-based delegation`
+  from each principal in `msDS-AllowedToActOnBehalfOfOtherIdentity` to the computer, and `SID
+  history` from the account to the SID's principal. An edge is drawn only when the attack
+  works with what the source holds: an enabled computer with an SPN, an admin the KDC lets
+  a service impersonate (not sensitive, not in Protected Users), protocol transition and a
+  resolvable SPN for constrained delegation, a listed principal that can run S4U2self for
+  resource-based. Unconstrained delegation, constrained delegation without protocol
+  transition, delegation to `krbtgt` or a service account and resource-based delegation from
+  an account with no SPN stay out, and the docs say why. The snapshot now keeps the
+  resource-based principals (redacted like every SID); a snapshot from an older version has
+  no list, so those edges are missing there, with a note. What-if and `plan` can remove each
+  edge: `delegation`, the new `rbcd-principal` (`rbcd:<computer>:<principal>`) and
+  `sid-history` (`sid-history:<account>[:<SID>]`) changes, with `-WhatIf` fix and rollback
+  lines, and a membership that decides who can be impersonated goes through a rebuild. The
+  viewer gets Delegation and SID history filters.
 - **Domain controller and computer health checks.** AD-ACC-014 reports stale enabled computer
   accounts (AD-ACC-005 covers users only). AD-ACC-015 reports gMSAs whose password interval is
   over 90 days. AD-INF-018 reports DCs whose machine password is over 45 days old. AD-INF-019

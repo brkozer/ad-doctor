@@ -117,6 +117,9 @@ class Account:
     last_logon: datetime | None = None
     admin_count: bool = False
     rbcd: bool = False
+    # who msDS-AllowedToActOnBehalfOfOtherIdentity lets act on this account; None when
+    # the attribute is not set, could not be read, and in older snapshots
+    rbcd_principals: list[str] | None = None
     allowed_to_delegate_to: list[str] = field(default_factory=list)
     laps: bool = False
     os: str | None = None
@@ -906,6 +909,8 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
         missing.append("AD-ADCS-018 (CA audit filter)")
     if "enrollment_https" not in data.get("probes", {}):
         missing.append("AD-ADCS-019 (HTTPS enrollment endpoints)")
+    if any(a.get("rbcd") and "rbcd_principals" not in a for a in data["accounts"]):
+        missing.append("the resource-based delegation edges of the control graph")
     notes = [f"snapshot from an older version: {text} not evaluated" for text in missing]
     if "dmsa_visible" not in data:
         notes.append(
@@ -951,7 +956,12 @@ def _encode(value: Any) -> Any:
             out["inherited"] = True
         return out
     if is_dataclass(value):
-        return {f.name: _encode(getattr(value, f.name)) for f in fields(value)}
+        out = {f.name: _encode(getattr(value, f.name)) for f in fields(value)}
+        # not when the attribute is unset: such an account adds nothing to the file. A
+        # null next to `rbcd` is a list that could not be parsed, not an older snapshot
+        if isinstance(value, Account) and value.rbcd_principals is None and not value.rbcd:
+            del out["rbcd_principals"]
+        return out
     if isinstance(value, dict):
         return {k: _encode(v) for k, v in value.items()}
     if isinstance(value, list):

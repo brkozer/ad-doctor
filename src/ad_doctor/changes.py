@@ -39,10 +39,12 @@ FIELDS = {
     "ca-right": ("ca", "trustee", "right"),
     "gmsa-reader": ("gmsa", "reader"),
     "delegation": ("account", "what"),
+    "rbcd-principal": ("computer", "principal"),
+    "sid-history": ("account", "sid"),
 }
 # fields that hold a DN (lower-cased in IDs) and a SID (upper-cased)
-DN_FIELDS = {"object", "group", "container", "gmsa", "account"}
-SID_FIELDS = {"trustee", "reader"}
+DN_FIELDS = {"object", "group", "container", "gmsa", "account", "computer"}
+SID_FIELDS = {"trustee", "reader", "principal", "sid"}
 COST = {
     "ace": 1,
     "inherited-ace": 1,
@@ -53,6 +55,8 @@ COST = {
     "pki-ace": 1,
     "gmsa-reader": 1,
     "delegation": 1,
+    "rbcd-principal": 1,
+    "sid-history": 1,
     "gpo-entry": 2,
     "gplink": 3,
     "ca-right": 3,
@@ -74,6 +78,8 @@ KIND_ORDER = (
     "gplink",
     "member",
     "delegation",
+    "rbcd-principal",
+    "sid-history",
 )
 DELEGATIONS = ("unconstrained", "protocol-transition", "rbcd")  # and "constrained:<SPN>"
 PRE2K = "S-1-5-32-554"
@@ -214,6 +220,10 @@ def describe(snap: Snapshot, prim: Prim, where: Where | None = None) -> str:
         return f"remove {f['right']} of {who('trustee')} on CA {f['ca']}"
     if kind == "gmsa-reader":
         return f"remove {who('reader')} from the password readers of {obj('gmsa')}"
+    if kind == "rbcd-principal":
+        return f"stop {who('principal')} delegating to {obj('computer')}"
+    if kind == "sid-history":
+        return f"remove {who('sid')} from the SID history of {obj('account')}"
     return f"remove {f['what']} delegation of {obj('account')}"
 
 
@@ -306,8 +316,12 @@ def facts(snap: Snapshot, prov: Provenance, where: Where, prims: Iterable[int]) 
             gm = next((x for x in snap.gmsas if x.dn.lower() == f.prim[1]), None)
             f.dn = gm.dn if gm else f.prim[1]
             f.readers = [s for s in (gm.readers if gm else []) if s != f.prim[2]]
-        elif kind == "delegation":
+        elif kind in ("delegation", "rbcd-principal", "sid-history"):
             f.dn = where.dn.get(f.prim[1], f.prim[1])
+            if kind == "rbcd-principal" or f.prim[2] == "rbcd":
+                held = next((x for x in snap.accounts if x.dn.lower() == f.prim[1]), None)
+                listed = (held.rbcd_principals if held else None) or []
+                f.readers = [s for s in listed if s != f.prim[2]]
     return out
 
 
@@ -324,7 +338,7 @@ def trustee_of(prim: Prim) -> str:
     kind = prim[0]
     if kind in ("ace", "inherited-ace", "pki-ace", "template-ace", "adminsdholder-ace"):
         return prim[-1]
-    if kind in ("gmsa-reader",):
+    if kind in ("gmsa-reader", "rbcd-principal"):
         return prim[2]
     if kind == "ca-right":
         return prim[2]
@@ -387,6 +401,12 @@ def assess(snap: Snapshot, prim: Prim, tier0: set[str], ctx: Context | None = No
             WARN_COST,
             "named like the Entra Connect sync account, but no sync server was found: "
             "check whether sync needs it or someone planted it",
+        )
+    if kind == "sid-history" and not prim[2].startswith(
+        tuple(f"{d}-" for d in (snap.domain_sid, snap.root_sid) if d)
+    ):
+        return Assessment(
+            "warn", WARN_COST, "resources still granted to the old SID lose access: re-ACL first"
         )
     if kind == "member":
         group_node = ctx.group_node.get(prim[1], f"dn:{prim[1]}")
@@ -479,7 +499,9 @@ def apply(snap: Snapshot, prov: Provenance, removed: Iterable[int]) -> dict[int,
         _remove_aces(snap, prov, wanted, gone)
     members = by_kind.get("member", set())
     if members:
-        snap.privileged = privileged_without(snap, {(p[1], p[2]) for p in members})
+        pairs = {(p[1], p[2]) for p in members}
+        snap.privileged = privileged_without(snap, pairs)
+        snap.protected_users = protected_without(snap, pairs)
         for o in snap.objects:
             if o.kind == "group" and any(p[1] == o.dn.lower() for p in members):
                 o.members = [m for m in o.members if not hit(("member", o.dn.lower(), m.lower()))]
@@ -549,6 +571,20 @@ def apply(snap: Snapshot, prov: Provenance, removed: Iterable[int]) -> dict[int,
         for prim in by_kind.get("delegation", ()):
             if prim[1] == account.dn.lower() and _undelegate(account, prim[2]):
                 gone[prov.index[prim]] += 1
+    if by_kind.get("rbcd-principal") or by_kind.get("sid-history"):
+        key = ""
+
+        def stays(kind: str, value: str) -> bool:
+            return not hit((kind, key, value))
+
+        for account in snap.accounts:
+            key = account.dn.lower()
+            if account.sid_history:
+                account.sid_history = [s for s in account.sid_history if stays("sid-history", s)]
+            if account.rbcd_principals:
+                kept = [s for s in account.rbcd_principals if stays("rbcd-principal", s)]
+                account.rbcd_principals = kept
+                account.rbcd = bool(kept)  # an empty list clears the attribute
     return gone
 
 
@@ -613,6 +649,8 @@ def _undelegate(a: object, what: str) -> bool:
         return True
     if what == "rbcd" and a.rbcd:
         a.rbcd = False
+        if a.rbcd_principals is not None:
+            a.rbcd_principals = []
         return True
     if what.startswith("constrained:"):
         spn = what.removeprefix("constrained:").lower()
@@ -632,6 +670,33 @@ PRIVILEGED_BUILTIN = {
     "Print Operators": "S-1-5-32-550",
     "Backup Operators": "S-1-5-32-551",
 }
+
+
+def protected_without(snap: Snapshot, pairs: set[tuple[str, str]]) -> list[str]:
+    """Snapshot.protected_users as it would be without these memberships."""
+    groups = {o.dn.lower(): o for o in snap.objects if o.kind == "group"}
+    root = next((k for k, o in groups.items() if o.sid == f"{snap.domain_sid}-525"), None)
+    if root is None:
+        return snap.protected_users
+
+    def closure(skip: bool) -> set[str]:
+        out: set[str] = set()
+        seen, stack = {root}, [root]
+        while stack:
+            group = stack.pop()
+            for m in groups[group].members:
+                key = m.lower()
+                if skip and (group, key) in pairs:
+                    continue
+                if key not in groups:
+                    out.add(key)
+                elif key not in seen:
+                    seen.add(key)
+                    stack.append(key)
+        return out
+
+    dropped = closure(False) - closure(True)
+    return [d for d in snap.protected_users if d.lower() not in dropped]
 
 
 def privileged_without(snap: Snapshot, pairs: set[tuple[str, str]]) -> dict[str, list[str]]:

@@ -25,6 +25,7 @@ from .whatif_fixtures import (
     HOLDER,
     OPS,
     TEAM_OU,
+    delegation_snapshot,
     kitchen_sink,
     lab_snapshots,
     load,
@@ -40,6 +41,7 @@ FIXTURES: dict[str, Callable[[], Snapshot]] = {
     "entra": lambda: entra_snapshot(helpdesk_reset=True),
     "gpo-local": _tier0_lab,
     "xss": xss_snapshot,
+    "delegation": delegation_snapshot,
 }
 
 

@@ -5,8 +5,9 @@ domain head). An edge A -> B means "A controls B or becomes B": group membership
 that allows a takeover, ownership, DCSync, editing a GPO, enrolling in an exploitable
 certificate template, reading a gMSA password, local admin rights a GPO hands out (admin
 on a computer is SYSTEM there, so it becomes the computer account), a sync server holding
-its sync account's password. A reverse breadth-first search from every tier-0 node finds
-the shortest path from any other principal.
+its sync account's password, delegation that lets an account impersonate an admin to a
+computer, a SID held in sIDHistory. A reverse breadth-first search from every tier-0
+node finds the shortest path from any other principal.
 
 Remote logon rights a GPO grants (RDP, WinRM, DCOM) are kept apart as logon edges: they
 are exported, but logon is not control, so the path search does not follow them.
@@ -36,6 +37,7 @@ from .checks import (
     _finding,
     _issuable,
     _risky_rights,
+    _spn_aliases,
     _sync_accounts,
     _sync_servers,
     _tier0_group_sids,
@@ -43,7 +45,7 @@ from .checks import (
     check,
     officer_templates,
 )
-from .model import WELL_KNOWN_SIDS, Account, DirObject, Finding, Severity, Snapshot
+from .model import UAC, WELL_KNOWN_SIDS, Account, DirObject, Finding, Severity, Snapshot
 
 if TYPE_CHECKING:
     from .provenance import Provenance
@@ -53,6 +55,11 @@ GPO_APPLIES = "GPO applies to"  # GPO to the scope of a link
 GPO_INHERITED = "GPO inherited by"  # scope to the scope of a child OU
 GPO_REACHES = "GPO reaches"  # scope to an account
 UNESCAPED_COMMA = gpo_scope.RDN_SEPARATOR
+CONSTRAINED = "constrained delegation (protocol transition)"
+RESOURCE_BASED = "resource-based delegation"
+SID_HISTORY = "SID history"
+# a snapshot does not hold a member server's local groups
+LOCAL_ADMIN_CAVEAT = "assumes Domain Admins is in the local Administrators"
 
 
 @dataclass
@@ -120,6 +127,13 @@ WELL_KNOWN_GROUPS = {"S-1-1-0", "S-1-5-7", "S-1-5-11", "S-1-5-9"}
 DOMAIN_GROUP_RIDS = {*map(str, range(512, 528)), "553", "571", "572"}
 
 
+def edge_text(g: Graph, src: str, dst: str, how: str) -> str:
+    """An edge's label as a path shows it: what the edge assumes must be in the text."""
+    caveats = g.edge_props.get((src, dst, how), {}).get("caveats")
+    mark = f" ({'; '.join(caveats)})".replace("]", "") if caveats else ""
+    return how + mark
+
+
 @dataclass
 class Path:
     start: str
@@ -129,10 +143,7 @@ class Path:
         out = g.name(self.start)
         src = self.start
         for node, how in self.steps:
-            caveats = g.edge_props.get((src, node, how), {}).get("caveats")
-            # a report has only this text: what an edge assumes must show in it
-            mark = f" ({'; '.join(caveats)})".replace("]", "") if caveats else ""
-            out += f" -[{how}{mark}]-> {g.name(node)}"
+            out += f" -[{edge_text(g, src, node, how)}]-> {g.name(node)}"
             src = node
         return out
 
@@ -444,11 +455,176 @@ def build(snap: Snapshot, provenance: bool = False) -> Graph:
         for sid in gm.readers:
             add(principal(sid), target, "read gMSA password", rec and rec.gmsa(gm.dn, sid))
 
+    _delegation_edges(snap, add, principal, rec, edge_props)
+
     tier0 = tier0_nodes(snap, node_of, domain_node, ca_nodes, names, snap.tier0_dns())
     names["tier0:dc-ou"] = "Domain Controllers OU"
     names[domain_node] = snap.domain
     kinds[domain_node] = "domain"
     return Graph(edges, names, tier0, logon_edges, edge_props, kinds, rec)
+
+
+def _delegation_edges(
+    snap: Snapshot,
+    add: Callable[[str, str, str, Any], None],
+    principal: Callable[[str], str],
+    rec: Provenance | None,
+    edge_props: dict[tuple[str, str, str], dict[str, Any]],
+) -> None:
+    """S4U delegation and SID history. Impersonating an admin to a computer makes the
+    source admin there, so it becomes the computer account. What each edge needs:
+
+    - constrained: protocol transition (without it S4U2self gives no forwardable ticket,
+      so the source needs a victim's ticket) and an SPN of its own; the target SPN
+      resolves to one computer, as the KDC would resolve it.
+    - resource-based: a listed principal that can run S4U2self: a computer (it can write
+      itself an SPN), an account with an SPN, or a group holding one of those.
+    - both: an enabled target with an SPN, and an admin of it that can be delegated.
+    - SID history: nothing else inside the domain; the holder's tickets carry the SID.
+    """
+    for a in snap.accounts:
+        if a.sid:
+            for sid in a.sid_history:
+                if sid.startswith("S-1-5-21-"):  # the built-in SIDs are not migrated ones
+                    add(
+                        _sid_node(a.sid),
+                        principal(sid),
+                        SID_HISTORY,
+                        rec and rec.sid_history(a.dn, sid),
+                    )
+    constrained = [
+        a
+        for a in snap.accounts
+        if a.sid and a.allowed_to_delegate_to and a.has(UAC.TRUSTED_TO_AUTH_FOR_DELEGATION)
+    ]
+    resource = [a for a in snap.accounts if a.sid and a.rbcd and a.rbcd_principals]
+    if not constrained and not resource:
+        return
+    groups = {o.dn.lower(): o for o in snap.objects if o.kind == "group"}
+    if rec is not None:  # a membership change can open or close these edges
+        rec.condition_groups = _condition_groups(snap, groups, resource)
+    server, dc = _impersonable(snap)
+
+    def host(a: Account | None) -> bool:
+        return (
+            a is not None
+            and a.is_computer
+            and not a.managed
+            and a.enabled
+            and bool(a.spns)
+            and (dc if a.is_dc else server)
+        )
+
+    def link(src: str, target: Account, how: str, why: Any) -> None:
+        dst = _sid_node(target.sid)
+        add(src, dst, how, why)
+        if not target.is_dc and src != dst:
+            edge_props[(src, dst, how)] = {"caveats": [LOCAL_ADMIN_CAVEAT]}
+
+    owner: dict[str, Account | None] = {}
+    if constrained:
+        for a in snap.accounts:
+            for spn in a.spns:
+                key = spn.lower()
+                owner[key] = a if key not in owner or owner[key] is a else None
+    aliases = _spn_aliases(snap)
+
+    def holder(spn: str) -> Account | None:
+        """The one account the KDC finds for an SPN: as written, else through sPNMappings."""
+        key = spn.lower().rstrip(".")
+        if key in owner:
+            return owner[key]
+        service, _, rest = key.partition("/")
+        return owner.get(f"{aliases[service]}/{rest}") if service in aliases else None
+
+    for a in constrained:
+        if a.is_computer or a.spns:
+            for spn in a.allowed_to_delegate_to:
+                target = holder(spn)
+                if target is not None and host(target):
+                    link(_sid_node(a.sid), target, CONSTRAINED, rec and rec.constrained(a.dn, spn))
+    by_sid = {a.sid: a for a in snap.accounts if a.sid}
+    group_of = {o.sid: o for o in groups.values() if o.sid}
+    broad = snap.broad_sids()
+
+    def can_s4u(sid: str) -> bool:
+        account = by_sid.get(sid)
+        if account is not None:
+            return account.is_computer or bool(account.spns)
+        if sid in broad:
+            return True
+        return sid in group_of and _holds_s4u_member(snap, groups, group_of[sid])
+
+    for target in resource:
+        if host(target):
+            for sid in target.rbcd_principals or ():
+                if can_s4u(sid):
+                    link(principal(sid), target, RESOURCE_BASED, rec and rec.rbcd(target.dn, sid))
+
+
+def _impersonable(snap: Snapshot) -> tuple[bool, bool]:
+    """(a member server, a domain controller) has an admin the KDC lets a service
+    impersonate: enabled, not marked sensitive, not in Protected Users. A writable DC's
+    own account counts on a DC: as that account a service can replicate."""
+    protected = {dn.lower() for dn in snap.protected_users}
+    accounts = snap.by_dn()
+
+    def usable(dn: str) -> bool:
+        a = accounts.get(dn.lower())
+        return (
+            a is not None
+            and a.enabled
+            and not a.has(UAC.NOT_DELEGATED)
+            and dn.lower() not in protected
+        )
+
+    server = any(usable(dn) for dn in snap.privileged.get("Domain Admins", []))
+    dc = (
+        server
+        or any(
+            usable(dn)
+            for name in ("Administrators", "Enterprise Admins")
+            for dn in snap.privileged.get(name, [])
+        )
+        or any(a.is_registered_dc and not a.is_rodc and usable(a.dn) for a in snap.accounts)
+    )
+    return server, dc
+
+
+def _holds_s4u_member(snap: Snapshot, groups: dict[str, DirObject], group: DirObject) -> bool:
+    """Whether the group holds a computer or an account with an SPN, nested or not."""
+    accounts = snap.by_dn()
+    seen, stack = {group.dn.lower()}, [group]
+    while stack:
+        for member in stack.pop().members:
+            key = member.lower()
+            a = accounts.get(key)
+            if a is not None and (a.is_computer or a.spns):
+                return True
+            if key in groups and key not in seen:
+                seen.add(key)
+                stack.append(groups[key])
+    return False
+
+
+def _condition_groups(
+    snap: Snapshot, groups: dict[str, DirObject], resource: list[Account]
+) -> set[str]:
+    """Lower-cased DNs of the groups, nested ones included, whose members decide whether
+    a delegation edge exists: the admins, Protected Users and listed groups."""
+    roots = {"S-1-5-32-544"}
+    for domain in {snap.domain_sid, snap.root_sid} - {""}:
+        roots |= {f"{domain}-{rid}" for rid in (512, 519, 525)}
+    roots |= {sid for a in resource for sid in a.rbcd_principals or ()}
+    stack = [dn for dn, o in groups.items() if o.sid in roots]
+    out = set(stack)
+    while stack:
+        for member in groups[stack.pop()].members:
+            key = member.lower()
+            if key in groups and key not in out:
+                out.add(key)
+                stack.append(key)
+    return out
 
 
 def tier0_nodes(

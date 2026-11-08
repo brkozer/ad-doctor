@@ -196,6 +196,7 @@ const CORE = (function () {
     ["membership", "Membership"], ["acl", "ACL rights"], ["owner", "Ownership"],
     ["contains", "Containment"], ["gpo", "Group Policy"], ["adcs", "AD CS"],
     ["dcsync", "DCSync"], ["gmsa", "gMSA password"], ["sync", "Entra sync"],
+    ["delegation", "Delegation"], ["sidhistory", "SID history"],
   ];
 
   // The family of a paths.build edge label.
@@ -208,6 +209,8 @@ const CORE = (function () {
     if (h === "DCSync") return "dcsync";
     if (h === "read gMSA password") return "gmsa";
     if (h === "hosts sync account") return "sync";
+    if (h.startsWith("constrained delegation") || h.startsWith("resource-based delegation")) return "delegation";
+    if (h === "SID history") return "sidhistory";
     if (/^(enroll|write template) \(ESC/.test(h) || / \(ESC7\)$/.test(h)) return "adcs";
     return "acl";
   }

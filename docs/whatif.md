@@ -71,7 +71,8 @@ one became.
 | membership | `member:"Domain Admins":grp171` |
 | Group Policy | `gplink:"<GPO>":"<container DN>"`, `gpo-entry:"<GPO>":Administrators:"Domain Users"` |
 | AD CS | `template:LabESC1:enroll:"Domain Users"`, `template:LabESC1:enrollee-supplies-subject`, `pki:NTAuthCertificates:helpdesk`, `ca:<CA>:helpdesk:ManageCertificates` |
-| gMSA, delegation | `gmsa:<gMSA>:<reader>`, `delegation:<account>:unconstrained` (or `protocol-transition`, `rbcd`, `constrained:<SPN>`) |
+| gMSA, delegation | `gmsa:<gMSA>:<reader>`, `delegation:<account>:unconstrained` (or `protocol-transition`, `rbcd`, `constrained:<SPN>`), `rbcd:<computer>:<principal>` |
+| SID history | `sid-history:<account>:<SID>`, `sid-history:<account>` (every SID the account holds) |
 | every right of a trustee | `all-rights-of:helpdesk`, `all-rights-of:helpdesk:tier0` (only those on a path) |
 
 Names are a sAMAccountName, a name, a DN or a SID. Two matches are an error that lists
@@ -227,7 +228,9 @@ at the place where the edge is made. The graph itself is the same with and witho
 | `pki-ace` | PKI object, trustee | ESC5 `full control` | 1 |
 | `ca-right` | CA, trustee, right | ESC7 | 3 |
 | `gmsa-reader` | gMSA, reader | `read gMSA password` | 1 |
-| `delegation` | account, kind | none: delegation is not a graph edge, so only findings change | 1 |
+| `delegation` | account, kind | `constrained:<SPN>`: the edge to the computer holding that SPN; `protocol-transition`: every constrained edge of the account; `rbcd`: every resource-based edge into the computer; `unconstrained`: no edge, only findings change | 1 |
+| `rbcd-principal` | computer, principal | `resource-based delegation` from that principal | 1 |
+| `sid-history` | account, SID | `SID history` to that principal | 1, 10 (warn) for a SID from outside this forest |
 
 The flags of `template-flag` are `require-approval`, `enrollee-supplies-subject`,
 `any-purpose-eku` and `request-agent-eku` (an EKU only goes when another one stays,
@@ -241,7 +244,9 @@ from one does not resolve against the real snapshot.
 **Not removable:** `contains` (ACL inheritance structure), GPO scope plumbing,
 `hosts sync account`, the edges out of a GPO with its filter changed (the right into that
 node is the change), the links of the two default domain policies, the nesting AD enforces
-(Domain Admins and Enterprise Admins in Administrators), implicit membership (Everyone,
+(Domain Admins and Enterprise Admins in Administrators), a domain controller's
+unconstrained delegation (DCs need it, so `delegation:<DC>:unconstrained` is refused),
+implicit membership (Everyone,
 Authenticated Users, Users and primary groups are where paths start, not edges), and
 everything out of a tier-0 node.
 
@@ -275,7 +280,8 @@ resolve through and what "expected to clear" in the output and fix lines come fr
 | `template-ace` | AD-ADCS-001 to AD-ADCS-004, AD-ADCS-006 to AD-ADCS-008, AD-ADCS-017 for that template | |
 | `pki-ace` / `ca-right` | AD-ADCS-005 / AD-ADCS-013 | |
 | `member` | AD-PRIV-003, AD-PRIV-004, AD-PRIV-006, AD-PRIV-008, AD-PRIV-009, AD-INV-001 | AD-ACC-006 |
-| `delegation` | AD-DEL-001 to AD-DEL-005, AD-CHAIN-002 | |
+| `delegation`, `rbcd-principal` | AD-DEL-001 to AD-DEL-005, AD-CHAIN-002 | |
+| `sid-history` | AD-ACC-007 when the account holds no other SID | |
 | any | AD-PATH-001 objects whose holder loses its path | AD-INV-* |
 
 Settings, probes, account hygiene, policies, trusts, CA registry flags and SYSVOL secrets
@@ -298,14 +304,20 @@ are never cleared by a removal; `--remove fp:` on them says so.
 - **GPO-enforced membership.** A member that Restricted Groups puts into a domain group
   has its own `member of via GPO` edge, so closing it takes both the `member` and the
   `gpo-entry` change. The cut finds that by itself.
-- **Monotone.** Every change only removes facts; fewer facts never add an edge.
+- **Monotone, with one exception.** Every change only removes facts, and fewer facts
+  never add an edge, except a membership that keeps an admin from being impersonated:
+  taking someone out of Protected Users can open a delegation edge. That change is
+  rebuilt, and the plan says so when the rebuilt exposure differs from the model.
 
 ## How it works
 
 **Forward.** Level 1 masks the graph: the edges of the changes are dropped and the rest
 keep their order, so the shortest paths, ties included, are those of a graph built from
 the changed snapshot. Changes that can move GPO scope are not masked but rebuilt: `gplink`,
-and a membership or GPO ACE that a security filter reads. Level 2 takes the changes out of
+and a membership or GPO ACE that a security filter reads. So is a membership that decides
+whether a delegation edge exists (Domain Admins, Administrators, Enterprise Admins,
+Protected Users and the groups a resource-based list names, nested ones included). Level
+2 takes the changes out of
 the snapshot in place (one mutator per kind, each reporting what it removed) and runs every
 check again. The AD-PATH-001 holders and exposure of both levels must agree; a difference
 stops the run as a model mismatch, a bug to report.
@@ -370,6 +382,10 @@ The commands work on the snapshot. What happens in AD after a change differs:
 - Certificates already issued stay valid until they expire or are revoked.
 - Other DCs see a change after replication.
 - Edges ad-doctor does not see stay: sessions, local admin outside Group Policy,
-  delegation as a path, trusts, Deny ACEs.
+  unconstrained delegation, constrained delegation without protocol transition, delegation
+  to a service account or `krbtgt`, trusts, Deny ACEs. See [AD-PATH-001](checks/AD-PATH-001.md)
+  for when a delegation edge is drawn.
+- Clearing `sIDHistory` cannot be undone with a Set command: it takes a migration tool
+  or a restore, so the rollback line for it is a comment.
 - What an attacker already planted (shadow credentials, added SPNs, other persistence) is
   not undone. Collect again and run `whatif --plan plan.toml --check`.

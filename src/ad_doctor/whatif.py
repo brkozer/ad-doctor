@@ -4,8 +4,8 @@ Level 1 masks the graph: edges whose change is in the set are dropped and everyt
 keeps its order, so `paths.paths_to_tier0`, `direct_holders`, `exposure` and `reachable`
 give the same answer, ties included, as a graph built from the changed snapshot (the
 graph-equality tests check this edge for edge). Changes that can move GPO scope (links,
-security filters), or take a CA right holder out of tier 0, are not masked: they go
-through a rebuild.
+security filters), take a CA right holder out of tier 0, or change who can be
+impersonated through delegation are not masked: they go through a rebuild.
 
 Level 2 takes the changes out of the snapshot in place and runs every check again, which
 also shows findings that would appear. The AD-PATH-001 holders and exposure of both levels
@@ -23,7 +23,7 @@ from . import changes, paths
 from .checks import run_all
 from .model import Finding, Snapshot
 from .paths import Graph, Path
-from .provenance import Gated, Options, Provenance
+from .provenance import GATE_KINDS, Gated, Options, Provenance
 from .report import fingerprint
 
 CA_KINDS = {"member", "ca-right", "template-flag"}  # changes that can change tier 0
@@ -107,7 +107,7 @@ def masked(
     closed = {
         gi
         for p in gone
-        if prov.prims[p][0] == "template-flag"
+        if prov.prims[p][0] in GATE_KINDS
         for gi, gate in enumerate(prov.gates)
         if p in gate.flags
     }
@@ -207,8 +207,9 @@ def _tier0(
 
 
 def maskable(prov: Provenance, removed: Iterable[int]) -> bool:
-    """False when a change can move GPO scope, or take a CA right holder out of tier 0
-    (its ESC7 edge is not in the graph while it is tier 0): level 1 then rebuilds."""
+    """False when a change can move GPO scope, take a CA right holder out of tier 0 (its
+    ESC7 edge is not in the graph while it is tier 0) or decide whether a delegation
+    edge exists: level 1 then rebuilds."""
     return not any(prov.needs_rebuild(p) for p in removed)
 
 

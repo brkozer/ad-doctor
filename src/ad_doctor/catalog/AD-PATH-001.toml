@@ -16,6 +16,9 @@ attributes = [
     "GPO local group settings in SYSVOL",
     "certificate template and CA ACLs",
     "msDS-GroupMSAMembership",
+    "msDS-AllowedToDelegateTo and userAccountControl (protocol transition)",
+    "msDS-AllowedToActOnBehalfOfOtherIdentity",
+    "sIDHistory",
 ]
 related = [
     "AD-ACL-001",
@@ -27,6 +30,9 @@ related = [
     "AD-ADCS-001",
     "AD-ADCS-013",
     "AD-ACL-006",
+    "AD-DEL-002",
+    "AD-DEL-003",
+    "AD-ACC-007",
 ]
 since = "0.1.0"
 
@@ -57,6 +63,9 @@ A -> B means A controls B or can become B:
 | `hosts sync account` | an Entra Connect server holds its sync account's password |
 | `enroll (ESC1-3)`, `write template (ESC4)`, `full control` on PKI objects, `ManageCA (ESC7)` | certificate templates, PKI containers and CA permissions |
 | `read gMSA password` | `msDS-GroupMSAMembership` |
+| `constrained delegation (protocol transition)` | `msDS-AllowedToDelegateTo` of an account with protocol transition, to the computer that holds the SPN |
+| `resource-based delegation` | the principals in `msDS-AllowedToActOnBehalfOfOtherIdentity`, to the computer that carries the attribute |
+| `SID history` | a domain SID in the account's `sIDHistory`, to the principal that SID belongs to |
 
 Tier 0 is the built-in admin and operator groups, domain controllers, `krbtgt`, the domain
 head, the Domain Controllers OU, AdminSDHolder, CA servers and the PKI objects. A reverse
@@ -90,6 +99,30 @@ disabled. The steps between the GPO and the account are scope nodes such as `use
 gpo_editor -[full control]-> LabOuReach -[GPO applies to]-> users under Lab -[GPO reaches]-> svc_sql
 ```
 
+A delegation edge means the source can impersonate an admin to the computer, and admin on
+a computer becomes that computer's account. It is drawn only when the attack works with
+what the source holds:
+
+- **The target** is an enabled computer with an SPN (gMSAs and user accounts that hold an
+  SPN are no targets: impersonating someone to a service does not give control of the
+  account the service runs as).
+- **An admin can be impersonated.** The KDC refuses a ticket for a user marked sensitive
+  or in Protected Users. A member server needs an enabled, delegable member of Domain
+  Admins, and the edge carries the caveat that Domain Admins is in its local
+  Administrators. A domain controller also accepts one of Administrators or Enterprise
+  Admins, or a writable DC's own account, as which a service can replicate.
+- **Constrained delegation** needs protocol transition (`TRUSTED_TO_AUTH_FOR_DELEGATION`)
+  and an SPN on a user source; a computer can give itself one. Without protocol transition
+  S4U2self returns no forwardable ticket, so the attack needs a ticket from a victim: no
+  edge. The target SPN must resolve to one computer, as written or through `sPNMappings`
+  (`cifs/host` to `HOST/host`).
+- **Resource-based delegation** starts at a listed computer, an account with an SPN, a group
+  holding one of those, or a broad group. A user without an SPN gets no edge; the U2U
+  variant works but replaces its password with a session key, so it is not modelled.
+- **SID history** needs nothing more inside the domain: the holder's tickets carry the SID.
+  Only domain SIDs count, not built-in ones. A foreign SID is an edge only to what that
+  SID is granted in this domain, because a snapshot sees one domain.
+
 Members who only inherit a path through a group are counted in the detail ("19 of 20
 enabled users (95%) have a path") instead of being listed. Remote logon rights a GPO grants
 (RDP, WinRM, DCOM) are exported to BloodHound but not followed, because logon is not
@@ -103,6 +136,15 @@ false_positives = """
   [accepted-risk file](../ci.md#accepted-risks).
 - **Local accounts and local groups** on servers are invisible over LDAP, so paths through
   them are missed rather than over-reported; the same goes for sessions and logons.
+- **Delegation paths** to a member server assume Domain Admins is in its local
+  Administrators (the path shows the caveat). The edges left out are missed on purpose:
+  unconstrained delegation, constrained delegation without protocol transition, delegation
+  to `krbtgt` (AD-DEL-001, AD-DEL-002 and AD-DEL-004 still report them), resource-based
+  delegation from an account with no SPN and principals of another domain, whose SPNs the
+  snapshot does not hold.
+- **A snapshot from an older version** does not list resource-based principals, so those
+  edges are missing there, with a note. `sIDHistory` is read on accounts only, not on
+  groups. An attribute the scanning account cannot read comes back as not set.
 - **GPO reach** assumes WMI filters match (the path shows the caveat), ignores Deny ACEs
   on the GPO, and assumes a user in scope logs on somewhere. Empty GPOs and disabled sides
   count, because the writer fills them in or turns them on. It can also miss: loopback

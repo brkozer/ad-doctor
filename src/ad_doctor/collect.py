@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import struct
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -439,6 +440,8 @@ class Collector:
         trustees |= {s for d in dmsas for s in d.readers}
         trustees |= {a.sid for d in dmsas for a in d.aces} | {d.owner for d in dmsas if d.owner}
         trustees |= {a.sid for c in ca_configs for a in c.aces}
+        trustees |= {s for a in accounts for s in a.rbcd_principals or ()}
+        trustees |= {s for a in accounts for s in a.sid_history if s.startswith("S-1-5-21-")}
         trustees |= {c.owner for c in ca_configs if c.owner}
 
         sysvol_result = self._sysvol(domain, [g.guid for g in gpos])
@@ -1659,6 +1662,22 @@ class Collector:
 
     # --- accounts --------------------------------------------------------------------
 
+    def _rbcd_principals(self, e: dict[str, list[Any]]) -> list[str] | None:
+        """The SIDs the security descriptor in msDS-AllowedToActOnBehalfOfOtherIdentity
+        allows, deny ACEs applied; None when there is none or it cannot be parsed."""
+        raw = e.get("msds-allowedtoactonbehalfofotheridentity")
+        if not raw:
+            return None
+        try:
+            return sorted({a.sid for a in sd.parse_ca(raw[0])[1]})
+        except (IndexError, ValueError, TypeError, struct.error):
+            self.notes.append(
+                f"{_first(e, 'sAMAccountName')}: msDS-AllowedToActOnBehalfOfOtherIdentity "
+                "could not be parsed: its resource-based delegation edges are not in the "
+                "control graph"
+            )
+            return None
+
     def _account(self, e: dict[str, list[Any]]) -> Account:
         classes = {c.lower() for c in _str(e.get("objectclass", []))}
         text = " ".join(_str(e.get("description", [])) + _str(e.get("info", [])))
@@ -1675,6 +1694,7 @@ class Collector:
             last_logon=filetime_to_datetime(_int(e, "lastLogonTimestamp")),
             admin_count=_int(e, "adminCount") == 1,
             rbcd=bool(e.get("msds-allowedtoactonbehalfofotheridentity")),
+            rbcd_principals=self._rbcd_principals(e),
             allowed_to_delegate_to=_str(e.get("msds-allowedtodelegateto", [])),
             laps=bool(
                 e.get("ms-mcs-admpwdexpirationtime") or e.get("mslaps-passwordexpirationtime")

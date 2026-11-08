@@ -62,7 +62,7 @@ def compact(g: paths.Graph, snap: Snapshot) -> dict[str, Any]:
         deg.append(len(outs))
         for target, label in outs:
             dst.append(index[target])
-            how.append(labels.setdefault(label, len(labels)))
+            how.append(labels.setdefault(paths.edge_text(g, node, target, label), len(labels)))
     kind = [kinds.setdefault(g.kind(n), len(kinds)) for n in order]
     primaries = {513, 515} | {a.primary_group for a in snap.accounts if a.primary_group}
     sids = [*WELL_KNOWN, *(f"{snap.domain_sid}-{rid}" for rid in sorted(primaries))]

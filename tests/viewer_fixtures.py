@@ -301,9 +301,12 @@ def parity(snap: Snapshot, sample: int = 0) -> dict[str, Any]:
 
 
 def write_parity(out: Path, extra: list[Path]) -> list[Path]:
+    from .whatif_fixtures import delegation_snapshot
+
     out.mkdir(parents=True, exist_ok=True)
     snaps = {"xss": (xss_snapshot(), 0), "full": (full_snapshots()[1], 0)}
     snaps["bench3000"] = (bench_snapshot(), 60)
+    snaps["delegation"] = (delegation_snapshot(), 0)
     for path in extra:
         snaps[path.stem] = (Snapshot.from_json(json.loads(path.read_text())), 200)
     written = []

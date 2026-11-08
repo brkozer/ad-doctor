@@ -29,7 +29,8 @@ latest additions, so the counts in them are lower than a scan shows today.
   (group membership, takeover ACEs, ownership, DCSync, GPO links and what those GPOs reach
   through OUs and sites, exploitable templates,
   gMSA readers, local admin rights that Group Policy hands out, an Entra Connect server
-  holding its sync account) from the snapshot and reports the shortest path from every non-tier-0
+  holding its sync account, delegation to computers, SID history) from the snapshot and
+  reports the shortest path from every non-tier-0
   principal to tier 0, plus the share of users that have one. `ad-doctor blast-radius`
   answers "what does this account control if it is phished?".
 - **Plays well with BloodHound.** `ad-doctor export-graph` writes the same graph as a

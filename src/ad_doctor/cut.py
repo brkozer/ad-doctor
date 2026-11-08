@@ -29,7 +29,7 @@ from fractions import Fraction
 from . import changes, paths
 from .model import Snapshot
 from .paths import Graph
-from .provenance import Gated, Options, Provenance, fixed_reason
+from .provenance import FACT_GATES, Gated, Options, Provenance, fixed_reason
 from .whatif import masked, reaching
 
 INF = 1 << 100
@@ -460,7 +460,23 @@ def build_model(
         if u in sink_like:
             continue  # part of the sink already
         a = nid(u)
-        target = entry(gate) if gate is not None else nid(v)
+        if gate is not None and prov.gates[gate].kind in FACT_GATES:
+            # one arc on the side all the fact's edges share, so it joins no routes
+            target = nid(v)
+            for f in gate_plan[gate][0]:
+                fin, fout = split(f)
+                if prov.gates[gate].kind == "same-source":
+                    if (a, fin) not in linked:
+                        linked.add((a, fin))
+                        net.arc(a, fin, INF)
+                    a = fout
+                else:
+                    if (fout, target) not in linked:
+                        linked.add((fout, target))
+                        net.arc(fout, target, INF)
+                    target = fin
+        else:
+            target = entry(gate) if gate is not None else nid(v)
         if not prims or not all(finite(p) for p in prims):
             net.arc(a, target, INF)
             continue

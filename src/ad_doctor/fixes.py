@@ -366,6 +366,17 @@ def change_lines(change: Facts, snap: Snapshot) -> list[str]:
                 f"Set-ADObject -Identity {_q(change.dn)} "
                 f"-Remove @{{'msDS-AllowedToDelegateTo' = {_q(spn)}}} -WhatIf"
             )
+    elif kind == "rbcd-principal":
+        rest = ", ".join(_q(s) for s in change.readers) if change.readers else "$null"
+        out.append(
+            f"Set-ADComputer -Identity {_q(change.dn)} "
+            f"-PrincipalsAllowedToDelegateToAccount {rest} -WhatIf"
+        )
+    elif kind == "sid-history":
+        out.append(
+            f"Set-ADObject -Identity {_q(change.dn)} "
+            f"-Remove @{{'sIDHistory' = {_q(change.prim[2])}}} -WhatIf"
+        )
     return [one_line(line) for line in out]
 
 
@@ -437,10 +448,27 @@ def rollback_lines(change: Facts, snap: Snapshot) -> list[str]:
                 f"Set-ADObject -Identity {_q(change.dn)} "
                 f"-Add @{{'msDS-AllowedToDelegateTo' = {_q(spn)}}} -WhatIf"
             )
+        elif change.readers:
+            everyone = ", ".join(_q(s) for s in change.readers)
+            out.append(
+                f"Set-ADComputer -Identity {_q(change.dn)} "
+                f"-PrincipalsAllowedToDelegateToAccount {everyone} -WhatIf"
+            )
         else:
             out.append(
                 "# rbcd: put back the msDS-AllowedToActOnBehalfOfOtherIdentity value saved before"
             )
+    elif kind == "rbcd-principal":
+        everyone = ", ".join(_q(s) for s in [*change.readers, sid])
+        out.append(
+            f"Set-ADComputer -Identity {_q(change.dn)} "
+            f"-PrincipalsAllowedToDelegateToAccount {everyone} -WhatIf"
+        )
+    elif kind == "sid-history":
+        out.append(
+            f"# {change.prim[2]}: sIDHistory cannot be written back with Set-ADObject; "
+            "it takes a migration (ADMT, DsAddSidHistory) or a restore"
+        )
     else:  # gpo-entry, ca-right: no dry run
         out.append("# put the entry back the way it was removed (no dry run)")
     return [one_line(line) for line in out]

@@ -15,6 +15,7 @@ the resolution is printed:
     template:LabESC1:enroll:"Domain Users"  template:LabESC1:enrollee-supplies-subject
     pki:NTAuthCertificates:helpdesk         ca:<CA>:<trustee>:ManageCertificates
     gmsa:<gMSA>:<reader>                    delegation:<account>:unconstrained
+    rbcd:<computer>:<principal>             sid-history:<account>[:<SID>]
     all-rights-of:helpdesk[:tier0]          every change of that trustee
 
 Names are a sAMAccountName, a name, a DN or a SID. More than one match is an error that
@@ -376,6 +377,11 @@ class Resolver:
         if kind == "delegation":
             a = next((x for x in snap.accounts if x.dn.lower() == key[1]), None)
             return a is not None and _delegates(a, key[2])
+        if kind in ("rbcd-principal", "sid-history"):
+            a = next((x for x in snap.accounts if x.dn.lower() == key[1]), None)
+            if a is None:
+                return False
+            return key[2] in ((a.rbcd_principals or []) if kind[0] == "r" else a.sid_history)
         return False
 
     def _made_edges(self, key: Prim) -> bool:
@@ -403,6 +409,9 @@ class Resolver:
                     known.add(c.owner)
             for gm in snap.gmsas:
                 known.update(gm.readers)
+            for a in snap.accounts:
+                known.update(a.sid_history)
+                known.update(a.rbcd_principals or ())
             for x in snap.gpo_local_groups:
                 known.update((x.group_sid, x.member_sid))
             self._known_sids = {k.upper() for k in known if k}
@@ -478,7 +487,7 @@ class Resolver:
             return any(c.name == key[1] for c in snap.probes.ca_configs)
         if kind == "gmsa-reader":
             return any(x.dn.lower() == key[1] for x in snap.gmsas)
-        if kind == "delegation":
+        if kind in ("delegation", "rbcd-principal", "sid-history"):
             return key[1] in self.where.dn
         return False
 
@@ -640,6 +649,16 @@ class Resolver:
                 if refused:
                     raise SpecError(refused)
                 return [("delegation", dn, what)], []
+            if kind in ("rbcd", "rbcd-principal"):
+                need(2, "rbcd:<computer>:<principal>")
+                return [("rbcd-principal", obj(args[0]), principal(args[1]))], []
+            if kind == "sid-history":
+                need(1, "sid-history:<account>[:<SID>]")
+                dn = obj(args[0])
+                if len(args) > 1:
+                    return [("sid-history", dn, principal(args[1]))], []
+                held = next((a for a in self.snap.accounts if a.dn.lower() == dn), None)
+                return [("sid-history", dn, s) for s in (held.sid_history if held else [])], []
         except _Absent as exc:
             return [], [str(exc)]
         raise SpecError(f"unknown kind of change {kind!r}")
@@ -850,10 +869,13 @@ class Resolver:
         if sid is None:
             return Resolved(spec, [], "absent", [f"no principal {args[0]!r} in this snapshot"])
         owned = {o.dn.lower() for o in self.snap.objects if o.owner == sid}
+        own = self.sid_dn.get(sid)  # a fact of the account itself, not a trustee in it
         hits = [
             p
             for p, key in enumerate(self.prov.prims)
-            if changes.trustee_of(key) == sid or (key[0] == "owner" and key[1] in owned)
+            if changes.trustee_of(key) == sid
+            or (key[0] == "owner" and key[1] in owned)
+            or (key[0] in ("delegation", "sid-history") and key[1] == own)
         ]
         if len(args) == 2:
             reach = _reaching(self.g)
@@ -1008,6 +1030,8 @@ def finding_specs(check: str, obj: str) -> list[str] | None:
         member, _, rest = rest.partition(" -> ")
         group = rest.split(" on ", 1)[0]
         return [f"gpo-entry:{_q(gpo)}:{_q(group)}:{_q(member)}"]
+    if check == "AD-ACC-007":
+        return [f"sid-history:{_q(_bare(obj))}"]
     if check in ("AD-DEL-001", "AD-CHAIN-002"):
         return [f"delegation:{_q(_bare(obj))}:unconstrained"]
     if check == "AD-DEL-002":
@@ -1055,6 +1079,10 @@ def canonical(snap: Snapshot, prim: Prim, where: changes.Where) -> str:
         return f"ca:{quote(f['ca'])}:{who('trustee')}:{f['right']}"
     if kind == "gmsa-reader":
         return f"gmsa:{dn('gmsa')}:{who('reader')}"
+    if kind == "rbcd-principal":
+        return f"rbcd:{dn('computer')}:{who('principal')}"
+    if kind == "sid-history":
+        return f"sid-history:{dn('account')}:{f['sid']}"
     return f"delegation:{dn('account')}:{f['what']}"
 
 
