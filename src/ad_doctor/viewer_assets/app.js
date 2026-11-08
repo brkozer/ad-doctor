@@ -405,7 +405,7 @@
     if (route === "findings") return { n: VM.findings.length };
     if (route === "paths") return VM.paths ? { n: VM.paths.list.length, alert: true } : null;
     if (route === "changes") return VM.baseline ? { n: "+" + VM.baseline.new.length } : null;
-    if (route === "whatif") return VM.whatif ? { n: VM.whatif.changes.length } : null;
+    if (route === "whatif") return VM.whatif ? { n: VM.whatif.changes.filter((c) => c.id).length } : null;
     if (route === "trend") return VM.trend ? { n: VM.trend.points.length } : null;
     if (route === "accepted") {
       const l = VM.lifecycle;
@@ -512,7 +512,13 @@
     }
     revealTab(current);
     const main = document.getElementById("main");
-    main.replaceChildren(h("div", { class: "wrap" }, ROUTES[r.name](r)));
+    let view;
+    try {
+      view = ROUTES[r.name](r);
+    } catch (err) {
+      view = h("div", { class: "empty" }, "This screen could not be shown: " + String((err && err.message) || err));
+    }
+    main.replaceChildren(h("div", { class: "wrap" }, view));
     if (changed) {
       window.scrollTo(0, 0);
       main.focus({ preventScroll: true });
@@ -1369,8 +1375,21 @@
     const isPlan = W.kind === "plan";
     const rec = W.recommendation;
     const b = W.before || {}, a = W.after || {};
-    const pct = (x, n) => (n ? Math.floor((100 * x) / n) + "%" : "–");
+    const pct = (x, n) => {
+      if (!n) return "–";
+      const p = Math.floor((100 * x) / n);
+      return x > 0 && p === 0 ? "<1%" : p + "%";
+    };
+    const applied = W.changes.filter((c) => c.id);
+    const goal = rec ? { exposure: "close the paths of enabled users outside tier 0",
+      "all-paths": "close every AD-PATH-001 path",
+      from: "close the paths of the named principals only" }[rec.goal] : null;
     const warn = [];
+    if (!W.check.ok) {
+      warn.push(h("div", { class: "banner high" }, h("div", null, h("strong", null, "This check failed. "),
+        "The result below did not pass its plan file.",
+        h("ul", null, W.check.problems.map((x) => h("li", null, x))))));
+    }
     if (W.collected_at && W.collected_at !== VM.meta.collected_at) {
       warn.push(h("div", { class: "banner medium" }, h("div", null, h("strong", null, "Another snapshot time. "),
         "The plan was made on the snapshot of " + fmtTime(W.collected_at) + ".")));
@@ -1379,14 +1398,16 @@
       stat(pct(a.exposed, a.users), "users with a path to tier 0", pct(b.exposed, b.users)),
       stat(String(a.holders), "principals with a path", String(b.holders)),
       stat(String(a.routes), "routes left (changes needed)", String(b.routes)),
-      stat(String(W.changes.length), isPlan ? "changes in the plan" : "changes simulated"));
+      stat(String(applied.length), isPlan ? "changes in the plan" : "changes simulated"));
     let summary = null;
     if (rec) {
       const parts = [plural(rec.changes, "change") + " (cost " + rec.cost + ")"];
       if (rec.budget !== null && rec.budget !== undefined) parts.push("budget of " + rec.budget + ": heuristic, no guarantee");
-      else if (rec.proven_minimum) parts.push("proven minimum (for paths ad-doctor sees)");
+      else if (rec.proven_minimum) parts.push("proven minimum (for paths ad-doctor sees" + (rec.goal === "from" ? ", from the named principals only)" : ")"));
       else if (rec.lower_bound) parts.push("at least " + rec.lower_bound.changes + " changes (cost " + rec.lower_bound.cost + ") are needed");
-      summary = h("p", { class: "wi-lede" }, parts.join(": ") + ".");
+      summary = h("p", { class: "wi-lede" }, "Goal: " + goal + ". " + parts.join(": ") + "." +
+        (rec.alternatives ? " Another cut of equal cost exists nearer " +
+          (rec.near === "tier0" ? "the sources" : "tier 0") + " (--near)." : ""));
     }
     const byId = new Map(W.changes.map((c) => [c.id, c]));
     const changeRow = (c) => {
@@ -1395,12 +1416,14 @@
       for (const w of c.warnings || []) extra.push(h("div", { class: "small warn-text" }, "Warning: " + w));
       if (c.fix && c.fix.length) {
         const script = c.fix.join("\n");
-        extra.push(h("details", null, h("summary", null, "Fix lines (dry run, -WhatIf)"),
+        extra.push(h("details", null, h("summary", null, "Fix lines from the plan JSON (each ends in -WhatIf; read them before running)"),
           copyButton(script, "Copy", "fix lines"), h("pre", { class: "code" }, script),
           c.rollback && c.rollback.length ? h("pre", { class: "code" }, c.rollback.join("\n")) : null));
       }
       return h("li", { class: "wi-change" },
-        h("div", null, h("code", null, c.id), " ", c.label, h("span", { class: "small muted" }, "  cost " + c.cost)),
+        h("div", null, h("code", null, c.id || c.spec || ""), " ", c.label,
+          c.status && c.status !== "applied" ? h("span", { class: "small warn-text" }, "  " + c.status) : null,
+          c.cost === null || c.cost === undefined ? null : h("span", { class: "small muted" }, "  cost " + c.cost)),
         extra);
     };
     const sections = [];
@@ -1422,14 +1445,21 @@
       : [];
     sections.push(...list("Closes in the snapshot", W.paths.closed, "good"));
     sections.push(...list("New: not there before", W.paths.new, "bad"));
-    sections.push(...list("Still open, another way", W.paths.rerouted));
+    if (W.paths.rerouted.length) {
+      sections.push(sectionTitle("Still open, another way (" + W.paths.rerouted.length + ")"));
+      sections.push(h("ul", { class: "wi-paths" }, W.paths.rerouted.map((r) => h("li", null,
+        h("div", { class: "small muted" }, "was ", h("code", null, r.before)), h("code", null, r.after)))));
+    }
     sections.push(...list("Still open, same path", W.paths.open));
     if (W.paths.unclosable.length) {
       sections.push(sectionTitle("Cannot be closed by removing a right (needs a decision)"));
       sections.push(h("ul", { class: "wi-paths" }, W.paths.unclosable.map((u) =>
         h("li", null, h("code", null, u.why), h("div", { class: "small muted" }, "→ " + u.suggest)))));
     }
-    if (W.findings.rechecked) {
+    if (!W.findings.rechecked) {
+      sections.push(sectionTitle("Findings"));
+      sections.push(h("div", { class: "empty" }, "Not rechecked: this result was made with --paths-only."));
+    } else {
       const frow = (f) => h("li", null, h("span", { class: "sev " + f.severity }, f.severity), " ",
         h("code", null, f.check), " " + f.object);
       sections.push(sectionTitle("Findings, rechecked on the changed snapshot"));
@@ -1441,6 +1471,18 @@
             h("ul", { class: "wi-findings" }, W.findings.new.map(frow))] : null)
         : h("div", { class: "empty" }, "None would clear or appear."));
     }
+    if (W.accounts.length) {
+      sections.push(sectionTitle("Blast radius"));
+      sections.push(h("ul", null, W.accounts.map((a) => h("li", null, a.account + ": " +
+        a.before.count + " objects (" + a.before.tier0 + " tier 0) → " +
+        a.after.count + " objects (" + a.after.tier0 + " tier 0)"))));
+    }
+    if (W.plan_status.length) {
+      sections.push(sectionTitle("Plan status"));
+      sections.push(h("ul", { class: "wi-paths" }, W.plan_status.map((s) => h("li", null,
+        h("strong", null, s.status), " ", h("code", null, s.id), " " + s.label + (s.due ? " (due " + s.due + ")" : ""),
+        s.problems.concat(s.note ? [s.note] : []).map((x) => h("div", { class: "small muted" }, x))))));
+    }
     if (W.assumptions.length) {
       sections.push(sectionTitle("Assumed tier 0 (not changes)"));
       sections.push(h("ul", null, W.assumptions.map((x) => h("li", null, x.name + " (" + x.source + ")"))));
@@ -1450,8 +1492,10 @@
       sections.push(sectionTitle("Caveats"));
       sections.push(h("ul", { class: "small" }, notes.map((n) => h("li", null, n))));
     }
-    return h("div", { class: "stack" },
-      pageHead("What-if", isPlan ? "Plan to close the paths to tier 0" : "What-if",
+    const planTitle = !rec || rec.goal === "exposure" ? "Plan to close the paths to tier 0"
+      : rec.goal === "from" ? "Plan for the named principals" : "Plan to close every path";
+    return h("div", { class: "stack wi" },
+      pageHead("What-if", isPlan ? planTitle : "What-if",
         "Simulated on the snapshot; Active Directory is unchanged and nothing was applied. Made by ad-doctor " +
           (W.version || "?") + "."),
       warn, stats, summary, sections);
@@ -1599,6 +1643,7 @@
           h("dt", null, "Acceptance file"), h("dd", null, yes(e.acceptances)),
           h("dt", null, "Invariants file"), h("dd", null, yes(e.invariants)),
           h("dt", null, "Fix script lines"), h("dd", null, yes(e.fixes)),
+          h("dt", null, "What-if plan"), h("dd", null, yes(e.whatif, VM.whatif ? VM.whatif.kind + ", " + plural(VM.whatif.changes.filter((c) => c.id).length, "change") : "")),
           h("dt", null, "Raw snapshot"), h("dd", null, yes(e.snapshot, "never embedded")),
           h("dt", null, "Redacted"), h("dd", null, yes(m.redacted, m.redacted ? "names are pseudonyms" : "")),
           h("dt", null, "Encrypted"), h("dd", null, yes(e.encrypted, e.encrypted

@@ -216,7 +216,7 @@ def sources_for(
     out: dict[str, int] = {}
     if names:
         for name in names:
-            for node in paths.identity_nodes(snap, name)[:1] or [_node_by_name(g, name)]:
+            for node in paths.identity_nodes(snap, name) or [_node_by_name(g, name)]:
                 if node and node not in skip:
                     out[node] = out.get(node, 0) + 1
         return out

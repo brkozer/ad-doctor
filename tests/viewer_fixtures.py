@@ -176,7 +176,8 @@ def build(out: Path) -> dict[str, Path]:
     """Write the pages (and the old report) into `out`; return their paths."""
     out.mkdir(parents=True, exist_ok=True)
     pages = {
-        name: out / f"{name}.html" for name in ("xss", "full", "sealed", "paths", "clean", "bench")
+        name: out / f"{name}.html"
+        for name in ("xss", "full", "sealed", "paths", "clean", "bench", "whatif")
     }
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
@@ -196,6 +197,33 @@ def build(out: Path) -> dict[str, Path]:
         args += ["--history", str(history(work, old)), "--fixes"]
         assert main(["plan", str(work / "new.json"), "-f", "json", "-o", str(work / "p.json")]) == 0
         args += ["--whatif", str(work / "p.json")]
+        # a result that failed its check, with a rerouted path and a blast radius
+        failed = json.loads((work / "p.json").read_text(encoding="utf-8"))
+        failed["kind"] = "whatif"
+        failed["check"] = {"ok": False, "problems": ["[expect] closes_all: still open"]}
+        failed["plan_status"] = [
+            {"id": "c:000000000000", "label": "remove x", "status": "stale", "due": None,
+             "problems": ["does not resolve"], "note": None}
+        ]  # fmt: skip
+        failed["paths"]["rerouted"] = [
+            {"fingerprint": "f", "before": {"object": "a -> b"}, "after": {"object": "a -> c -> b"}}
+        ]
+        failed["accounts"] = [
+            {
+                "account": "alice",
+                "before": {"count": 9, "tier0": 2},
+                "after": {"count": 3, "tier0": 0},
+            }
+        ]
+        failed["findings"]["rechecked"] = False
+        failed["steps"], failed["recommendation"] = [], None  # as whatif writes it
+        failed["changes"].append(
+            {"id": None, "spec": "member:x:y", "label": "member:x:y", "cost": None,
+             "status": "absent", "notes": [], "warnings": []}
+        )  # fmt: skip
+        (work / "failed.json").write_text(json.dumps(failed), encoding="utf-8")
+        view = ["view", str(work / "new.json"), "--whatif", str(work / "failed.json")]
+        assert main([*view, "--no-encrypt", "--graph", "none", "-o", str(pages["whatif"])]) == 0
         assert main([*args, "--no-encrypt", "-o", str(pages["full"])]) == 0
         saved = os.environ.get("AD_DOCTOR_VIEW_PASSPHRASE")
         os.environ["AD_DOCTOR_VIEW_PASSPHRASE"] = PASSPHRASE

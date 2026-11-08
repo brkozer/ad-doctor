@@ -166,7 +166,8 @@ max_holders = 4
 
 The kind and its identity fields decide; `id` is a checksum of them, so an `id` that does
 not match means the file was edited. Strings are escaped like the viewer's accept drafts.
-`plan` writes `[expect]` from what the plan reaches.
+`plan` writes `[expect]` from what the plan reaches. With `--keep` or `--allow KIND` it
+leaves `closes_all` out, because the file does not record them.
 
 Against any later snapshot each `[[change]]` is:
 

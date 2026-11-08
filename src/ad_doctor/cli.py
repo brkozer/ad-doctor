@@ -553,7 +553,10 @@ def cmd_view(args: argparse.Namespace) -> int:
         opts.blast_for = args.blast_radius_for
         opts.command = _command(args)
         if args.whatif:
-            doc = _load_json(args.whatif)
+            try:
+                doc = _load_json(args.whatif)
+            except RecursionError:
+                raise ValueError(f"--whatif {args.whatif.name}: nested too deeply") from None
             digest = None if source is None else _sha256(args.input)
             why = viewer.whatif_problem(doc, report.snap.domain, digest)
             if why is not None:

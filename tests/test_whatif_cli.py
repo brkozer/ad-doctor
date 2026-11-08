@@ -31,6 +31,10 @@ def write(tmp_path: Path, snap: Snapshot, name: str = "snap.json") -> Path:
     return path
 
 
+from .test_checks import user  # noqa: E402
+from .test_gpo_local import ADMINS, GUID_A, LAB, entry, gpo, gsnap, host, link  # noqa: E402
+
+
 def run(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, str, str]:
     code = main([*argv])
     out = capsys.readouterr()
@@ -647,3 +651,94 @@ def test_output_is_the_same_under_another_hash_seed(tmp_path: Path) -> None:
         )  # fmt: skip
         outs.add(done.stdout)
     assert len(outs) == 1
+
+
+# -- [expect] closes_all, judged after the changes ------------------------------------------
+
+_DOM = "S-1-5-21-1-2-3"
+_DA_DN = "CN=Domain Admins,CN=Users,DC=lab,DC=test"
+_EXPECT = (
+    'schema = 1\n[plan]\ndomain = "lab.test"\ngoal = "exposure"\n[expect]\ncloses_all = true\n'
+)
+
+
+def _da_snapshot(
+    accounts: list[Any], members: list[str], aces: list[Any], objects: list[Any]
+) -> Snapshot:
+    ws = host("WS01", rid=2004)
+    da = DirObject(
+        _DA_DN, "Domain Admins", "group", sid=f"{_DOM}-512", members=members, aces=aces,
+        dacl_protected=True,
+    )  # fmt: skip
+    return gsnap(
+        *accounts,
+        ws,
+        gpos=[gpo("LabGpo", GUID_A, link(LAB))],
+        entries=[entry(GUID_A, ADMINS, f"{_DOM}-3999")],
+        objects=[da, *objects],
+        privileged={"Domain Admins": members},
+    )
+
+
+def _account(sam: str, rid: int) -> Any:
+    return user(sam, sid=f"{_DOM}-{rid}")
+
+
+def _check(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], snap: Snapshot, *remove: str
+) -> tuple[int, dict[str, Any]]:
+    path = write(tmp_path, snap)
+    toml = tmp_path / "expect.toml"
+    toml.write_text(_EXPECT)
+    args = ["whatif", str(path), "--plan", str(toml), "--check", "--paths-only"]
+    for spec in remove:
+        args += ["--remove", spec]
+    return run_json(capsys, *args)
+
+
+def test_closes_all_sees_a_user_who_left_tier0(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    adm = _account("adm", 3001)
+    snap = _da_snapshot([adm], [adm.dn], [Ace(adm.sid, sd.GENERIC_ALL)], [])
+    code, doc = _check(tmp_path, capsys, snap, 'member:"Domain Admins":adm')
+    assert code == 2 and doc["after"]["exposed"] == 1
+    assert any("closes_all" in p for p in doc["check"]["problems"])
+
+
+def test_closes_all_passes_when_the_route_ended_at_a_departed_member(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    adm, atk = _account("adm", 3001), _account("atk", 3002)
+    obj = DirObject(adm.dn, "adm", "user", sid=adm.sid, aces=[Ace(atk.sid, sd.GENERIC_ALL)])
+    snap = _da_snapshot([adm, atk], [adm.dn], [], [obj])
+    code, doc = _check(tmp_path, capsys, snap, 'member:"Domain Admins":adm')
+    assert code == 0, doc["check"]
+    assert doc["after"]["exposed"] == 0
+
+
+def test_plan_with_keep_or_allow_passes_its_own_check(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    a1, a2, adm = _account("a1", 3020), _account("a2", 3021), _account("adm", 3001)
+    mid = DirObject(f"CN=Mid,{LAB}", "Mid", "group", sid=f"{_DOM}-1800", members=[a2.dn])
+    aces = [Ace(a1.sid, sd.GENERIC_ALL), Ace(mid.sid, sd.GENERIC_ALL)]
+    path = write(tmp_path, _da_snapshot([a1, a2, adm], [adm.dn], aces, [mid]))
+    for opts in (["--keep", f'ace:"{_DA_DN}":a1'], ["--allow", "member"]):
+        toml = tmp_path / "plan.toml"
+        args = ["plan", str(path), *opts, "--paths-only", "-f", "toml", "-o", str(toml)]
+        assert run(capsys, *args)[0] == 0
+        assert "closes_all" not in toml.read_text(encoding="utf-8")
+        assert (
+            run(capsys, "whatif", str(path), "--plan", str(toml), "--check", "--paths-only")[0] == 0
+        )
+
+
+def test_from_counts_implicit_group_routes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    alice, adm = _account("alice", 3010), _account("adm", 3001)
+    du = f"{_DOM}-513"
+    path = write(tmp_path, _da_snapshot([alice, adm], [adm.dn], [Ace(du, sd.GENERIC_ALL)], []))
+    _, doc = run_json(capsys, "plan", str(path), "--from", "alice", "--paths-only")
+    assert doc["changes"], "the route through Domain Users is alice's too"

@@ -119,8 +119,10 @@ ad-doctor view snap.json --graph none -o summary.html   # no graph, not encrypte
   allowed by SHA-256, `connect-src 'none'`, no forms, frames or plugins, and Trusted Types
   enforced where the browser supports them. The page links nowhere; documentation URLs
   are shown as text to copy.
-- **Minimum data.** The file holds what the report says plus the paths and what `--graph`
-  and `--history` add, never the raw snapshot. A redacted snapshot shows its pseudonyms
+- **Minimum data.** The file holds what the report says plus the paths and what `--graph`,
+  `--history` and `--whatif` add, never the raw snapshot. A `--whatif` plan brings change
+  labels, path strings and, with `--fixes`, PowerShell lines; encryption follows the graph,
+  so pass `--encrypt` for a page with a plan and no graph. A redacted snapshot shows its pseudonyms
   only. Nothing is stored in the browser (no localStorage, IndexedDB or cookies). The file
   is written with mode 0600.
 - **What encryption does not cover.** Once unlocked, browser extensions with access to

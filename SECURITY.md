@@ -70,7 +70,8 @@ another machine and sometimes sent to someone. What it holds and how it is prote
 **What is in it.** The report (findings, objects, fingerprints, remediation), the control
 paths to tier 0 and their chokepoints, and whatever the command line added: the baseline
 diff, the acceptance and invariant state, earlier reports for the trend (`--history`), the
-fix-script lines (`--fixes`) and the control graph (`--graph`). With `--graph full` that is
+fix-script lines (`--fixes`), a plan or what-if result (`--whatif`) and the control graph
+(`--graph`). With `--graph full` that is
 every principal and object with an edge, every control edge and every account's name and
 SID: a map of who can take over what. `--graph paths` holds only the blast radius of the
 principals on control paths and of the accounts named with `--blast-radius-for`. The raw

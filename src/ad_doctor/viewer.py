@@ -156,11 +156,104 @@ def whatif_problem(doc: Any, domain: str, sha256: str | None) -> str | None:
         return "it is not ad-doctor output"
     if doc.get("kind") not in ("plan", "whatif") or doc.get("schema") != 1:
         return "it is not `plan -f json` or `whatif -f json` output"
-    snap = doc.get("snapshot") or {}
+    snap = doc.get("snapshot")
+    if not isinstance(snap, dict):
+        return "it has no snapshot block"
     if str(snap.get("domain", "")).lower() != domain.lower():
         return f"it is for {snap.get('domain')}, this report for {domain}"
     if sha256 is not None and snap.get("sha256") != sha256:
         return "it was made from another snapshot file; run plan on this one"
+    return _whatif_shape(doc)
+
+
+def _fits(value: Any, kind: str) -> bool:
+    if kind.endswith("?") and value is None:
+        return True
+    kind = kind.rstrip("?")
+    if kind == "int":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "strs":
+        return isinstance(value, list) and all(isinstance(x, str) for x in value)
+    if kind == "rows":
+        return isinstance(value, list) and all(isinstance(x, dict) for x in value)
+    return isinstance(value, {"str": str, "bool": bool, "obj": dict}[kind])
+
+
+def _bad_key(where: str, obj: dict[str, Any], spec: dict[str, str]) -> str | None:
+    for key, kind in spec.items():
+        if not _fits(obj.get(key), kind):
+            return f"{where}{key} is not what `plan -f json` writes"
+    return None
+
+
+_NUMBERS = {"exposed": "int", "users": "int", "holders": "int", "routes": "int?"}
+_WHATIF_TOP = {
+    "changes": "rows", "before": "obj", "after": "obj", "paths": "obj", "findings": "obj",
+    "check": "obj", "steps": "rows?", "recommendation": "obj?", "plan_status": "rows?",
+    "accounts": "rows?", "assumptions": "rows?", "notes": "strs?", "caveats": "strs?",
+}  # fmt: skip
+_WHATIF_ROWS: dict[str, dict[str, str]] = {
+    "changes": {
+        "id": "str?", "spec": "str?", "label": "str", "cost": "int?", "status": "str?",
+        "notes": "strs?", "warnings": "strs?", "fix": "strs?", "rollback": "strs?",
+    },
+    "steps": {
+        "n": "int", "title": "str", "changes": "strs", "exposed_after": "int",
+        "holders_after": "int", "routes_after": "int?",
+    },
+    "plan_status": {
+        "id": "str", "label": "str", "status": "str", "due": "str?", "problems": "strs",
+        "note": "str?",
+    },
+    "accounts": {"account": "str", "before": "obj", "after": "obj"},
+    "assumptions": {"name": "str", "source": "str"},
+}  # fmt: skip
+_WHATIF_RECOMMENDATION = {
+    "goal": "str", "near": "str", "cost": "int", "changes": "int", "budget": "int?",
+    "proven_minimum": "bool", "alternatives": "bool", "lower_bound": "obj?",
+}  # fmt: skip
+
+
+def _whatif_shape(doc: dict[str, Any]) -> str | None:
+    """The page only writes text, but a wrong type would break the screen: refuse it here.
+    Fix lines are shown for copying, so each must be a comment or end in -WhatIf."""
+    problem = _bad_key("", doc, _WHATIF_TOP)
+    if problem:
+        return problem
+    for block in ("before", "after"):
+        if problem := _bad_key(f"{block}.", doc[block], _NUMBERS):
+            return problem
+    for key, spec in _WHATIF_ROWS.items():
+        for row in doc.get(key) or []:
+            problem = _bad_key(f"{key}: ", row, spec)
+            if problem:
+                return problem
+    rec = doc.get("recommendation")
+    if rec is not None and (problem := _bad_key("recommendation.", rec, _WHATIF_RECOMMENDATION)):
+        return problem
+    p = doc["paths"]
+    for key in ("closed", "rerouted", "open", "new", "unclosable"):
+        if not _fits(p.get(key), "rows"):
+            return f"paths.{key} is not what `plan -f json` writes"
+    for key in ("closed", "open", "new"):
+        if not all(isinstance(r.get("path"), dict) for r in p[key]):
+            return f"paths.{key} is not what `plan -f json` writes"
+    for r in p["rerouted"]:
+        if not (isinstance(r.get("before"), dict) and isinstance(r.get("after"), dict)):
+            return "paths.rerouted is not what `plan -f json` writes"
+    for r in p["unclosable"]:
+        if problem := _bad_key("paths.unclosable: ", r, {"why": "str", "suggest": "str"}):
+            return problem
+    f = doc["findings"]
+    if not (_fits(f.get("cleared", []), "rows") and _fits(f.get("new", []), "rows")):
+        return "findings is not what `plan -f json` writes"
+    if not _fits(doc["check"].get("problems", []), "strs"):
+        return "check.problems is not what `plan -f json` writes"
+    for c in doc["changes"]:
+        for line in [*(c.get("fix") or []), *(c.get("rollback") or [])]:
+            text = line.strip()
+            if text and not text.startswith("#") and not text.endswith("-WhatIf"):
+                return f"a fix line of {c.get('id')} has no -WhatIf"
     return None
 
 
@@ -172,7 +265,7 @@ def _whatif(doc: dict[str, Any] | None, fixes: bool) -> dict[str, Any] | None:
     keys = WHATIF_CHANGE_KEYS + (("fix", "rollback") if fixes else ())
 
     def path_rows(rows: list[dict[str, Any]]) -> list[str]:
-        return [str((r.get("path") or {}).get("object", "")) for r in rows]
+        return [str(r["path"].get("object", "")) for r in rows]
 
     p = doc.get("paths") or {}
     f = doc.get("findings") or {}
@@ -187,7 +280,13 @@ def _whatif(doc: dict[str, Any] | None, fixes: bool) -> dict[str, Any] | None:
         "recommendation": doc.get("recommendation"),
         "paths": {
             "closed": path_rows(p.get("closed", [])),
-            "rerouted": path_rows(p.get("rerouted", [])),
+            "rerouted": [
+                {
+                    "before": str(r["before"].get("object", "")),
+                    "after": str(r["after"].get("object", "")),
+                }
+                for r in p.get("rerouted", [])
+            ],
             "open": path_rows(p.get("open", [])),
             "new": path_rows(p.get("new", [])),
             "unclosable": [
@@ -200,6 +299,12 @@ def _whatif(doc: dict[str, Any] | None, fixes: bool) -> dict[str, Any] | None:
             "cleared": f.get("cleared", []),
             "new": f.get("new", []),
         },
+        "check": {
+            "ok": bool((doc.get("check") or {}).get("ok", True)),
+            "problems": (doc.get("check") or {}).get("problems", []),
+        },
+        "plan_status": doc.get("plan_status") or [],
+        "accounts": doc.get("accounts") or [],
         "assumptions": doc.get("assumptions") or [],
         "notes": doc.get("notes") or [],
         "caveats": doc.get("caveats") or [],
@@ -224,6 +329,7 @@ def _meta(r: Report, snap: Snapshot | None, opts: Options) -> dict[str, Any]:
             "acceptances": opts.entries is not None,
             "invariants": opts.spec is not None,
             "fixes": opts.fixes and snap is not None,
+            "whatif": opts.whatif is not None,
             "snapshot": False,
             "encrypted": opts.encrypted,
         },

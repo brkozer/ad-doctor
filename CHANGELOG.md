@@ -7,6 +7,22 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+### Fixed
+
+- **What-if screen.** A result that failed `--check` now says so, with its problems and each
+  change's plan status. Rerouted paths no longer show as blank rows. The screen states the
+  plan's goal, says when findings were not rechecked, marks absent changes, and shows the
+  blast radius of `--account`. Long names and titles no longer widen the page on a phone.
+  The About screen lists the embedded plan.
+- **`view --whatif` refuses a malformed file** with a message instead of a traceback or a
+  blank screen, and refuses fix lines without `-WhatIf`. The screen labels them as coming
+  from the JSON, since the page cannot vouch for an edited file.
+- **`[expect] closes_all`** is judged on the graph after the changes. It no longer passes
+  when a change takes a user out of tier 0 who still has a path, fails when a route ended
+  at that user, or depends on whether a change forced a rebuild for accepted holders.
+- **`plan --from NAME`** counts the routes through the account's implicit groups.
+- **`plan --keep` and `--allow KIND`** no longer write a `closes_all` their own plan fails.
+
 ## [0.2.0] - 2026-11-08
 
 ### Added

@@ -568,21 +568,32 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     routes_after = cut.routes(m, removed)
     if statuses:
         mark_ineffective(ctx, statuses, removed, extra, m)
-    closes_all = None
-    if plan is not None and "closes_all" in plan.expect:
-        closes_all = cut.closes(m, removed)
+    # a route kept by a change the plan removes is not kept any more
+    left = {k: v for k, v in keeps.items() if k not in removed}
+    kept_model = (
+        m if len(left) == len(keeps) else cut.build_model(ctx.snap, ctx.g, srcs, left, extra)
+    )
+    unclosable = kept_model.sink_like - kept_model.tier0
     if findings_needed:
         ctx.baseline()
 
     res = whatif.run(ctx.snap, ctx.g, removed, accounts, True, extra, None, recheck(ctx.spec))
-    if closes_all is not None and not res.maskable:
-        # the flow model reads the masked graph; the rebuilt one decides
+    closes_all = None
+    if plan is not None and "closes_all" in plan.expect:
+        # judged on the graph after the changes: someone a change took out of tier 0 is a
+        # source now, and a route that ended at them is gone. Routes the model holds as
+        # unclosable (kept or fixed) do not count.
         sources = set(m.sources) | set(
-            cut.sources_for(ctx.snap, res.after.graph, goal, sources_from)
+            cut.sources_for(
+                ctx.snap,
+                res.after.graph,
+                "exposure" if goal == "from" and not sources_from else goal,
+                sources_from,
+                cut.accepted_holders(res.after.graph, accepted_holders),
+            )
         )
-        # sources the model already found unclosable (kept or fixed routes) do not count
-        closes_all = closes_all and not any(
-            x in res.after.found and x not in res.after.graph.tier0 and x not in m.sink_like
+        closes_all = not any(
+            x in res.after.found and x not in res.after.graph.tier0 and x not in unclosable
             for x in sources
         )
     counts = _edge_counts(ctx.g, res.before, removed)
@@ -882,10 +893,13 @@ def run_plan(args: argparse.Namespace) -> tuple[dict[str, Any], int, planfile.Pl
     if args.max_changes is None:
         users = max(res.after.users, 1)
         out.expect = {
-            "closes_all": True,
             "max_exposed_percent": math.ceil(100 * res.after.exposed / users),
             "max_holders": len(res.after.holders),
         }
+        # --keep and --allow KIND are not in the file: on a check, what they held back
+        # would count as closable
+        if not (args.keep or kinds):
+            out.expect = {"closes_all": True, **out.expect}
     return doc, 0, out
 
 

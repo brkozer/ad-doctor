@@ -6,9 +6,11 @@ import base64
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from html.parser import HTMLParser
 from importlib import resources
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -362,3 +364,58 @@ def test_whatif_needs_a_plan_of_this_snapshot(
     code = main(["view", str(other), "--whatif", str(plan), "--no-encrypt", "--graph", "none"])
     assert code == 1
     assert "another snapshot" in capsys.readouterr().err
+
+
+def _plan_doc(tmp_path: Path) -> tuple[dict[str, Any], str]:
+    snap = tmp_path / "s.json"
+    snap.write_text(json.dumps(xss_snapshot().to_json()))
+    plan = tmp_path / "p.json"
+    assert main(["plan", str(snap), "-f", "json", "-o", str(plan)]) == 0
+    doc = json.loads(plan.read_text(encoding="utf-8"))
+    return doc, doc["snapshot"]["domain"]
+
+
+def test_whatif_carries_check_status_and_rerouted(tmp_path: Path) -> None:
+    doc, _ = _plan_doc(tmp_path)
+    doc["check"] = {"ok": False, "problems": ["bad"]}
+    doc["plan_status"] = [{"id": "c:1", "status": "stale"}]
+    doc["paths"]["rerouted"] = [{"before": {"object": "a"}, "after": {"object": "b"}}]
+    w = viewer._whatif(doc, False)
+    assert w is not None
+    assert w["check"] == {"ok": False, "problems": ["bad"]}
+    assert w["plan_status"] == [{"id": "c:1", "status": "stale"}]
+    assert w["paths"]["rerouted"] == [{"before": "a", "after": "b"}]
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (lambda d: d.update(snapshot=5), "no snapshot block"),
+        (lambda d: d.update(changes=5), "changes"),
+        (lambda d: d["changes"][0].update(label=5), "label"),
+        (lambda d: d.update(before=[]), "before"),
+        (lambda d: d["before"].update(exposed="x"), "exposed"),
+        (lambda d: d["paths"].update(closed=5), "paths.closed"),
+        (lambda d: d["paths"].update(rerouted=[{"path": {}}]), "paths.rerouted"),
+        (lambda d: d["recommendation"].update(goal=5), "goal"),
+        (lambda d: d["check"].update(problems=[5]), "check.problems"),
+        (lambda d: d["changes"][0].update(fix=["Remove-ADUser alice"]), "no -WhatIf"),
+    ],
+)
+def test_whatif_refuses_a_malformed_file(
+    tmp_path: Path, change: Callable[[dict[str, Any]], Any], expected: str
+) -> None:
+    doc, domain = _plan_doc(tmp_path)
+    assert viewer.whatif_problem(doc, domain, None) is None
+    change(doc)
+    assert expected in str(viewer.whatif_problem(doc, domain, None))
+
+
+def test_whatif_deep_json_is_refused(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    snap = tmp_path / "s.json"
+    snap.write_text(json.dumps(xss_snapshot().to_json()))
+    deep = tmp_path / "deep.json"
+    deep.write_text("[" * 200000 + "]" * 200000)
+    args = ["view", str(snap), "--whatif", str(deep), "--no-encrypt", "--graph", "none"]
+    assert main([*args, "-o", str(tmp_path / "o.html")]) == 1
+    assert "--whatif deep.json" in capsys.readouterr().err

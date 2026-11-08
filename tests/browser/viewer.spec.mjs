@@ -464,3 +464,31 @@ test("what-if: the embedded plan shows steps, change IDs and fix lines", async (
   expect(external(seen.requests)).toEqual([]);
   expect(seen.errors).toEqual([]);
 });
+
+test("what-if: a failed check, rerouted paths and absent changes are shown as they are", async ({ page }) => {
+  const seen = watch(page);
+  await page.goto(url("whatif") + "#whatif");
+  const main = page.locator("main");
+  await expect(main.locator(".banner.high")).toContainText("This check failed");
+  await expect(main.locator(".banner.high")).toContainText("closes_all: still open");
+  await expect(main).toContainText("was a -> b");
+  await expect(main).toContainText("a -> c -> b");
+  await expect(main).toContainText("stale");
+  await expect(main).toContainText("does not resolve");
+  await expect(main).toContainText("alice: 9 objects (2 tier 0)");
+  await expect(main).toContainText("Not rechecked");
+  await expect(main).toContainText("absent");
+  await expect(main).not.toContainText("cost null");
+  await page.evaluate(() => { location.hash = "#about"; });
+  await expect(page.locator("main")).toContainText("What-if plan");
+  expect(seen.errors).toEqual([]);
+});
+
+for (const name of ["full", "xss", "whatif"]) {
+  test(`what-if: ${name} does not scroll sideways`, async ({ page }) => {
+    await page.goto(url(name) + "#whatif");
+    await expect(page.locator("main h1")).toBeVisible();
+    const width = page.viewportSize().width;
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+  });
+}

@@ -667,3 +667,6 @@ table.heat .tick { color: var(--muted); margin-left: 2px; }
 .wi-paths.good code { color: var(--ok); }
 .wi-paths.bad code { color: var(--high); }
 .wi-lede { margin: 0 0 16px; }
+.wi .section-title h2 { white-space: normal; }
+.wi-step-head, .wi-change, .wi-change > div, .wi-lede { min-width: 0; overflow-wrap: anywhere; }
+.wi .banner ul { margin: 6px 0 0; padding-left: 18px; }
