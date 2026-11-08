@@ -7,6 +7,8 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-09
+
 ### Fixed
 
 - **What-if screen.** A result that failed `--check` now says so, with its problems and each
