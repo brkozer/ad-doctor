@@ -7,6 +7,8 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-08
+
 ### Added
 
 - **`ad-doctor plan` and `ad-doctor whatif`.** `plan` computes the cheapest set of

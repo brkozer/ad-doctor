@@ -137,7 +137,7 @@ schema = 1
 domain = "adlab.test"
 domain_sid = "S-1-5-21-..."
 made_against = 2026-11-07T22:51:51Z
-made_by = "ad-doctor 0.1.5 plan"
+made_by = "ad-doctor 0.2.0 plan"
 goal = "exposure"
 
 [assume]
