@@ -88,6 +88,7 @@ class Options:
     graph: str = "none"  # none, paths or full (viewer_graph.choose resolves auto)
     blast_for: list[str] | None = None  # --blast-radius-for accounts (paths mode)
     encrypted: bool = False  # recorded in the payload's metadata; render() encrypts
+    whatif: dict[str, Any] | None = None  # a `plan` or `whatif -f json` result
 
 
 # --- viewmodel ------------------------------------------------------------------------
@@ -121,6 +122,7 @@ def viewmodel(r: Report, snap: Snapshot | None, opts: Options) -> dict[str, Any]
         else None,
         "graph": None,
         "blast": None,
+        "whatif": _whatif(opts.whatif, opts.fixes),
     }
     if snap is not None and opts.graph != "none":
         _graph(vm, snap, opts)
@@ -140,6 +142,68 @@ def _graph(vm: dict[str, Any], snap: Snapshot, opts: Options) -> None:
             "subjects": subjects,
             "limits": {"tier0": viewer_graph.TIER0_PATHS, "per_kind": viewer_graph.PER_KIND},
         }
+
+
+WHATIF_CHANGE_KEYS = (
+    "id", "kind", "spec", "label", "class", "cost", "status", "notes", "warnings",
+    "objects_affected", "expected_to_clear",
+)  # fmt: skip
+
+
+def whatif_problem(doc: Any, domain: str, sha256: str | None) -> str | None:
+    """Why a JSON file cannot go on the What-if screen of this report, or None."""
+    if not isinstance(doc, dict) or doc.get("tool") != "ad-doctor":
+        return "it is not ad-doctor output"
+    if doc.get("kind") not in ("plan", "whatif") or doc.get("schema") != 1:
+        return "it is not `plan -f json` or `whatif -f json` output"
+    snap = doc.get("snapshot") or {}
+    if str(snap.get("domain", "")).lower() != domain.lower():
+        return f"it is for {snap.get('domain')}, this report for {domain}"
+    if sha256 is not None and snap.get("sha256") != sha256:
+        return "it was made from another snapshot file; run plan on this one"
+    return None
+
+
+def _whatif(doc: dict[str, Any] | None, fixes: bool) -> dict[str, Any] | None:
+    """The part of a plan or what-if result the What-if screen shows. Fix lines go in
+    only with --fixes, as for findings."""
+    if doc is None:
+        return None
+    keys = WHATIF_CHANGE_KEYS + (("fix", "rollback") if fixes else ())
+
+    def path_rows(rows: list[dict[str, Any]]) -> list[str]:
+        return [str((r.get("path") or {}).get("object", "")) for r in rows]
+
+    p = doc.get("paths") or {}
+    f = doc.get("findings") or {}
+    return {
+        "kind": doc["kind"],
+        "version": doc.get("version"),
+        "collected_at": (doc.get("snapshot") or {}).get("collected_at"),
+        "changes": [{k: c.get(k) for k in keys} for c in doc.get("changes", [])],
+        "before": doc.get("before"),
+        "after": doc.get("after"),
+        "steps": doc.get("steps") or [],
+        "recommendation": doc.get("recommendation"),
+        "paths": {
+            "closed": path_rows(p.get("closed", [])),
+            "rerouted": path_rows(p.get("rerouted", [])),
+            "open": path_rows(p.get("open", [])),
+            "new": path_rows(p.get("new", [])),
+            "unclosable": [
+                {"name": u.get("name"), "why": u.get("why"), "suggest": u.get("suggest")}
+                for u in p.get("unclosable", [])
+            ],
+        },
+        "findings": {
+            "rechecked": bool(f.get("rechecked")),
+            "cleared": f.get("cleared", []),
+            "new": f.get("new", []),
+        },
+        "assumptions": doc.get("assumptions") or [],
+        "notes": doc.get("notes") or [],
+        "caveats": doc.get("caveats") or [],
+    }
 
 
 def _meta(r: Report, snap: Snapshot | None, opts: Options) -> dict[str, Any]:

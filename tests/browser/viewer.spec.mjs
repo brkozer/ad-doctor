@@ -6,7 +6,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const BUILD = resolve(dirname(fileURLToPath(import.meta.url)), "build");
-const ROUTES = ["overview", "findings", "paths", "blast", "changes", "trend", "accepted", "about", "print"];
+const ROUTES = ["overview", "findings", "paths", "blast", "changes", "whatif", "trend", "accepted", "about", "print"];
 const PAGES = ["xss", "full", "paths"];
 
 function url(name) {
@@ -32,7 +32,7 @@ for (const name of PAGES) {
   test(`${name}: every screen renders, makes no request and runs no injected script`, async ({ page }) => {
     const seen = watch(page);
     await page.goto(url(name));
-    await expect(page.locator(".nav a")).toHaveCount(8);
+    await expect(page.locator(".nav a")).toHaveCount(9);
     for (const route of ROUTES) {
       await page.evaluate((r) => { location.hash = "#" + r; }, route);
       await expect(page.locator("main h1")).toBeVisible();
@@ -169,7 +169,7 @@ test("an encrypted file opens with the passphrase and only with it", async ({ pa
   await field.fill(PASSPHRASE);
   await field.press("Enter");
   await expect(page.locator(".side-domain .value")).toHaveText("lab.test");
-  await expect(page.locator(".nav a")).toHaveCount(8);
+  await expect(page.locator(".nav a")).toHaveCount(9);
   await page.evaluate(() => { location.hash = "#about"; });
   await expect(page.getByText("Authenticated: the AES-GCM tag matched")).toBeVisible();
   // Lock forgets everything: the page reloads locked, without the route in the URL
@@ -449,4 +449,18 @@ test("the risk score marker stands out of the scale, inside its ends", async ({ 
   expect(mark[3]).toBeGreaterThan(track[3]); // taller than the bar, not hidden in it
   expect(mark[0]).toBeGreaterThanOrEqual(track[0]);
   expect(mark[0] + mark[2]).toBeLessThanOrEqual(track[0] + track[2]);
+});
+
+test("what-if: the embedded plan shows steps, change IDs and fix lines", async ({ page }) => {
+  const seen = watch(page);
+  await page.goto(url("full") + "#whatif");
+  await expect(page.locator("main h1")).toHaveText("Plan to close the paths to tier 0");
+  await expect(page.locator(".wi-steps > li").first()).toBeVisible();
+  await expect(page.locator(".wi-change code").first()).toHaveText(/^c:[0-9a-f]{12}$/);
+  await page.locator(".wi-change summary").first().click();
+  await expect(page.locator(".wi-change pre.code").first()).toContainText("-WhatIf");
+  await page.goto(url("paths") + "#whatif");
+  await expect(page.locator("main .empty")).toContainText("--whatif plan.json");
+  expect(external(seen.requests)).toEqual([]);
+  expect(seen.errors).toEqual([]);
 });

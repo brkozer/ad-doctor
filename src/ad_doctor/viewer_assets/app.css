@@ -655,3 +655,15 @@ table.heat .tick { color: var(--muted); margin-left: 2px; }
   .obj .btn { grid-row: 1 / span 2; grid-column: 2; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+/* what-if */
+.wi-steps, .wi-changes, .wi-paths, .wi-findings { margin: 0 0 16px; padding-left: 22px; }
+.wi-steps > li { margin-bottom: 14px; }
+.wi-step-head { margin-bottom: 6px; }
+.wi-changes { list-style: none; padding-left: 0; }
+.wi-change { padding: 6px 0; border-top: 1px solid var(--rule); }
+.wi-change details { margin-top: 6px; }
+.wi-paths li, .wi-findings li { margin: 3px 0; overflow-wrap: anywhere; }
+.wi-paths.good code { color: var(--ok); }
+.wi-paths.bad code { color: var(--high); }
+.wi-lede { margin: 0 0 16px; }

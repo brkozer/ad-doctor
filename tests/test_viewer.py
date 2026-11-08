@@ -325,3 +325,40 @@ def test_paths_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> No
     assert capsys.readouterr().out.startswith("```mermaid\nflowchart LR")
     assert main(["paths", str(path), "--chokepoints"]) == 0
     assert "paths to tier 0; shared by 2 or more" in capsys.readouterr().out
+
+
+def test_whatif_screen_data(pages: dict[str, Path]) -> None:
+    vm = json.loads(decode_payload(pages["full"].read_text(encoding="utf-8")))
+    w = vm["whatif"]
+    assert w["kind"] == "plan" and w["changes"] and w["steps"]
+    assert {"fix", "rollback"} <= set(w["changes"][0])  # built with --fixes
+    assert set(w["paths"]) == {"closed", "rerouted", "open", "new", "unclosable"}
+    assert all(isinstance(p, str) for p in w["paths"]["closed"])
+    xss = json.loads(decode_payload(pages["xss"].read_text(encoding="utf-8")))
+    assert xss["whatif"] is not None
+    plain = json.loads(decode_payload(pages["paths"].read_text(encoding="utf-8")))
+    assert plain["whatif"] is None
+
+
+def test_whatif_needs_a_plan_of_this_snapshot(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    snap = tmp_path / "s.json"
+    snap.write_text(json.dumps(xss_snapshot().to_json()))
+    plan = tmp_path / "p.json"
+    assert main(["plan", str(snap), "-f", "json", "-o", str(plan)]) == 0
+    doc = json.loads(plan.read_text(encoding="utf-8"))
+    digest = hashlib.sha256(snap.read_bytes()).hexdigest()
+    domain = doc["snapshot"]["domain"]
+    assert viewer.whatif_problem(doc, domain, digest) is None
+    assert viewer.whatif_problem(doc, domain, None) is None  # a JSON report: domain only
+    assert "another snapshot" in str(viewer.whatif_problem(doc, domain, "0" * 64))
+    assert "is for" in str(viewer.whatif_problem(doc, "other.test", digest))
+    assert "not ad-doctor" in str(viewer.whatif_problem({"tool": "x"}, domain, None))
+    assert "plan -f json" in str(viewer.whatif_problem({**doc, "kind": "analyze"}, domain, None))
+    other = tmp_path / "other.json"
+    other.write_text(snap.read_text() + " ")
+    capsys.readouterr()
+    code = main(["view", str(other), "--whatif", str(plan), "--no-encrypt", "--graph", "none"])
+    assert code == 1
+    assert "another snapshot" in capsys.readouterr().err

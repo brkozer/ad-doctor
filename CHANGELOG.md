@@ -25,6 +25,10 @@ logic or severity between versions, but an ID is never reused for something else
   and 3 on plan rot. The Entra sync account's DCSync, `[[keep]]` entries, accepted findings
   and declared invariants are never proposed. Nothing opens a connection to a directory.
   See `docs/whatif.md`.
+- **What-if screen in the viewer.** `view --whatif plan.json` embeds a `plan -f json`
+  or `whatif -f json` result of the same snapshot file: exposure before and after,
+  the steps with their change IDs, fix lines with `--fixes`, the paths closed, open or
+  new, the unclosable sources and the findings that would clear or appear.
 - **What-if engine.** `paths.build(snap, provenance=True)` records the removable fact
   behind every edge where the edge is made; the graph is the same either way, and
   `analyze` and `paths` text output is byte for byte that of 0.1.5. SDProp copies go with

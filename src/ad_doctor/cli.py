@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import sys
@@ -443,7 +444,7 @@ def _command(args: argparse.Namespace) -> str:
     parts = ["ad-doctor", args.cmd]
     if args.cmd in ("analyze", "view"):
         parts.append(getattr(args, "snapshot", None) or args.input)
-    for flag in ("baseline", "accept", "invariants"):
+    for flag in ("baseline", "accept", "invariants", "whatif"):
         if getattr(args, flag, None):
             parts += [f"--{flag}", getattr(args, flag)]
     if args.cmd == "view":
@@ -456,6 +457,14 @@ def _command(args: argparse.Namespace) -> str:
     else:
         parts += ["-f", "html"]
     return " ".join(str(Path(p).name) if isinstance(p, Path) else p for p in parts)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _snapshot_of_report(data: dict[str, Any]) -> Snapshot:
@@ -543,6 +552,13 @@ def cmd_view(args: argparse.Namespace) -> int:
         opts.fixes = args.fixes
         opts.blast_for = args.blast_radius_for
         opts.command = _command(args)
+        if args.whatif:
+            doc = _load_json(args.whatif)
+            digest = None if source is None else _sha256(args.input)
+            why = viewer.whatif_problem(doc, report.snap.domain, digest)
+            if why is not None:
+                raise ValueError(f"--whatif {args.whatif.name}: {why}")
+            opts.whatif = doc
         page = viewer.render(viewer.viewmodel(report, source, opts), passphrase)
         _write_private(out, page)
     except ERRORS as exc:
@@ -860,6 +876,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=f"encrypt the file with a passphrase ({seal.ENV} or a prompt); the default "
         "when a graph is embedded",
+    )
+    p_view.add_argument(
+        "--whatif",
+        type=Path,
+        metavar="JSON",
+        help="a `plan -f json` or `whatif -f json` result of this snapshot, for the What-if screen",
     )
     p_view.add_argument("--open", action="store_true", help="open it in the default browser")
 

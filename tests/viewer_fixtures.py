@@ -182,8 +182,10 @@ def build(out: Path) -> dict[str, Path]:
         work = Path(tmp)
         xss = work / "xss.json"
         xss.write_text(json.dumps(xss_snapshot().to_json()))
+        plan = work / "xss-plan.json"
+        assert main(["plan", str(xss), "-f", "json", "-o", str(plan)]) == 0
         args = ["view", str(xss), "--fixes", "--no-encrypt", "-o", str(pages["xss"])]
-        assert main(args) == 0
+        assert main([*args, "--whatif", str(plan)]) == 0
         old, new = full_snapshots()
         (work / "old.json").write_text(json.dumps(old.to_json()))
         (work / "new.json").write_text(json.dumps(new.to_json()))
@@ -192,6 +194,8 @@ def build(out: Path) -> dict[str, Path]:
         args = ["view", str(work / "new.json"), "--baseline", str(work / "old.json")]
         args += ["--accept", str(work / "accept.toml"), "--invariants", str(work / "inv.toml")]
         args += ["--history", str(history(work, old)), "--fixes"]
+        assert main(["plan", str(work / "new.json"), "-f", "json", "-o", str(work / "p.json")]) == 0
+        args += ["--whatif", str(work / "p.json")]
         assert main([*args, "--no-encrypt", "-o", str(pages["full"])]) == 0
         saved = os.environ.get("AD_DOCTOR_VIEW_PASSPHRASE")
         os.environ["AD_DOCTOR_VIEW_PASSPHRASE"] = PASSPHRASE

@@ -395,6 +395,7 @@
     ["paths", "Control paths"],
     ["blast", "Blast radius"],
     ["changes", "Changes"],
+    ["whatif", "What-if"],
     ["trend", "Trend"],
     ["accepted", "Policy"],
     ["about", "About this file"],
@@ -404,6 +405,7 @@
     if (route === "findings") return { n: VM.findings.length };
     if (route === "paths") return VM.paths ? { n: VM.paths.list.length, alert: true } : null;
     if (route === "changes") return VM.baseline ? { n: "+" + VM.baseline.new.length } : null;
+    if (route === "whatif") return VM.whatif ? { n: VM.whatif.changes.length } : null;
     if (route === "trend") return VM.trend ? { n: VM.trend.points.length } : null;
     if (route === "accepted") {
       const l = VM.lifecycle;
@@ -473,6 +475,7 @@
     paths: viewPaths,
     blast: viewBlast,
     changes: viewChanges,
+    whatif: viewWhatif,
     trend: viewTrend,
     accepted: viewAccepted,
     about: viewAbout,
@@ -1352,6 +1355,106 @@
     show(state.tab);
     return h("div", { class: "stack" }, pageHead("Changes", title, sub, actions), warn, stats,
       h("div", null, bar, body), drop);
+  }
+
+  // ---- what-if ------------------------------------------------------------------------
+
+  function viewWhatif() {
+    const W = VM.whatif;
+    if (!W) {
+      return h("div", { class: "stack" }, pageHead("What-if", "What-if plan"), h("div", { class: "empty" },
+        "No plan in this file. Build one with ", cmd("ad-doctor plan snap.json -f json -o plan.json"),
+        " and pass it with ", cmd("--whatif plan.json"), "."));
+    }
+    const isPlan = W.kind === "plan";
+    const rec = W.recommendation;
+    const b = W.before || {}, a = W.after || {};
+    const pct = (x, n) => (n ? Math.floor((100 * x) / n) + "%" : "–");
+    const warn = [];
+    if (W.collected_at && W.collected_at !== VM.meta.collected_at) {
+      warn.push(h("div", { class: "banner medium" }, h("div", null, h("strong", null, "Another snapshot time. "),
+        "The plan was made on the snapshot of " + fmtTime(W.collected_at) + ".")));
+    }
+    const stats = h("div", { class: "stats" },
+      stat(pct(a.exposed, a.users), "users with a path to tier 0", pct(b.exposed, b.users)),
+      stat(String(a.holders), "principals with a path", String(b.holders)),
+      stat(String(a.routes), "routes left (changes needed)", String(b.routes)),
+      stat(String(W.changes.length), isPlan ? "changes in the plan" : "changes simulated"));
+    let summary = null;
+    if (rec) {
+      const parts = [plural(rec.changes, "change") + " (cost " + rec.cost + ")"];
+      if (rec.budget !== null && rec.budget !== undefined) parts.push("budget of " + rec.budget + ": heuristic, no guarantee");
+      else if (rec.proven_minimum) parts.push("proven minimum (for paths ad-doctor sees)");
+      else if (rec.lower_bound) parts.push("at least " + rec.lower_bound.changes + " changes (cost " + rec.lower_bound.cost + ") are needed");
+      summary = h("p", { class: "wi-lede" }, parts.join(": ") + ".");
+    }
+    const byId = new Map(W.changes.map((c) => [c.id, c]));
+    const changeRow = (c) => {
+      const extra = [];
+      for (const n of c.notes || []) extra.push(h("div", { class: "small muted" }, n));
+      for (const w of c.warnings || []) extra.push(h("div", { class: "small warn-text" }, "Warning: " + w));
+      if (c.fix && c.fix.length) {
+        const script = c.fix.join("\n");
+        extra.push(h("details", null, h("summary", null, "Fix lines (dry run, -WhatIf)"),
+          copyButton(script, "Copy", "fix lines"), h("pre", { class: "code" }, script),
+          c.rollback && c.rollback.length ? h("pre", { class: "code" }, c.rollback.join("\n")) : null));
+      }
+      return h("li", { class: "wi-change" },
+        h("div", null, h("code", null, c.id), " ", c.label, h("span", { class: "small muted" }, "  cost " + c.cost)),
+        extra);
+    };
+    const sections = [];
+    if (W.steps.length) {
+      sections.push(sectionTitle(isPlan ? "Steps (heuristic order)" : "Steps"));
+      sections.push(h("ol", { class: "wi-steps" }, W.steps.map((s) =>
+        h("li", null,
+          h("div", { class: "wi-step-head" }, h("strong", null, s.title),
+            h("span", { class: "small muted" }, "  → exposed " + s.exposed_after + ", principals " +
+              s.holders_after + ", routes " + s.routes_after)),
+          h("ul", { class: "wi-changes" }, s.changes.map((id) => byId.get(id)).filter(Boolean).map(changeRow))))));
+    } else if (W.changes.length) {
+      sections.push(sectionTitle("Changes"));
+      sections.push(h("ul", { class: "wi-changes" }, W.changes.map(changeRow)));
+    }
+    const list = (title, rows, cls) => rows.length
+      ? [sectionTitle(title + " (" + rows.length + ")"), h("ul", { class: "wi-paths " + (cls || "") },
+        rows.map((r) => h("li", null, h("code", null, r))))]
+      : [];
+    sections.push(...list("Closes in the snapshot", W.paths.closed, "good"));
+    sections.push(...list("New: not there before", W.paths.new, "bad"));
+    sections.push(...list("Still open, another way", W.paths.rerouted));
+    sections.push(...list("Still open, same path", W.paths.open));
+    if (W.paths.unclosable.length) {
+      sections.push(sectionTitle("Cannot be closed by removing a right (needs a decision)"));
+      sections.push(h("ul", { class: "wi-paths" }, W.paths.unclosable.map((u) =>
+        h("li", null, h("code", null, u.why), h("div", { class: "small muted" }, "→ " + u.suggest)))));
+    }
+    if (W.findings.rechecked) {
+      const frow = (f) => h("li", null, h("span", { class: "sev " + f.severity }, f.severity), " ",
+        h("code", null, f.check), " " + f.object);
+      sections.push(sectionTitle("Findings, rechecked on the changed snapshot"));
+      sections.push(W.findings.cleared.length || W.findings.new.length
+        ? h("div", null,
+          W.findings.cleared.length ? [h("h3", null, "Would clear (" + W.findings.cleared.length + ")"),
+            h("ul", { class: "wi-findings" }, W.findings.cleared.map(frow))] : null,
+          W.findings.new.length ? [h("h3", null, "Would appear (" + W.findings.new.length + ")"),
+            h("ul", { class: "wi-findings" }, W.findings.new.map(frow))] : null)
+        : h("div", { class: "empty" }, "None would clear or appear."));
+    }
+    if (W.assumptions.length) {
+      sections.push(sectionTitle("Assumed tier 0 (not changes)"));
+      sections.push(h("ul", null, W.assumptions.map((x) => h("li", null, x.name + " (" + x.source + ")"))));
+    }
+    const notes = W.notes.concat(W.caveats);
+    if (notes.length) {
+      sections.push(sectionTitle("Caveats"));
+      sections.push(h("ul", { class: "small" }, notes.map((n) => h("li", null, n))));
+    }
+    return h("div", { class: "stack" },
+      pageHead("What-if", isPlan ? "Plan to close the paths to tier 0" : "What-if",
+        "Simulated on the snapshot; Active Directory is unchanged and nothing was applied. Made by ad-doctor " +
+          (W.version || "?") + "."),
+      warn, stats, summary, sections);
   }
 
   function changeTable(kind, rows) {

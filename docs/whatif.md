@@ -343,6 +343,19 @@ At 250,000 users loading the snapshot and building the provenance graph take mos
 paths-only time; with findings, every check runs twice (before and after the changes).
 The bench domain has few paths for its size, so its plan is one step of all its changes.
 
+## In the viewer
+
+The HTML viewer shows a plan or a what-if result on its What-if screen:
+
+```bash
+ad-doctor plan snap.json -f json -o plan.json
+ad-doctor view snap.json --whatif plan.json
+```
+
+The JSON must come from the same snapshot file (its SHA-256 is checked) or, for a
+JSON report, the same domain. The screen shows what was computed on the command line; it
+does not run a new plan in the page.
+
 ## Limits
 
 The commands work on the snapshot. What happens in AD after a change differs:
