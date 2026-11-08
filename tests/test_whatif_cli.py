@@ -403,7 +403,8 @@ CHANGE_KEYS = {
 }  # fmt: skip
 TOP_KEYS = {
     "tool", "kind", "schema", "version", "simulated", "snapshot", "changes", "before", "after",
-    "paths", "findings", "accounts", "plan_status", "check", "notes", "caveats",
+    "paths", "findings", "accounts", "assumptions", "plan_status", "check", "notes",
+    "caveats",
 }  # fmt: skip
 
 
@@ -415,7 +416,7 @@ def test_json_keys(lab: tuple[Path, Path], capsys: pytest.CaptureFixture[str]) -
     assert set(doc["snapshot"]) == {"domain", "domain_sid", "collected_at", "sha256", "file"}
     assert set(doc["changes"][0]) == CHANGE_KEYS
     assert set(doc["before"]) == {"exposed", "users", "holders", "routes"}
-    assert set(doc["paths"]) == {"closed", "rerouted", "open", "unclosable"}
+    assert set(doc["paths"]) == {"closed", "rerouted", "open", "unclosable", "new"}
     assert set(doc["findings"]) == {"rechecked", "cleared", "new", "changed", "accepted"}
     assert set(doc["recommendation"]) == {
         "goal", "near", "cost", "changes", "lower_bound", "exact", "proven_minimum",

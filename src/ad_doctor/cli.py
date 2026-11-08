@@ -91,6 +91,16 @@ def _write_private(path: Path, text: str | Iterable[str]) -> None:
         out.writelines([text] if isinstance(text, str) else text)
 
 
+def _positive(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return value
+
+
 def _use_color(stream: Any) -> bool:
     if "NO_COLOR" in os.environ:
         return False
@@ -779,7 +789,10 @@ def main(argv: list[str] | None = None) -> int:
         help="close the paths of these principals only (repeatable)",
     )
     p_plan.add_argument(
-        "--max-changes", type=int, metavar="K", help="a budget of K changes (heuristic)"
+        "--max-changes",
+        type=_positive,
+        metavar="K",
+        help="a budget of K changes, 1 or more (heuristic)",
     )
     p_plan.add_argument(
         "--near",

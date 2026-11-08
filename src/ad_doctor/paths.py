@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import gpo_scope, sd
 from .checks import (
+    CA_RIGHTS,
     CREATOR_OWNER,
     EKU_ANY,
     EKU_REQUEST_AGENT,
@@ -248,7 +249,8 @@ def build(snap: Snapshot, provenance: bool = False) -> Graph:
             if ace.sid not in skip:
                 rights = object_rights(ace, o.kind)
                 if rights:
-                    add(principal(ace.sid), target, ", ".join(rights), rec and rec.ace(o, ace))
+                    how = ", ".join(rights)
+                    add(principal(ace.sid), target, how, rec and rec.ace(o, ace, how))
         if o.kind == "domain":
             # DCSync is normally two ACEs, one per replication right
             get = {a.sid for a in o.aces if a.extended_right(sd.DS_REPL_GET_CHANGES)}
@@ -291,7 +293,7 @@ def build(snap: Snapshot, provenance: bool = False) -> Graph:
                 rights = object_rights(ace, kind)
                 if rights:
                     how = f"{', '.join(rights)} (inherited)"
-                    add(principal(ace.sid), node, how, rec and rec.ace(parent, ace))
+                    add(principal(ace.sid), node, how, rec and rec.ace(parent, ace, how))
 
     logon_edges: dict[str, list[Edge]] = {}
     edge_props: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -431,6 +433,8 @@ def build(snap: Snapshot, provenance: bool = False) -> Graph:
         add(principal(sid), ca_node, f"{right} (ESC7)", rec and rec.ca_right(c.name, sid, right))
         if rec is not None and principal(sid) != ca_node:
             rec.note_ca_edge(principal(sid), ca_node)
+    if rec is not None:
+        rec.hidden_ca = _hidden_ca_holders(snap)
 
     # gMSA password readers become the gMSA
     for gm in snap.gmsas:
@@ -471,6 +475,18 @@ def tier0_nodes(
             if a.sam.upper() == ca.upper() and a.sid:
                 tier0.add(_sid_node(a.sid))
     return tier0
+
+
+def _hidden_ca_holders(snap: Snapshot) -> set[str]:
+    """SIDs holding a CA right that ca_control leaves out (tier 0, not a fixed tier-0
+    group): a membership change can take them out of tier 0 and give them an edge."""
+    shown = {sid for _, sid, _ in ca_control(snap)}
+    held: set[str] = set()
+    for c in snap.probes.ca_configs:
+        if c.owner:
+            held.add(c.owner)
+        held |= {a.sid for a in c.aces if any(a.mask & bit for bit, _ in CA_RIGHTS)}
+    return held - shown - _tier0_group_sids(snap)
 
 
 def _dacl_writers(o: DirObject | None, skip: set[str]) -> dict[str, str]:

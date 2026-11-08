@@ -58,7 +58,7 @@ against the seeded lab DC in [`lab/`](lab/README.md) and is skipped unless the
 The what-if tests compare the masked graph with one built from the changed snapshot for
 every change of the fixtures. `AD_DOCTOR_WHATIF_SNAPSHOTS` (snapshot files, separated
 like `PATH`) adds every single change and 200 random sets on each of those snapshots, and
-`uv run pytest -m slow` runs the 10,000-user sample, which takes minutes.
+`uv run pytest -m slow` runs the 10,000-user sample, which takes about ten minutes on one core.
 
 What-if output follows a few wording rules, which `tests/test_whatif_cli.py` checks on the
 rendered text and on `docs/whatif.md`: "closes in the snapshot", "would clear",

@@ -20,7 +20,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from . import sd
-from .checks import CA_RIGHTS, _sync_accounts
+from .checks import CA_RIGHTS, _sync_accounts, _sync_servers
 from .model import EXCHANGE_GROUPS, UAC, GpLink, GpoLocalGroup, Snapshot
 from .provenance import TEMPLATE_FLAGS, Prim, Provenance
 
@@ -234,6 +234,7 @@ class Facts:
     entry: GpoLocalGroup | None = None
     link: GpLink | None = None
     inheritance_known: bool = True
+    orphan: bool = False  # an AdminSDHolder copy SDProp no longer rewrites
 
 
 def facts(snap: Snapshot, prov: Provenance, where: Where, prims: Iterable[int]) -> dict[int, Facts]:
@@ -245,14 +246,15 @@ def facts(snap: Snapshot, prov: Provenance, where: Where, prims: Iterable[int]) 
     holders: dict[int, set[str]] = {}
     if sids:
         for dn, lists in where.lists.items():
+            kind = where.kind.get(dn)
             for aces in lists:
                 for a in aces:
                     if a.sid not in sids:
                         continue
-                    p = by_key.get(prov.ace_prim_key(dn, a))
-                    if p is None:
-                        continue
-                    holders.setdefault(p, set()).add(dn)
+                    for key in prov.ace_prim_keys(dn, a, kind):
+                        p = by_key.get(key)
+                        if p is not None:
+                            holders.setdefault(p, set()).add(dn)
     gpos = {g.guid.upper(): g for g in snap.gpos}
     for p, f in out.items():
         kind, *_ = f.prim
@@ -265,9 +267,10 @@ def facts(snap: Snapshot, prov: Provenance, where: Where, prims: Iterable[int]) 
                 for a in where.aces(anchor)
                 if a.sid == f.prim[-1]
                 and not a.inherited
-                and prov.ace_prim_key(anchor, a) == f.prim
+                and f.prim in prov.ace_prim_keys(anchor, a, where.kind.get(anchor))
             )
             f.copies = len(holders.get(p, set()) - {anchor})
+            f.orphan = kind == "ace" and prov.orphan_copy(anchor, f.prim[-1], f.aces)
         elif kind == "owner":
             f.dn = where.dn.get(f.prim[1], f.prim[1])
             o = where.objects.get(f.prim[1])
@@ -350,6 +353,11 @@ class Context:
         self.exchange = {
             sid for sid, name in snap.principals.items() if name.lower() in EXCHANGE_GROUPS
         } | {o.sid for o in snap.objects if o.sid and o.name.lower() in EXCHANGE_GROUPS}
+        self.domain = snap.domain_dn.lower()
+        # accounts that look like the Entra Connect sync account, with no sync server
+        self.sync_unverified = {
+            a.sid for a in _sync_accounts(snap) if a.sid and not _sync_servers(snap, a)
+        }
 
 
 def assess(snap: Snapshot, prim: Prim, tier0: set[str], ctx: Context | None = None) -> Assessment:
@@ -369,6 +377,17 @@ def assess(snap: Snapshot, prim: Prim, tier0: set[str], ctx: Context | None = No
             return Assessment("warn", WARN_COST, "Key Admins manage key credentials by design")
         if trustee in (PRE2K, f"{snap.domain_sid}-517"):
             return Assessment("warn", WARN_COST, "a default grant that Windows expects")
+    if (
+        trustee in ctx.sync_unverified
+        and kind in ("ace", "inherited-ace")
+        and prim[1] == ctx.domain
+    ):
+        return Assessment(
+            "warn",
+            WARN_COST,
+            "named like the Entra Connect sync account, but no sync server was found: "
+            "check whether sync needs it or someone planted it",
+        )
     if kind == "member":
         group_node = ctx.group_node.get(prim[1], f"dn:{prim[1]}")
         if group_node in tier0:
@@ -382,14 +401,23 @@ def assess(snap: Snapshot, prim: Prim, tier0: set[str], ctx: Context | None = No
 
 def default_keeps(snap: Snapshot, prov: Provenance) -> dict[int, str]:
     """Changes never proposed unless asked: the Entra sync account's DCSync (decision D4;
-    `allow warn` lifts it). Its server is then reported as not closable by removal."""
+    `allow warn` lifts it). Its server is then reported as not closable by removal. The
+    account is found by name and description, so it is kept only when its sync server is
+    in the domain too; else its DCSync is a warn-class change like any other."""
     out = {}
     domain = snap.domain_dn.lower()
     for account in _sync_accounts(snap):
+        servers = _sync_servers(snap, account)
+        if not servers:
+            continue
+        server = servers[0].sam
         for kind in ("ace", "inherited-ace"):
             p = prov.lookup((kind, domain, account.sid))
             if p is not None:
-                out[p] = "Entra Connect needs DCSync"
+                out[p] = (
+                    f"kept by default: looks like the Entra Connect sync account of {server}, "
+                    "which needs DCSync"
+                )
     return out
 
 
@@ -529,27 +557,30 @@ def _remove_aces(snap: Snapshot, prov: Provenance, wanted: set[int], gone: dict[
     AdminSDHolder change, inherited copies with the container they come from."""
     sids = {prov.prims[p][-1] for p in wanted if prov.prims[p][0] in ACE_KINDS}
 
-    def keep(dn: str, aces: list[sd.Ace]) -> list[sd.Ace]:
+    def keep(dn: str, aces: list[sd.Ace], kind: str) -> list[sd.Ace]:
         out = []
         for a in aces:
             if a.sid in sids:
-                p = prov.index.get(prov.ace_prim_key(dn, a))
-                if p is not None and p in wanted:
-                    gone[p] += 1  # ACE entries; one AD ACE can sit in two lists
+                # an inherited copy with several possible sources goes when all of them do
+                ps = [prov.index.get(k) for k in prov.ace_prim_keys(dn, a, kind)]
+                if all(p is not None and p in wanted for p in ps):
+                    for p in ps:
+                        assert p is not None
+                        gone[p] += 1  # ACE entries; one AD ACE can sit in two lists
                     continue
             out.append(a)
         return out
 
     for o in snap.objects:
         dn = o.dn.lower()
-        o.aces = keep(dn, o.aces)
-        o.inheritable = keep(dn, o.inheritable)
+        o.aces = keep(dn, o.aces, o.kind)
+        o.inheritable = keep(dn, o.inheritable, o.kind)
     for g in snap.gpos:  # the GPO checks and security filtering read Gpo.aces
-        g.aces = keep(prov.gpo_dns[g.guid.upper()], g.aces)
+        g.aces = keep(prov.gpo_dns[g.guid.upper()], g.aces, "gpo")
     if "domain" in snap.acls:
-        snap.acls["domain"] = keep(snap.domain_dn.lower(), snap.acls["domain"])
+        snap.acls["domain"] = keep(snap.domain_dn.lower(), snap.acls["domain"], "domain")
     if "AdminSDHolder" in snap.acls:
-        snap.acls["AdminSDHolder"] = keep(prov.holder_dn, snap.acls["AdminSDHolder"])
+        snap.acls["AdminSDHolder"] = keep(prov.holder_dn, snap.acls["AdminSDHolder"], "container")
 
 
 def _set_flag(t: object, flag: str) -> bool:

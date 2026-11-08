@@ -4,7 +4,8 @@ Level 1 masks the graph: edges whose change is in the set are dropped and everyt
 keeps its order, so `paths.paths_to_tier0`, `direct_holders`, `exposure` and `reachable`
 give the same answer, ties included, as a graph built from the changed snapshot (the
 graph-equality tests check this edge for edge). Changes that can move GPO scope (links,
-security filters) are not masked: they go through a rebuild.
+security filters), or take a CA right holder out of tier 0, are not masked: they go
+through a rebuild.
 
 Level 2 takes the changes out of the snapshot in place and runs every check again, which
 also shows findings that would appear. The AD-PATH-001 holders and exposure of both levels
@@ -206,8 +207,9 @@ def _tier0(
 
 
 def maskable(prov: Provenance, removed: Iterable[int]) -> bool:
-    """False when a change can move GPO scope: level 1 then rebuilds the graph."""
-    return not any(prov.scope_sensitive(p) for p in removed)
+    """False when a change can move GPO scope, or take a CA right holder out of tier 0
+    (its ESC7 edge is not in the graph while it is tier 0): level 1 then rebuilds."""
+    return not any(prov.needs_rebuild(p) for p in removed)
 
 
 def reaching(g: Graph) -> set[str]:

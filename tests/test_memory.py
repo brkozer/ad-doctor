@@ -33,10 +33,28 @@ def _rich_snapshot() -> Snapshot:
     return snapshot(a, objects=[group], privileged={"Domain Admins": [a.dn]})
 
 
+def _without_default_inherited(value: Any) -> Any:
+    """asdict's output as the snapshot writes it: an ACE holds `inherited` only when
+    it is set."""
+    if isinstance(value, dict):
+        out = {k: _without_default_inherited(v) for k, v in value.items()}
+        if "mask" in out and out.get("inherited") is False:
+            del out["inherited"]
+        return out
+    if isinstance(value, list):
+        return [_without_default_inherited(v) for v in value]
+    return value
+
+
 def test_to_json_is_what_asdict_gave() -> None:
     snap = _rich_snapshot()
-    assert snap.to_json() == _encode(asdict(snap))
-    assert list(snap.to_json()) == list(_encode(asdict(snap)))
+    snap.objects[0].aces.append(Ace("S-1-5-11", sd.WRITE_DAC, inherited=True))
+    expected = _without_default_inherited(_encode(asdict(snap)))
+    assert snap.to_json() == expected
+    assert list(snap.to_json()) == list(expected)
+    aces = snap.to_json()["objects"][0]["aces"]
+    assert "inherited" not in aces[0] and aces[1]["inherited"] is True
+    assert Snapshot.from_json(json.loads(json.dumps(snap.to_json()))) == snap
 
 
 def test_load_shares_equal_aces_and_member_dns() -> None:

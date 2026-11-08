@@ -24,7 +24,7 @@ from .model import Finding, Severity, Snapshot
 from .paths import Graph
 from .provenance import Provenance
 from .report import fingerprint
-from .resolve import Resolved, Resolver, SpecError, canonical
+from .resolve import ORPHAN_NOTE, Resolved, Resolver, SpecError, canonical
 
 SCHEMA = 1
 
@@ -119,6 +119,18 @@ def tier0_nodes(ctx: Context, names: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def assumptions(ctx: Context, groups: list[tuple[str, list[str]]]) -> list[dict[str, str]]:
+    """The nodes treated as tier 0 without a change, with where each name came from:
+    they move every number, so every output lists them."""
+    rows: dict[str, dict[str, str]] = {}
+    for source, names in groups:
+        for name in names:
+            node = ctx.resolver.node(name)
+            if node is not None and node not in rows:
+                rows[node] = {"node": node, "name": ctx.g.name(node), "source": source}
+    return list(rows.values())
+
+
 def caveats(snap: Snapshot, check_hint: str) -> list[str]:
     return [
         f"Simulated on the snapshot of {snap.collected_at:%Y-%m-%d %H:%M} UTC; AD is unchanged "
@@ -179,6 +191,8 @@ def change_notes(f: changes.Facts, assessment: changes.Assessment) -> list[str]:
             f"SDProp removes the copies on {f.copies} protected objects at its next run "
             "(60 minutes)"
         )
+    if f.orphan:
+        notes.append(ORPHAN_NOTE)
     if kind == "member" and assessment.cost == changes.TIER0_MEMBER_COST:
         notes.append("takes away tier-0 rights; AD-ACC-006 flags the adminCount left behind")
     if kind in ("gplink", "gpo-entry"):
@@ -254,6 +268,7 @@ def _path_rec(g: Graph, node: str, p: paths.Path) -> dict[str, Any]:
 
 def paths_block(res: whatif.Result, unclosable: list[cut.Unclosable]) -> dict[str, Any]:
     bg, ag = res.before.graph, res.after.graph
+    bg_holders = res.before.holders
     rerouted = []
     for node in res.rerouted:
         new = res.after.holders.get(node) or res.after.found[node]
@@ -270,6 +285,7 @@ def paths_block(res: whatif.Result, unclosable: list[cut.Unclosable]) -> dict[st
         "open": [
             _path_rec(ag, n, res.after.holders.get(n) or res.after.found[n]) for n in res.open
         ],
+        "new": [_path_rec(ag, n, p) for n, p in res.after.holders.items() if n not in bg_holders],
         "unclosable": [
             {"node": u.node, "name": bg.name(u.node), "why": u.why, "suggest": u.suggest}
             for u in unclosable
@@ -394,7 +410,10 @@ def lifecycle(ctx: Context, plan: planfile.PlanFile) -> list[Status]:
             problems.append(
                 f"id {e.id} does not match its fields ({e.expected_id}): the file was edited"
             )
-        if ctx.resolver.exists(prim):
+        bad = ctx.resolver.entry_problem(prim)
+        if bad is not None:
+            st = Status(e, "stale", None, [*problems, bad])
+        elif ctx.resolver.exists(prim):
             st = Status(e, "open", ctx.resolver.register(prim), problems)
             if e.due is not None and e.due < ctx.today:
                 st.status = "overdue"
@@ -424,8 +443,8 @@ def mark_ineffective(
     full = _reach(ctx, m, removed, extra)
     for s in candidates:
         assert s.p is not None
-        if prov.scope_sensitive(s.p):
-            s.note = "not tested for ineffectiveness: it can move GPO scope"
+        if prov.needs_rebuild(s.p):
+            s.note = "not tested for ineffectiveness: it can move GPO scope or tier 0"
             continue
         if _reach(ctx, m, removed - {s.p}, extra) == full:
             s.status = "ineffective"
@@ -497,6 +516,7 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     problems_rot: list[str] = []
     problems_gate: list[str] = []
     resolved: list[Resolved] = []
+    ctx.resolver.want_ids(x.strip() for x in args.remove or [])
     for spec in args.remove or []:
         r = ctx.resolver.resolve(spec)
         if r.status == "absent" and (args.strict or args.check):
@@ -505,6 +525,7 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     statuses: list[Status] = []
     goal, sources_from, allow = "exposure", [], []
     tier0_names = list(args.tier0 or [])
+    plan_tier0: list[str] = []
     if plan is not None:
         if plan.domain_sid and plan.domain_sid != ctx.snap.domain_sid:
             problems_rot.append(
@@ -514,6 +535,7 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         else:
             statuses = lifecycle(ctx, plan)
             tier0_names += plan.tier0
+            plan_tier0 = list(plan.tier0)
         goal, sources_from, allow = plan.goal, plan.sources, plan.allow
     extra = tier0_nodes(ctx, tier0_names)
     removed: set[int] = {p for r in resolved for p in r.prims}
@@ -553,6 +575,16 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         ctx.baseline()
 
     res = whatif.run(ctx.snap, ctx.g, removed, accounts, True, extra, None, recheck(ctx.spec))
+    if closes_all is not None and not res.maskable:
+        # the flow model reads the masked graph; the rebuilt one decides
+        sources = set(m.sources) | set(
+            cut.sources_for(ctx.snap, res.after.graph, goal, sources_from)
+        )
+        # sources the model already found unclosable (kept or fixed routes) do not count
+        closes_all = closes_all and not any(
+            x in res.after.found and x not in res.after.graph.tier0 and x not in m.sink_like
+            for x in sources
+        )
     counts = _edge_counts(ctx.g, res.before, removed)
     doc = document(ctx, "whatif")
     closed_by = _closed_by(ctx, res, removed)
@@ -581,10 +613,15 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     doc["paths"] = paths_doc
     doc["findings"] = fb
     doc["accounts"] = res.accounts
+    doc["assumptions"] = assumptions(
+        ctx, [("--tier0", list(args.tier0 or [])), ("plan file", plan_tier0)]
+    )
     doc["plan_status"] = [
         {
             "id": s.entry.id or s.entry.expected_id,
-            "label": s.entry.label or changes.describe(ctx.snap, s.entry.prim, ctx.resolver.where),
+            # built from the identity fields: the file's own label is free text anyone
+            # can edit, and must not stand next to an ID that does something else
+            "label": changes.describe(ctx.snap, s.entry.prim, ctx.resolver.where),
             "status": s.status,
             "due": s.entry.due.isoformat() if s.entry.due else None,
             "problems": s.problems,
@@ -614,6 +651,11 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         )
     if args.paths_only:
         notes.append("--paths-only: findings were not rechecked")
+    if plan_tier0 and args.check:
+        notes.append(
+            f"the plan file treats {len(plan_tier0)} nodes as tier 0 ([assume] tier0): the "
+            "numbers and the check count them as tier 0; review an edit there like a change"
+        )
     doc["notes"] = notes
     if problems_rot and not args.check:
         notes += [f"plan: {x}" for x in problems_rot]
@@ -716,6 +758,7 @@ def run_plan(args: argparse.Namespace) -> tuple[dict[str, Any], int, planfile.Pl
         if k not in changes.FIELDS:
             raise SpecError(f"--allow takes warn or a change kind ({', '.join(changes.FIELDS)})")
     keeps = file_keeps(ctx, given)
+    ctx.resolver.want_ids(x.strip() for x in args.keep or [])
     for spec in args.keep or []:
         r = ctx.resolver.resolve(spec)
         if r.status == "absent":
@@ -755,6 +798,20 @@ def run_plan(args: argparse.Namespace) -> tuple[dict[str, Any], int, planfile.Pl
     expected = expected_map(ctx, set(p.changes)) if findings_needed else {}
     step_closed = _step_holders(ctx, p, extra) if args.format == "markdown" else {}
     res = whatif.run(ctx.snap, ctx.g, p.changes, (), True, extra, None, recheck(ctx.spec))
+    expected_after = p.steps[-1].exposed_after if p.steps else p.before[0]
+    if not res.maskable and res.after.exposed != expected_after:
+        # the cut reads the masked graph; a rebuild (GPO scope, a CA right holder out of
+        # tier 0) shows what the model could not
+        p.proven = p.exact = False
+        p.note = "; ".join(
+            x
+            for x in (
+                p.note,
+                f"the rebuilt graph leaves {res.after.exposed} users exposed where the model "
+                f"expected {expected_after}: not shown to be the minimum",
+            )
+            if x
+        )
     counts = _edge_counts(ctx.g, res.before, p.changes)
     closed_by = _closed_by(ctx, res, set(p.changes))
     doc = document(ctx, "plan")
@@ -783,6 +840,9 @@ def run_plan(args: argparse.Namespace) -> tuple[dict[str, Any], int, planfile.Pl
     doc["paths"] = paths_doc
     doc["findings"] = fb
     doc["accounts"] = []
+    doc["assumptions"] = assumptions(
+        ctx, [("--tier0", list(args.tier0 or [])), ("plan file", given.tier0 if given else [])]
+    )
     doc["steps"] = step_rows
     doc["recommendation"] = {
         "goal": goal,

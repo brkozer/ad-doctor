@@ -528,7 +528,8 @@ def _route_label(g: Graph, prov: Provenance, u: str, v: str, keeps: dict[int, st
         prims, _ = _instances(prov, u, i, w)
         kept = [keeps[p] for p in prims if p in keeps]
         if kept:
-            return f"{how} (kept: {kept[0]})"
+            reason = kept[0] if kept[0].startswith("kept") else f"kept: {kept[0]}"
+            return f"{how} ({reason})"
         return how
     return "?"
 
@@ -942,12 +943,30 @@ def plan(
         # when the network could join routes
         cut = prune(m, cut)
     lb = lower_bound(m)
-    cost = sum(m.cost[p] for p in cut)
     exact = m.inexact == 0
-    proven = exact or cost == lb[1]
     before = numbers(m, [])
+    note = ""
+    final = m
+    if max_changes is None and not names:
+        final, cut, left = _resolve_left_tier0(
+            m, snap, g, goal, near, all_keeps, extra, accepted, cut
+        )
+        if final is not m:
+            exact = False
+            note = (
+                "the cut takes members out of tier 0, which gives them paths of their own: "
+                "solved again with them as sources, so the plan is not shown to be the minimum"
+            )
+        if left:
+            names_left = ", ".join(g.name(n) for n in left[:5])
+            note += ("; " if note else "") + (
+                f"{len(left)} principals that leave tier 0 still have a path ({names_left})"
+            )
+    cost = sum(final.cost[p] for p in cut)
+    proven = final is m and (exact or cost == lb[1])
     if max_changes is None:
-        steps, note = order(m, cut)
+        steps, order_note = order(final, cut)
+        note = "; ".join(x for x in (note, order_note) if x)
         chosen = [p for s in steps for p in s.changes]
     else:
         steps, note = order(m, cut, budget=max_changes)
@@ -960,7 +979,7 @@ def plan(
         cost if max_changes is None else sum(m.cost[p] for p in chosen),
         lb,
         exact,
-        m.inexact,
+        final.inexact,
         proven and max_changes is None,
         alternatives,
         m.unclosable,
@@ -969,6 +988,56 @@ def plan(
         len(m.sources),
         note,
     )
+
+
+def _resolve_left_tier0(
+    m: Model,
+    snap: Snapshot,
+    g: Graph,
+    goal: str,
+    near: str,
+    keeps: dict[int, str],
+    extra: set[str],
+    accepted: Iterable[str],
+    cut: list[int],
+    rounds: int = 4,
+) -> tuple[Model, list[int], list[str]]:
+    """A cut that takes a member out of a tier-0 group moves principals out of tier 0;
+    with rights of their own they then have a path, and the sources (taken from tier 0
+    before any change) miss them. Solve again with the membership changes made and those
+    principals as sources, until the cut moves no one else. Returns the model the cut
+    belongs to, the cut, and the principals still left with a path."""
+    excluded = accepted_holders(g, accepted)
+    final = m
+    left: list[str] = []
+    for i in range(rounds + 1):
+        after = masked(g, snap, cut, extra)
+        moved = m.tier0 - after.tier0
+        if not moved:
+            return final, cut, []
+        reach = reaching(after)
+        srcs = sources_for(snap, after, goal, (), excluded)
+        left = sorted(x for x in moved if x in reach and (x in srcs or x.startswith("sid:")))
+        if not left:
+            return final, cut, []
+        if i == rounds:
+            break
+        members = [p for p in cut if m.prov.prims[p][0] == "member"]
+        view = masked(g, snap, members, extra)
+        nxt = build_model(
+            snap, g, sources_for(snap, view, goal, (), excluded), keeps, extra, members
+        )
+        nxt.where, nxt.r0, nxt.users = m.where, m.r0, m.users
+        for p in members:  # made already: not in the network, but in the steps
+            nxt.cost[p] = final.cost[p]
+            if p in final.warn:
+                nxt.warn[p] = final.warn[p]
+        _, more = min_cut(nxt, near)
+        new_cut = sorted(set(members) | set(more), key=lambda p: changes.change_id(m.prov.prims[p]))
+        if set(new_cut) == set(cut) and final is not m:
+            break
+        final, cut = nxt, new_cut
+    return final, cut, left
 
 
 def brute_force_minimum(

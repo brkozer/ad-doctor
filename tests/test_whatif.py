@@ -242,7 +242,7 @@ def test_older_snapshot_loads_without_the_new_fields() -> None:
     del data["ace_inheritance_checked"]
     for o in data["objects"]:
         for a in o["aces"] + o["inheritable"]:
-            del a["inherited"]
+            a.pop("inherited", None)
     snap = Snapshot.from_json(data)
     assert snap.ace_inheritance_checked is False
     assert not any(a.inherited for o in snap.objects for a in o.aces)

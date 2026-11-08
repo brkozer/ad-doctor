@@ -48,6 +48,12 @@ WHERE_INSTEAD = {
 }
 
 
+ORPHAN_NOTE = (
+    "adminCount left behind: SDProp no longer rewrites this object, so the copy stays "
+    "when the AdminSDHolder ACE goes"
+)
+
+
 class SpecError(ValueError):
     """A change that cannot be used as written: syntax, ambiguity, a fixed edge, a
     setting."""
@@ -117,6 +123,8 @@ class Resolver:
         self.where = changes.Where(snap, g.prov)
         self._findings = findings
         self._ids: dict[str, int] | None = None
+        self._missing: set[str] = set()  # IDs looked up and not in the table
+        self._known_sids: set[str] | None = None
         self._holders: dict[str, Path] | None = None
         self._edge_ids: dict[str, tuple[str, str, str]] | None = None
         # lower-case name -> SID or DN, a list only when names collide (large domains: no
@@ -264,18 +272,38 @@ class Resolver:
 
     # -- IDs ----------------------------------------------------------------------------
 
-    def ids(self) -> dict[str, int]:
+    def want_ids(self, texts: Iterable[str]) -> None:
+        """Find these change IDs in one pass over the change table. Only the IDs asked
+        for are kept: a table of every ID costs about 100 MB at 250,000 users."""
         if self._ids is None:
-            self._ids = {changes.change_id(p): i for i, p in enumerate(self.prov.prims)}
-        return self._ids
+            self._ids = {}
+        wanted = {t for t in texts if CHANGE_ID.fullmatch(t)} - self._ids.keys()
+        wanted -= self._missing
+        if not wanted:
+            return
+        for i, p in enumerate(self.prov.prims):
+            cid = changes.change_id(p)
+            if cid in wanted:
+                self._ids[cid] = i
+                wanted.discard(cid)
+                if not wanted:
+                    break
+        self._missing |= wanted
+
+    def id_lookup(self, text: str) -> int | None:
+        self.want_ids([text])
+        assert self._ids is not None
+        return self._ids.get(text)
 
     def register(self, key: Prim) -> int:
         """The index of a change, added to the table when it made no edge."""
         p = self.prov.lookup(key)
         if p is None:
             p = self.prov.prim(key)
+            cid = changes.change_id(key)
+            self._missing.discard(cid)
             if self._ids is not None:
-                self._ids[changes.change_id(key)] = p
+                self._ids[cid] = p
         return p
 
     # -- facts --------------------------------------------------------------------------
@@ -283,9 +311,11 @@ class Resolver:
     def ace_keys(self, dn: str, sid: str) -> list[Prim]:
         """The changes behind the trustee's ACEs on the object, in first-seen order."""
         out: dict[Prim, None] = {}
+        kind = self.where.kind.get(dn)
         for a in self.where.aces(dn):
             if a.sid == sid:
-                out[self.prov.ace_prim_key(dn, a)] = None
+                for key in self.prov.ace_prim_keys(dn, a, kind):
+                    out[key] = None
         return list(out)
 
     def exists(self, key: Prim) -> bool:
@@ -354,6 +384,81 @@ class Resolver:
         p = self.prov.lookup(key)
         return p is not None and bool(_index(self.prov).srcs.get(p))
 
+    def sid_known(self, sid: str) -> bool:
+        """Whether the SID appears anywhere in the snapshot: a principal, an account, an
+        object, or the trustee of some ACE, CA right, GPO entry or gMSA reader."""
+        if self._known_sids is None:
+            snap = self.snap
+            known = set(self.where.sid_name)
+            for lists in self.where.lists.values():
+                for aces in lists:
+                    known.update(a.sid for a in aces)
+            for t in snap.templates:
+                known.update(a.sid for a in t.aces)
+            for aces in snap.acls.values():
+                known.update(a.sid for a in aces)
+            for c in snap.probes.ca_configs:
+                known.update(a.sid for a in c.aces)
+                if c.owner:
+                    known.add(c.owner)
+            for gm in snap.gmsas:
+                known.update(gm.readers)
+            for x in snap.gpo_local_groups:
+                known.update((x.group_sid, x.member_sid))
+            self._known_sids = {k.upper() for k in known if k}
+        return sid.upper() in self._known_sids
+
+    def entry_problem(self, key: Prim) -> str | None:
+        """Why a plan entry cannot stand for a change in this snapshot, checked against
+        what --remove accepts: an unknown flag, right or delegation, a trustee that
+        appears nowhere, or a fact that is not a change (a DC's delegation)."""
+        from .checks import CA_RIGHTS
+
+        kind = key[0]
+        if kind == "template-flag" and key[2] not in TEMPLATE_FLAGS:
+            return f"unknown template flag {key[2]!r} (flags: {', '.join(TEMPLATE_FLAGS)})"
+        if kind == "ca-right" and key[3] not in {r for _, r in CA_RIGHTS}:
+            return f"unknown CA right {key[3]!r}: a CA right is ManageCA or ManageCertificates"
+        if kind == "delegation":
+            what = key[2]
+            if what not in DELEGATIONS and not (
+                what.startswith("constrained:") and len(what) > len("constrained:")
+            ):
+                return (
+                    f"unknown delegation {what!r}: unconstrained, protocol-transition, rbcd "
+                    "or constrained:<SPN>"
+                )
+            refused = self.dc_delegation(key[1], what)
+            if refused:
+                return refused
+        for name, value in zip(changes.FIELDS[kind], key[1:], strict=True):
+            if name in changes.SID_FIELDS and self._no_such_principal(value):
+                return f"{name} {value} appears nowhere in this snapshot: unresolved trustee"
+        return None
+
+    def _no_such_principal(self, sid: str) -> bool:
+        """A SID of this domain (or its forest root) that no principal, well-known name or
+        ACE has: a typo. A foreign SID can leave the snapshot with the change itself."""
+        prefixes = {p for p in (self.snap.domain_sid, self.snap.root_sid) if p}
+        if not any(sid.upper().startswith(p.upper() + "-") for p in prefixes):
+            return False
+        if self.snap.name_of(sid) != sid:
+            return False
+        return not self.sid_known(sid)
+
+    def dc_delegation(self, dn: str, what: str) -> str | None:
+        """A domain controller needs unconstrained delegation: taking it away is not a
+        change (AD-DEL-001 leaves DCs out for the same reason)."""
+        if what != "unconstrained":
+            return None
+        a = next((x for x in self.snap.accounts if x.dn.lower() == dn), None)
+        if a is not None and (a.is_dc or a.is_rodc):
+            return (
+                f"{a.sam} is a domain controller: DCs need unconstrained delegation, so "
+                "taking it away is not a change"
+            )
+        return None
+
     def anchor_exists(self, key: Prim) -> bool:
         """Whether the object the change is about is in the snapshot (else the plan entry
         is stale: renamed, deleted or a typo)."""
@@ -384,7 +489,7 @@ class Resolver:
         if not text:
             raise SpecError("empty change")
         if CHANGE_ID.fullmatch(text):
-            p = self.ids().get(text)
+            p = self.id_lookup(text)
             if p is None:
                 return Resolved(spec, [], "absent", ["absent in this snapshot"])
             return Resolved(spec, [p])
@@ -530,7 +635,11 @@ class Resolver:
                         "a delegation is unconstrained, protocol-transition, rbcd or "
                         "constrained:<SPN>"
                     )
-                return [("delegation", obj(args[0]), what)], []
+                dn = obj(args[0])
+                refused = self.dc_delegation(dn, what)
+                if refused:
+                    raise SpecError(refused)
+                return [("delegation", dn, what)], []
         except _Absent as exc:
             return [], [str(exc)]
         raise SpecError(f"unknown kind of change {kind!r}")
@@ -541,6 +650,17 @@ class Resolver:
         if not keys:
             return [(kind, dn, sid)], []
         written = (kind, dn, sid)
+        # the object's own ACEs (an SDProp copy counts: it is written on the object) win;
+        # copies inherited from above are only named, never added in silence
+        own = [k for k in keys if k[0] == "adminsdholder-ace" or k[1] == dn]
+        above = [k for k in keys if k not in own]
+        if own:
+            for k in above:
+                notes.append(
+                    f"also inherits ACEs of this trustee from {self.where.dn.get(k[1], k[1])}: "
+                    f"name that change ({changes.change_id(k)}) to remove them"
+                )
+            keys = own
         for k in keys:
             if k[0] == "adminsdholder-ace":
                 notes.append(
@@ -553,7 +673,7 @@ class Resolver:
                 )
             elif k[0] != kind and kind != "ace":
                 notes.append(f"resolves to {k[0]} (how the ACE is held there)")
-        if written not in keys and not notes:
+        if written not in keys and not any("resolves to" in n for n in notes):
             notes.append(f"resolves to {keys[0][0]}")
         return keys, notes
 

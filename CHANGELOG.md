@@ -29,7 +29,7 @@ logic or severity between versions, but an ID is never reused for something else
   behind every edge where the edge is made; the graph is the same either way, and
   `analyze` and `paths` text output is byte for byte that of 0.1.5. SDProp copies go with
   the AdminSDHolder ACE, inherited copies with the OU they come from. Provenance costs
-  4.6 s and 270 MB more at 250,000 users.
+  about 4 s and 270 MB more at 250,000 users (graph build alone, in its own process).
 - **`paths -f json`** gives each step the IDs of the changes that remove it, and each
   `--chokepoints` edge row an `id`, both accepted by `whatif --remove`.
 
@@ -37,7 +37,9 @@ logic or severity between versions, but an ID is never reused for something else
 
 - **Snapshots keep the INHERITED_ACE flag** (`Ace.inherited`, and
   `ace_inheritance_checked` on the snapshot). Older snapshots still load; there an
-  inherited copy cannot be told from an explicit ACE, and what-if output says so.
+  inherited copy cannot be told from an explicit ACE, and what-if output says so. The
+  key is written only when true, so 0.1.5 still reads a snapshot with no inherited ACE;
+  one that has them needs 0.2.0.
 - **`scripts/bench.py`** lists nested Domain Admins members as tier 0, as a collection
   does, and times a plan. The benchmark rows in the README are measured again.
 

@@ -127,12 +127,29 @@ def _strings(value: object, where: str) -> list[str]:
     return list(value)
 
 
+def _table(data: dict[str, object], key: str, name: str) -> dict[str, object]:
+    value = data.get(key, {})
+    if not isinstance(value, dict):
+        raise PlanError(f"{name}: [{key}] must be a table")
+    return value
+
+
+def _array(data: dict[str, object], key: str, name: str) -> list[object]:
+    value = data.get(key, [])
+    if not isinstance(value, list):
+        raise PlanError(f"{name}: {key} must be an array of tables ([[{key}]])")
+    return value
+
+
 def loads(text: str, name: str = "plan") -> PlanFile:
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise PlanError(f"{name}: {exc}") from exc
-    if data.get("schema", SCHEMA) != SCHEMA:
+    except RecursionError as exc:
+        raise PlanError(f"{name}: nested too deep") from exc
+    schema = data.get("schema", SCHEMA)
+    if type(schema) is not int or schema != SCHEMA:
         raise PlanError(f"{name}: schema {data.get('schema')!r} is not {SCHEMA}")
     head = data.get("plan", {})
     if not isinstance(head, dict):
@@ -153,11 +170,11 @@ def loads(text: str, name: str = "plan") -> PlanFile:
         goal=goal,
         sources=_strings(head.get("from"), f"{name}: from"),
         allow=_strings(head.get("allow"), f"{name}: allow"),
-        tier0=_strings(data.get("assume", {}).get("tier0"), f"{name}: [assume] tier0"),
+        tier0=_strings(_table(data, "assume", name).get("tier0"), f"{name}: [assume] tier0"),
     )
-    for i, item in enumerate(data.get("change", []), 1):
+    for i, item in enumerate(_array(data, "change", name), 1):
         plan.changes.append(_entry(item, f"{name}: change {i}", keep=False))
-    for i, item in enumerate(data.get("keep", []), 1):
+    for i, item in enumerate(_array(data, "keep", name), 1):
         plan.keeps.append(_entry(item, f"{name}: keep {i}", keep=True))
     expect = data.get("expect", {})
     if not isinstance(expect, dict):

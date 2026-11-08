@@ -9,6 +9,7 @@ or budget claim.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from .fixes import one_line, render_change_script
@@ -67,6 +68,9 @@ def _paths(doc: dict[str, Any]) -> list[str]:
     if p["open"]:
         out.append(f"Still open, same path ({len(p['open'])}):")
         out += _clip([_path_text(r["path"]) for r in p["open"]])
+    if p.get("new"):
+        out.append(f"New: a path that was not there before ({len(p['new'])}):")
+        out += _clip([_path_text(r["path"]) for r in p["new"]])
     if p["unclosable"]:
         out.append("Cannot be closed by removing a right (needs a decision):")
         for u in p["unclosable"][:SHOW]:
@@ -111,6 +115,14 @@ def _change_rows(c: dict[str, Any], status: bool) -> list[str]:
     return out
 
 
+def _assumed(doc: dict[str, Any]) -> list[str]:
+    rows = doc.get("assumptions", [])
+    if not rows:
+        return []
+    shown = ", ".join(f"{r['name']} ({r['source']})" for r in rows)
+    return [f"Assumed tier 0 (not changes; numbers count them as tier 0): {shown}", ""]
+
+
 def render_text(doc: dict[str, Any]) -> str:
     plan = doc["kind"] == "plan"
     snap = doc["snapshot"]
@@ -127,7 +139,7 @@ def render_text(doc: dict[str, Any]) -> str:
             "from": "close the paths of the principals named with --from",
         }[rec["goal"]]
         out.append(f"Goal: {goal}.")
-        out += ["", "Tier-0 paths:", *_numbers(doc), ""]
+        out += ["", *_assumed(doc), "Tier-0 paths:", *_numbers(doc), ""]
         if doc["steps"]:
             label = "budget, heuristic" if rec["budget"] is not None else "heuristic order"
             out.append(f"Steps ({label}; each closes in the snapshot what it says):")
@@ -142,14 +154,19 @@ def render_text(doc: dict[str, Any]) -> str:
                     extra = [f"warning: {w}" for w in c["warnings"]] + c["notes"]
                     out.append(f"        {cid}  {c['label']}  (cost {c['cost']})")
                     out += [f"          {x}" for x in extra]
+        elif rec["budget"] is not None and doc["before"]["routes"]:
+            out.append("The budget allows no change that helps.")
         else:
             out.append("Nothing to change: no closable source reaches tier 0.")
         out += ["", _verdict(rec)]
         if rec["alternatives"]:
             other = "the sources" if rec["near"] == "tier0" else "tier 0"
             out.append(f"Another cut of equal cost exists nearer {other} (--near).")
-        if rec["note"]:
-            out.append(f"Note: {rec['note']}.")
+        note = rec["note"]
+        if rec["budget"] is not None:  # the verdict line says it already
+            note = note.removesuffix("heuristic: no guarantee").removesuffix("; ")
+        if note:
+            out.append(f"Note: {note}.")
         out.append("")
     else:
         out.append("Changes:")
@@ -157,7 +174,7 @@ def render_text(doc: dict[str, Any]) -> str:
             out += _change_rows(c, status=True)
         if not doc["changes"]:
             out.append("  none")
-        out += ["", "Tier-0 paths:", *_numbers(doc), ""]
+        out += ["", *_assumed(doc), "Tier-0 paths:", *_numbers(doc), ""]
     out += _paths(doc)
     out += ["", *_findings(doc)]
     if doc.get("accounts"):
@@ -208,6 +225,15 @@ def _verdict(rec: dict[str, Any]) -> str:
     )
 
 
+_MD_META = re.compile(r"([\\`*_\[\]<>|])")
+
+
+def _esc(text: str) -> str:
+    """Directory text outside a code span: one line, Markdown and HTML characters
+    escaped, so a name cannot open a tag, a link or a table cell."""
+    return _MD_META.sub(r"\\\1", one_line(text))
+
+
 def _md(text: str) -> str:
     """Directory text inside a Markdown code span: one line, no backticks breaking out."""
     return "`` " + one_line(text).replace("`", "'") + " ``"
@@ -235,10 +261,11 @@ def render_markdown(doc: dict[str, Any]) -> str:
     plan = doc["kind"] == "plan"
     b, a = doc["before"], doc["after"]
     out = [
-        f"# {'Plan' if plan else 'What-if'} for {one_line(snap['domain'])}",
+        f"# {'Plan' if plan else 'What-if'} for {_esc(snap['domain'])}",
         "",
         f"Simulated on the snapshot of {_when(doc)}; AD is unchanged.",
         "",
+        *[_esc(line) if line else line for line in _assumed(doc)],
         "| | before | after |",
         "|---|---|---|",
         f"| exposed users | {b['exposed']} of {b['users']} | {a['exposed']} of {a['users']} |",
@@ -261,7 +288,10 @@ def render_markdown(doc: dict[str, Any]) -> str:
                         f"After this step: {s['exposed_after']} users exposed, "
                         f"{s['holders_after']} principals with a path.",
                         *(
-                            ["Closes in the snapshot the paths of: " + ", ".join(s["closes"])]
+                            [
+                                "Closes in the snapshot the paths of: "
+                                + ", ".join(map(_esc, s["closes"]))
+                            ]
                             if s.get("closes")
                             else []
                         ),
@@ -274,10 +304,10 @@ def render_markdown(doc: dict[str, Any]) -> str:
                 sections.append((c["label"], [c], []))
     together = ", with the other changes," if len(doc["changes"]) > 1 else ""
     for title, items, lines in sections:
-        out += [f"### {one_line(title)}", ""]
-        out += lines + ([""] if lines else [])
+        out += [f"### {_esc(title)}", ""]
+        out += [one_line(x) for x in lines] + ([""] if lines else [])
         for c in items:
-            out += [f"**{c['id']}**: {one_line(c['label'])}", ""]
+            out += [f"**{c['id']}**: {_esc(c['label'])}", ""]
             out.append(f"- What: {_md(c['spec'])} ({c['kind']}, cost {c['cost']})")
             if c["expected_to_clear"]:
                 out.append(
@@ -287,17 +317,21 @@ def render_markdown(doc: dict[str, Any]) -> str:
             else:
                 out.append(f"- Why: takes away {c['edges_on_paths']} edges on paths to tier 0")
             for w in c["warnings"]:
-                out.append(f"- Warning: {one_line(w)}")
+                out.append(f"- Warning: {_esc(w)}")
             for n in c["notes"]:
-                out.append(f"- Note: {one_line(n)}")
+                out.append(f"- Note: {_esc(n)}")
             fence = _fence([*c["fix"], *c["rollback"]])
             out += ["", "Fix (every command runs with -WhatIf):", "", fence + "powershell"]
             out += c["fix"] + [fence, "", "Rollback:", "", fence + "powershell"]
             out += c["rollback"] + [fence, ""]
+    if doc["paths"].get("new"):
+        out += ["### New paths after the changes", ""]
+        out += [f"- {_md(r['path']['object'])}" for r in doc["paths"]["new"]]
+        out.append("")
     if doc["paths"]["unclosable"]:
         out += ["### Cannot be closed by removing a right", ""]
         for u in doc["paths"]["unclosable"]:
-            out.append(f"- {_md(u['why'])}: {one_line(u['suggest'])}")
+            out.append(f"- {_md(u['why'])}: {_esc(u['suggest'])}")
         out.append("")
     f = doc["findings"]
     if f["rechecked"]:
@@ -307,7 +341,7 @@ def render_markdown(doc: dict[str, Any]) -> str:
         if not (f["cleared"] or f["new"]):
             out.append("- none would clear or appear")
         out.append("")
-    out += ["### Caveats", "", *[f"- {one_line(c)}" for c in doc["caveats"]], ""]
+    out += ["### Caveats", "", *[f"- {_esc(c)}" for c in doc["caveats"]], ""]
     return "\n".join(out)
 
 

@@ -769,6 +769,13 @@ def _probes(data: dict[str, Any], seen_aces: dict[Ace, Ace]) -> Probes:
 def _encode(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
+    if isinstance(value, Ace):
+        # `inherited` only when set: snapshots stay as small as before, and an ACE
+        # without the flag reads in older versions too
+        out = {f.name: getattr(value, f.name) for f in fields(value) if f.name != "inherited"}
+        if value.inherited:
+            out["inherited"] = True
+        return out
     if is_dataclass(value):
         return {f.name: _encode(getattr(value, f.name)) for f in fields(value)}
     if isinstance(value, dict):

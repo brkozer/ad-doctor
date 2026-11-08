@@ -18,8 +18,9 @@ from .sd import Ace
 
 Fix = Callable[[Finding, Snapshot], list[str]]
 # Control characters, line breaks among them: object text comes from the directory (GPO
-# and CA names), and a newline in it must not end a comment and start a command.
-_CONTROL = re.compile("[\x00-\x1f\x7f\x85\u2028\u2029]")
+# and CA names), and a newline in it must not end a comment and start a command. The
+# bidi controls are here too: they can reorder what a reviewer reads on screen.
+_CONTROL = re.compile("[\x00-\x1f\x7f\x85\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
 
 
 def one_line(text: str) -> str:

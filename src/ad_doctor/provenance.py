@@ -9,13 +9,18 @@ The rules where the snapshot and AD differ are applied here, at the edge, and th
 mutators in `changes.py` ask the same functions which facts a primitive covers, so the
 graph and the changed snapshot agree by construction:
 
-- SDProp: an ACE of trustee T on a protected object that equals an ACE of T on
+- SDProp: an ACE of trustee T on an object SDProp rewrites that equals an ACE of T on
   AdminSDHolder (mask and object type) belongs to `adminsdholder-ace(T)`: SDProp puts the
-  copy back within the hour until the AdminSDHolder ACE goes.
+  copy back within the hour until the AdminSDHolder ACE goes. SDProp rewrites the
+  protected groups, their members (nested and by primary group), Administrator and
+  krbtgt. adminCount or a protected DACL alone is not enough: an account taken out of the
+  groups keeps both, and SDProp leaves it alone, so the copy there is a change of its own.
 - Inheritance: with the INHERITED_ACE flag kept (`Snapshot.ace_inheritance_checked`), an
-  inherited copy belongs to the nearest container above that holds an explicit
-  inheritable ACE of the same trustee. Older snapshots cannot tell, so a copy is a change
-  of its own there: a plan can be too large, never too small.
+  inherited copy belongs to the container above whose explicit inheritable ACE it copies:
+  same trustee, object type and rights, for the child's class. When more than one
+  container could be the source, the copy stays until all of them change (the edge holds
+  one option per candidate). Older snapshots cannot tell, so a copy is a change of its
+  own there: a plan can be too large, never too small.
 - One AD ACE, two lists: a container's ACEs of one trustee in `aces` and `inheritable` are
   one primitive (`inherited-ace` when the trustee has an inheritable ACE there).
 
@@ -32,6 +37,13 @@ from typing import TYPE_CHECKING
 
 from . import gpo_scope, sd
 from .model import CertTemplate, DirObject, Snapshot
+
+CLASS_OF_KIND = {
+    "user": sd.USER_CLASS,
+    "computer": sd.COMPUTER_CLASS,
+    "group": sd.GROUP_CLASS,
+    "ou": sd.OU_CLASS,
+}
 
 if TYPE_CHECKING:
     from .gpo_scope import Grant
@@ -51,9 +63,10 @@ FIXED = {reason: -1 - i for i, reason in enumerate(FIXED_REASONS)}
 
 # the default domain and domain controllers policies: their links are not a change
 DEFAULT_GPOS = {"{31B2F340-016D-11D2-945F-00C04FB984F9}", "{6AC1786C-016F-11D2-945F-00C04FB984F9}"}
-# objects SDProp rewrites from AdminSDHolder: these groups (domain RIDs, BUILTIN), and the
-# accounts with adminCount, Administrator and krbtgt
+# objects SDProp rewrites from AdminSDHolder: these groups (domain RIDs, BUILTIN), their
+# members, Administrator and krbtgt
 SDPROP_RIDS = {"512", "516", "518", "519", "521", "526", "527"}
+SDPROP_PRIMARY = {512, 516, 518, 519, 521}  # members by primaryGroupID
 SDPROP_BUILTIN = {
     "S-1-5-32-544",
     "S-1-5-32-548",
@@ -214,28 +227,32 @@ class Provenance:
 
         self.containers: set[str] = set()
         self.explicit_inheritable: dict[str, frozenset[str]] = {}
+        # container -> its explicit inheritable ACEs: (sid, rights, object type, class)
+        self.sources: dict[str, list[tuple[str, int, str | None, str | None]]] = {}
         for o in snap.objects:
             if o.kind in ("ou", "container", "domain"):
                 key = o.dn.lower()
                 self.containers.add(key)
-                self.explicit_inheritable[key] = frozenset(
-                    a.sid for a in o.inheritable if not a.inherited
-                )
-        self.protected: set[str] = set()
+                own = [a for a in o.inheritable if not a.inherited]
+                self.explicit_inheritable[key] = frozenset(a.sid for a in own)
+                if own:
+                    self.sources[key] = [
+                        (a.sid, mapped(a.mask), a.object_type, a.inherited_object_type) for a in own
+                    ]
         holder: DirObject | None = None
         for o in snap.objects:
-            key = o.dn.lower()
-            if key.startswith("cn=adminsdholder,cn=system,"):
+            if o.dn.lower().startswith("cn=adminsdholder,cn=system,"):
                 holder = o
-            rid = o.sid.rsplit("-", 1)[-1]
-            sdprop_group = o.sid in SDPROP_BUILTIN or (
-                rid in SDPROP_RIDS and o.sid.startswith(("S-1-5-21-",))
-            )
-            if sdprop_group or (o.dacl_protected and o.kind in ("user", "computer", "group")):
-                self.protected.add(key)
-        for a in snap.accounts:
-            if a.admin_count or a.rid in (500, 502):
-                self.protected.add(a.dn.lower())
+        self.protected = sdprop_scope(snap)
+        # adminCount or a protected DACL without SDProp behind it: what is left after an
+        # account leaves the protected groups (AD-ACC-006)
+        self.orphans = {
+            o.dn.lower()
+            for o in snap.objects
+            if o.dacl_protected and o.kind in ("user", "computer", "group")
+        }
+        self.orphans |= {a.dn.lower() for a in snap.accounts if a.admin_count}
+        self.orphans -= self.protected
         self.holder_dn = (
             holder.dn.lower() if holder else f"cn=adminsdholder,cn=system,{self.domain_dn}"
         )
@@ -243,7 +260,10 @@ class Provenance:
         self.holder_aces: dict[str, set[tuple[int, str | None]]] = {}
         for ace in holder_aces:
             self.holder_aces.setdefault(ace.sid, set()).add((ace.mask, ace.object_type))
-        self._copy_owner_cache: dict[tuple[str, str], str | None] = {}
+        self._copy_owner_cache: dict[tuple[object, ...], tuple[str, ...]] = {}
+        # CA right holders ca_control leaves out because they are tier 0 (set by
+        # paths.build): a membership change can bring their ESC7 edge into the graph
+        self.hidden_ca: set[str] = set()
         self._lower: dict[int, str] = {}
         self.templates = {t.name: template_facts(t) for t in snap.templates}
         # SIDs whose membership a GPO security filter reads: a change there moves GPO scope
@@ -314,18 +334,29 @@ class Provenance:
             key = self._lower[id(o)] = o.dn.lower()
         return key
 
-    def _copy_owner(self, dn: str, sid: str) -> str | None:
-        """The nearest container above `dn` with an explicit inheritable ACE of `sid`."""
-        cache_key = (dn, sid)
-        if cache_key in self._copy_owner_cache:
-            return self._copy_owner_cache[cache_key]
-        found = None
+    def _copy_owners(self, dn: str, ace: sd.Ace, kind: str | None) -> tuple[str, ...]:
+        """The containers above `dn` whose explicit inheritable ACE this inherited copy
+        can come from: same trustee and object type, rights that cover the copy's, and a
+        class filter that lets the child (or the copy, as it passes on) inherit it."""
+        cache_key = (dn, ace.sid, ace.mask, ace.object_type, ace.inherited_object_type, kind)
+        found = self._copy_owner_cache.get(cache_key)
+        if found is not None:
+            return found
+        rights = mapped(ace.mask)
+        child_class = CLASS_OF_KIND.get(kind or "")
+        out = []
         for comma in gpo_scope.RDN_SEPARATOR.finditer(dn):
             parent = dn[comma.end() :]
-            if sid in self.explicit_inheritable.get(parent, ()):
-                found = parent
-                break
-        self._copy_owner_cache[cache_key] = found
+            for sid, mask, object_type, only in self.sources.get(parent, ()):
+                if (
+                    sid == ace.sid
+                    and object_type == ace.object_type
+                    and not rights & ~mask
+                    and only in (None, child_class, ace.inherited_object_type)
+                ):
+                    out.append(parent)
+                    break
+        found = self._copy_owner_cache[cache_key] = tuple(out)
         return found
 
     def _object_key(self, dn: str, sid: str) -> Prim:
@@ -333,29 +364,46 @@ class Provenance:
             return ("inherited-ace", dn, sid)
         return ("ace", dn, sid)
 
-    def ace_prim_key(self, dn: str, ace: sd.Ace) -> Prim:
-        """The primitive behind one ACE in the `aces` or `inheritable` list of the object
-        with this (lower-cased) DN. The mutators in changes.py ask this too."""
+    def ace_prim_keys(self, dn: str, ace: sd.Ace, kind: str | None = None) -> tuple[Prim, ...]:
+        """The primitives behind one ACE in the `aces` or `inheritable` list of the object
+        with this (lower-cased) DN and kind; the ACE stays while any of them does (more
+        than one only for an inherited copy with several possible sources). The mutators
+        in changes.py ask this too."""
         sid = ace.sid
         if ace.inherited:
-            owner = self._copy_owner(dn, sid)
-            if owner is not None:
-                return self._object_key(owner, sid)
+            owners = self._copy_owners(dn, ace, kind)
+            if owners:
+                return tuple(self._object_key(owner, sid) for owner in owners)
         elif dn == self.holder_dn or (
             dn in self.protected and (ace.mask, ace.object_type) in self.holder_aces.get(sid, ())
         ):
-            return ("adminsdholder-ace", sid)
-        return self._object_key(dn, sid)
+            return (("adminsdholder-ace", sid),)
+        return (self._object_key(dn, sid),)
 
-    def ace_key(self, dn: str, ace: sd.Ace) -> int:
-        return self.prim(self.ace_prim_key(dn, ace))
+    def ace_prim_key(self, dn: str, ace: sd.Ace, kind: str | None = None) -> Prim:
+        """The first primitive of `ace_prim_keys`."""
+        return self.ace_prim_keys(dn, ace, kind)[0]
 
-    def ace(self, o: DirObject, ace: sd.Ace) -> int:
-        return self.ace_key(self._dn(o), ace)
+    def orphan_copy(self, dn: str, sid: str, aces: Iterable[sd.Ace]) -> bool:
+        """Whether one of these ACEs of the trustee equals its AdminSDHolder ACE on an
+        object with adminCount (or a protected DACL) that SDProp no longer rewrites."""
+        if dn not in self.orphans:
+            return False
+        held = self.holder_aces.get(sid, set())
+        return any(a.sid == sid and (a.mask, a.object_type) in held for a in aces)
+
+    def ace_key(self, dn: str, ace: sd.Ace, kind: str | None = None) -> int:
+        return self.prim(self.ace_prim_key(dn, ace, kind))
+
+    def ace(self, o: DirObject, ace: sd.Ace, how: str = "") -> Why:
+        keys = self.ace_prim_keys(self._dn(o), ace, o.kind)
+        if len(keys) == 1:
+            return self.prim(keys[0])
+        return Options(tuple((self.prim(k), how) for k in keys))
 
     def dcsync(self, o: DirObject, sid: str) -> int:
         dn = self._dn(o)
-        get = {self.ace_key(dn, a) for a in o.aces if a.sid == sid and _replicates(a)}
+        get = {self.ace_key(dn, a, o.kind) for a in o.aces if a.sid == sid and _replicates(a)}
         if len(get) != 1:
             self.unsupported += 1
         return min(get)
@@ -376,7 +424,7 @@ class Provenance:
         seen = set()
         for a in o.aces:
             if a.sid == sid and a.rewrites_dacl:
-                p = self.ace(o, a)
+                p = self.ace_key(self._dn(o), a, o.kind)
                 if p not in seen:
                     seen.add(p)
                     items.append((p, "full control"))
@@ -492,6 +540,14 @@ class Provenance:
                         return None
         return kills
 
+    def needs_rebuild(self, p: int) -> bool:
+        """Whether the masked graph can miss what removing the primitive does: GPO scope
+        moves, or a membership change takes a CA right holder out of tier 0, which brings
+        its ESC7 edge (left out while it is tier 0) into the graph."""
+        if self.scope_sensitive(p):
+            return True
+        return bool(self.hidden_ca) and self.prims[p][0] == "member"
+
     def scope_sensitive(self, p: int) -> bool:
         """Whether removing the primitive can move GPO scope (links, security filters),
         which the masked graph does not model: such a change goes through a rebuild."""
@@ -515,6 +571,51 @@ class Provenance:
             filters = self.gpo_filter_sids.get(key[1])
             return filters is not None and key[2] in filters
         return False
+
+
+# generic rights as AD maps them on an object (DS generic mapping)
+_GENERIC = (
+    (sd.GENERIC_ALL, sd.FULL_CONTROL),
+    (sd.GENERIC_WRITE, 0x00020028),
+    (sd.GENERIC_READ, 0x00020094),
+    (0x20000000, 0x00020004),  # GENERIC_EXECUTE
+)
+
+
+def mapped(mask: int) -> int:
+    """The rights of a mask with the generic bits mapped: an inherited copy can hold the
+    mapped rights of its source's generic ones."""
+    out = mask
+    for bit, rights in _GENERIC:
+        if mask & bit:
+            out = (out & ~bit) | rights
+    return out
+
+
+def sdprop_scope(snap: Snapshot) -> set[str]:
+    """Lower-cased DNs of the objects SDProp rewrites from AdminSDHolder: the protected
+    groups, their members (nested, and by primaryGroupID as the collector lists them),
+    Administrator and krbtgt."""
+    groups = {o.dn.lower(): o for o in snap.objects if o.kind == "group"}
+    out: set[str] = set()
+    for o in snap.objects:
+        rid = o.sid.rsplit("-", 1)[-1]
+        if o.sid in SDPROP_BUILTIN or (rid in SDPROP_RIDS and o.sid.startswith("S-1-5-21-")):
+            out.add(o.dn.lower())
+    stack = [dn for dn in out if dn in groups]
+    while stack:
+        for m in groups[stack.pop()].members:
+            key = m.lower()
+            if key not in out:
+                out.add(key)
+                if key in groups:
+                    stack.append(key)
+    for dns in snap.privileged.values():  # transitive lists from the collector
+        out |= {dn.lower() for dn in dns}
+    for a in snap.accounts:
+        if a.rid in (500, 502) or a.primary_group in SDPROP_PRIMARY:
+            out.add(a.dn.lower())
+    return out
 
 
 def _replicates(a: sd.Ace) -> bool:
