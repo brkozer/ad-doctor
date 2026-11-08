@@ -15,8 +15,9 @@ logic or severity between versions, but an ID is never reused for something else
   blast radius of `--account`. Long names and titles no longer widen the page on a phone.
   The About screen lists the embedded plan.
 - **`view --whatif` refuses a malformed file** with a message instead of a traceback or a
-  blank screen, and refuses fix lines without `-WhatIf`. The screen labels them as coming
-  from the JSON, since the page cannot vouch for an edited file.
+  blank screen. With `--fixes`, each change's label and fix lines are built from the snapshot
+  for its ID and never read from the JSON, so an edited file cannot put its own command
+  under a dry-run heading; an ID the snapshot does not have is refused.
 - **`[expect] closes_all`** is judged on the graph after the changes. It no longer passes
   when a change takes a user out of tier 0 who still has a path, fails when a route ended
   at that user, or depends on whether a change forced a rebuild for accepted holders.

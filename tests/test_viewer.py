@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import re
@@ -399,7 +400,6 @@ def test_whatif_carries_check_status_and_rerouted(tmp_path: Path) -> None:
         (lambda d: d["paths"].update(rerouted=[{"path": {}}]), "paths.rerouted"),
         (lambda d: d["recommendation"].update(goal=5), "goal"),
         (lambda d: d["check"].update(problems=[5]), "check.problems"),
-        (lambda d: d["changes"][0].update(fix=["Remove-ADUser alice"]), "no -WhatIf"),
     ],
 )
 def test_whatif_refuses_a_malformed_file(
@@ -419,3 +419,48 @@ def test_whatif_deep_json_is_refused(tmp_path: Path, capsys: pytest.CaptureFixtu
     args = ["view", str(snap), "--whatif", str(deep), "--no-encrypt", "--graph", "none"]
     assert main([*args, "-o", str(tmp_path / "o.html")]) == 1
     assert "--whatif deep.json" in capsys.readouterr().err
+
+
+def _built(tmp_path: Path, doc: dict[str, Any], *extra: str) -> dict[str, Any]:
+    plan = tmp_path / "edited.json"
+    plan.write_text(json.dumps(doc), encoding="utf-8")
+    out = tmp_path / "o.html"
+    args = [
+        "view",
+        str(tmp_path / "s.json"),
+        "--whatif",
+        str(plan),
+        "--no-encrypt",
+        "--graph",
+        "none",
+    ]
+    assert main([*args, *extra, "-o", str(out)]) == 0
+    return json.loads(decode_payload(out.read_text(encoding="utf-8")))["whatif"]
+
+
+def test_whatif_fix_lines_come_from_the_snapshot(tmp_path: Path) -> None:
+    doc, _ = _plan_doc(tmp_path)
+    clean = copy.deepcopy(doc)
+    evil = "Remove-ADUser alice -Confirm:$false; #-WhatIf"
+    for c in doc["changes"]:
+        c.update(fix=[evil], rollback=[evil], label="harmless")
+    w = _built(tmp_path, doc, "--fixes")
+    assert evil not in json.dumps(w) and "harmless" not in json.dumps(w)
+    for got, want in zip(w["changes"], clean["changes"], strict=True):
+        assert (got["fix"], got["rollback"], got["label"]) == (
+            want["fix"], want["rollback"], want["label"],
+        )  # fmt: skip
+    # without --fixes no line reaches the page at all
+    assert all("fix" not in c for c in _built(tmp_path, doc)["changes"])
+
+
+def test_whatif_refuses_a_change_id_the_snapshot_lacks(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    doc, _ = _plan_doc(tmp_path)
+    doc["changes"][0]["id"] = "c:000000000000"
+    plan = tmp_path / "edited.json"
+    plan.write_text(json.dumps(doc), encoding="utf-8")
+    args = ["view", str(tmp_path / "s.json"), "--whatif", str(plan), "--fixes", "--no-encrypt"]
+    assert main([*args, "--graph", "none", "-o", str(tmp_path / "o.html")]) == 1
+    assert "c:000000000000 is not in this snapshot" in capsys.readouterr().err

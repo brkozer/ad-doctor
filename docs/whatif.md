@@ -355,7 +355,9 @@ ad-doctor view snap.json --whatif plan.json
 
 The JSON must come from the same snapshot file (its SHA-256 is checked) or, for a
 JSON report, the same domain. The screen shows what was computed on the command line; it
-does not run a new plan in the page.
+does not run a new plan in the page. Fix lines on the page are built from the snapshot
+for each change ID, never read from the JSON, and an ID the snapshot does not have is
+refused.
 
 ## Limits
 

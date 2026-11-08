@@ -215,8 +215,7 @@ _WHATIF_RECOMMENDATION = {
 
 
 def _whatif_shape(doc: dict[str, Any]) -> str | None:
-    """The page only writes text, but a wrong type would break the screen: refuse it here.
-    Fix lines are shown for copying, so each must be a comment or end in -WhatIf."""
+    """The page only writes text, but a wrong type would break the screen: refuse it here."""
     problem = _bad_key("", doc, _WHATIF_TOP)
     if problem:
         return problem
@@ -249,17 +248,13 @@ def _whatif_shape(doc: dict[str, Any]) -> str | None:
         return "findings is not what `plan -f json` writes"
     if not _fits(doc["check"].get("problems", []), "strs"):
         return "check.problems is not what `plan -f json` writes"
-    for c in doc["changes"]:
-        for line in [*(c.get("fix") or []), *(c.get("rollback") or [])]:
-            text = line.strip()
-            if text and not text.startswith("#") and not text.endswith("-WhatIf"):
-                return f"a fix line of {c.get('id')} has no -WhatIf"
     return None
 
 
 def _whatif(doc: dict[str, Any] | None, fixes: bool) -> dict[str, Any] | None:
     """The part of a plan or what-if result the What-if screen shows. Fix lines go in
-    only with --fixes, as for findings."""
+    only with --fixes, as for findings, and by then cli.py has rebuilt them from the
+    snapshot (whatif_cmd.rebuild_fix_lines)."""
     if doc is None:
         return None
     keys = WHATIF_CHANGE_KEYS + (("fix", "rollback") if fixes else ())

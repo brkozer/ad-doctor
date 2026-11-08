@@ -561,6 +561,12 @@ def cmd_view(args: argparse.Namespace) -> int:
             why = viewer.whatif_problem(doc, report.snap.domain, digest)
             if why is not None:
                 raise ValueError(f"--whatif {args.whatif.name}: {why}")
+            if args.fixes and source is not None:
+                from . import whatif_cmd  # imported here as for the whatif command
+
+                why = whatif_cmd.rebuild_fix_lines(source, doc)
+                if why is not None:
+                    raise ValueError(f"--whatif {args.whatif.name}: {why}")
             opts.whatif = doc
         page = viewer.render(viewer.viewmodel(report, source, opts), passphrase)
         _write_private(out, page)

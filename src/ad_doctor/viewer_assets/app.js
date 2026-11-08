@@ -1416,7 +1416,7 @@
       for (const w of c.warnings || []) extra.push(h("div", { class: "small warn-text" }, "Warning: " + w));
       if (c.fix && c.fix.length) {
         const script = c.fix.join("\n");
-        extra.push(h("details", null, h("summary", null, "Fix lines from the plan JSON (each ends in -WhatIf; read them before running)"),
+        extra.push(h("details", null, h("summary", null, "Fix lines (dry run, -WhatIf), built from this snapshot"),
           copyButton(script, "Copy", "fix lines"), h("pre", { class: "code" }, script),
           c.rollback && c.rollback.length ? h("pre", { class: "code" }, c.rollback.join("\n")) : null));
       }

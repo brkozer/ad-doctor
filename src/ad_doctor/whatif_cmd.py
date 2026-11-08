@@ -927,5 +927,37 @@ def _step_holders(ctx: Context, p: cut.Plan, extra: list[str]) -> dict[int, list
     return out
 
 
+def rebuild_fix_lines(snap: Snapshot, doc: dict[str, Any]) -> str | None:
+    """Replace the label and fix lines of each change in a plan or what-if result with the
+    ones this snapshot gives for its ID. The JSON is a file anyone can edit, and these lines
+    are offered for copying. Returns why that cannot be done, or None."""
+    from .fixes import change_lines, rollback_lines
+
+    g = paths.build(snap, provenance=True)
+    prov = g.prov
+    assert prov is not None
+    wanted = {c["id"] for c in doc["changes"] if c.get("id")}
+    found: dict[str, int] = {}
+    for i, prim in enumerate(prov.prims):
+        change = changes.change_id(prim)
+        if change in wanted:
+            found[change] = i
+    if missing := sorted(wanted - set(found)):
+        return f"change {missing[0]} is not in this snapshot"
+    facts = changes.facts(snap, prov, Resolver(snap, g).where, list(found.values()))
+    counts = _edge_counts(g, whatif.state(snap, g), found.values())
+    for c in doc["changes"]:
+        if not c.get("id"):
+            c.pop("fix", None)
+            c.pop("rollback", None)
+            continue
+        p = found[c["id"]]
+        f = facts[p]
+        if prov.prims[p][0] == "inherited-ace":  # as record() counts them
+            f.copies = max(f.copies, counts[p][2] - 1)
+        c.update(label=f.label, fix=change_lines(f, snap), rollback=rollback_lines(f, snap))
+    return None
+
+
 def snapshot_hint(path: Path) -> str:
     return path.name

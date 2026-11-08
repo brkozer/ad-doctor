@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from ad_doctor import changes, fixes, paths, planfile, sd
+from ad_doctor import changes, fixes, paths, planfile, sd, whatif_cmd
 from ad_doctor.cli import main
 from ad_doctor.model import CertTemplate, DirObject, Gmsa, Snapshot
 from ad_doctor.resolve import Resolver, SpecError, edge_id, finding_specs, split
@@ -742,3 +742,16 @@ def test_from_counts_implicit_group_routes(
     path = write(tmp_path, _da_snapshot([alice, adm], [adm.dn], [Ace(du, sd.GENERIC_ALL)], []))
     _, doc = run_json(capsys, "plan", str(path), "--from", "alice", "--paths-only")
     assert doc["changes"], "the route through Domain Users is alice's too"
+
+
+@pytest.mark.parametrize("inherited_bit", [True, False])
+def test_rebuilt_fix_lines_equal_the_commands_own(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], inherited_bit: bool
+) -> None:
+    snap = kitchen_sink(inherited_bit)
+    _, doc = run_json(capsys, "plan", str(write(tmp_path, snap)))
+    rebuilt = json.loads(json.dumps(doc))
+    for change in rebuilt["changes"]:
+        change.update(fix=["x"], rollback=["x"], label="x")
+    assert whatif_cmd.rebuild_fix_lines(kitchen_sink(inherited_bit), rebuilt) is None
+    assert rebuilt["changes"] == doc["changes"]
