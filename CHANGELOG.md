@@ -7,6 +7,8 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-09
+
 ### Added
 
 - **Registry policy from SYSVOL.** Each GPO's computer-side `Machine\Registry.pol` is read
