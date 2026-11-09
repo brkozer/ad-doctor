@@ -348,8 +348,9 @@ const CORE = (function () {
 
   // The old report against the current findings ({id, title, severity, objects, keys}),
   // like the --baseline comparison: new, resolved, and changed (same identity, other
-  // object text or severity).
-  function diffReports(old, current) {
+  // object text or severity). `unknown` holds check IDs this run could not evaluate: their
+  // findings are not known to be gone, so they stay out of resolved.
+  function diffReports(old, current, unknown) {
     const before = index(old.findings);
     const after = index(current);
     const row = (x) => ({ id: x.f.id, title: x.f.title, severity: x.f.severity, object: x.o });
@@ -364,12 +365,16 @@ const CORE = (function () {
       } else unchanged++;
     }
     const resolved = [];
-    for (const [k, y] of before) if (!after.has(k)) resolved.push(y);
+    const notEvaluated = [];
+    for (const [k, y] of before) {
+      if (!after.has(k)) (unknown && unknown.has(y.f.id) ? notEvaluated : resolved).push(y);
+    }
     fresh.sort(bySortKey);
     resolved.sort(bySortKey);
+    notEvaluated.sort(bySortKey);
     changed.sort(bySortKey);
     return {
-      new: fresh.map(row), resolved: resolved.map(row),
+      new: fresh.map(row), resolved: resolved.map(row), not_evaluated: notEvaluated.map(row),
       changed: changed.map((c) => { delete c.sort; return c; }), unchanged: unchanged,
     };
   }

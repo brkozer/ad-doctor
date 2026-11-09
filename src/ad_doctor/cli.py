@@ -17,6 +17,7 @@ from . import (
     __version__,
     accept,
     catalog,
+    coverage,
     explain,
     invariants,
     opengraph,
@@ -134,17 +135,30 @@ def _report_findings(data: dict[str, Any]) -> list[Finding]:
 
 def _findings_from(
     path: Path, only: list[str] | None = None, spec: dict[str, Any] | None = None
-) -> tuple[str, list[Finding]]:
+) -> tuple[str, list[Finding], set[str]]:
     """Findings from either a saved snapshot (analyzed like the current run) or a
-    JSON report."""
+    JSON report, and the checks that could not be evaluated there."""
     data = _load_json(path)
     if data.get("tool") == "ad-doctor":
-        return data["domain"], _report_findings(data)
+        findings = _report_findings(data)
+        recorded = coverage.from_report(data)
+        if recorded is None:
+            ran = data.get("checks")
+            recorded = coverage.compute(
+                _snapshot_of_report(data),
+                {f.check_id for f in findings},
+                ran=ran if isinstance(ran, list) else None,
+                use_data=False,
+            )
+        return data["domain"], findings, coverage.unevaluated(recorded)
     snap = Snapshot.from_json(data)
     findings = run_all(snap, only)
     if spec is not None:
         findings += invariants.evaluate(snap, spec)
-    return snap.domain, findings
+    wanted = {i.upper() for i in only} if only else None
+    ran = None if wanted is None else [c.id for c in REGISTRY if c.id in wanted]
+    statuses = coverage.compute(snap, {f.check_id for f in findings}, ran=ran)
+    return snap.domain, findings, coverage.unevaluated(statuses)
 
 
 def _fails(findings: list[Finding], level: str | None) -> bool:
@@ -152,11 +166,14 @@ def _fails(findings: list[Finding], level: str | None) -> bool:
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
-    domain, old = _findings_from(args.old)
-    _, new = _findings_from(args.new)
+    domain, old, _ = _findings_from(args.old)
+    _, new, unknown = _findings_from(args.new)
     before, after = finding_keys(old), finding_keys(new)
     added = sorted(after - before)
-    removed = sorted(before - after)
+    gone = sorted(before - after)
+    # the newer run did not judge the check, so nothing says these are gone
+    removed = [k for k in gone if k[0] not in unknown]
+    unverified = [k for k in gone if k[0] in unknown]
     sev = {f.check_id: f.severity for f in [*old, *new]}
     title = {f.check_id: f.title for f in [*old, *new]}
     # keys are identities; show the object text (a path's identity is only its start)
@@ -170,16 +187,20 @@ def cmd_diff(args: argparse.Namespace) -> int:
                         {"id": c, "object": shown[c, o], "severity": str(sev[c])} for c, o in added
                     ],
                     "resolved": [{"id": c, "object": shown[c, o]} for c, o in removed],
+                    "not_evaluated": [{"id": c, "object": shown[c, o]} for c, o in unverified],
                 },
                 indent=2,
             )
         )
     else:
-        print(f"{domain}: {len(added)} new, {len(removed)} resolved")
+        tail = f", {len(unverified)} not evaluated in the newer run" if unverified else ""
+        print(f"{domain}: {len(added)} new, {len(removed)} resolved{tail}")
         for c, o in added:
             print(f"+ [{str(sev[c]).upper():6}] {c}  {shown[c, o]}  ({title[c]})")
         for c, o in removed:
             print(f"- [{str(sev[c]).upper():6}] {c}  {shown[c, o]}  ({title[c]})")
+        for c, o in unverified:
+            print(f"? [{str(sev[c]).upper():6}] {c}  {shown[c, o]}  ({title[c]})")
     fresh = set(added)
     new_findings = [f for f in new for o in f.objects if (f.check_id, f.key(o)) in fresh]
     return 2 if _fails(new_findings, args.fail_on) else 0
@@ -398,7 +419,11 @@ ERRORS = (
 
 
 def _analyze(
-    args: argparse.Namespace, snap: Snapshot, findings: list[Finding], from_report: bool = False
+    args: argparse.Namespace,
+    snap: Snapshot,
+    findings: list[Finding],
+    from_report: bool = False,
+    report_data: dict[str, Any] | None = None,
 ) -> tuple[Report, viewer.Options]:
     """Invariants, acceptances and the baseline on top of the findings: the part of a run
     that scan, analyze and view share. Returns the report and what the viewer needs."""
@@ -409,11 +434,16 @@ def _analyze(
             raise ValueError("--invariants needs a snapshot, not a JSON report")
         findings += invariants.evaluate(snap, spec)
         findings.sort(key=lambda f: (-f.severity, f.check_id))
-    report = Report(snap, findings)
+    report = Report(snap, findings, from_snapshot=not from_report)
+    if from_report and report_data is not None:
+        report.recorded = coverage.from_report(report_data)
+        checks = report_data.get("checks")
+        report.ran = list(checks) if isinstance(checks, list) else None
     if not from_report:
         wanted = {i.upper() for i in only or []}
         report.ran = [c.id for c in REGISTRY if not wanted or c.id in wanted]
         report.ran += list(invariants.IDS) if spec is not None else []
+    unknown = coverage.unevaluated(report.statuses())
     opts = viewer.Options(spec=spec)
     if args.accept:
         entries = accept.load(args.accept)
@@ -425,13 +455,15 @@ def _analyze(
             ran = {c.id for c in REGISTRY if not only or c.id in {i.upper() for i in only}}
         if spec is not None:
             ran |= set(invariants.IDS)
+        # a check that gave no answer cannot make an acceptance stale
+        ran -= unknown
         kept, accepted, notes = accept.apply(findings, entries, today, ran)
         report.findings = kept
         report.accepted += accepted
         snap.notes.extend(notes)
         opts.entries, opts.ran = entries, ran
     if args.baseline:
-        _, old = _findings_from(args.baseline, only, spec)
+        _, old, _ = _findings_from(args.baseline, only, spec)
         report.new = finding_keys(report.findings) - finding_keys(old)
         stamp = _load_json(args.baseline).get("collected_at")
         opts.baseline = viewer.Baseline(old, stamp, args.baseline.name)
@@ -532,10 +564,8 @@ def cmd_view(args: argparse.Namespace) -> int:
                 raise ValueError("--fixes needs a snapshot, not a JSON report")
             if args.graph not in ("auto", "none") or args.blast_radius_for:
                 raise ValueError("--graph and --blast-radius-for need a snapshot, not a report")
-            report, opts = _analyze(args, snap, findings, from_report=True)
+            report, opts = _analyze(args, snap, findings, from_report=True, report_data=data)
             report.accepted = [Accepted(**a) for a in data.get("accepted", [])] + report.accepted
-            checks = data.get("checks")
-            report.ran = list(checks) if isinstance(checks, list) else None
             opts.source, source = "report", None
         else:
             source = Snapshot.from_json(data)
@@ -973,8 +1003,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.format == "text":
         text = render_text(report, color=not args.output and _use_color(sys.stdout))
     elif args.format == "junit":
-        only = {i.upper() for i in args.only or []}
-        text = render_junit(report, [c.id for c in REGISTRY if not only or c.id in only])
+        text = render_junit(report)
     elif args.format == "html":
         # the same page as `ad-doctor view`, with the defaults: no fix lines, nothing extra
         opts.command = _command(args)

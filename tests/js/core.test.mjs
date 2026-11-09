@@ -70,6 +70,9 @@ test("ad-hoc diff keys paths by their start, like ad-doctor diff", () => {
     { id: "AD-KRB-002", title: "k", severity: "high", objects: ["eve"] },
     { id: "AD-SEC-001", title: "s", severity: "low", objects: ["dc1"] },
   ];
+  const held = CORE.diffReports(old, current, new Set(["AD-ACC-001"]));
+  assert.deepEqual(held.resolved, []);
+  assert.deepEqual(held.not_evaluated.map((r) => r.id + ":" + r.object), ["AD-ACC-001:bob"]);
   const d = CORE.diffReports(old, current);
   assert.deepEqual(d.new.map((r) => r.id + ":" + r.object), ["AD-SEC-001:dc1"]);
   assert.deepEqual(d.resolved.map((r) => r.id + ":" + r.object), ["AD-ACC-001:bob"]);

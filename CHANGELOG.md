@@ -9,6 +9,15 @@ logic or severity between versions, but an ID is never reused for something else
 
 ### Added
 
+- **Per-check status.** Every run now says, per check, whether it was judged, not applicable
+  or not evaluated, with the reason (data unreadable, older snapshot, switched off). It is in
+  the JSON report (`check_status`, `coverage`; `schema` is now 3), and in the text, Markdown,
+  SARIF and JUnit output and the viewer's overview. The status is computed from the collection notes, so
+  snapshots from earlier versions get one too. A check that was not evaluated never counts as
+  passed: JUnit marks it skipped, its earlier findings stay out of "resolved" in `diff`,
+  `--baseline` and the viewer, an acceptance of it is not reported as stale, and the risk score is
+  then labelled a minimum. Findings are unchanged. `--no-sysvol`, `--no-probes` and
+  `--http-port 0` now leave a note saying what they skipped.
 - **Registry policy from SYSVOL.** Each GPO's computer-side `Machine\Registry.pol` is read
   ([MS-GPREG] format, delete and soft markers included) and only the values the checks need are
   kept. A file that does not parse or cannot be read is a note and stays unknown. A value named

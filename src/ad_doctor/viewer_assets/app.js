@@ -623,11 +623,13 @@
     const cats = h("div", { class: "panel" }, sectionTitle("Risk by category",
       h("span", { class: "small muted" }, "0 to 100 per category")),
     h("div", { class: "cats" }, VM.categories.map(([name, score]) => {
+      const unknown = VM.coverage ? VM.coverage.by_category[name] || 0 : 0;
       const bar = h("span", { class: fillClass(score) });
       bar.style.width = (score ? Math.max(score, 2) : 0) + "%";
-      return h("a", { class: "cat" + (score ? "" : " zero"), href: hrefFor("findings", { cat: name }) },
+      return h("a", { class: "cat" + (score || unknown ? "" : " zero"), href: hrefFor("findings", { cat: name }),
+        title: unknown ? plural(unknown, "check") + " not evaluated" : null },
         h("span", { class: "name" }, name), h("span", { class: "track" }, bar),
-        h("span", { class: "v" }, String(score)));
+        h("span", { class: "v" + (unknown ? " warn-text" : "") }, score + (unknown ? "+" : "")));
     })));
 
     const acts = h("div", { class: "panel" }, sectionTitle("Top actions",
@@ -653,12 +655,44 @@
 
     out.push(h("div", null, sectionTitle("Lifecycle"), lifecycleTiles()));
 
+    out.push(coveragePanel());
+
     if (VM.notes.length) {
       out.push(h("div", { class: "panel" }, sectionTitle("Notes",
         h("span", { class: "small muted" }, "what this run could not check, and acceptance warnings")),
       h("ul", { class: "notes" }, VM.notes.map((n) => h("li", null, n)))));
     }
     return h("div", { class: "stack" }, out);
+  }
+
+  function minimumScore() {
+    return Boolean(VM.coverage && VM.coverage.score_is_minimum);
+  }
+
+  function notEvaluatedCount() {
+    return VM.coverage ? VM.coverage.not_evaluated : 0;
+  }
+
+  const REASON = { unreadable: "Data unreadable", older_snapshot: "Older snapshot", switched_off: "Switched off" };
+
+  function coveragePanel() {
+    const cov = VM.coverage;
+    if (!cov) return null;
+    const rows = VM.check_status.filter((c) => c.status === "not_evaluated");
+    const na = VM.check_status.filter((c) => c.status === "not_applicable");
+    const table = (list, why) => h("div", { class: "table-wrap" }, h("table", null,
+      h("thead", null, h("tr", null, ["Check", "Title", "Why"].map((x) => h("th", null, x)))),
+      h("tbody", null, list.map((c) => h("tr", null,
+        h("td", { class: "nowrap mono" }, c.id), h("td", null, c.title), h("td", null, why(c)))))));
+    return h("div", { class: "panel" }, sectionTitle("Check coverage",
+      h("span", { class: "small muted" }, cov.judged + " judged · " + cov.not_applicable + " not applicable · " +
+        cov.not_evaluated + " not evaluated")),
+    rows.length ? table(rows, (c) => [REASON[c.reason] || c.reason, h("div", { class: "small muted" }, (c.notes || []).join("; "))]) :
+      h("div", { class: "empty good" }, "Every check that applies was judged."),
+    cov.partial ? h("p", { class: "small muted" }, plural(cov.partial, "check") + " found something but could not judge everything it covers; see the notes.") : null,
+    (cov.unattributed_notes || []).length ? h("p", { class: "small warn-text" }, plural(cov.unattributed_notes.length, "failed search") + " could not be tied to a check; the score is a minimum.") : null,
+    na.length ? h("details", { class: "row-top" }, h("summary", null, "Not applicable (" + na.length + ")"),
+      table(na, (c) => (c.notes || []).join("; "))) : null);
   }
 
   function exposureMeter(pct) {
@@ -694,10 +728,14 @@
       h("div", { class: "score-top" },
         h("div", null, h("div", { class: "eyebrow" }, "Risk score"),
           h("div", { class: "hero-num" }, String(VM.score), h("span", { class: "unit" }, "/100"))),
-        h("div", { class: "grade " + VM.grade, "aria-label": "Grade " + VM.grade }, VM.grade)),
+        h("div", { class: "grade" + (minimumScore() ? "" : " " + VM.grade),
+          "aria-label": "Grade " + VM.grade + (minimumScore() ? ", a minimum" : "") }, VM.grade)),
       h("div", { class: "scale" }, track, labels),
       b ? h("div", { class: "delta" }, "Baseline " + fmtDate(b.collected_at) + ": ",
         h("b", null, b.score + " (" + b.grade + ")"), " → ", h("b", null, VM.score + " (" + VM.grade + ")")) : null,
+      minimumScore() ? h("p", { class: "small warn-text" }, notEvaluatedCount()
+        ? "A minimum: " + plural(notEvaluatedCount(), "check") + " not evaluated, and those add nothing to it."
+        : "A minimum: a failed search could not be tied to a check.") : null,
       h("p", { class: "formula" }, "Lower is better. Each high finding adds 15, medium 6, low 2, " +
         "capped at 100; exposure tells more once the score saturates."));
   }
@@ -761,7 +799,10 @@
   function viewFindings(r) {
     if (!VM.findings.length) {
       return h("div", null, pageHead("Findings", "Findings"),
-        h("div", { class: "empty good" }, h("strong", null, "No findings: every check that ran passed. "),
+        h("div", { class: "empty" + (notEvaluatedCount() ? "" : " good") },
+          h("strong", null, notEvaluatedCount()
+            ? "No findings in the checks judged: " + plural(notEvaluatedCount(), "check") + " not evaluated. "
+            : "No findings: every check that ran passed. "),
           "What this run could not check is listed under ", h("a", { href: "#about" }, "About this file"),
           VM.notes.length ? [" and in the ", h("a", { href: "#overview" }, "notes on the overview")] : null, "."));
     }
@@ -1344,6 +1385,7 @@
       stat(c.new.length ? "+" + c.new.length : "0", "new findings on objects"),
       stat(c.resolved.length ? "−" + c.resolved.length : "0", "resolved"));
     const tabs = [["new", "New", c.new], ["resolved", "Resolved", c.resolved], ["changed", "Changed", c.changed]];
+    if ((c.not_evaluated || []).length) tabs.push(["not_evaluated", "Not evaluated now", c.not_evaluated]);
     const body = h("div", null);
     const bar = h("div", { class: "tabs", role: "tablist" });
     const show = (key) => {
@@ -1504,7 +1546,7 @@
   function changeTable(kind, rows) {
     if (!rows.length) {
       const text = { new: "Nothing new since the baseline.", resolved: "Nothing was resolved.",
-        changed: "No finding changed shape or severity." }[kind];
+        changed: "No finding changed shape or severity.", not_evaluated: "Nothing here." }[kind];
       return h("div", { class: "empty" }, text);
     }
     const head = kind === "changed"
@@ -1514,7 +1556,7 @@
       h("thead", null, h("tr", null, head.map((x) => h("th", null, x)))),
       h("tbody", null, rows.map((r) => h("tr", null,
         h("td", null, sevTag(r.severity)),
-        h("td", { class: "nowrap" }, kind === "resolved" ? h("span", { class: "mono" }, r.id) :
+        h("td", { class: "nowrap" }, kind === "resolved" || kind === "not_evaluated" ? h("span", { class: "mono" }, r.id) :
           h("a", { class: "mono", href: hrefFor("findings", { open: r.id }) }, r.id)),
         h("td", null, h("span", { class: "mono" }, r.object)),
         kind === "changed"
@@ -1677,6 +1719,9 @@
     return h("div", { class: "stack" },
       pageHead("Executive summary", VM.meta.domain, metaLine(), [back]),
       banners(),
+      notEvaluatedCount() ? h("div", { class: "banner medium" }, h("div", null,
+        h("strong", null, "Partial assessment. "),
+        plural(notEvaluatedCount(), "check") + " could not be evaluated, so the score below is a minimum.")) : null,
       h("div", { class: "grid" },
         h("div", { class: "span-7" }, h("div", { class: "panel" },
           h("div", { class: "eyebrow" }, "Tier-0 exposure"),
@@ -1901,7 +1946,8 @@
         const e = exposurePct(p);
         return h("tr", null,
           h("td", { class: "nowrap" }, fmtDate(p.at)), h("td", null, h("span", { class: "mono" }, p.name)),
-          h("td", { class: "nowrap" }, p.version + (p.checks ? " · " + p.checks + " checks" : "")),
+          h("td", { class: "nowrap" }, p.version + (p.checks ? " · " + p.checks + " checks" : "") +
+            (p.not_evaluated ? " · " + p.not_evaluated + " not evaluated" : "")),
           h("td", { class: "num" }, p.score + " (" + p.grade + ")"),
           SEVERITIES.map((s) => h("td", { class: "num" }, String(p.counts[s]))),
           h("td", { class: "num" }, e === null ? "–" : fmtPct(e) + (p.users ? " (" + p.exposed + "/" + p.users + ")" : "")));
@@ -2299,7 +2345,8 @@
     }
     try {
       const rep = CORE.parseReport(await file.text());
-      state.adhoc = { name: file.name, report: rep, diff: CORE.diffReports(rep, currentFindings()) };
+      const unknown = new Set((VM.check_status || []).filter((x) => x.status === "not_evaluated").map((x) => x.id));
+      state.adhoc = { name: file.name, report: rep, diff: CORE.diffReports(rep, currentFindings(), unknown) };
       state.tab = "new";
       announce("Compared with " + file.name);
       route();

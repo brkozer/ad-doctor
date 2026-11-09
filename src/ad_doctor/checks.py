@@ -3797,6 +3797,25 @@ def esc10(snap: Snapshot) -> Finding | None:
     )
 
 
+def ca_unjudged(c: CaConfig) -> list[tuple[str, str]]:
+    """(setting, ESC) a readable CA did not answer for."""
+    return [
+        (name, esc)
+        for name, esc, missing in (
+            ("InterfaceFlags", "ESC11", c.interface_flags is None),
+            # a real CA descriptor always has an owner: neither means it was not read
+            ("security descriptor", "ESC7", c.owner is None and not c.aces),
+            ("EditFlags", "ESC6", c.edit_flags is None and not c.third_party_policy),
+            (
+                "DisableExtensionList",
+                "ESC16",
+                c.disabled_extensions is None and not c.third_party_policy,
+            ),
+        )
+        if missing
+    ]
+
+
 @check("AD-ADCS-016", "CA configuration could not be read")
 def unread_ca_config(snap: Snapshot) -> Finding | None:
     hits = []
@@ -3809,21 +3828,7 @@ def unread_ca_config(snap: Snapshot) -> Finding | None:
                 f"{c.host}: policy module {c.policy_module} is not Microsoft's; "
                 "ESC6 and ESC16 not judged"
             )
-        absent = [
-            (name, esc)
-            for name, esc, missing in (
-                ("InterfaceFlags", "ESC11", c.interface_flags is None),
-                # a real CA descriptor always has an owner: neither means it was not read
-                ("security descriptor", "ESC7", c.owner is None and not c.aces),
-                ("EditFlags", "ESC6", c.edit_flags is None and not c.third_party_policy),
-                (
-                    "DisableExtensionList",
-                    "ESC16",
-                    c.disabled_extensions is None and not c.third_party_policy,
-                ),
-            )
-            if missing
-        ]
+        absent = ca_unjudged(c)
         if absent:
             hits.append(
                 f"{c.host}: {', '.join(n for n, _ in absent)} absent or empty; "

@@ -11,7 +11,7 @@ from typing import Any
 from xml.sax.saxutils import escape as xml_escape
 from xml.sax.saxutils import quoteattr
 
-from . import __version__, docgen
+from . import __version__, coverage, docgen
 from . import catalog as docs  # report.catalog() exists
 from .checks import MITRE, REGISTRY
 from .fixes import one_line
@@ -19,8 +19,9 @@ from .model import CATEGORIES, Finding, Severity, Snapshot
 
 WEIGHT = {Severity.HIGH: 15, Severity.MEDIUM: 6, Severity.LOW: 2, Severity.INFO: 0}
 GRADES = [(10, "A"), (25, "B"), (45, "C"), (70, "D"), (100, "F")]
-# version of the JSON report's layout: 2 added `schema` and `checks` (the check IDs that ran)
-REPORT_SCHEMA = 2
+# version of the JSON report's layout: 2 added `schema` and `checks` (the check IDs that ran);
+# 3 added `check_status` (what each check could judge) and `coverage` (its counts)
+REPORT_SCHEMA = 3
 
 
 @dataclass
@@ -40,6 +41,22 @@ class Report:
     new: set[tuple[str, str]] | None = None
     # check IDs that ran, when known (a trend marks the scans where the set changed)
     ran: list[str] | None = None
+    # what a JSON report recorded per check; a snapshot has none and works it out
+    recorded: dict[str, coverage.CheckStatus] | None = None
+    # False for a JSON report: only its notes are left of the snapshot behind it
+    from_snapshot: bool = True
+
+    def statuses(self) -> dict[str, coverage.CheckStatus]:
+        """Every check of this run: judged, not applicable, or not evaluated and why."""
+        if self.recorded is not None:
+            return self.recorded
+        return coverage.compute(
+            self.snap,
+            [f.check_id for f in self.findings],
+            [a.check_id for a in self.accepted],
+            self.ran,
+            use_data=self.from_snapshot,
+        )
 
     @property
     def score(self) -> int:
@@ -109,11 +126,54 @@ def _wrap(text: str, prefix: str = "", prefix_len: int = 0) -> str:
     return "\n".join([first, *rest])
 
 
+MAX_LISTED_CHECKS = 20
+
+
+def _listed(ids: list[str]) -> str:
+    more = len(ids) - MAX_LISTED_CHECKS
+    return ", ".join(ids[:MAX_LISTED_CHECKS]) + (f" (+{more} more)" if more > 0 else "")
+
+
+def _status_lines(statuses: dict[str, coverage.CheckStatus]) -> list[str]:
+    """The checks a reader must not take for clean, by reason."""
+    rows = list(statuses.values())
+    counts = coverage.summary(statuses, [])
+    lines = [
+        f"checks: {counts[coverage.JUDGED]} judged, {counts[coverage.NOT_APPLICABLE]} not "
+        f"applicable, {counts[coverage.NOT_EVALUATED]} not evaluated"
+    ]
+    for reason, text in coverage.REASON_TEXT.items():
+        ids = [s.id for s in rows if s.status == coverage.NOT_EVALUATED and s.reason == reason]
+        if ids:
+            lines.append(f"not evaluated ({text}): {_listed(ids)}")
+    na = [s.id for s in rows if s.status == coverage.NOT_APPLICABLE]
+    if na:
+        lines.append(f"not applicable: {_listed(na)}")
+    partial = [s.id for s in rows if s.partial]
+    if partial:
+        lines.append(f"judged in part: {_listed(partial)}")
+    return lines
+
+
+def _minimum(statuses: dict[str, coverage.CheckStatus], notes: list[str]) -> str:
+    """How the score reads when some checks gave no answer; empty when all of them did."""
+    if not any(s.status == coverage.NOT_EVALUATED for s in statuses.values()):
+        return (
+            "a minimum: a failed search was not tied to a check"
+            if coverage.unattributed(notes)
+            else ""
+        )
+    n = sum(s.status == coverage.NOT_EVALUATED for s in statuses.values())
+    return f"a minimum: {n} check{'s' if n != 1 else ''} not evaluated" if n else ""
+
+
 def render_text(r: Report, color: bool = False) -> str:
     def c(code: str, text: str) -> str:
         return f"{code}{text}{RESET}" if color else text
 
     snap = r.snap
+    statuses = r.statuses()
+    minimum = _minimum(statuses, snap.notes)
     lines = [
         c(BOLD, f"ad-doctor {__version__}")
         + f"  domain {snap.domain}  {len(snap.accounts)} accounts  "
@@ -121,7 +181,7 @@ def render_text(r: Report, color: bool = False) -> str:
         "",
     ]
     if not r.findings:
-        lines += ["No findings.", ""]
+        lines += ["No findings in the checks judged." if minimum else "No findings.", ""]
     for f in r.findings:
         tag = c(SEVERITY_COLOR[f.severity], f"[{str(f.severity).upper():6}]")
         new = c(BOLD, " NEW") if r.is_new(f) else ""
@@ -138,9 +198,11 @@ def render_text(r: Report, color: bool = False) -> str:
         lines.append(c(DIM, one_line(accepted)))
     for note in snap.notes:
         lines.append(c(DIM, f"note: {one_line(note)}"))
+    lines += [c(DIM, line) for line in _status_lines(statuses)]
     counts = r.counts()
     lines.append(
         f"risk score {c(BOLD, str(r.score))}/100 (grade {r.grade})  "
+        + (f"{minimum}  " if minimum else "")
         + "  ".join(c(SEVERITY_COLOR[s], f"{s!s} {counts[s]}") for s in reversed(Severity))
     )
     if r.findings:
@@ -152,6 +214,7 @@ def render_text(r: Report, color: bool = False) -> str:
 
 
 def report_dict(r: Report) -> dict[str, Any]:
+    statuses = r.statuses()
     return {
         "tool": "ad-doctor",
         "schema": REPORT_SCHEMA,
@@ -180,6 +243,8 @@ def report_dict(r: Report) -> dict[str, Any]:
         "accepted": [a.__dict__ for a in r.accepted],
         "notes": r.snap.notes,
         **({"checks": sorted(r.ran)} if r.ran is not None else {}),
+        "check_status": [s.to_json() for _, s in sorted(statuses.items())],
+        "coverage": coverage.summary(statuses, r.snap.notes),
     }
 
 
@@ -209,21 +274,6 @@ _CONTROL = re.compile("[\x00-\x1f\x7f\x85\u2028\u2029]")
 _BACKTICKS = re.compile("`+")
 # Not allowed in XML 1.0 even as an entity; directory text can hold them
 _XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
-
-
-# A note that names a check says the check could not judge all it covers. Two forms only
-# state what a check is for: "AD-POL-001 judges the default ..." and a closing "(AD-GPO-008)".
-CHECK_IN_NOTE = re.compile(r"(?<!\()\bAD-[A-Z]+-\d+\b(?! judges )")
-
-
-def not_judged(r: Report) -> dict[str, list[str]]:
-    """Check ID -> the notes that say it could not judge everything it covers. The IDs in
-    the notes are the only record that exists in snapshots from every version."""
-    out: dict[str, list[str]] = {}
-    for note in r.snap.notes:
-        for check_id in dict.fromkeys(CHECK_IN_NOTE.findall(note)):
-            out.setdefault(check_id, []).append(note)
-    return out
 
 
 def _xml_safe(text: str) -> str:
@@ -261,13 +311,16 @@ def _docs_suffix(check_id: str) -> str:
 def render_markdown(r: Report) -> str:
     snap = r.snap
     counts = r.counts()
+    statuses = r.statuses()
+    minimum = _minimum(statuses, snap.notes)
     out = [
         f"# ad-doctor report: {snap.domain}",
         "",
         f"Collected {snap.collected_at:%Y-%m-%d %H:%M} UTC with ad-doctor {__version__}. "
         f"Risk score **{r.score}/100** (grade **{r.grade}**): "
         + ", ".join(f"{counts[s]} {s}" for s in reversed(Severity))
-        + ".",
+        + "."
+        + (f" The score is {minimum}." if minimum else ""),
         "",
         "| Severity | ID | Finding | Objects |",
         "|---|---|---|---|",
@@ -298,9 +351,36 @@ def render_markdown(r: Report) -> str:
         for a in r.accepted:
             scope = ", ".join(a.objects) or "all objects"
             out.append(_prose(f"- {a.check_id} ({scope}), until {a.expires}: {a.reason}"))
+    out += _markdown_status(statuses)
     if snap.notes:
         out += ["", "## Notes", "", *[f"- {_prose(n)}" for n in snap.notes]]
     return "\n".join(out) + "\n"
+
+
+def _status_why(s: coverage.CheckStatus) -> str:
+    reason = coverage.REASON_TEXT.get(s.reason or "", "")
+    return reason + (": " if reason and s.notes else "") + "; ".join(s.notes)
+
+
+def _markdown_status(statuses: dict[str, coverage.CheckStatus]) -> list[str]:
+    rows = sorted(statuses.values(), key=lambda s: s.id)
+    counts = coverage.summary(statuses, [])
+    out = [
+        "",
+        "## Check status",
+        "",
+        f"{counts[coverage.JUDGED]} judged, {counts[coverage.NOT_APPLICABLE]} not applicable, "
+        f"{counts[coverage.NOT_EVALUATED]} not evaluated.",
+    ]
+    for status, heading in (
+        (coverage.NOT_EVALUATED, "Not evaluated"),
+        (coverage.NOT_APPLICABLE, "Not applicable"),
+    ):
+        hits = [s for s in rows if s.status == status]
+        if hits:
+            out += ["", f"| {heading} | Check | Why |", "|---|---|---|"]
+            out += [f"| {s.id} | {_md(s.title)} | {_md(_status_why(s))} |" for s in hits]
+    return out
 
 
 PATH_STEP = re.compile(r" -\[([^\]]+)\]-> ")
@@ -366,7 +446,7 @@ def _sarif_notifications(r: Report) -> list[dict[str, Any]]:
     """The collection notes; one that names checks says which were not fully judged."""
     out: list[dict[str, Any]] = []
     for note in r.snap.notes:
-        checks = sorted(set(CHECK_IN_NOTE.findall(note)))
+        checks = sorted(coverage.named_checks(note))
         item: dict[str, Any] = {
             "level": "warning" if checks else "note",
             "message": {"text": note},
@@ -377,8 +457,24 @@ def _sarif_notifications(r: Report) -> list[dict[str, Any]]:
     return out
 
 
+def _sarif_status(statuses: dict[str, coverage.CheckStatus]) -> list[dict[str, Any]]:
+    """A check that gave no answer is a condition of this run, not a result: one notification
+    each, tied to its rule."""
+    return [
+        {
+            "level": "note" if s.reason == coverage.SWITCHED_OFF else "warning",
+            "message": {"text": f"{s.id} not evaluated: {_status_why(s)}"},
+            "associatedRule": {"id": s.id},
+            "properties": {"status": s.status, "reason": s.reason},
+        }
+        for _, s in sorted(statuses.items())
+        if s.status == coverage.NOT_EVALUATED
+    ]
+
+
 def render_sarif(r: Report) -> str:
     by_id = {f.check_id: f for f in r.findings}
+    statuses = r.statuses()
     rules: list[dict[str, Any]] = []
     for check_id, title in catalog(r):
         props: dict[str, Any] = {
@@ -407,6 +503,10 @@ def render_sarif(r: Report) -> str:
         if f is not None:
             # the severity it fired with beats the worst case the catalog lists
             props["security-severity"] = SECURITY_SEVERITY.get(f.severity, "1.0")
+        if (st := statuses.get(check_id)) is not None:
+            props["status"] = st.status
+            if st.reason is not None:
+                props["statusReason"] = st.reason
         rules.append(rule)
     results = [
         {
@@ -441,9 +541,11 @@ def render_sarif(r: Report) -> str:
                     {
                         "executionSuccessful": True,
                         "toolConfigurationNotifications": _sarif_notifications(r),
+                        "toolExecutionNotifications": _sarif_status(statuses),
                     }
                 ],
                 "results": results,
+                "properties": {"coverage": coverage.summary(statuses, r.snap.notes)},
             }
         ],
     }
@@ -454,15 +556,17 @@ def render_sarif(r: Report) -> str:
 
 
 def render_junit(r: Report, ran: list[str] | None = None) -> str:
-    """One test case per check: failed when it found something, skipped when accepted or
-    when a note says it could not judge everything it covers."""
+    """One test case per check: failed when it found something, skipped when accepted, not
+    applicable or not evaluated. `ran` narrows the cases; without it every check is listed,
+    so a check that was switched off shows as skipped rather than vanishing."""
     by_id = {f.check_id: f for f in r.findings}
     accepted = {a.check_id for a in r.accepted}
-    unjudged = not_judged(r)
+    statuses = r.statuses()
     checks = catalog(r)
     registered = {c.id for c in REGISTRY}
     # checks that ran, plus findings that do not come from a registered check (invariants)
     ids = set(ran if ran is not None else registered) | (by_id.keys() - registered)
+    unknown = {c for c, s in statuses.items() if s.status != coverage.JUDGED}
     cases = []
     for check_id, title in checks:
         if check_id not in ids:
@@ -484,15 +588,17 @@ def render_junit(r: Report, ran: list[str] | None = None) -> str:
                 f'  <testcase classname="ad-doctor" name={name}>'
                 '<skipped message="accepted risk"/></testcase>'
             )
-        elif check_id in unjudged:
-            why = quoteattr(_xml_safe("not judged: " + "; ".join(unjudged[check_id])))
+        elif check_id in unknown:
+            st = statuses[check_id]
+            label = "not applicable" if st.status == coverage.NOT_APPLICABLE else "not evaluated"
+            why = quoteattr(_xml_safe(f"{label}: {_status_why(st)}"))
             cases.append(
                 f'  <testcase classname="ad-doctor" name={name}><skipped message={why}/></testcase>'
             )
         else:
             cases.append(f'  <testcase classname="ad-doctor" name={name}/>')
     failures = sum(1 for i in ids if i in by_id)
-    skipped = sum(1 for i in ids if (i in accepted or i in unjudged) and i not in by_id)
+    skipped = sum(1 for i in ids if (i in accepted or i in unknown) and i not in by_id)
     suite = quoteattr(_xml_safe(f"ad-doctor {r.snap.domain}"))
     header = (
         f'<testsuite name={suite} tests="{len(cases)}" failures="{failures}" '

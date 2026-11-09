@@ -62,4 +62,5 @@ ad-doctor scan dc01.corp.example --ldaps -k
 | `--single-dc` | probe only the DC being scanned |
 
 Parts that cannot run (no AD CS, SYSVOL unreachable) become notes in the report rather than
-failing the scan.
+failing the scan, and the report lists every check as judged, not applicable or not
+evaluated with the reason: see [check status](ci.md#check-status).

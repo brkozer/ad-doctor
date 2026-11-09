@@ -10,7 +10,7 @@ import ldap3
 import pytest
 from ldap3.core.exceptions import LDAPNoSuchObjectResult
 
-from ad_doctor import redact, report, sd
+from ad_doctor import coverage, redact, sd
 from ad_doctor.checks import run_all
 from ad_doctor.collect import _blank_name_notes, _sysvol_unseen_notes
 from ad_doctor.model import Dmsa, Severity, Snapshot, invisible_chars
@@ -236,7 +236,7 @@ def test_sarif_carries_the_notes() -> None:
 
 def test_not_judged_keeps_the_notes_per_check() -> None:
     snap = snapshot(notes=["a: AD-INF-019 not judged", "b: AD-INF-019 not judged"])
-    assert report.not_judged(Report(snap, [])) == {"AD-INF-019": snap.notes}
+    assert coverage.note_gaps(snap.notes) == {"AD-INF-019": snap.notes}
 
 
 # --- AD-INF-019 ---------------------------------------------------------------------------------

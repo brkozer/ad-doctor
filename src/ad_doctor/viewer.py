@@ -32,7 +32,7 @@ from functools import cache
 from importlib import resources
 from typing import Any
 
-from . import __version__, accept, catalog, explain, paths, seal, trend, viewer_graph
+from . import __version__, accept, catalog, coverage, explain, paths, seal, trend, viewer_graph
 from .fixes import _name as object_name
 from .fixes import snippet
 from .invariants import IDS as INVARIANT_IDS
@@ -117,6 +117,8 @@ def viewmodel(r: Report, snap: Snapshot | None, opts: Options) -> dict[str, Any]
         "invariants": _invariants(r.findings, opts.spec),
         "baseline": _baseline(r, opts),
         "notes": list(r.snap.notes),
+        "check_status": rep["check_status"],
+        "coverage": rep["coverage"],
         "trend": trend.build(opts.history, trend.point(rep, "this run"))
         if opts.history is not None
         else None,
@@ -563,13 +565,17 @@ def _baseline(r: Report, opts: Options) -> dict[str, Any] | None:
             changed.append({**row(nf, no), "before": oo, "before_severity": str(of.severity)})
     old_paths = next((f for f in old if f.check_id == "AD-PATH-001"), None)
     score = score_of(old)
+    unknown = coverage.unevaluated(r.statuses())
+    gone = [row(*before[k]) for k in sorted(before.keys() - after.keys())]
     return {
         "name": b.name,
         "collected_at": b.collected_at,
         "score": score,
         "grade": grade_of(score),
         "new": [row(*after[k]) for k in sorted(after.keys() - before.keys())],
-        "resolved": [row(*before[k]) for k in sorted(before.keys() - after.keys())],
+        # a finding of a check this run could not evaluate is not known to be gone
+        "resolved": [g for g in gone if g["id"] not in unknown],
+        "not_evaluated": [g for g in gone if g["id"] in unknown],
         "changed": changed,
         "unchanged": len(finding_keys(r.findings) & finding_keys(old)) - len(changed),
         "exposed": old_paths.data.get("exposed") if old_paths else None,

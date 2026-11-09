@@ -37,7 +37,16 @@ def point(data: dict[str, Any], name: str) -> dict[str, Any]:
     out.update(_exposure(data))
     checks = data.get("checks")
     out["checks"] = sorted(checks) if isinstance(checks, list) else None
+    out["not_evaluated"] = _not_evaluated(data)
     return out
+
+
+def _not_evaluated(data: dict[str, Any]) -> list[str] | None:
+    """Check IDs the report could not evaluate; None for a report that does not say."""
+    rows = data.get("check_status")
+    if not isinstance(rows, list):
+        return None
+    return sorted(str(r["id"]) for r in rows if r.get("status") == "not_evaluated")
 
 
 def _exposure(data: dict[str, Any]) -> dict[str, Any]:
@@ -54,7 +63,8 @@ def _exposure(data: dict[str, Any]) -> dict[str, Any]:
     checks = data.get("checks")
     ran = not isinstance(checks, list) or "AD-PATH-001" in checks
     accepted = any(a.get("check_id") == "AD-PATH-001" for a in data.get("accepted", []))
-    return {"exposed": 0 if ran and not accepted else None, "users": None}
+    judged = "AD-PATH-001" not in (_not_evaluated(data) or [])
+    return {"exposed": 0 if ran and judged and not accepted else None, "users": None}
 
 
 def load(directory: Path, domain: str) -> list[dict[str, Any]]:
@@ -102,12 +112,20 @@ def build(history: list[dict[str, Any]], current: dict[str, Any]) -> dict[str, A
                 notes.append(f"checks {' '.join(parts)}")
                 if added:
                     notes.append("new: " + ", ".join(added[:6]) + (" …" if len(added) > 6 else ""))
+        if before["not_evaluated"] is not None and now["not_evaluated"] is not None:
+            more = len(set(now["not_evaluated"]) - set(before["not_evaluated"]))
+            fewer = len(set(before["not_evaluated"]) - set(now["not_evaluated"]))
+            if more or fewer:
+                parts = [f"+{more}"] if more else []
+                parts += [f"-{fewer}"] if fewer else []
+                notes.append(f"not evaluated {' '.join(parts)}")
         if notes:
             markers.append({"index": i, "notes": notes})
     categories = list(dict.fromkeys(c for p in points for c in p["categories"]))
     rows = []
     for p in points:
-        row = {k: v for k, v in p.items() if k != "checks"}
+        row = {k: v for k, v in p.items() if k not in ("checks", "not_evaluated")}
         row["checks"] = len(p["checks"]) if p["checks"] is not None else None
+        row["not_evaluated"] = len(p["not_evaluated"]) if p["not_evaluated"] is not None else None
         rows.append(row)
     return {"points": rows, "markers": markers, "categories": categories}

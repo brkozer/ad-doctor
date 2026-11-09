@@ -390,10 +390,22 @@ test("print keeps the bars and gives findings their full width", async ({ page }
   expect(pdf.length).toBeGreaterThan(1000);
 });
 
+test("the overview says which checks gave no answer and calls the score a minimum", async ({ page }) => {
+  const seen = watch(page);
+  await page.goto(url("clean"));
+  const panel = page.locator(".panel").filter({ hasText: "Check coverage" });
+  await expect(panel).toContainText("not evaluated");
+  await expect(panel.locator("tbody tr").first()).toContainText("AD-");
+  await expect(page.locator(".panel").filter({ hasText: "Risk score" })).toContainText("A minimum:");
+  expect(seen.errors).toEqual([]);
+});
+
 test("a clean domain reads as good news, and says why there is no graph", async ({ page }) => {
   const seen = watch(page);
   await page.goto(url("clean") + "#findings");
-  await expect(page.locator(".empty.good")).toContainText("No findings: every check that ran passed.");
+  // the clean fixture holds no probe results, so it does not read as all clear
+  await expect(page.locator(".empty").first()).toContainText("No findings in the checks judged:");
+  await expect(page.locator(".empty.good")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Export CSV" })).toHaveCount(0);
   await page.evaluate(() => { location.hash = "#blast"; });
   await expect(page.locator(".empty")).toContainText("Pages from ad-doctor analyze -f html carry no control graph.");

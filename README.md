@@ -289,7 +289,11 @@ ad-doctor export-graph 2026-11.json -o graph.json --paths-only
 | `--signing-probe-port PORT` | plain LDAP port for the signing probe; `0` skips it |
 
 Parts that cannot run (no AD CS, SYSVOL unreachable, Kerberos without an NTLM account for
-the signing probes) become notes in the report instead of failing the scan. Domain
+the signing probes) become notes in the report instead of failing the scan, and every
+format shows each check as **judged**, **not applicable** (the snapshot proves the feature
+is absent) or **not evaluated**, with the reason (data unreadable, older snapshot, switched
+off). A check that was not evaluated never counts as passed: JUnit marks it skipped, a
+finding it had before stays out of "resolved" and the risk score is then a minimum. Domain
 controllers that require LDAP signing (the default on Windows Server 2025) reject plain
 LDAP binds, so use `--ldaps`.
 

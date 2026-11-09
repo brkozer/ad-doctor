@@ -1470,7 +1470,13 @@ class Collector:
 
     def _sysvol(self, domain: str, gpo_guids: list[str]) -> sysvol.SysvolResult:
         t = self.target
-        if t is None or not t.sysvol:
+        if t is None:
+            return sysvol.SysvolResult()
+        if not t.sysvol:
+            self.notes.append(
+                "SYSVOL not checked by choice: AD-GPP-001, AD-GPP-002, AD-GPO-003, AD-GPO-005, "
+                "AD-GPO-006 and AD-GPO-007 did not judge it"
+            )
             return sysvol.SysvolResult()
         if not t.user and not t.kerberos:
             self.notes.append("SYSVOL not checked: needs credentials")
@@ -1575,6 +1581,15 @@ class Collector:
             self.notes.append(
                 "HTTPS enrollment endpoints not probed by choice: AD-ADCS-019 did not judge them"
             )
+        if not t.probes:
+            self.notes.append(
+                "SMB, Print Spooler and channel binding probes not run by choice: AD-INF-008, "
+                "AD-INF-009, AD-INF-010 and AD-INF-013 did not judge them"
+            )
+        if self.ca_dns_hosts and not (t.probes and t.http_port):
+            self.notes.append(
+                "web enrollment not probed by choice: AD-ADCS-010 and AD-CHAIN-003 did not judge it"
+            )
         if not t.probes and not t.plain_port:
             return result
         for name, scanned in self._dc_targets(dc_dns_host, accounts):
@@ -1638,9 +1653,12 @@ class Collector:
     def _ca_configs(self, dc_dns_host: str) -> list[CaConfig]:
         """Each enterprise CA's configuration, read from its registry over the winreg pipe."""
         t = self.target
-        if t is None or not t.probes or not self.ca_dns_hosts:
+        if t is None or not self.ca_dns_hosts:
             return []
         skipped = "CA configuration (ESC6, ESC7, ESC11, ESC16, audit filter) not read"
+        if not t.probes:
+            self.notes.append(f"{skipped}: --no-probes")
+            return []
         if not t.ca_registry:
             self.notes.append(f"{skipped}: --no-ca-registry")
             return []

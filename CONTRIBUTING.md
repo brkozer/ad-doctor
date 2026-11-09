@@ -76,7 +76,9 @@ is proven, "heuristic" on every ordering or budget claim, and never "fixed", "re
    only source of `checks.MITRE`.
 3. **Collect what it needs** in `collect.py`, through `optional()` when the data may be
    missing or unreadable, so the scan goes on with a note instead of failing. New snapshot
-   fields need defaults so that older snapshots still load.
+   fields need defaults so that older snapshots still load. A note about something a check
+   could not judge names its ID (or gets a rule in `coverage.py`): that is what marks the
+   check `not_evaluated` rather than passed.
 4. **Feed the graph** if the misconfiguration gives control over something: add the edge
    in `paths.py` so attack paths and `blast-radius` see it.
 5. **Test it**: at least one test where it fires, one where it stays quiet, and the
