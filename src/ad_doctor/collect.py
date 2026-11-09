@@ -16,8 +16,10 @@ from urllib.parse import urlsplit
 
 import ldap3
 from ldap3.core.exceptions import (
+    LDAPBindError,
     LDAPException,
     LDAPInsufficientAccessRightsResult,
+    LDAPInvalidCredentialsResult,
     LDAPNoSuchObjectResult,
     LDAPOperationResult,
 )
@@ -225,6 +227,10 @@ class DnsNodeScan:
 
 class CollectError(Exception):
     pass
+
+
+class BindRejected(CollectError):
+    """The server refused these credentials: another DC would only count against lockout."""
 
 
 @dataclass
@@ -3090,7 +3096,7 @@ def _policy_file_notes(snap: Snapshot, unread: list[str]) -> list[str]:
     return notes
 
 
-def connect(target: Target) -> ldap3.Connection:
+def connect(target: Target, auto_referrals: bool = True) -> ldap3.Connection:
     server = ldap3.Server(
         target.host,
         port=target.port,
@@ -3106,6 +3112,7 @@ def connect(target: Target) -> ldap3.Connection:
                 sasl_mechanism=ldap3.KERBEROS,
                 read_only=True,
                 raise_exceptions=True,
+                auto_referrals=auto_referrals,
             )
             conn.bind()
         elif target.user and "\\" in target.user:
@@ -3116,11 +3123,12 @@ def connect(target: Target) -> ldap3.Connection:
                 authentication=ldap3.NTLM,
                 read_only=True,
                 raise_exceptions=True,
+                auto_referrals=auto_referrals,
             )
             conn.open()
             # LDAPS binds carry a channel binding token so DCs that enforce it accept them
             if not probes.ntlm_bind(conn, channel_binding=target.use_ssl):
-                raise CollectError(f"bind failed: {conn.result.get('message') or conn.result}")
+                raise BindRejected(f"bind failed: {conn.result.get('message') or conn.result}")
         elif target.user:
             conn = ldap3.Connection(
                 server,
@@ -3129,9 +3137,18 @@ def connect(target: Target) -> ldap3.Connection:
                 read_only=True,
                 auto_bind=True,
                 raise_exceptions=True,
+                auto_referrals=auto_referrals,
             )
         else:
-            conn = ldap3.Connection(server, read_only=True, auto_bind=True, raise_exceptions=True)
+            conn = ldap3.Connection(
+                server,
+                read_only=True,
+                auto_bind=True,
+                raise_exceptions=True,
+                auto_referrals=auto_referrals,
+            )
+    except (LDAPInvalidCredentialsResult, LDAPBindError) as exc:
+        raise BindRejected(f"bind to {target.host}:{target.port} failed: {exc}") from exc
     except LDAPException as exc:
         raise CollectError(f"bind to {target.host}:{target.port} failed: {exc}") from exc
     return conn

@@ -12,7 +12,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from . import __version__
+from . import __version__, forest
 from .coverage import named_checks
 from .fixes import one_line
 from .report import _md
@@ -67,7 +67,11 @@ def build(paths: list[Path]) -> dict[str, Any]:
             newest[key] = (data, path.name)
     if len(newest) < 2:
         notes.append("only one domain among these reports")
-    reports = [newest[k] for k in sorted(newest)]
+    return _document([newest[k] for k in sorted(newest)], notes)
+
+
+def _document(reports: list[tuple[dict[str, Any], str]], notes: list[str]) -> dict[str, Any]:
+    """Rows per domain and per check, from one report of each domain."""
     rows = [_row(data, name) for data, name in reports]
 
     versions = {r["version"] for r in rows}
@@ -133,8 +137,157 @@ def build(paths: list[Path]) -> dict[str, Any]:
     }
 
 
+def _manifest(directory: Path) -> dict[str, Any]:
+    path = directory / forest.MANIFEST
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"rollup: {directory}: no readable {forest.MANIFEST}: {exc}") from exc
+    if (
+        not isinstance(data, dict)
+        or data.get("tool") != forest.MANIFEST_TOOL
+        or not isinstance(data.get("domains"), list)
+    ):
+        raise ValueError(f"rollup: {path}: not the result of a --forest run")
+    if data.get("schema") != forest.MANIFEST_SCHEMA:
+        raise ValueError(f"rollup: {path}: written by another version (schema mismatch)")
+    return data
+
+
+def build_forest(directory: Path) -> dict[str, Any]:
+    """The rollup of one --forest run: a row per domain that was read, what was not read, and
+    who holds the groups that span the forest."""
+    manifest = _manifest(directory)
+    reports: list[tuple[dict[str, Any], str]] = []
+    missing: list[dict[str, str]] = []
+    for row in manifest["domains"]:
+        domain, stem = str(row["domain"]), str(row["stem"])
+        if row.get("status") != "read":
+            missing.append({"domain": domain, "reason": str(row.get("reason") or "not read")})
+            continue
+        path = directory / f"{forest.file_stem(str(row['dn']))}{forest.REPORT_SUFFIX}"
+        if not path.exists():
+            missing.append(
+                {
+                    "domain": domain,
+                    "reason": f"collected, but no report: run analyze on {stem}"
+                    f"{forest.SNAPSHOT_SUFFIX} -f json -o {path.name}",
+                }
+            )
+            continue
+        data = _load(path)
+        if str(data["domain"]).lower() != domain.lower():
+            missing.append(
+                {"domain": domain, "reason": f"{path.name} is a report of {data['domain']}"}
+            )
+            continue
+        reports.append((data, path.name))
+    doc = _document(sorted(reports, key=lambda r: str(r[0]["domain"]).lower()), [])
+    names = [m["domain"] for m in missing]
+    for entry in doc["checks"]:
+        entry["not_judged"] = [*entry["not_judged"], *names]
+    groups = manifest.get("groups", {})
+    complete = (
+        not missing
+        and not manifest.get("partial")
+        and bool(groups)
+        and all(g.get("status") == "read" for g in groups.values())
+    )
+    doc["forest"] = {
+        "root": str(manifest.get("root", "")),
+        "complete": complete,
+        "domains": len(manifest["domains"]),
+        "read": len(reports),
+        "not_evaluated": missing,
+        "referrals": manifest.get("referrals", []),
+        "groups": groups,
+        "notes": manifest.get("notes", []),
+        "collected_at": manifest.get("collected_at"),
+    }
+    return doc
+
+
 def render_json(doc: dict[str, Any]) -> str:
     return json.dumps(doc, indent=2)
+
+
+NOT_JOINED = (
+    "A forest scan joins only the two groups above across domains. Control paths, findings "
+    "and scores stay per domain."
+)
+
+
+def _holder_line(holder: dict[str, Any]) -> str:
+    state = {True: "enabled", False: "disabled", None: "state unknown"}[holder.get("enabled")]
+    via = " via ".join(str(v) for v in holder.get("via", []))
+    how = f", through {via}" if via else ""
+    how += ", as primary group" if holder.get("primary_group") else ""
+    return f"{holder['name']} ({holder['domain']}, {holder['kind']}, {state}{how})"
+
+
+def _group_state(group: dict[str, Any]) -> str:
+    if group["status"] == "not_evaluated":
+        return f"NOT EVALUATED: {group.get('reason', '')}"
+    n = len(group["holders"])
+    count = f"{n} holder{'' if n == 1 else 's'}"
+    return count if group["status"] == "read" else f"{count} found, PARTIAL"
+
+
+def _forest_text(doc: dict[str, Any]) -> list[str]:
+    f = doc["forest"]
+    state = "all domains read" if f["complete"] else "INCOMPLETE"
+    lines = [f"ad-doctor forest rollup: {one_line(f['root'])}, {f['read']} of {f['domains']} "
+             f"domains read, {state}", ""]  # fmt: skip
+    if f["not_evaluated"]:
+        lines.append("Not evaluated (nothing is known about these domains):")
+        lines += [f"  {one_line(m['domain'])}: {one_line(m['reason'])}" for m in f["not_evaluated"]]
+        lines.append("")
+    for name, group in f["groups"].items():
+        lines.append(f"{name} (forest root {one_line(group['domain'])}): {_group_state(group)}")
+        lines += [f"  {one_line(_holder_line(h))}" for h in group["holders"]]
+        lines += [
+            f"  not resolved: {one_line(u['name'])}: {one_line(u['reason'])}"
+            for u in group["unresolved"]
+        ]
+        lines.append("")
+    if f["referrals"]:
+        lines.append("Referrals (crossRefs that point outside the forest, not scanned):")
+        lines += [f"  {one_line(r['name'])}: {one_line(r['target'])}" for r in f["referrals"]]
+        lines.append("")
+    if f["notes"]:
+        lines += ["Forest notes:"] + [f"  {one_line(n)}" for n in f["notes"]] + [""]
+    lines += [NOT_JOINED, ""]
+    return lines
+
+
+def _forest_markdown(doc: dict[str, Any]) -> list[str]:
+    f = doc["forest"]
+    state = "all domains read" if f["complete"] else "**INCOMPLETE**"
+    lines = [
+        f"# ad-doctor forest rollup: {_md(f['root'])}",
+        "",
+        f"{f['read']} of {f['domains']} domains read, {state}.",
+        "",
+    ]
+    if f["not_evaluated"]:
+        lines += ["## Not evaluated", "", "Nothing is known about these domains.", ""]
+        lines += [f"- {_md(m['domain'])}: {_md(m['reason'])}" for m in f["not_evaluated"]]
+        lines.append("")
+    for name, group in f["groups"].items():
+        lines += [f"## {_md(name)}", "", _md(_group_state(group)), ""]
+        lines += [f"- {_md(_holder_line(h))}" for h in group["holders"]]
+        lines += [
+            f"- not resolved: {_md(u['name'])}: {_md(u['reason'])}" for u in group["unresolved"]
+        ]
+        lines.append("")
+    if f["referrals"]:
+        lines += ["## Referrals", "", "crossRefs that point outside the forest, not scanned.", ""]
+        lines += [f"- {_md(r['name'])}: {_md(r['target'])}" for r in f["referrals"]]
+        lines.append("")
+    if f["notes"]:
+        lines += ["## Forest notes", ""] + [f"- {_md(n)}" for n in f["notes"]] + [""]
+    lines += [NOT_JOINED, ""]
+    return lines
 
 
 def _exposure(row: dict[str, Any]) -> str:
@@ -148,7 +301,8 @@ def _counts(row: dict[str, Any]) -> Counter[str]:
 
 
 def render_text(doc: dict[str, Any]) -> str:
-    lines = [f"ad-doctor rollup: {doc['reports']} domains, scores not averaged", ""]
+    lines = _forest_text(doc) if "forest" in doc else []
+    lines += [f"ad-doctor rollup: {doc['reports']} domains, scores not averaged", ""]
     header = (
         f"{'DOMAIN':32} {'GR':>2} {'SCORE':>5} {'HIGH':>4} {'MED':>3} {'LOW':>3} {'INFO':>4} "
         f"{'OBJECTS':>7} {'CHECKS':>6}  {'EXPOSED':10} {'SCANNED':10}"
@@ -167,6 +321,8 @@ def render_text(doc: dict[str, Any]) -> str:
     lines += ["", "Findings across domains:"]
     for c in doc["checks"]:
         total = doc["reports"]
+        if "forest" in doc and doc["forest"]["not_evaluated"]:
+            total = f"{total} read, of {doc['forest']['domains']}"
         lines.append(
             f"  {c['id']:12} {c['severity']:6} {len(c['domains'])}/{total} domains, "
             f"{c['objects']} objects: {one_line(c['title'])}"
@@ -183,7 +339,8 @@ def render_text(doc: dict[str, Any]) -> str:
 
 
 def render_markdown(doc: dict[str, Any]) -> str:
-    lines = [
+    lines = _forest_markdown(doc) if "forest" in doc else []
+    lines += [
         f"# ad-doctor rollup: {doc['reports']} domains",
         "",
         "Scores are per domain and are not averaged.",

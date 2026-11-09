@@ -9,6 +9,13 @@ logic or severity between versions, but an ID is never reused for something else
 
 ### Added
 
+- **Forest scan** (`collect --forest`, `scan --forest`, `rollup --forest DIR`): every domain of the
+  forest, listed from the `crossRef` objects and reached through the DCs named under `CN=Sites`,
+  one domain at a time and one ordinary snapshot each. A domain that cannot be read is listed as
+  not evaluated, the result reads `INCOMPLETE` and the exit code is 3. The rollup adds who holds
+  Enterprise Admins and Schema Admins across all domains; control paths are not joined across
+  domains (see the Forest scan page). Only unit tests and a single-domain forest have
+  exercised it so far.
 - **Patch level** (AD-INF-029, AD-ADCS-022): each DC's and CA's build and UBR are read over the
   `winreg` pipe and compared with a dated table of Microsoft's fixed builds (`patches.toml`), including
   CVE-2026-54121 (Certighost). A version match never goes above medium, and `--no-patch-level` turns

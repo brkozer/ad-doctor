@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import textwrap
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape as xml_escape
 from xml.sax.saxutils import quoteattr
@@ -343,6 +346,21 @@ def _extra(f: Finding) -> dict[str, Any]:
 
 def render_json(r: Report) -> str:
     return json.dumps(report_dict(r), indent=2)
+
+
+def write_private(path: Path, text: str | Iterable[str]) -> None:
+    """Write a file only its owner can read: snapshots, reports and fix scripts describe
+    how to attack the domain they came from."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)  # the mode above applies only to a new file
+        out = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+    with out:
+        out.writelines([text] if isinstance(text, str) else text)
 
 
 # --- Markdown ------------------------------------------------------------------------
