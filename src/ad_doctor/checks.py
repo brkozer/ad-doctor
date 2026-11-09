@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-from . import catalog, gpo_scope, sd
+from . import catalog, dnsprop, gpo_scope, sd
 from .gpo_scope import LOCAL_GROUPS, Grant
 from .model import (
     EXCHANGE_GROUPS,
@@ -21,6 +21,7 @@ from .model import (
     CaConfig,
     CertTemplate,
     Dmsa,
+    DnsZone,
     Finding,
     KeyCredential,
     Pso,
@@ -2833,6 +2834,135 @@ def dmsa_control(snap: Snapshot) -> Finding | None:
         "Remove the listed rights so that only tier 0 and the hosts running the service hold "
         "them. Finish or roll back migrations that are not in use.",
         sorted(objects),
+    )
+
+
+@check("AD-DNS-001", "DNS zones that accept nonsecure dynamic updates")
+def dns_nonsecure_updates(snap: Snapshot) -> Finding | None:
+    if not snap.dns_zones_checked:
+        return None
+    hits = [
+        z
+        for z in snap.dns_zones
+        if z.zone_type == dnsprop.ZONE_TYPE_PRIMARY and z.allow_update == dnsprop.UPDATE_NONSECURE
+    ]
+    if not hits:
+        return None
+    return _finding(
+        "AD-DNS-001",
+        Severity.MEDIUM if all(z.reverse for z in hits) else Severity.HIGH,
+        "Anyone who can reach a DNS server of these zones can add or change records without "
+        "logging on, and send clients to a host of their choice.",
+        "Set dynamic updates to 'Secure only' on each zone.",
+        sorted(z.label for z in hits),
+    )
+
+
+def foreign_zone_trustee(
+    zone: DnsZone, sid: str, domain_sid: str, root_sid: str, admin_sids: list[str]
+) -> bool:
+    """A principal of another domain on a forest-wide zone: its DnsAdmins group, which
+    holds the zone by default, cannot be told from any other group there."""
+    if zone.source != "ForestDnsZones" or not sid.startswith("S-1-5-21-"):
+        return False
+    if sid in admin_sids or sid.startswith(f"{domain_sid}-"):
+        return False
+    root_known = any(s.startswith(f"{root_sid}-") for s in admin_sids)
+    return not (root_known and sid.startswith(f"{root_sid}-"))
+
+
+def _zone_writers(zone: DnsZone) -> set[str]:
+    """SIDs with a right to change the zone, its settings, or the records in it."""
+    delete = sd.DELETE_CHILD | sd.DELETE_TREE
+    out = {
+        a.sid
+        for a in zone.aces
+        if a.takeover
+        or a.writes(sd.DNS_PROPERTY)
+        or a.mask & sd.DELETE
+        or (a.mask & delete and a.object_type in (None, sd.DNS_NODE_CLASS))
+    }
+    out |= {
+        a.sid
+        for a in zone.inheritable
+        if a.inherited_object_type in (None, sd.DNS_NODE_CLASS)
+        and (a.takeover or a.writes(sd.DNS_RECORD) or a.mask & sd.DELETE)
+    }
+    return out
+
+
+@check("AD-DNS-002", "DNS zones writable outside tier 0")
+def dns_zone_control(snap: Snapshot) -> Finding | None:
+    if not snap.dns_zones_checked:
+        return None
+    held = snap.tier0_dns() | {dn.lower() for dn in snap.dns_admins}
+    allowed = _tier0_group_sids(snap) | set(snap.dns_admin_sids)
+    allowed |= {CREATOR_OWNER, PRINCIPAL_SELF}
+    allowed |= {a.sid for a in snap.accounts if a.sid and a.dn.lower() in held}
+    allowed |= {o.sid for o in snap.objects if o.sid and o.dn.lower() in held}
+    broad = snap.broad_sids()
+    hits = []
+    broad_forward = False
+    for zone in snap.dns_zones:
+        if not zone.acl_read:
+            continue
+        others = allowed | {
+            s
+            for s in {*_zone_writers(zone), zone.owner or ""}
+            if foreign_zone_trustee(
+                zone, s, snap.domain_sid, snap.root_sid or snap.domain_sid, snap.dns_admin_sids
+            )
+        }
+        writers = _zone_writers(zone) - others
+        who = {snap.name_of(s) for s in writers}
+        if zone.owner and zone.owner not in others:
+            who.add(f"{snap.name_of(zone.owner)} (owner)")
+        if who:
+            hits.append(f"{zone.label}: {', '.join(sorted(who))}")
+            broad_forward = broad_forward or (bool(writers & broad) and not zone.reverse)
+    if not hits:
+        return None
+    unnamed = (
+        ""
+        if any(s.startswith(f"{snap.domain_sid}-") for s in snap.dns_admin_sids)
+        else " The DnsAdmins group was not found by name, so a renamed one may be listed."
+    )
+    return _finding(
+        "AD-DNS-002",
+        Severity.HIGH if broad_forward else Severity.MEDIUM,
+        "These principals can rewrite the zone, its permissions, or the records in it, and so "
+        "redirect the clients that use those names." + unnamed,
+        "Remove the rights that are not needed and give ownership back to Domain Admins.",
+        sorted(hits),
+    )
+
+
+@check("AD-DNS-003", "Authenticated users can add records to DNS zones")
+def dns_zone_create_child(snap: Snapshot) -> Finding | None:
+    if not snap.dns_zones_checked:
+        return None
+    broad = snap.broad_sids()
+    hits = []
+    for zone in snap.dns_zones:
+        if not zone.acl_read or zone.zone_type != dnsprop.ZONE_TYPE_PRIMARY:
+            continue
+        who = {
+            snap.name_of(a.sid)
+            for a in zone.aces
+            if a.sid in broad and a.creates(sd.DNS_NODE_CLASS)
+        }
+        if who:
+            hits.append(f"{zone.label}: {', '.join(sorted(who))}")
+    if not hits:
+        return None
+    return _finding(
+        "AD-DNS-003",
+        Severity.INFO,
+        "The default: any domain account can add a record for a name that does not exist yet, "
+        "including a wildcard, and clients that look that name up go to its host.",
+        "Create the names that should not be claimable (for example a wildcard and wpad) as "
+        "static records, and watch for new dnsNode objects.",
+        sorted(hits),
     )
 
 

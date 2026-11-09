@@ -1,0 +1,53 @@
+id = "AD-DNS-003"
+aliases = ["adidns-create-child", "dns-record-creation"]
+summary = "Information only: authenticated users can add records to DNS zones stored in Active Directory, which is the Windows default."
+severities = ["info"]
+severity_logic = """
+**Information** only, and it adds nothing to the score: this is how Windows ships, and secure dynamic
+update relies on it. It is shown so that the exposure is known and the names that matter can be reserved.
+"""
+mitre = ["T1557"]
+data_sources = ["ldap"]
+attributes = ["nTSecurityDescriptor"]
+related = ["AD-DNS-001", "AD-DNS-002"]
+since = "0.2.3"
+
+risk = """
+By default any authenticated user may create a child object in a zone, and so add a record over LDAP for
+a name that does not exist yet. That includes a wildcard, which also answers every name without
+a record of its own. Unlike broadcast name spoofing this works across subnets, and the
+creator owns the new record. Existing names are protected by their own ACLs.
+"""
+
+detection = """
+From the DACL of every readable primary zone: an ACE that gives a broad group (Authenticated Users,
+Everyone, Domain Users and the like) `CreateChild` for all classes or for `dnsNode`, or
+`GenericAll`. A broad group with more than that is also [AD-DNS-002](AD-DNS-002.md).
+
+No record is created and records are not listed. The check does not tell whether a wildcard or a
+`wpad` record exists. A zone whose descriptor does not come back is named in a note.
+"""
+
+false_positives = """
+- **Expected on almost every domain.** Accept it if you have reserved the names that matter.
+"""
+
+remediation = """
+Removing the right can stop clients from registering their own names, so it is not the first step.
+
+1. **Reserve the names that matter** as static records: a wildcard, and `wpad`.
+2. **Watch for new `dnsNode` objects** created by accounts that are not computers or DNS servers.
+3. **Limit the right** only where clients do not register themselves, and after testing.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-DNS-003"
+
+[[references]]
+title = "DNS zones in DNS Server on Windows Server: reserving names"
+url = "https://learn.microsoft.com/en-us/windows-server/networking/dns/zone-types"
+kind = "vendor"
+
+[[references]]
+title = "Exploiting Active Directory-Integrated DNS (NetSPI)"
+url = "https://www.netspi.com/blog/technical-blog/network-pentesting/exploiting-adidns/"
+kind = "research"

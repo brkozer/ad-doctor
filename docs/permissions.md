@@ -21,6 +21,7 @@ the directory.
 - fine-grained password policy settings and `msDS-PSOAppliesTo`, when the account may read them (an ordinary user normally cannot), with one BASE read of `groupType` for each linked group, at most 500 per scan
 - dMSA owner, DACL, `msDS-DelegatedMSAState` and `msDS-GroupMSAMembership`, when the account may see them (an ordinary user normally cannot)
 - `msDS-AllowedToActOnBehalfOfOtherIdentity` (who may delegate to a computer; a list the scan cannot parse is a note, and its edges are left out)
+- `dnsZone` objects under `CN=MicrosoftDNS` in the DomainDnsZones and ForestDnsZones partitions and under `CN=System` (`name`, `dnsProperty`, owner and DACL), and the `objectSid` of DnsAdmins; no zone transfer is attempted
 - one BASE read of each `member` value of a tier-0 group that no search returned, at most 500
   per scan
 

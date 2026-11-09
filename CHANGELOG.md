@@ -7,6 +7,19 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+### Added
+
+- **Active Directory-integrated DNS zones (`AD-DNS-001` to `AD-DNS-003`).** The scan reads the
+  `dnsZone` objects in the DomainDnsZones and ForestDnsZones partitions and in the domain
+  partition, with a bounded parser for `dnsProperty` ([MS-DNSP] 2.3.2.1). AD-DNS-001 reports
+  primary zones that accept nonsecure dynamic updates (high, medium when only reverse zones
+  do). AD-DNS-002 reports zones whose ACL gives write control outside tier 0 and DnsAdmins
+  (medium, high for a broad group on a forward zone). AD-DNS-003 reports, as information
+  only, that authenticated users can add records, which is the default. An unreadable zone
+  is a note and is not reported as passing, and snapshots from older versions say these
+  checks were not evaluated. No zone transfer is attempted. On the lab: the two default zones
+  use secure updates, neither check fires, and AD-DNS-003 lists both zones.
+
 ## [0.2.2] - 2026-11-09
 
 ### Added

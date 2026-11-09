@@ -20,8 +20,8 @@ from ldap3.core.exceptions import (
 )
 from ldap3.protocol.microsoft import security_descriptor_control
 
-from . import gpo_scope, keycred, probes, sd, sysvol
-from .checks import san_note
+from . import dnsprop, gpo_scope, keycred, probes, sd, sysvol
+from .checks import foreign_zone_trustee, san_note
 from .model import (
     TIER0_RIDS,
     UAC,
@@ -32,6 +32,7 @@ from .model import (
     DcProbe,
     DirObject,
     Dmsa,
+    DnsZone,
     DomainPolicy,
     Gmsa,
     GpLink,
@@ -161,6 +162,15 @@ ACCOUNT_ATTRS = [
     *PASSWORD_ATTRIBUTES,
     *LAPS_PASSWORD_ATTRIBUTES,
 ]
+
+
+DNS_DOMAIN_ZONES = "DomainDnsZones"
+DNS_FOREST_ZONES = "ForestDnsZones"
+DNS_LEGACY_ZONES = "domain partition"
+DNS_REVERSE_SUFFIXES = (".in-addr.arpa", ".ip6.arpa")
+# root hints, not a zone clients update; a copy in the domain partition may have no properties
+DNS_ROOT_HINTS = "rootdnsservers"
+DNS_ADMINS_FILTER = "(&(objectClass=group)(sAMAccountName=DnsAdmins))"
 
 
 class CollectError(Exception):
@@ -428,6 +438,9 @@ class Collector:
         dc_sites, site_count = self._dc_sites(config_dn)
         sites, subnets, topology_checked = self._site_topology(config_dn)
         conflicts, conflicts_checked = self._conflicts(domain_dn, config_dn)
+        dns_zones, dns_admin_sids, dns_checked = self._dns_zones(
+            domain_dn, root_dn, domain_sid, root_sid
+        )
         dfsr_flags, frs_dcs, dfsr_dcs, replication_checked = self._sysvol_replication(domain_dn)
         ca_configs = self._ca_configs(dc_dns_host)
 
@@ -441,6 +454,8 @@ class Collector:
         trustees |= {s for d in dmsas for s in d.readers}
         trustees |= {a.sid for d in dmsas for a in d.aces} | {d.owner for d in dmsas if d.owner}
         trustees |= {a.sid for c in ca_configs for a in c.aces}
+        trustees |= {a.sid for z in dns_zones for a in (*z.aces, *z.inheritable)}
+        trustees |= {z.owner for z in dns_zones if z.owner}
         trustees |= {s for a in accounts for s in a.rbcd_principals or ()}
         trustees |= {s for a in accounts for s in a.sid_history if s.startswith("S-1-5-21-")}
         trustees |= {c.owner for c in ca_configs if c.owner}
@@ -525,6 +540,9 @@ class Collector:
             sysvol_replication_checked=replication_checked,
             conflicts=conflicts,
             conflicts_checked=conflicts_checked,
+            dns_zones=dns_zones,
+            dns_zones_checked=dns_checked,
+            dns_admin_sids=dns_admin_sids,
             notes=self.notes,
             ace_inheritance_checked=True,
         )
@@ -976,6 +994,146 @@ class Collector:
         if not ok:
             self.notes.append("conflict object searches refused: AD-INF-021 did not judge them")
         return out, ok
+
+    def _dns_zones(
+        self, domain_dn: str, root_dn: str, domain_sid: str, root_sid: str
+    ) -> tuple[list[DnsZone], list[str], bool]:
+        """The dnsZone objects under CN=MicrosoftDNS in the two DNS application partitions
+        and in the domain partition, and the DnsAdmins SIDs. A DC that holds no copy of a
+        partition cannot answer for it, so that location is a note and not "no zones"."""
+        info = self.conn.server.info
+        held = {str(c).lower() for c in getattr(info, "naming_contexts", None) or []}
+        forest = root_dn or domain_dn
+        partitions = [
+            (DNS_DOMAIN_ZONES, f"DC={DNS_DOMAIN_ZONES},{domain_dn}"),
+            (DNS_FOREST_ZONES, f"DC={DNS_FOREST_ZONES},{forest}"),
+        ]
+        zones: list[DnsZone] = []
+        partition_read = False
+        for source, partition in partitions:
+            if partition.lower() not in held:
+                self.notes.append(
+                    f"this DC holds no copy of {source}: DNS zones stored there not judged "
+                    "(AD-DNS-001 to AD-DNS-003)"
+                )
+                continue
+            found = self._zones_under(f"CN=MicrosoftDNS,{partition}", source, must_exist=True)
+            if found is None:
+                continue
+            partition_read = True
+            zones += found
+        legacy = self._zones_under(
+            f"CN=MicrosoftDNS,CN=System,{domain_dn}", DNS_LEGACY_ZONES, must_exist=False
+        )
+        zones += legacy or []
+        checked = partition_read or bool(legacy)
+        if not checked:
+            self.notes.append(
+                "no DNS zone location could be read: AD-DNS-001 to AD-DNS-003 not judged"
+            )
+        elif not zones:
+            self.notes.append(
+                "no Active Directory-integrated DNS zone was visible: none exist, or this "
+                "account cannot see them"
+            )
+        admin_sids = self._dns_admin_sids(domain_dn, forest, domain_sid, root_sid)
+        self._dns_zone_notes(zones, admin_sids, domain_sid, root_sid)
+        return zones, admin_sids, checked
+
+    def _zones_under(self, base: str, source: str, must_exist: bool) -> list[DnsZone] | None:
+        found = self.attempt(
+            base,
+            "(objectClass=dnsZone)",
+            ["name", "dnsProperty", "nTSecurityDescriptor"],
+            must_exist=must_exist,
+            scope=ldap3.LEVEL,
+            controls=OWNER_AND_DACL,
+        )
+        if found is None:
+            return None
+        return [z for z in (self._dns_zone(e, source) for e in found) if z is not None]
+
+    def _dns_zone(self, e: dict[str, Any], source: str) -> DnsZone | None:
+        dn = e["distinguishedname"][0]
+        name = _first(e, "name") or _rdn_value(dn)
+        # the server's own zones (..TrustAnchors, ..InProgress-, ..Deleted-) and the losers
+        # of a replication conflict do not answer queries under that name
+        if name.startswith("..") or "\ncnf:" in name.lower():
+            return None
+        props = dnsprop.parse(e.get("dnsproperty", []))
+        raw_sd = e.get("ntsecuritydescriptor")
+        try:
+            desc = sd.parse(raw_sd[0]) if raw_sd else sd.Descriptor(None, False, [])
+        except (IndexError, ValueError, struct.error):
+            desc = sd.Descriptor(None, False, [])
+        lowered = f".{name.lower()}"
+        return DnsZone(
+            dn=dn,
+            name=name,
+            source=source,
+            reverse=lowered.endswith(DNS_REVERSE_SUFFIXES),
+            zone_type=props.zone_type,
+            allow_update=props.allow_update,
+            acl_read=bool(desc.aces or desc.inheritable),
+            owner=desc.owner,
+            aces=desc.aces,
+            inheritable=desc.inheritable,
+        )
+
+    def _dns_admin_sids(
+        self, domain_dn: str, forest: str, domain_sid: str, root_sid: str
+    ) -> list[str]:
+        sids: list[str] = []
+        for base in {domain_dn, forest}:
+            for e in self.optional(base, DNS_ADMINS_FILTER, ["objectSid"]):
+                if e.get("objectsid"):
+                    sids.append(sid_to_str(e["objectsid"][0]))
+        if not any(s.startswith(f"{domain_sid}-") for s in sids):
+            self.notes.append(
+                "DnsAdmins not found by name: a renamed group would be listed in AD-DNS-002"
+            )
+        return sorted(sids)
+
+    def _dns_zone_notes(
+        self, zones: list[DnsZone], admin_sids: list[str], domain_sid: str, root_sid: str
+    ) -> None:
+        def shown(names: list[str]) -> str:
+            extra = f" and {len(names) - 5} more" if len(names) > 5 else ""
+            return ", ".join(names[:5]) + extra
+
+        unread = sorted(
+            z.label
+            for z in zones
+            if z.name.lower() != DNS_ROOT_HINTS
+            and (
+                z.zone_type is None
+                or (z.zone_type == dnsprop.ZONE_TYPE_PRIMARY and z.allow_update is None)
+            )
+        )
+        if unread:
+            self.notes.append(
+                f"dynamic update setting of {len(unread)} DNS zone(s) not readable, "
+                f"AD-DNS-001 did not judge them: {shown(unread)}"
+            )
+        closed = sorted(z.label for z in zones if not z.acl_read)
+        if closed:
+            self.notes.append(
+                f"security descriptor of {len(closed)} DNS zone(s) not readable, "
+                f"AD-DNS-002 and AD-DNS-003 did not judge them: {shown(closed)}"
+            )
+        foreign = sorted(
+            z.label
+            for z in zones
+            if any(
+                foreign_zone_trustee(z, sid, domain_sid, root_sid, admin_sids)
+                for sid in {a.sid for a in (*z.aces, *z.inheritable)} | {z.owner or ""}
+            )
+        )
+        if foreign:
+            self.notes.append(
+                f"{len(foreign)} forest-wide DNS zone(s) name principals of another domain "
+                f"that AD-DNS-002 cannot place: {shown(foreign)}"
+            )
 
     def _sysvol_replication(self, domain_dn: str) -> tuple[int | None, list[str], list[str], bool]:
         """The domain's migration state, and which DCs hold an FRS or DFSR SYSVOL

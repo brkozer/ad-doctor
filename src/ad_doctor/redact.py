@@ -57,6 +57,8 @@ KEEP = {
     # the checks find Exchange servers by these group names
     *model.EXCHANGE_GROUPS,
     model.DEFAULT_POLICY_MODULE.lower(),
+    # where Active Directory keeps DNS zones
+    "microsoftdns", "domaindnszones", "forestdnszones",
     # the fixed parts of enrollment URLs
     "certsrv", "service.svc", "ces",
     # DN attribute types: a host label with one of these names must not rewrite every DN
@@ -105,7 +107,7 @@ FIXED_KEYS = {
                 model.Gmsa, model.Rodc, model.Trust, model.Gpo, model.GppPassword,
                 model.ScriptSecret, model.GpoLocalGroup, model.GpLink,
                 model.UnreadableMember, model.KeyCredential, model.Site, model.Subnet,
-                model.ConflictObject, model.Pso, model.Dmsa)
+                model.ConflictObject, model.Pso, model.Dmsa, model.DnsZone)
     for f in dataclasses.fields(cls)
 } | {"domain", "AdminSDHolder", "sid", "mask", "object_type", "inherited_object_type"}  # fmt: skip
 # values from a fixed list, which the checks compare: never data, whatever the names around
@@ -219,6 +221,9 @@ class Redactor:
             words.update([dmsa["name"], *_dn_values(dmsa["dn"])])
             if dmsa.get("preceded_by"):
                 words.update(_dn_values(dmsa["preceded_by"]))
+        # the whole name only: the labels of a reverse zone are the digits of its network
+        for zone in data.get("dns_zones", []):
+            words.update([zone["name"], *_dn_values(zone["dn"])])
         for o in data.get("objects", []):
             words.add(o["name"])
             words.update(_dn_values(o["dn"]))

@@ -22,13 +22,18 @@ pytestmark = pytest.mark.lab
 # AD-ACC-005, AD-ACC-011 and AD-KRB-006 (need time to pass), AD-ACC-007 and AD-INF-006
 # (need a real second domain), AD-ACC-014 and AD-INF-018 (need time to pass), AD-ACC-015,
 # AD-INF-019, AD-INF-020 and AD-INF-021 (not in the lab, read in the test below), AD-ACC-016,
-# AD-POL-003, AD-ACL-009 and AD-KRB-007 (not in the lab or not readable by adreader), AD-INF-012
+# AD-POL-003, AD-ACL-009 and AD-KRB-007 (not in the lab or not readable by adreader), AD-DNS-001
+# and AD-DNS-002 (the lab's zones have the default settings), AD-INF-012
 # (needs an RODC), AD-ACC-009 (confidential on 2025),
 # AD-INF-008 (DCs require SMB signing), AD-INF-009 and the high grade of AD-CHAIN-002/003
 # (no spooler on Server Core 2025), AD-INF-011 (needs a week without backup), AD-INF-003 (a
 # 2025 DC needs level 2016), AD-INF-013 and AD-ADCS-016 (need a host the probes cannot read)
 # and AD-PRIV-001 (not seeded: no tier-0 group here has more than five members).
 EXPECTED = {
+    "AD-DNS-003": {
+        "_msdcs.adlab.test (ForestDnsZones): Authenticated Users",
+        "adlab.test (DomainDnsZones): Authenticated Users",
+    },
     "AD-KRB-002": {"legacy_app"},
     "AD-KRB-003": {"svc_sql", "svc_web"},
     "AD-KRB-004": {"des_user"},
@@ -269,6 +274,16 @@ def test_plain_user_cannot_read_psos_or_dmsas(snap: Snapshot) -> None:
     assert any("AD-POL-003" in n for n in snap.notes)
     assert snap.dmsas_checked and snap.dmsas == []
     assert any("AD-ACL-009" in n for n in snap.notes)
+
+
+def test_plain_user_reads_dns_zones(snap: Snapshot, findings: dict[str, set[str]]) -> None:
+    assert snap.dns_zones_checked and len(snap.dns_admin_sids) == 1
+    zones = {z.label: z for z in snap.dns_zones}
+    for label in ("adlab.test (DomainDnsZones)", "_msdcs.adlab.test (ForestDnsZones)"):
+        assert (zones[label].zone_type, zones[label].allow_update) == (1, 2)
+        assert zones[label].acl_read and not zones[label].reverse
+    assert not {"AD-DNS-001", "AD-DNS-002"} & findings.keys()
+    assert not any("DNS zone" in n for n in snap.notes)
 
 
 def test_every_dc_probed(snap: Snapshot) -> None:

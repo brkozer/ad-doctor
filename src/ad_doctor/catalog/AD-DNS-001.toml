@@ -1,0 +1,79 @@
+id = "AD-DNS-001"
+aliases = ["dns-nonsecure-updates"]
+summary = "Primary DNS zones stored in Active Directory accept dynamic updates from anyone, without authentication."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when any forward lookup zone accepts nonsecure updates: those names are what clients connect to.
+**Medium** when only reverse lookup zones do.
+"""
+mitre = ["T1557"]
+data_sources = ["ldap"]
+attributes = ["dnsProperty"]
+related = ["AD-DNS-002", "AD-DNS-003"]
+since = "0.2.3"
+
+risk = """
+A zone set to **Nonsecure and secure** takes a dynamic update from any host that can reach one of
+its DNS servers, with no logon and no signature. An attacker can add a name or replace the address
+of one that exists, and receive the connections, credentials and relayable authentication of the
+clients that use it. Windows offers **Secure only** on every zone stored in Active Directory, so
+this setting is rarely needed.
+"""
+
+detection = """
+From the LDAP snapshot: the `dnsZone` objects under `CN=MicrosoftDNS` in the DomainDnsZones and
+ForestDnsZones partitions and under `CN=System` in the domain partition. The `dnsProperty` values are
+parsed as [MS-DNSP] 2.3.2.1 describes, with every length checked. The check reads property 0x01, the
+zone type, and property 0x02, the dynamic update setting (0 none, 1 nonsecure and secure, 2 secure only).
+Only primary zones are judged: stub and conditional forwarder zones take no updates.
+
+**Unknown is not clean.** A value that is missing, malformed or stored twice with different contents
+is "unknown", the zone is named in a note, and it is not reported as passing. A DC that holds no copy of a
+partition cannot answer for it, which is also a note. File-backed zones are not in the directory and
+are not seen. The server's internal zones (`..TrustAnchors` and similar) and the copies replication
+renamed are skipped.
+"""
+
+false_positives = """
+- **A DNS server used by clients that cannot authenticate** (some appliances) may need this on purpose.
+  Move those clients to static records, or to their own zone, instead of opening the main one.
+"""
+
+remediation = """
+1. **Review** which zones and clients are affected (read-only):
+
+    ```powershell
+    Get-DnsServerZone | Select-Object ZoneName, ZoneType, DynamicUpdate
+    ```
+
+2. **Switch the zone to secure updates.** Clients that are not domain members can then no longer
+   register, so test first:
+
+    ```powershell
+    Set-DnsServerPrimaryZone -Name 'corp.example' -DynamicUpdate Secure -WhatIf
+    ```
+
+3. **Look for records** added while the zone was open, and remove the ones nobody can explain.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-DNS-001"
+
+[[references]]
+title = "[MS-DNSP]: dnsProperty"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dnsp/445c7843-e4a1-4222-8c0f-630c230a4c80"
+kind = "spec"
+
+[[references]]
+title = "[MS-DNSP]: Property Id"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dnsp/3af63871-0cc4-4179-916c-5caade55a8f3"
+kind = "spec"
+
+[[references]]
+title = "[MS-DNSP]: DNS_RPC_ZONE_INFO_W2K (fAllowUpdate)"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dnsp/e8651544-0fbb-4038-8232-375ff2d8a55e"
+kind = "spec"
+
+[[references]]
+title = "Set-DnsServerPrimaryZone"
+url = "https://learn.microsoft.com/en-us/powershell/module/dnsserver/set-dnsserverprimaryzone"
+kind = "vendor"
