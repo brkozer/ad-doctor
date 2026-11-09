@@ -24,6 +24,7 @@ import base64
 import copy
 import gzip
 import hashlib
+import itertools
 import json
 import re
 from dataclasses import dataclass
@@ -101,6 +102,7 @@ def viewmodel(r: Report, snap: Snapshot | None, opts: Options) -> dict[str, Any]
         _finding(f, d, snap, opts) for f, d in zip(r.findings, rep["findings"], strict=True)
     ]
     path_block = _paths(r.findings)
+    path_ids: list[str] = path_block.pop("node_ids") if path_block else []
     counts = r.counts()
     vm: dict[str, Any] = {
         "schema": SCHEMA,
@@ -126,18 +128,36 @@ def viewmodel(r: Report, snap: Snapshot | None, opts: Options) -> dict[str, Any]
         "whatif_model": None,
     }
     if snap is not None and opts.graph != "none":
-        _graph(vm, snap, opts)
+        _graph(vm, snap, opts, path_ids)
     vm["lifecycle"] = _lifecycle(vm)
     return vm
 
 
-def _graph(vm: dict[str, Any], snap: Snapshot, opts: Options) -> None:
+def _graph(vm: dict[str, Any], snap: Snapshot, opts: Options, path_ids: list[str]) -> None:
     if opts.graph == "full":
         g = paths.build(snap, provenance=True)
         vm["graph"] = viewer_graph.compact(g, snap)
         vm["blast"] = {"mode": "full"}
+        doc = opts.whatif or {}
         plan_ids = [c["id"] for c in (vm["whatif"] or {}).get("changes", []) if c.get("id")]
-        vm["whatif_model"] = viewer_graph.whatif_model(g, snap, vm["graph"], plan_ids)
+        assume = [str(a["node"]) for a in doc.get("assumptions") or [] if a.get("node")]
+        goal = (doc.get("recommendation") or {}).get("goal")
+        steps: list[tuple[str, str]] = []
+        for p in (vm["paths"] or {}).get("list", []):
+            ids = [p["start"], *(s["node"] for s in p["steps"])]
+            steps += [(path_ids[a], path_ids[b]) for a, b in itertools.pairwise(ids)]
+        model = viewer_graph.whatif_model(
+            g,
+            snap,
+            vm["graph"],
+            plan_ids,
+            assume,
+            goal if goal == "all-paths" else "exposure",
+            steps,
+        )
+        where = {n: i for i, n in enumerate(viewer_graph.nodes_of(g))}
+        model["path_nodes"] = [where.get(n, -1) for n in path_ids]
+        vm["whatif_model"] = model
     else:
         analysis = paths.analyze(snap)
         subjects = viewer_graph.precomputed(analysis.graph, snap, analysis, opts.blast_for or [])
@@ -421,6 +441,7 @@ def _paths(findings: list[Finding]) -> dict[str, Any] | None:
         "users": users,
         "broad": "Broad groups have a path" in f.detail,
         "nodes": nodes,
+        "node_ids": list(index),
         "list": rows,
         "chokepoints": chokepoints,
         "mermaid": "\n".join(mermaid[1:-1]),  # without the Markdown fence

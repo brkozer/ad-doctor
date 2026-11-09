@@ -9,11 +9,14 @@ logic or severity between versions, but an ID is never reused for something else
 
 ### Added
 
-- `ad-doctor view` with the full graph embeds what the page needs to evaluate a set of
-  removals, and `core.js` ports the evaluation: masked graph, tier 0 after the changes,
-  exposure, holders, and paths closed, rerouted, open and new. Changes that need a rebuild
-  are marked and get no number; findings are not rechecked in the browser. There is no
-  screen for it yet, and no interactive what-if above the full-graph limit.
+- `ad-doctor view` with the full graph has an interactive What-if screen. It starts from
+  the embedded plan, or from nothing; each change can be turned on and off, and new ones
+  come from the edges and chokepoints on Control paths. Exposure, holders, routes and the
+  paths closed, rerouted, open and new follow live, computed in the page on the
+  same model as `whatif` and checked against it. The difference from the plan in the file
+  is shown; changes that need a rebuild are unavailable with the reason and get no number.
+  *Download plan.toml* writes a file `whatif --plan` accepts. Findings are not rechecked
+  in the browser, and there is no interactive what-if above the full-graph limit.
 
 ## [0.2.2] - 2026-11-09
 

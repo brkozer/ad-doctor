@@ -40,6 +40,7 @@ for (const file of files) {
     assert.equal(base.after.users, data.before.users, "users before");
     assert.equal(base.after.holders, data.before.holders, "holders before");
     assert.equal(base.after.reaching, data.before.found, "found before");
+    assert.equal(base.after.routes, data.before.routes, "routes before");
     assert.deepEqual(base.closed, []);
     assert.deepEqual(base.rerouted, []);
     assert.deepEqual(base.new, []);
@@ -75,6 +76,7 @@ for (const file of files) {
       assert.equal(holders.length, c.holder_count, "holders " + where);
       assert.deepEqual(holders.slice(0, 10), c.holders_first, "holders " + where);
       assert.equal(digest(holders), c.holders, "holders " + where);
+      assert.equal(r.after.routes, c.routes, "routes " + where);
       assert.equal(r.after.exposed, c.exposed, "exposed " + where);
       assert.equal(r.after.users, c.users, "users " + where);
       assert.equal(r.closed.length, c.closed_count, "closed " + where);

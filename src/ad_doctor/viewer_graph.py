@@ -20,9 +20,9 @@ import heapq
 from collections.abc import Iterable
 from typing import Any
 
-from . import changes, checks, paths, whatif
+from . import changes, checks, cut, paths, whatif
 from .model import Snapshot
-from .provenance import FACT_GATES, Options, Provenance
+from .provenance import FACT_GATES, FIXED_REASONS, Options, Provenance
 
 FULL_GRAPH_OBJECTS = 50_000
 HOLDERS = 25  # path holders precomputed in paths mode, in report order
@@ -355,14 +355,126 @@ def _tier0_model(
     }
 
 
+def _offered(g: paths.Graph, edges: Iterable[tuple[str, str]]) -> set[int]:
+    """The primitives behind these edges (source, target; parallel ones too): the page can
+    add a change from a path it shows, so those are the ones it has to name."""
+    prov = g.prov
+    assert prov is not None
+    out: set[int] = set()
+    for src, target in set(edges):
+        for i, (dst, _) in enumerate(g.edges.get(src, ())):
+            if dst != target:
+                continue
+            ex = prov.extra.get((src, i))
+            if isinstance(ex, Options):
+                out.update(p for p, _ in ex.items if p >= 0)
+            elif ex is not None:
+                out.add(ex.prim)
+            elif prov.why[src][i] >= 0:
+                out.add(prov.why[src][i])
+    return out
+
+
+def _rebuild_reason(prov: Provenance, p: int) -> str:
+    """Why the page cannot evaluate this change (Provenance.needs_rebuild), or ""."""
+    if not prov.needs_rebuild(p):
+        return ""
+    if prov.scope_sensitive(p):
+        return "it can move GPO scope"
+    if prov.prims[p][1] in prov.condition_groups:
+        return "it decides whether a delegation edge exists"
+    return "it can take a CA right holder out of tier 0, which adds an edge"
+
+
+def _change_rows(
+    g: paths.Graph,
+    snap: Snapshot,
+    numbers: dict[int, int],
+    wanted: Iterable[int],
+    tier0: set[str],
+) -> list[list[Any]]:
+    """[number, change ID, identity values, label, cost, warning, why it needs a rebuild] of
+    the changes on the page's paths and in its plan. Only these: at 10,000 users a row
+    for every primitive would cost more than the rest of the model."""
+    prov = g.prov
+    assert prov is not None
+    where = changes.Where(snap, prov)
+    ctx = changes.Context(snap)
+    keeps = changes.default_keeps(snap, prov)
+    rows = []
+    for p in sorted(wanted, key=numbers.__getitem__):
+        key = prov.prims[p]
+        verdict = changes.assess(snap, key, tier0, ctx)
+        warning = keeps.get(p, "") or (verdict.warning if verdict.cls == "warn" else "")
+        label = changes.describe(snap, key, where)
+        cid = changes.change_id(key)
+        rows.append(
+            [numbers[p], cid, list(key[1:]), label, verdict.cost, warning, _rebuild_reason(prov, p)]
+        )
+    return rows
+
+
+def _flow(
+    snap: Snapshot,
+    g: paths.Graph,
+    view: paths.Graph,
+    numbers: dict[int, int],
+    extra: list[str],
+    goal: str,
+) -> dict[str, Any]:
+    """The network behind `routes` (cut.build_model with `whatif`'s default keeps). arcs:
+    the forward arcs in runs by source, [source delta, count, target deltas...]. prim:
+    [pin delta, number] per change, in order of pin; a change is the arc pin -> pin + 1.
+    dropped: the changes it has no arc for (cut.routes builds a new network for those; the
+    page does not)."""
+    prov = g.prov
+    assert prov is not None
+    sources = cut.sources_for(snap, view, goal)
+    m = cut.build_model(snap, g, sources, changes.default_keeps(snap, prov), extra)
+    to = m.net.to
+    pairs = sorted((to[i + 1], to[i]) for i in range(0, len(to), 2))
+    arcs: list[int] = []
+    last_src = 0
+    at = 0
+    while at < len(pairs):
+        src = pairs[at][0]
+        end = at
+        while end < len(pairs) and pairs[end][0] == src:
+            end += 1
+        arcs += [src - last_src, end - at, *_deltas(b for _, b in pairs[at:end])]
+        last_src, at = src, end
+    pins = sorted((to[e + 1], numbers[p]) for p, e in m.prim_arc.items())
+    assert all(to[e] == to[e + 1] + 1 for e in m.prim_arc.values())
+    prim: list[int] = []
+    last = 0
+    for pin, num in pins:
+        prim += [pin - last, num]
+        last = pin
+    return {
+        "n": len(m.net.head),
+        "s": m.s,
+        "t": m.t,
+        "arcs": arcs,
+        "prim": prim,
+        "dropped": sorted(numbers[p] for p in m.dropped),
+    }
+
+
 def whatif_model(
-    g: paths.Graph, snap: Snapshot, data: dict[str, Any], plan_ids: Iterable[str] = ()
+    g: paths.Graph,
+    snap: Snapshot,
+    data: dict[str, Any],
+    plan_ids: Iterable[str] = (),
+    assume: Iterable[str] = (),
+    goal: str = "exposure",
+    path_edges: Iterable[tuple[str, str]] = (),
 ) -> dict[str, Any]:
     """What the page needs to evaluate a set of removals (`g` built with provenance, `data`
     its compact form, whose label table gains the labels an edge falls back to). core.js
     ports whatif.masked and the state of AD-PATH-001 over this; the Node tests compare it
-    with Python for every fixture. Primitives are numbers: the page names none of them
-    yet, and at 10,000 users one change ID each would cost more than everything here.
+    with Python for every fixture. Primitives are numbers; `changes` names the ones behind
+    `path_edges` (the steps of the paths the page shows) and in the plan. `assume` holds the
+    nodes a plan treats as tier 0.
 
     - prim: per edge, -1 - reason for a fixed edge, 0 for the next new primitive, else
       1 + an earlier primitive. options and gated hold the edges with more than one
@@ -372,12 +484,16 @@ def whatif_model(
       search, and a source that cannot reach tier 0 before a removal cannot after one.
     - rebuild: primitives the mask does not model (Provenance.needs_rebuild); the page
       sends those to the command line and shows no number for them.
+    - changes, fields: what the page shows of a change and writes to a plan file.
+    - net: the flow network the routes number comes from (`goal` picks its sources).
     """
     prov = g.prov
     assert prov is not None
     order = nodes_of(g)
     index = {n: i for i, n in enumerate(order)}
     numbers = prim_numbers(g)
+    extra = [n for n in dict.fromkeys(assume) if n in index]
+    view = whatif.masked(g, snap, (), extra)
     base: dict[str, int] = {}
     total = 0
     prim: list[int] = []
@@ -410,12 +526,12 @@ def whatif_model(
         if isinstance(ex, Options):
             dst = g.edges[src][i][0]
             options.append(
-                [edge, [[numbers[p] if p >= 0 else -1, label_of(src, dst, h)] for p, h in ex.items]]
+                [edge, [[numbers[p] if p >= 0 else p, label_of(src, dst, h)] for p, h in ex.items]]
             )
         else:
             gated.append([edge, numbers[ex.prim], ex.gate])
 
-    reach = whatif.reaching(g)
+    reach = whatif.reaching(view)
     seq: list[int] = []
     last = 0
     for i, node in enumerate(order):
@@ -434,11 +550,14 @@ def whatif_model(
         prim_kind[numbers[p]] = kinds.setdefault(key[0], len(kinds))
     wanted = set(plan_ids)
     plan = {}
+    named = _offered(g, path_edges)
     if wanted:
         for p, key in enumerate(prov.prims):
             cid = changes.change_id(key)
             if cid in wanted:
                 plan[cid] = numbers[p]
+                named.add(p)
+    rows = _change_rows(g, snap, numbers, named, set(view.tier0))
     return {
         "prim": prim,
         "prim_kind": prim_kind,
@@ -470,4 +589,11 @@ def whatif_model(
         "not_sid": _deltas(i for i, n in enumerate(order) if not n.startswith("sid:")),
         "tier0": _tier0_model(g, snap, prov, index, numbers, base),
         "plan": plan,
+        "fixed": list(FIXED_REASONS),
+        "fields": {kind: list(names) for kind, names in changes.FIELDS.items()},
+        "changes": rows,
+        "net": _flow(snap, g, view, numbers, extra, goal),
+        "goal": goal,
+        "assume": [[index[n], n] for n in extra],
+        "path_nodes": [],
     }

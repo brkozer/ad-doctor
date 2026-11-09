@@ -371,10 +371,46 @@ ad-doctor view snap.json --whatif plan.json
 ```
 
 The JSON must come from the same snapshot file (its SHA-256 is checked) or, for a
-JSON report, the same domain. The screen shows what was computed on the command line; it
-does not run a new plan in the page. Fix lines on the page are built from the snapshot
-for each change ID, never read from the JSON, and an ID the snapshot does not have is
-refused.
+JSON report, the same domain. Fix lines on the page are built from the snapshot for each
+change ID, never read from the JSON, and an ID the snapshot does not have is refused.
+
+<p align="center"><img src="viewer-whatif.png" alt="What-if screen on a redacted lab snapshot: one change of the plan turned off, exposure, principals with a path and routes before and after, and the difference from the plan in the file" width="85%"></p>
+
+With the full graph (`--graph full`, the default up to 50,000 objects) the screen is
+interactive. It starts from the plan the file carries, or from nothing:
+
+- Each change has a box. Unticking or ticking it recomputes, in the page and on the same
+  model as `whatif`, exposed users, principals with a path, routes (changes needed) and the
+  paths closed, rerouted, still open and new. *Start from nothing* and *Back to the plan*
+  reset the selection.
+- On Control paths every step of a path and every chokepoint has *Add to what-if*. A
+  chokepoint that is a node adds the edges into it on the shown paths. An edge whose reason
+  is structure (`contains`, GPO scope and the others under "Not removable") says why.
+- A panel compares the selection with the plan in the file: its numbers and the changes
+  left out and added.
+- A change that needs a rebuild (it can move GPO scope, take a CA right holder out of tier
+  0, or decide whether a delegation edge exists) is unavailable, with the reason. The page
+  shows no number for it, even as part of a set, and leaves it out of the download: the file
+  lists its ID as a comment. So does a change with no edge in this graph.
+- *Download plan.toml* writes the selection in the format above; `whatif --plan` accepts it.
+  It has no `[expect]` and no `[[keep]]`: those are decisions the page does not know. The goal
+  is `exposure`, or `all-paths` when the plan was made for it; `from` plans are written as
+  `exposure`. `[assume] tier0` is kept.
+
+Findings are not rechecked in the browser, and the page says so: run `whatif` on the snapshot
+for the findings that would clear. Routes are the same maximum flow as the command line
+with its default kept changes, so a plan made with `--keep` or a `[[keep]]` can count
+differently (the page says when its numbers differ from the plan's). Nothing is stored; the
+selection lives in the tab and is gone on Lock or reload. Above the full-graph limit the screen
+only shows the plan.
+
+The numbers come from the same model and are checked: `tests/js/whatif.test.mjs` compares
+the page's graph, tier 0, paths, holders, exposure and routes with Python for every
+fixture, and a Playwright test feeds a downloaded plan to `whatif --plan` and compares the
+result with what the page showed. On the lab, a selection of a plan with one change off and
+one added from a chokepoint gave 19 of 20 users exposed, 4 principals with a path, 2 routes
+on the page and from `ad-doctor whatif --plan`; on a 10,000-user bench domain, 4,300 of
+9,949, 183 and 2 on both.
 
 ## Limits
 

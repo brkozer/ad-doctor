@@ -7,6 +7,9 @@
 // - edgeKind(): the family of a control edge, for the path filters.
 // - whatifModel(), whatifMask(), whatifEvaluate(): a port of whatif.masked and the path half
 //   of whatif.run over the model viewer_graph.whatif_model embeds. Findings are not rechecked.
+// - whatifRoutes(): the maximum flow of cut.routes over the embedded network.
+// - whatifEdgeChanges(), whatifFindEdge(): which changes an edge of a path comes from.
+// - whatifPlanToml(): a plan file in the format planfile.py reads and writes.
 // - acceptDraft(): accept-draft.toml in the format accept.py reads.
 // - parseReport(), diffReports(): an ad-hoc diff against a dropped JSON report, keyed like
 //   `ad-doctor diff` (check, object identity).
@@ -269,12 +272,21 @@ const CORE = (function () {
     }
     const pairs = new Map();
     for (const [p, group, member] of raw.tier0.pairs) pairs.set(p, [group, member]);
+    const baseTier0 = G.tier0.slice();
+    for (const [node] of raw.assume) baseTier0[node] = 1;
+    const names = new Map();
+    for (const [num, id, values, label, cost, warning, rebuild] of raw.changes) {
+      names.set(num, { num: num, id: id, kind: raw.kinds[raw.prim_kind[num]], values: values,
+        label: label, cost: cost, warning: warning, rebuild: rebuild });
+    }
     return {
       prim: prim, primKind: raw.prim_kind, kinds: raw.kinds, count: raw.prim_kind.length,
       special: special, options: options, gated: gated, gates: raw.gates, templates: templates,
       eku: raw.eku, seq: seq, sources: sources, notSid: notSid, rebuild: rebuild,
       tier0: raw.tier0, tier0Kinds: new Set(raw.tier0.kinds), pairs: pairs,
       memberOf: G.labels.indexOf("member of"), plan: raw.plan, before: null,
+      baseTier0: baseTier0, assume: raw.assume, names: names, fieldNames: raw.fields, fixed: raw.fixed,
+      goal: raw.goal, pathNodes: raw.path_nodes, net: raw.net, flow: null, routesBefore: null,
     };
   }
 
@@ -382,7 +394,7 @@ const CORE = (function () {
 
   // whatif._tier0, for changes that can take something out of tier 0
   function tier0After(G, W, removed, gone, closed) {
-    if (!removed.some((p) => W.tier0Kinds.has(W.kinds[W.primKind[p]]))) return G.tier0;
+    if (!removed.some((p) => W.tier0Kinds.has(W.kinds[W.primKind[p]]))) return W.baseTier0;
     const T = W.tier0;
     const tier0 = new Uint8Array(G.n);
     for (const i of T.fixed) tier0[i] = 1;
@@ -400,6 +412,7 @@ const CORE = (function () {
         if (hidden || !dropped.has(id)) tier0[node] = 1;
       }
     }
+    for (const [node] of W.assume) tier0[node] = 1;
     return tier0;
   }
 
@@ -425,7 +438,7 @@ const CORE = (function () {
   // returns, so reachable() and blastRadius() work on it unchanged. `removed` is an array
   // of primitive numbers.
   function whatifMask(G, W, removed) {
-    if (!removed.length) return Object.assign({}, G, { order: W.sources });
+    if (!removed.length) return Object.assign({}, G, { order: W.sources, tier0: W.baseTier0 });
     const gone = new Uint8Array(W.count);
     for (const p of removed) gone[p] = 1;
     const closed = new Uint8Array(W.gates.length);
@@ -544,6 +557,156 @@ const CORE = (function () {
     return M.names[node] + " -[" + M.labels[h[1]] + "]-> " + M.names[h[0]] + stepsText(M, S, h[0]);
   }
 
+  // The network as arrays, built on first use: arc 2i is the i-th forward arc, 2i + 1 its
+  // reverse, adj[off[x]..off[x + 1]] the arcs leaving x.
+  function flowNet(W) {
+    if (W.flow) return W.flow;
+    const net = W.net;
+    const pairs = []; // source, target, per forward arc
+    for (let i = 0, src = 0; i < net.arcs.length;) {
+      src += net.arcs[i++];
+      const count = net.arcs[i++];
+      let dst = 0;
+      for (let k = 0; k < count; k++) {
+        dst += net.arcs[i++];
+        pairs.push(src, dst);
+      }
+    }
+    const arcs = pairs.length / 2;
+    const off = new Int32Array(net.n + 1);
+    for (let i = 0; i < arcs; i++) {
+      off[pairs[2 * i] + 1]++;
+      off[pairs[2 * i + 1] + 1]++;
+    }
+    for (let i = 0; i < net.n; i++) off[i + 1] += off[i];
+    const fill = off.slice(0, net.n);
+    const adj = new Int32Array(2 * arcs);
+    const to = new Int32Array(2 * arcs);
+    for (let i = 0; i < arcs; i++) {
+      const a = pairs[2 * i];
+      const b = pairs[2 * i + 1];
+      to[2 * i] = b;
+      to[2 * i + 1] = a;
+      adj[fill[a]++] = 2 * i;
+      adj[fill[b]++] = 2 * i + 1;
+    }
+    const byPin = new Map();
+    for (let i = 0, pin = 0; i < net.prim.length; i += 2) {
+      pin += net.prim[i];
+      byPin.set(pin, net.prim[i + 1]);
+    }
+    const primArc = [];
+    for (let i = 0; i < arcs; i++) {
+      const num = byPin.get(pairs[2 * i]);
+      if (num !== undefined && pairs[2 * i + 1] === pairs[2 * i] + 1) primArc.push([num, i]);
+    }
+    W.flow = { off: off, adj: adj, to: to, primArc: primArc, dropped: new Set(net.dropped), s: net.s, t: net.t, n: net.n };
+    return W.flow;
+  }
+
+  const FLOW_INF = 1000000000;
+
+  // Dinic: only the value is used, and the value of a maximum flow does not depend on the
+  // order the arcs are tried in.
+  function maxFlow(F, cap) {
+    const level = new Int32Array(F.n);
+    const next = new Int32Array(F.n);
+    const queue = new Int32Array(F.n);
+    const stack = new Int32Array(F.n);
+    let flow = 0;
+    for (;;) {
+      level.fill(-1);
+      level[F.s] = 0;
+      let head = 0;
+      let tail = 0;
+      queue[tail++] = F.s;
+      while (head < tail) {
+        const x = queue[head++];
+        for (let i = F.off[x]; i < F.off[x + 1]; i++) {
+          const arc = F.adj[i];
+          if (cap[arc] > 0 && level[F.to[arc]] < 0) {
+            level[F.to[arc]] = level[x] + 1;
+            queue[tail++] = F.to[arc];
+          }
+        }
+      }
+      if (level[F.t] < 0) return flow;
+      next.set(F.off.subarray(0, F.n));
+      let depth = 0;
+      for (;;) {
+        const x = depth === 0 ? F.s : F.to[stack[depth - 1]];
+        if (x === F.t) {
+          let push = FLOW_INF;
+          for (let i = 0; i < depth; i++) if (cap[stack[i]] < push) push = cap[stack[i]];
+          flow += push;
+          let lowest = -1;
+          for (let i = depth - 1; i >= 0; i--) {
+            cap[stack[i]] -= push;
+            cap[stack[i] ^ 1] += push;
+            if (cap[stack[i]] === 0) lowest = i;
+          }
+          depth = lowest;
+          if (flow >= FLOW_INF) return flow;
+          continue;
+        }
+        let advanced = false;
+        for (; next[x] < F.off[x + 1]; next[x]++) {
+          const arc = F.adj[next[x]];
+          if (cap[arc] > 0 && level[F.to[arc]] === level[x] + 1) {
+            stack[depth++] = arc;
+            advanced = true;
+            break;
+          }
+        }
+        if (advanced) continue;
+        if (depth === 0) break;
+        level[x] = -1;
+        depth--;
+        next[depth === 0 ? F.s : F.to[stack[depth - 1]]]++;
+      }
+    }
+  }
+
+  // cut.routes: the changes still needed, every change at cost 1. null when a removal has
+  // no arc in the network (Python builds a new network then).
+  function whatifRoutes(W, removed) {
+    const F = flowNet(W);
+    if (removed.some((p) => F.dropped.has(p))) return null;
+    const cap = new Int32Array(F.to.length);
+    for (let i = 0; i < cap.length; i += 2) cap[i] = FLOW_INF;
+    const gone = new Set(removed);
+    for (const [p, arc] of F.primArc) cap[2 * arc] = gone.has(p) ? 0 : 1;
+    const flow = maxFlow(F, cap);
+    return flow >= FLOW_INF ? -1 : flow;
+  }
+
+  // The edge from one node to another with this label as a path shows it, or -1.
+  function whatifFindEdge(G, from, to, how) {
+    let any = -1;
+    for (let e = G.off[from]; e < G.off[from + 1]; e++) {
+      if (G.dst[e] !== to) continue;
+      const label = G.labels[G.how[e]];
+      if (label === how || label.startsWith(how + " (")) return e;
+      if (any < 0) any = e;
+    }
+    return any;
+  }
+
+  // What taking an edge out means: every change that keeps it alive, or why no change can.
+  function whatifEdgeChanges(W, e) {
+    if (W.special[e]) {
+      const opts = W.options.get(e);
+      if (opts) {
+        const stuck = opts.find(([p]) => p < 0);
+        if (stuck) return { prims: [], fixed: W.fixed[-1 - stuck[0]] };
+        return { prims: Array.from(new Set(opts.map(([p]) => p))), fixed: null };
+      }
+      return { prims: [W.gated.get(e)[0]], fixed: null };
+    }
+    const p = W.prim[e];
+    return p < 0 ? { prims: [], fixed: W.fixed[-1 - p] } : { prims: [p], fixed: null };
+  }
+
   // whatif.run's path half for a set of removals. Either {rebuild: [...]} with no numbers
   // (the mask does not model those), or before/after, tier 0 after the changes and each
   // holder of before closed, rerouted or open, plus the holders that are new. `note`
@@ -578,11 +741,13 @@ const CORE = (function () {
     for (const [node, h] of A.holders) {
       if (!B.holders.has(node)) fresh.push({ node: node, path: holderText(M, A, node, h) });
     }
-    const numbers = (S) => ({ exposed: S.exposed, users: S.users, holders: S.holders.size, reaching: S.order.length });
+    if (W.routesBefore === null) W.routesBefore = whatifRoutes(W, []);
+    const numbers = (S, routes) => ({ exposed: S.exposed, users: S.users, holders: S.holders.size,
+      reaching: S.order.length, routes: routes });
     const tier0 = [];
     for (let i = 0; i < M.n; i++) if (M.tier0[i]) tier0.push(i);
     return {
-      rebuild: [], before: numbers(B), after: numbers(A), tier0: tier0,
+      rebuild: [], before: numbers(B, W.routesBefore), after: numbers(A, whatifRoutes(W, removed)), tier0: tier0,
       closed: closed, rerouted: rerouted, open: open, new: fresh,
       findings_rechecked: false, note: WHATIF_FINDINGS_NOTE,
       graph: M, state: A,
@@ -607,6 +772,34 @@ const CORE = (function () {
       else out += ch;
     }
     return out + '"';
+  }
+
+  // A snapshot's collected_at as TOML wants it, or null: planfile.dumps writes UTC seconds.
+  function tomlDateTime(iso) {
+    const text = String(iso);
+    const ms = Date.parse(/(Z|[+-]\d\d:\d\d)$/.test(text) ? text : text + "Z");
+    return isNaN(ms) ? null : new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+  }
+
+  // planfile.dumps for changes of the page: same header, tables and escaping. `info` has
+  // domain, domain_sid, made_against, made_by, goal, assume (node IDs) and skipped (change
+  // IDs left out, written as comments: those IDs are hex, so no directory text gets there).
+  function whatifPlanToml(entries, info) {
+    const lines = ["# ad-doctor plan for " + (commentText(info.domain) || "a domain") +
+      ": changes to make in AD, checked with `ad-doctor whatif SNAPSHOT --plan FILE --check`",
+    "schema = 1", "", "[plan]",
+    "domain = " + tomlString(info.domain), "domain_sid = " + tomlString(info.domain_sid)];
+    const made = tomlDateTime(info.made_against);
+    if (made) lines.push("made_against = " + made);
+    lines.push("made_by = " + tomlString(info.made_by), "goal = " + tomlString(info.goal));
+    if (info.assume.length) lines.push("", "[assume]", "tier0 = [" + info.assume.map(tomlString).join(", ") + "]");
+    for (const id of info.skipped) lines.push("# left out, needs the command line: " + commentText(id));
+    for (const e of entries) {
+      lines.push("", "[[change]]", "id = " + tomlString(e.id), "kind = " + tomlString(e.kind));
+      for (const [name, value] of e.fields) lines.push(name + " = " + tomlString(value));
+      if (e.label) lines.push("label = " + tomlString(e.label));
+    }
+    return lines.join("\n") + "\n";
   }
 
   function commentText(value) {
@@ -750,7 +943,8 @@ const CORE = (function () {
 
   return {
     graph, kindOf, findAccount, identity, startNodes, reachable, pathTo, blastRadius,
-    pathRecord, render, subject, whatifModel, whatifMask, whatifState, whatifEvaluate,
+    pathRecord, render, subject, whatifModel, whatifMask, whatifState, whatifEvaluate, whatifRoutes,
+    whatifFindEdge, whatifEdgeChanges, whatifPlanToml,
     whatifFoundText: foundText, whatifHolderText: holderText, EDGE_KINDS, edgeKind, tomlString, validDate, draftProblems,
     acceptDraft, parseReport, diffReports, scoreOf, gradeOf, keyOf,
   };

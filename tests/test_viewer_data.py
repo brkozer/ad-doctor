@@ -12,15 +12,17 @@ import shutil
 import subprocess
 import tomllib
 from collections import Counter
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from ad_doctor import accept, changes, paths, sd, seal, trend, viewer_graph, whatif
+from ad_doctor import accept, changes, paths, planfile, sd, seal, trend, viewer_graph, whatif
 from ad_doctor.checks import REGISTRY, run_all
 from ad_doctor.cli import main
 from ad_doctor.model import Finding, Severity
+from ad_doctor.provenance import FIXED_REASONS
 from ad_doctor.sd import Ace
 
 from .test_acl_adcs import template
@@ -443,3 +445,113 @@ def test_draft_keys_match_what_accept_reads(pages: dict[str, Path]) -> None:
     entries = [accept.Entry("AD-PATH-001", {f["keys"][0]}, "r", date(2027, 1, 1))]
     _, accepted, _ = accept.apply([found], entries, date(2026, 11, 5))
     assert accepted and found.objects[0] in accepted[0].objects
+
+
+# --- the page's interactive what-if --------------------------------------------------------
+
+
+def test_whatif_model_names_what_the_page_can_add() -> None:
+    from .whatif_fixtures import kitchen_sink
+
+    snap = kitchen_sink()
+    g = paths.build(snap, provenance=True)
+    prov = g.prov
+    assert prov is not None
+    reach = whatif.reaching(g)
+    edges = [(s, d) for s in reach for d, _ in g.edges.get(s, ()) if d in reach]
+    model = viewer_graph.whatif_model(g, snap, viewer_graph.compact(g, snap), path_edges=edges)
+    numbers = viewer_graph.prim_numbers(g)
+    by_number = {n: p for p, n in numbers.items()}
+    rows = {r[0]: r for r in model["changes"]}
+    wanted = set()
+    for src in reach:
+        for i, (dst, _) in enumerate(g.edges.get(src, ())):
+            if dst in reach and prov.why[src][i] >= 0 and (src, i) not in prov.extra:
+                wanted.add(numbers[prov.why[src][i]])
+    assert wanted <= set(rows)
+    rebuilt = 0
+    for num, row in rows.items():
+        key = prov.prims[by_number[num]]
+        _, cid, values, label, cost, _, why = row
+        assert cid == changes.change_id(key) and tuple(values) == key[1:] and label and cost > 0
+        assert bool(why) == prov.needs_rebuild(by_number[num])
+        rebuilt += bool(why)
+    assert rebuilt
+    assert model["fixed"] == list(FIXED_REASONS) and model["goal"] == "exposure"
+    assert model["fields"]["ace"] == list(changes.FIELDS["ace"])
+
+
+def test_whatif_model_maps_the_path_screen_to_the_graph(pages: dict[str, Path]) -> None:
+    vm = _vm(pages["full"])
+    mapping = vm["whatif_model"]["path_nodes"]
+    assert len(mapping) == len(vm["paths"]["nodes"]) and "node_ids" not in vm["paths"]
+    for at, node in zip(mapping, vm["paths"]["nodes"], strict=True):
+        assert vm["graph"]["names"][at] == node["name"]
+    assert _vm(pages["paths"])["whatif_model"] is None
+
+
+def test_whatif_model_carries_the_routes_network() -> None:
+    from .whatif_fixtures import kitchen_sink
+
+    snap = kitchen_sink()
+    g = paths.build(snap, provenance=True)
+    assert g.prov is not None
+    net = viewer_graph.whatif_model(g, snap, viewer_graph.compact(g, snap))["net"]
+    assert net["n"] > 2 and net["arcs"] and net["prim"]
+    pins = net["prim"][0::2]
+    assert all(d >= 0 for d in pins) and sum(pins) < net["n"]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs Node")
+def test_plan_file_from_the_page_is_the_one_python_writes(tmp_path: Path) -> None:
+    hostile = 'CN=a"b\\c,\nDC=lab'
+    prims = [
+        ("member", "cn=g,dc=lab,dc=test", "cn=u,dc=lab,dc=test"),
+        ("template-flag", 'Web"Legacy\n[[change]]', "require-approval"),
+        ("ace", hostile.lower(), "S-1-5-21-1-2-3-1117"),
+    ]
+    entries = [
+        {
+            "id": changes.change_id(prim),
+            "kind": prim[0],
+            "fields": [[n, prim[i + 1]] for i, n in enumerate(changes.FIELDS[prim[0]])],
+            "label": f'remove "x"\n{prim[0]}',
+        }
+        for prim in prims
+    ]
+    made = datetime(2026, 11, 6, 18, 58, tzinfo=UTC)
+    domain, sid = "lab.test", "S-1-5-21-1-2-3"
+    info = {
+        "domain": domain,
+        "domain_sid": sid,
+        "made_against": made.isoformat(),
+        "made_by": "ad-doctor 0.2.2 viewer",
+        "goal": "exposure",
+        "assume": ['sid:S-1-5-21-1-2-3-"1'],
+        "skipped": [],
+    }
+
+    def js(data: dict[str, Any]) -> str:
+        run = subprocess.run(
+            ["node", str(ROOT / "tests/js/run.mjs"), "whatifPlanToml"],
+            input=json.dumps([entries, data]), capture_output=True, text=True, check=True,
+        )  # fmt: skip
+        return str(json.loads(run.stdout))
+
+    plan = planfile.PlanFile(
+        domain=domain,
+        domain_sid=sid,
+        made_against=made,
+        made_by=info["made_by"],
+        tier0=list(info["assume"]),
+        changes=[planfile.entry_for(p, f'remove "x"\n{p[0]}') for p in prims],
+    )
+    text = js(info)
+    assert text == planfile.dumps(plan)
+    loaded = planfile.loads(text)
+    assert [e.prim for e in loaded.changes] == prims
+    assert all(e.id == e.expected_id for e in loaded.changes)
+    assert loaded.tier0 == info["assume"]
+    # a hostile domain and a forged ID stay comments and strings, whatever they hold
+    evil = {**info, "domain": 'x"\n[[change]]\nkind = "owner"', "skipped": ["c:1\n[[change]]"]}
+    assert [e.prim for e in planfile.loads(js(evil)).changes] == prims

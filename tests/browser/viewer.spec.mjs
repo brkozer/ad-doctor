@@ -1,11 +1,13 @@
 // The viewer in a real browser: every screen renders, nothing leaves the page, and
 // directory names that are XSS payloads stay text.
 import { test, expect } from "@playwright/test";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const BUILD = resolve(dirname(fileURLToPath(import.meta.url)), "build");
+const ROOT = resolve(BUILD, "../../..");
 const ROUTES = ["overview", "findings", "paths", "blast", "changes", "whatif", "trend", "accepted", "about", "print"];
 const PAGES = ["xss", "full", "paths"];
 
@@ -487,6 +489,201 @@ test("what-if: a failed check, rerouted paths and absent changes are shown as th
 for (const name of ["full", "xss", "whatif"]) {
   test(`what-if: ${name} does not scroll sideways`, async ({ page }) => {
     await page.goto(url(name) + "#whatif");
+    await expect(page.locator("main h1")).toBeVisible();
+    const width = page.viewportSize().width;
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+  });
+}
+
+// ---- what-if, live ------------------------------------------------------------------
+
+function results(page) {
+  return page.locator(".wl-results").evaluate((el) => ({
+    exposed: Number(el.dataset.exposed), users: Number(el.dataset.users), holders: Number(el.dataset.holders),
+    routes: el.dataset.routes === "" ? null : Number(el.dataset.routes),
+    closed: Number(el.dataset.closed), rerouted: Number(el.dataset.rerouted), new: Number(el.dataset.new),
+  }));
+}
+
+async function downloadPlan(page, name) {
+  const [dl] = await Promise.all([page.waitForEvent("download"), page.getByRole("button", { name: "Download plan.toml" }).click()]);
+  expect(dl.suggestedFilename()).toBe("plan.toml");
+  const file = resolve(BUILD, "download-" + name + "-" + test.info().project.name + "-" + test.info().retry + ".toml");
+  await dl.saveAs(file);
+  return file;
+}
+
+// the Python command on the snapshot the page was built from, with the page's own file
+function runPlan(name, file, ...more) {
+  const out = execFileSync("uv", ["run", "ad-doctor", "whatif", resolve(BUILD, name + "-snapshot.json"), "--plan", file,
+    "--paths-only", "-f", "json", ...more], { cwd: ROOT, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+  return JSON.parse(out);
+}
+
+function sameNumbers(doc, page) {
+  expect({ exposed: doc.after.exposed, users: doc.after.users, holders: doc.after.holders, routes: doc.after.routes,
+    closed: doc.paths.closed.length, rerouted: doc.paths.rerouted.length, new: doc.paths.new.length })
+    .toEqual({ exposed: page.exposed, users: page.users, holders: page.holders, routes: page.routes,
+      closed: page.closed, rerouted: page.rerouted, new: page.new });
+}
+
+for (const name of ["live", "xss", "noplan"]) {
+  test(`what-if: a download from ${name} gives Python the numbers the page showed`, async ({ page }) => {
+    const seen = watch(page);
+    await page.goto(url(name) + "#whatif");
+    await expect(page.locator(".wl-results")).toBeVisible();
+    if (name === "noplan") {
+      await page.evaluate(() => { location.hash = "#paths"; });
+      await page.locator(".wl-edges .wl-add").first().click();
+      await page.evaluate(() => { location.hash = "#whatif"; });
+    } else if (name === "live") {
+      // one change of the plan off, so it is the selection and not the plan that is written
+      await page.locator(".wl-row input:not(:disabled)").first().uncheck();
+      await page.evaluate(() => { location.hash = "#paths"; });
+      await page.locator(".wl-choke .wl-add").first().click();
+      await page.evaluate(() => { location.hash = "#whatif"; });
+    }
+    await expect(page.locator(".wl-row input:checked").first()).toBeVisible();
+    const shown = await results(page);
+    const file = await downloadPlan(page, name);
+    const text = readFileSync(file, "utf-8");
+    const doc = runPlan(name, file, "--check");
+    sameNumbers(doc, shown);
+    expect(doc.kind).toBe("whatif");
+    expect(doc.plan_status.every((s) => s.problems.every((p) => !p.includes("edited")))).toBe(true);
+    const ids = new Set(doc.plan_status.map((s) => s.id));
+    const want = await page.locator(".wl-row:has(input:checked)").evaluateAll((rows) => rows.map((r) => r.dataset.change));
+    expect(ids).toEqual(new Set(want));
+    if (name === "xss") {
+      expect(text).toContain('window.__pwned=1'); // the hostile name is a string in the file
+      expect(doc.plan_status.length).toBeGreaterThan(0);
+    }
+    expect(external(seen.requests)).toEqual([]);
+    expect(seen.errors).toEqual([]);
+  });
+}
+
+test("what-if: the plan can be turned off and on, numbers follow, the difference is shown", async ({ page }) => {
+  const seen = watch(page);
+  await page.goto(url("live") + "#whatif");
+  await expect(page.locator(".wl-same")).toBeVisible();
+  const before = await results(page);
+  const first = page.locator(".wl-row input:not(:disabled)").first();
+  await first.uncheck();
+  await expect(page.locator(".wl-diff")).toContainText("Left out (1)");
+  const off = await results(page);
+  expect(off).not.toEqual(before);
+  await first.check();
+  await expect(page.locator(".wl-diff")).not.toContainText("Left out");
+  await expect(page.locator(".wl-results")).toHaveAttribute("data-exposed", String(before.exposed));
+  // nothing selected: nothing to download, and the numbers are the snapshot's
+  await page.getByRole("button", { name: "Start from nothing" }).click();
+  await expect(page.locator(".wl-row input:checked")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Download plan.toml" })).toBeDisabled();
+  const nothing = await results(page);
+  expect([nothing.closed, nothing.rerouted, nothing.new]).toEqual([0, 0, 0]);
+  await page.getByRole("button", { name: "Back to the plan" }).click();
+  await expect(page.locator(".wl-same")).toBeVisible();
+  expect(await results(page)).toEqual(before);
+  expect(seen.errors).toEqual([]);
+});
+
+test("what-if: a change that needs a rebuild is unavailable, says why and stays out of the file", async ({ page }) => {
+  await page.goto(url("live") + "#whatif");
+  const row = page.locator(".wl-row:has(.wl-unavailable)").first();
+  await expect(row.locator("input")).toBeDisabled();
+  await expect(row.locator("input")).not.toBeChecked();
+  await expect(row.locator(".wl-unavailable")).toContainText("Unavailable here:");
+  await expect(row.locator(".wl-unavailable")).toContainText("ad-doctor whatif");
+  const id = await row.getAttribute("data-change");
+  const text = readFileSync(await downloadPlan(page, "rebuild"), "utf-8");
+  expect(text).toContain("# left out, needs the command line: " + id);
+  expect(text).not.toContain('id = "' + id + '"');
+});
+
+test("what-if: changes come from the path screen's edges and chokepoints", async ({ page }) => {
+  const seen = watch(page);
+  await page.goto(url("live") + "#whatif");
+  await page.getByRole("button", { name: "Start from nothing" }).click();
+  await page.evaluate(() => { location.hash = "#paths"; });
+  const add = page.locator(".wl-edges .wl-add").first();
+  await expect(add).toHaveText("Add to what-if");
+  await add.click();
+  await expect(add).toHaveText("In what-if: remove");
+  await add.click();
+  await expect(add).toHaveText("Add to what-if");
+  await add.click();
+  await expect(page.locator(".nav a[data-route=whatif] .count")).toHaveText("1");
+  const choke = page.locator(".wl-choke .wl-add");
+  expect(await choke.count()).toBeGreaterThan(0);
+  await choke.first().click();
+  await choke.last().click(); // an edge row and a node row
+  await page.evaluate(() => { location.hash = "#whatif"; });
+  const added = page.locator(".wl-row:has-text('added')");
+  await expect(added.first()).toBeVisible();
+  await expect(added.first().locator("input")).toBeChecked();
+  const count = await added.count();
+  await added.first().getByRole("button", { name: /^Remove from the selection/ }).click();
+  await expect(page.locator(".wl-row:has-text('added')")).toHaveCount(count - 1);
+  expect(seen.errors).toEqual([]);
+});
+
+test("what-if: an edge no change can take out says why", async ({ page }) => {
+  await page.goto(url("live") + "#paths");
+  let why = await page.locator(".wl-why").count();
+  for (const item of await page.locator(".pitem").all()) {
+    if (why) break;
+    await item.click();
+    why = await page.locator(".wl-why").count();
+  }
+  expect(why).toBeGreaterThan(0);
+  await expect(page.locator(".wl-why").first()).toContainText(/cannot be removed|unavailable here/);
+});
+
+test("what-if: starting from nothing and the screen without a graph", async ({ page }) => {
+  await page.goto(url("noplan") + "#whatif");
+  await expect(page.locator("main")).toContainText("Nothing selected yet");
+  await expect(page.getByRole("button", { name: "Download plan.toml" })).toBeDisabled();
+  await page.goto(url("whatif") + "#whatif");
+  await expect(page.locator(".wl-results")).toHaveCount(0);
+});
+
+test("what-if: hostile names stay text in the selection, the paths and the file", async ({ page }) => {
+  const seen = watch(page);
+  await page.goto(url("xss") + "#paths");
+  await page.locator(".wl-edges .wl-add").first().click();
+  await page.evaluate(() => { location.hash = "#whatif"; });
+  const payload = '<img src=x onerror="window.__pwned=1">';
+  await expect(page.locator(".wl-row").filter({ hasText: payload }).first()).toBeVisible();
+  for (const box of await page.locator(".wl-row input:not(:disabled)").all()) { await box.uncheck(); await box.check(); }
+  expect(await page.evaluate(() => window.__pwned)).toBeUndefined();
+  expect(await page.locator("img, iframe, object, embed, script[src], main svg svg").count()).toBe(0);
+  expect(external(seen.requests)).toEqual([]);
+  expect(seen.errors).toEqual([]);
+});
+
+test("what-if: works in an encrypted file and is gone after Lock", async ({ page }) => {
+  const seen = watch(page);
+  await page.goto(url("sealed"));
+  await page.getByLabel("Passphrase", { exact: true }).fill(PASSPHRASE);
+  await page.getByRole("button", { name: "Unlock" }).click();
+  await expect(page.locator(".nav a")).toHaveCount(9);
+  await page.evaluate(() => { location.hash = "#whatif"; });
+  await expect(page.locator(".wl-results")).toBeVisible();
+  const box = page.locator(".wl-row input:not(:disabled)").first();
+  await box.uncheck();
+  await expect(page.locator(".wl-diff")).toContainText("Left out (1)");
+  await box.check();
+  const file = await downloadPlan(page, "sealed");
+  expect(readFileSync(file, "utf-8")).toContain("[[change]]");
+  await page.locator(".btn.lock").click();
+  await expect(page.locator("h1")).toHaveText("This report is encrypted");
+  expect(external(seen.requests)).toEqual([]);
+});
+
+for (const [name, hash] of [["live", "#whatif"], ["live", "#paths"], ["xss", "#whatif"], ["xss", "#paths"]]) {
+  test(`what-if: ${name}${hash} does not scroll sideways with the controls`, async ({ page }) => {
+    await page.goto(url(name) + hash);
     await expect(page.locator("main h1")).toBeVisible();
     const width = page.viewportSize().width;
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
