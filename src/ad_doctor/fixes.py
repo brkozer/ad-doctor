@@ -148,6 +148,7 @@ FIXES: dict[str, Fix] = {
     "AD-ACC-007": _per_object("Set-ADUser {o} -Clear sIDHistory -WhatIf"),
     "AD-PRIV-002": _per_object("Set-ADAccountControl {o} -AccountNotDelegated $true -WhatIf"),
     "AD-PRIV-004": _per_object("Remove-ADGroupMember DnsAdmins -Members {o} -WhatIf"),
+    "AD-DNS-001": _per_object("Set-DnsServerPrimaryZone -Name {o} -DynamicUpdate Secure -WhatIf"),
     "AD-POL-001": lambda f, snap: [
         f"Set-ADDefaultDomainPasswordPolicy -Identity {_q(snap.domain)} -MinPasswordLength 14 "
         "-ComplexityEnabled $true -LockoutThreshold 10 -WhatIf"

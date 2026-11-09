@@ -433,6 +433,57 @@ class ConflictObject:
 
 
 @dataclass
+class DnsZone:
+    """One Active Directory-integrated DNS zone (a dnsZone object)."""
+
+    dn: str
+    name: str
+    source: str  # DomainDnsZones, ForestDnsZones or domain partition
+    # decided from the name when collected: a redacted name no longer shows it
+    reverse: bool = False
+    # DNS_ZONE_TYPE and fAllowUpdate; None when not readable or malformed
+    zone_type: int | None = None
+    allow_update: int | None = None
+    # False when the security descriptor did not come back or could not be parsed
+    acl_read: bool = False
+    owner: str | None = None
+    aces: list[Ace] = field(default_factory=list)
+    # ACEs the records of the zone inherit
+    inheritable: list[Ace] = field(default_factory=list)
+    # False when its records could not be listed, and in older snapshots
+    nodes_read: bool = False
+
+    @property
+    def label(self) -> str:
+        return f"{self.name} ({self.source})"
+
+
+@dataclass
+class DnsNode:
+    """A dnsNode the checks judge. Only these are kept: a zone can hold many thousands."""
+
+    name: str
+    zone: str
+    source: str
+    kind: str  # dnsprop.KIND_*: decided when collected, a redacted name no longer shows it
+    # DNS_RECORD_TYPE of the readable dnsRecord values; None when none could be read
+    record_types: list[int] | None = None
+    # dNSTombstoned; None when not returned
+    tombstoned: bool | None = None
+    # None when the security descriptor did not come back or could not be parsed
+    owner: str | None = None
+
+    @property
+    def is_tombstoned(self) -> bool:
+        types = self.record_types or []
+        return self.tombstoned is True or (bool(types) and set(types) == {0})
+
+    @property
+    def readable(self) -> bool:
+        return self.is_tombstoned or self.record_types is not None
+
+
+@dataclass
 class Rodc:
     name: str
     reveal: list[str]  # msDS-RevealOnDemandGroup DNs
@@ -647,6 +698,20 @@ class Snapshot:
     conflicts: list[ConflictObject] = field(default_factory=list)
     # False in older snapshots and when the searches failed
     conflicts_checked: bool = False
+    # Active Directory-integrated DNS zones, without the server's internal ones
+    dns_zones: list[DnsZone] = field(default_factory=list)
+    # False in older snapshots and when no location of the zones could be read
+    dns_zones_checked: bool = False
+    # SIDs of the DnsAdmins groups read: this domain's and the forest root's
+    dns_admin_sids: list[str] = field(default_factory=list)
+    # names with a marshaled target, wildcards and well-known names, whoever created them
+    dns_nodes: list[DnsNode] = field(default_factory=list)
+    # False in older snapshots and when the records of no zone could be listed
+    dns_nodes_checked: bool = False
+    # lower-cased host names of SPNs that a dnsNode exists for; the rest of a zone is not kept
+    dns_spn_hosts: list[str] = field(default_factory=list)
+    # names delegated to other DNS servers (NS records) that some SPN host lies under
+    dns_delegations: list[str] = field(default_factory=list)
     # parts of the collection that could not run (no AD CS, SYSVOL unreachable, ...)
     notes: list[str] = field(default_factory=list)
     # False in older snapshots: Ace.inherited was not kept, so an inherited copy looks
@@ -825,6 +890,22 @@ class Snapshot:
             sysvol_replication_checked=data.get("sysvol_replication_checked", False),
             conflicts=[ConflictObject(**x) for x in data.get("conflicts", [])],
             conflicts_checked=data.get("conflicts_checked", False),
+            dns_zones=[
+                DnsZone(
+                    **{
+                        **z,
+                        "aces": _aces(z.get("aces", []), seen_aces),
+                        "inheritable": _aces(z.get("inheritable", []), seen_aces),
+                    }
+                )
+                for z in data.get("dns_zones", [])
+            ],
+            dns_zones_checked=data.get("dns_zones_checked", False),
+            dns_admin_sids=data.get("dns_admin_sids", []),
+            dns_nodes=[DnsNode(**n) for n in data.get("dns_nodes", [])],
+            dns_nodes_checked=data.get("dns_nodes_checked", False),
+            dns_spn_hosts=data.get("dns_spn_hosts", []),
+            dns_delegations=data.get("dns_delegations", []),
             dns_admins=data.get("dns_admins", []),
             pre2k_members=data.get("pre2k_members", []),
             ds_heuristics=data.get("ds_heuristics", ""),
@@ -958,6 +1039,8 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
             ("psos_checked", "AD-POL-003 (fine-grained password policy settings)"),
             ("dmsas_checked", "AD-ACL-009 (control over dMSAs)"),
             ("krbtgt_links_checked", "AD-KRB-007 (Entra Kerberos objects)"),
+            ("dns_zones_checked", "AD-DNS-001 to AD-DNS-003 (DNS zones)"),
+            ("dns_nodes_checked", "AD-DNS-004 to AD-DNS-007 (DNS records)"),
         )
         if key not in data
     ]
@@ -1083,4 +1166,5 @@ CATEGORIES = {
     "PATH": "Attack paths",
     "CHAIN": "Attack paths",
     "INV": "Invariants",
+    "DNS": "DNS",
 }

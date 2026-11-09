@@ -6,7 +6,8 @@ import dataclasses
 import re
 import struct
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
@@ -20,8 +21,8 @@ from ldap3.core.exceptions import (
 )
 from ldap3.protocol.microsoft import security_descriptor_control
 
-from . import gpo_scope, keycred, probes, sd, sysvol
-from .checks import san_note
+from . import dnsprop, gpo_scope, keycred, probes, sd, sysvol
+from .checks import dns_lookup_hosts, foreign_zone_trustee, san_note
 from .model import (
     TIER0_RIDS,
     UAC,
@@ -32,6 +33,8 @@ from .model import (
     DcProbe,
     DirObject,
     Dmsa,
+    DnsNode,
+    DnsZone,
     DomainPolicy,
     Gmsa,
     GpLink,
@@ -163,6 +166,33 @@ ACCOUNT_ATTRS = [
 ]
 
 
+DNS_DOMAIN_ZONES = "DomainDnsZones"
+DNS_FOREST_ZONES = "ForestDnsZones"
+DNS_LEGACY_ZONES = "domain partition"
+DNS_REVERSE_SUFFIXES = (".in-addr.arpa", ".ip6.arpa")
+# root hints, not a zone clients update; a copy in the domain partition may have no properties
+DNS_ROOT_HINTS = "rootdnsservers"
+DNS_ADMINS_FILTER = "(&(objectClass=group)(sAMAccountName=DnsAdmins))"
+# of each kind: anyone can create these, and one kind must not push out another
+MAX_KEPT_DNS_NODES = 200
+
+
+@dataclass
+class DnsNodeScan:
+    """What the walk of the zones keeps; a name no check asks about is dropped as it arrives."""
+
+    wanted: set[str]
+    # every name that could be a parent of a wanted name
+    parents: set[str]
+    hosts: set[str] = field(default_factory=set)
+    delegations: set[str] = field(default_factory=set)
+    kept: list[tuple[str, DnsNode]] = field(default_factory=list)
+    kept_by_kind: Counter[str] = field(default_factory=Counter)
+    dropped: Counter[str] = field(default_factory=Counter)
+    names_seen: int = 0
+    no_records: int = 0
+
+
 class CollectError(Exception):
     pass
 
@@ -260,6 +290,17 @@ class Collector:
         controls: list[Any] | None = None,
     ) -> list[dict[str, list[Any]]]:
         """Paged search returning raw attribute values with lower-cased names."""
+        return list(self.stream(base, flt, attrs, scope, controls))
+
+    def stream(
+        self,
+        base: str,
+        flt: str,
+        attrs: list[str],
+        scope: str = ldap3.SUBTREE,
+        controls: list[Any] | None = None,
+    ) -> Iterator[dict[str, list[Any]]]:
+        """search(), one entry at a time, for what is too large to hold."""
         entries = self.conn.extend.standard.paged_search(
             base,
             flt,
@@ -269,7 +310,6 @@ class Collector:
             paged_size=PAGE_SIZE,
             generator=True,
         )
-        out = []
         for e in entries:
             if e.get("type") != "searchResEntry":
                 continue
@@ -282,8 +322,7 @@ class Collector:
                     self.ranged.add((e["dn"].lower(), key))
                 raw[key] = list(v)
             raw["distinguishedname"] = [e["dn"]]
-            out.append(raw)
-        return out
+            yield raw
 
     def optional(self, base: str, flt: str, attrs: list[str], **kw: Any) -> list[dict[str, Any]]:
         """A search that may fail without failing the scan.
@@ -428,6 +467,10 @@ class Collector:
         dc_sites, site_count = self._dc_sites(config_dn)
         sites, subnets, topology_checked = self._site_topology(config_dn)
         conflicts, conflicts_checked = self._conflicts(domain_dn, config_dn)
+        dns_zones, dns_admin_sids, dns_checked = self._dns_zones(
+            domain_dn, root_dn, domain_sid, root_sid
+        )
+        dns_scan, dns_nodes_checked = self._dns_nodes(dns_zones, accounts, domain)
         dfsr_flags, frs_dcs, dfsr_dcs, replication_checked = self._sysvol_replication(domain_dn)
         ca_configs = self._ca_configs(dc_dns_host)
 
@@ -441,6 +484,8 @@ class Collector:
         trustees |= {s for d in dmsas for s in d.readers}
         trustees |= {a.sid for d in dmsas for a in d.aces} | {d.owner for d in dmsas if d.owner}
         trustees |= {a.sid for c in ca_configs for a in c.aces}
+        trustees |= {a.sid for z in dns_zones for a in (*z.aces, *z.inheritable)}
+        trustees |= {z.owner for z in dns_zones if z.owner}
         trustees |= {s for a in accounts for s in a.rbcd_principals or ()}
         trustees |= {s for a in accounts for s in a.sid_history if s.startswith("S-1-5-21-")}
         trustees |= {c.owner for c in ca_configs if c.owner}
@@ -531,6 +576,13 @@ class Collector:
             sysvol_replication_checked=replication_checked,
             conflicts=conflicts,
             conflicts_checked=conflicts_checked,
+            dns_zones=dns_zones,
+            dns_zones_checked=dns_checked,
+            dns_admin_sids=dns_admin_sids,
+            dns_nodes=[node for _, node in dns_scan.kept],
+            dns_nodes_checked=dns_nodes_checked,
+            dns_spn_hosts=sorted(dns_scan.hosts),
+            dns_delegations=sorted(dns_scan.delegations),
             notes=self.notes,
             ace_inheritance_checked=True,
         )
@@ -984,6 +1036,293 @@ class Collector:
         if not ok:
             self.notes.append("conflict object searches refused: AD-INF-021 did not judge them")
         return out, ok
+
+    def _dns_zones(
+        self, domain_dn: str, root_dn: str, domain_sid: str, root_sid: str
+    ) -> tuple[list[DnsZone], list[str], bool]:
+        """The dnsZone objects under CN=MicrosoftDNS in the two DNS application partitions
+        and in the domain partition, and the DnsAdmins SIDs. A DC that holds no copy of a
+        partition cannot answer for it, so that location is a note and not "no zones"."""
+        info = self.conn.server.info
+        held = {str(c).lower() for c in getattr(info, "naming_contexts", None) or []}
+        forest = root_dn or domain_dn
+        partitions = [
+            (DNS_DOMAIN_ZONES, f"DC={DNS_DOMAIN_ZONES},{domain_dn}"),
+            (DNS_FOREST_ZONES, f"DC={DNS_FOREST_ZONES},{forest}"),
+        ]
+        zones: list[DnsZone] = []
+        partition_read = False
+
+        def unread_location(source: str) -> str:
+            return (
+                f"{source} could not be read: DNS zones stored there not judged "
+                "(AD-DNS-001 to AD-DNS-003)"
+            )
+
+        for source, partition in partitions:
+            if partition.lower() not in held:
+                self.notes.append(
+                    f"this DC holds no copy of {source}: DNS zones stored there not judged "
+                    "(AD-DNS-001 to AD-DNS-003)"
+                )
+                continue
+            found = self._zones_under(f"CN=MicrosoftDNS,{partition}", source, must_exist=True)
+            if found is None:
+                self.notes.append(unread_location(source))
+                continue
+            partition_read = True
+            zones += found
+        legacy = self._zones_under(
+            f"CN=MicrosoftDNS,CN=System,{domain_dn}", DNS_LEGACY_ZONES, must_exist=False
+        )
+        if legacy is None:
+            self.notes.append(unread_location(DNS_LEGACY_ZONES))
+        zones += legacy or []
+        # every domain partition can hold a copy of the root hints: that alone answers nothing
+        checked = partition_read or any(z.name.lower() != DNS_ROOT_HINTS for z in legacy or [])
+        if not checked:
+            self.notes.append(
+                "no DNS zone location could be read: AD-DNS-001 to AD-DNS-003 not judged"
+            )
+        elif not zones:
+            self.notes.append(
+                "no Active Directory-integrated DNS zone was visible: none exist, or this "
+                "account cannot see them"
+            )
+        admin_sids = self._dns_admin_sids(domain_dn, forest, domain_sid, root_sid)
+        self._dns_zone_notes(zones, admin_sids, domain_sid, root_sid)
+        return zones, admin_sids, checked
+
+    def _dns_nodes(
+        self, zones: list[DnsZone], accounts: list[Account], domain: str
+    ) -> tuple[DnsNodeScan, bool]:
+        """Walk the dnsNode objects of the forward zones, one at a time. A name is kept only
+        when a check asks about it, so memory follows the names kept and not the zone."""
+        wanted = dns_lookup_hosts(accounts, domain)
+        parents = {host.split(".", i)[-1] for host in wanted for i in range(1, host.count(".") + 1)}
+        scan = DnsNodeScan(wanted, parents)
+        checked = False
+        skipped: list[str] = []
+        for zone in zones:
+            if zone.reverse or zone.name.lower() == DNS_ROOT_HINTS:
+                continue
+            zone.nodes_read = self._scan_zone(zone, scan)
+            checked = checked or zone.nodes_read
+            if not zone.nodes_read:
+                skipped.append(zone.label)
+        if skipped:
+            self.notes.append(
+                f"records of {len(skipped)} DNS zone(s) could not be listed, AD-DNS-004 to "
+                f"AD-DNS-007 did not judge them: {', '.join(sorted(skipped)[:5])}"
+            )
+        elif not checked:
+            self.notes.append("no forward DNS zone was listed: AD-DNS-004 to AD-DNS-007 not judged")
+        if checked:
+            self._read_node_owners(scan)
+            self._dns_node_notes(zones, scan)
+        return scan, checked
+
+    def _scan_zone(self, zone: DnsZone, scan: DnsNodeScan) -> bool:
+        before = scan.names_seen
+        try:
+            for e in self.stream(
+                zone.dn,
+                "(objectClass=dnsNode)",
+                ["name", "dnsRecord", "dNSTombstoned"],
+                scope=ldap3.LEVEL,
+            ):
+                self._scan_node(e, zone, scan)
+        except LDAPNoSuchObjectResult:
+            return False
+        except LDAPOperationResult as exc:
+            self.notes.append(f"records of {zone.label} not fully read: {exc.description}")
+            return False
+        # every zone holds at least its "@" name, so no name at all means the listing was hidden
+        return scan.names_seen > before
+
+    def _scan_node(self, e: dict[str, Any], zone: DnsZone, scan: DnsNodeScan) -> None:
+        dn = e["distinguishedname"][0]
+        name = _first(e, "name") or _rdn_value(dn)
+        lowered = name.lower()
+        if lowered.startswith("..") or "\ncnf:" in lowered or len(name) > dnsprop.MAX_NAME_LENGTH:
+            return
+        scan.names_seen += 1
+        if not e.get("dnsrecord"):
+            scan.no_records += 1
+        zone_name = zone.name.lower()
+        full = zone_name if name == "@" else f"{lowered}.{zone_name}"
+        if full in scan.wanted:
+            scan.hosts.add(full)
+        kind = dnsprop.node_kind(name)
+        if kind is None and (name == "@" or full not in scan.parents):
+            return
+        types = dnsprop.record_types(e.get("dnsrecord", []))
+        if name != "@" and full in scan.parents and dnsprop.TYPE_NS in (types or ()):
+            scan.delegations.add(full)
+        if kind is None:
+            return
+        if scan.kept_by_kind[kind] >= MAX_KEPT_DNS_NODES:
+            scan.dropped[kind] += 1
+            return
+        scan.kept_by_kind[kind] += 1
+        # stored and shown: a name is free text to whoever created it
+        shown = "".join(c if c.isprintable() else "?" for c in name)
+        scan.kept.append(
+            (
+                dn,
+                DnsNode(
+                    name=shown,
+                    zone=zone.name,
+                    source=zone.source,
+                    kind=kind,
+                    record_types=types,
+                    tombstoned=_optional_bool(e, "dNSTombstoned"),
+                ),
+            )
+        )
+
+    def _read_node_owners(self, scan: DnsNodeScan) -> None:
+        """Who owns each kept name: one BASE read each, a few hundred at most."""
+        for dn, node in scan.kept:
+            try:
+                found = self.search(
+                    dn,
+                    "(objectClass=*)",
+                    ["nTSecurityDescriptor"],
+                    ldap3.BASE,
+                    controls=OWNER_AND_DACL,
+                )
+                raw = found[0].get("ntsecuritydescriptor") if found else None
+                node.owner = sd.parse(raw[0]).owner if raw else None
+            except (
+                LDAPNoSuchObjectResult,
+                LDAPOperationResult,
+                IndexError,
+                ValueError,
+                struct.error,
+            ):
+                node.owner = None
+
+    def _dns_node_notes(self, zones: list[DnsZone], scan: DnsNodeScan) -> None:
+        if scan.no_records:
+            self.notes.append(
+                f"{scan.no_records} of {scan.names_seen} DNS names came back without dnsRecord: "
+                "they count as existing, and their records were not judged"
+            )
+        for kind, dropped in sorted(scan.dropped.items()):
+            self.notes.append(
+                f"{dropped} more DNS names of kind '{kind}' not read, past the limit of "
+                f"{MAX_KEPT_DNS_NODES}: AD-DNS-004 to AD-DNS-006 list the first ones only"
+            )
+        no_owner = sum(n.owner is None and n.kind != dnsprop.KIND_MARSHALED for _, n in scan.kept)
+        if no_owner:
+            self.notes.append(
+                f"owner of {no_owner} wildcard or well-known DNS name(s) not readable: AD-DNS-005 "
+                "lists them for review, AD-DNS-006 did not judge them"
+            )
+        blind = sorted(
+            z.label for z in zones if z.nodes_read and (z.zone_type is None or not z.acl_read)
+        )
+        if blind:
+            self.notes.append(
+                f"AD-DNS-007 did not judge SPN hosts under {len(blind)} zone(s) whose "
+                f"type or permissions were not readable: {', '.join(blind[:5])}"
+            )
+
+    def _zones_under(self, base: str, source: str, must_exist: bool) -> list[DnsZone] | None:
+        found = self.attempt(
+            base,
+            "(objectClass=dnsZone)",
+            ["name", "dnsProperty", "nTSecurityDescriptor"],
+            must_exist=must_exist,
+            scope=ldap3.LEVEL,
+            controls=OWNER_AND_DACL,
+        )
+        if found is None:
+            return None
+        return [z for z in (self._dns_zone(e, source) for e in found) if z is not None]
+
+    def _dns_zone(self, e: dict[str, Any], source: str) -> DnsZone | None:
+        dn = e["distinguishedname"][0]
+        name = _first(e, "name") or _rdn_value(dn)
+        # the server's own zones (..TrustAnchors, ..InProgress-, ..Deleted-) and the losers
+        # of a replication conflict do not answer queries under that name
+        if name.startswith("..") or "\ncnf:" in name.lower():
+            return None
+        props = dnsprop.parse(e.get("dnsproperty", []))
+        raw_sd = e.get("ntsecuritydescriptor")
+        try:
+            desc = sd.parse(raw_sd[0]) if raw_sd else sd.Descriptor(None, False, [])
+        except (IndexError, ValueError, struct.error):
+            desc = sd.Descriptor(None, False, [])
+        lowered = f".{name.lower()}"
+        return DnsZone(
+            dn=dn,
+            name=name,
+            source=source,
+            reverse=lowered.endswith(DNS_REVERSE_SUFFIXES),
+            zone_type=props.zone_type,
+            allow_update=props.allow_update,
+            acl_read=bool(desc.aces or desc.inheritable),
+            owner=desc.owner,
+            aces=desc.aces,
+            inheritable=desc.inheritable,
+        )
+
+    def _dns_admin_sids(
+        self, domain_dn: str, forest: str, domain_sid: str, root_sid: str
+    ) -> list[str]:
+        sids: list[str] = []
+        for base in {domain_dn, forest}:
+            for e in self.optional(base, DNS_ADMINS_FILTER, ["objectSid"]):
+                if e.get("objectsid"):
+                    sids.append(sid_to_str(e["objectsid"][0]))
+        if not any(s.startswith(f"{domain_sid}-") for s in sids):
+            self.notes.append(
+                "DnsAdmins not found by name: a renamed group would be listed in AD-DNS-002"
+            )
+        return sorted(sids)
+
+    def _dns_zone_notes(
+        self, zones: list[DnsZone], admin_sids: list[str], domain_sid: str, root_sid: str
+    ) -> None:
+        def shown(names: list[str]) -> str:
+            extra = f" and {len(names) - 5} more" if len(names) > 5 else ""
+            return ", ".join(names[:5]) + extra
+
+        unread = sorted(
+            z.label
+            for z in zones
+            if z.name.lower() != DNS_ROOT_HINTS
+            and (
+                z.zone_type is None
+                or (z.zone_type == dnsprop.ZONE_TYPE_PRIMARY and z.allow_update is None)
+            )
+        )
+        if unread:
+            self.notes.append(
+                f"dynamic update setting of {len(unread)} DNS zone(s) not readable, "
+                f"AD-DNS-001 did not judge them: {shown(unread)}"
+            )
+        closed = sorted(z.label for z in zones if not z.acl_read)
+        if closed:
+            self.notes.append(
+                f"security descriptor of {len(closed)} DNS zone(s) not readable, "
+                f"AD-DNS-002 and AD-DNS-003 did not judge them: {shown(closed)}"
+            )
+        foreign = sorted(
+            z.label
+            for z in zones
+            if any(
+                foreign_zone_trustee(z, sid, domain_sid, root_sid, admin_sids)
+                for sid in {a.sid for a in (*z.aces, *z.inheritable)} | {z.owner or ""}
+            )
+        )
+        if foreign:
+            self.notes.append(
+                f"{len(foreign)} forest-wide DNS zone(s) name principals of another domain "
+                f"that AD-DNS-002 cannot place: {shown(foreign)}"
+            )
 
     def _sysvol_replication(self, domain_dn: str) -> tuple[int | None, list[str], list[str], bool]:
         """The domain's migration state, and which DCs hold an FRS or DFSR SYSVOL

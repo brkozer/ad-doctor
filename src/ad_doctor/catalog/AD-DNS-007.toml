@@ -1,0 +1,95 @@
+id = "AD-DNS-007"
+aliases = ["ghost-spn-dns", "unresolved-spn-host"]
+summary = "An account in use holds an SPN for a host name with no DNS record, in a zone where any domain user can add one."
+severities = ["low", "medium"]
+severity_logic = """
+**Medium** for a `HOST` or `CIFS` SPN on a computer account, the case that gives SYSTEM on that
+computer when SMB signing is not enforced. **Low** for other service classes and for accounts that
+are not computers, where the relay needs a service that accepts the ticket.
+"""
+mitre = ["T1557", "T1187"]
+data_sources = ["ldap"]
+attributes = [
+    "servicePrincipalName",
+    "dNSHostName",
+    "lastLogonTimestamp",
+    "name (dnsNode)",
+    "dnsRecord",
+    "nTSecurityDescriptor (dnsZone)",
+]
+related = ["AD-DEL-005", "AD-DNS-003", "AD-DNS-004"]
+since = "0.2.4"
+
+risk = """
+A ghost SPN names a host that nothing in DNS answers for: a retired server, a pre-staged service or
+a typing mistake. The KDC still issues tickets for it. A low-privileged user adds a record for the
+name pointing at their own machine and coerces a client to connect. The client asks for a ticket
+for the ghost SPN and sends it to the attacker, who relays it to the account that holds the SPN.
+
+CVE-2025-58726 is the case of a computer account without SMB signing, which gives SYSTEM on it. The
+October 2025 update blocks that reflection, while other services that accept the ticket can remain
+exposed.
+
+[AD-DEL-005](AD-DEL-005.md) is a different problem. It reports delegation targets in
+`msDS-AllowedToDelegateTo` that no account holds, whatever DNS says. This check starts from SPNs that an
+account does hold and asks whether the name resolves.
+"""
+
+detection = """
+From each enabled account's `servicePrincipalName`, except `krbtgt`, the host part gives a DNS name.
+A short host counts only for `HOST`, `CIFS`, `HTTP`, `WWW`, `LDAP` and `WSMAN`, under the domain's own
+name: other classes can hold anything there. The account's own short name is left out.
+
+An SPN is reported when all of these hold:
+
+1. The account has logged on within 90 days. A computer must also have a DNS record of its own,
+   since relaying needs a host that is still there.
+2. The zone that holds the name is the longest match among the forward zones read, its records were
+   all listed, and it is a primary zone.
+3. Any domain user can add a name: a broad group can create `dnsNode` objects, or the zone
+   takes nonsecure updates.
+4. No `dnsNode` exists for the name. A tombstoned record still counts as existing, and so does one
+   whose data cannot be read.
+5. No NS record delegates it elsewhere.
+
+A wildcard does not stop a name being reported. It answers only names without a record of their own,
+so an explicit record still takes precedence and the name can still be claimed. When a wildcard holding
+an address or an alias lies in the zone that holds the name, the finding says it may answer the name
+today. A TXT wildcard and a wildcard in a parent zone answer nothing for it.
+
+The whole zone is not stored: the collector keeps only the names that SPNs ask about. A zone that
+could not be listed, or whose permissions could not be read, is named in a note and not judged.
+"""
+
+false_positives = """
+- **Names served by another DNS server**, through a conditional forwarder or a zone not stored in
+  Active Directory, can look absent when they fall under a zone that is. This is not visible over LDAP.
+- **Names in a hosts file** resolve for that machine only and still count as absent.
+- **A record the scanning account cannot list** looks absent. Listing is open by default.
+"""
+
+remediation = """
+1. **Check the name**: `Resolve-DnsName ghost.corp.example`.
+2. **Remove an SPN nothing uses**, or add the record the service needs:
+
+    ```powershell
+    setspn -D HOST/ghost.corp.example SRV01
+    ```
+
+3. **Enforce SMB signing** on every domain-joined computer, and install the October 2025 or later
+   Windows updates.
+4. **Limit who can add DNS records** where clients do not register themselves. See
+   [AD-DNS-003](AD-DNS-003.md).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-DNS-007"
+
+[[references]]
+title = "Exploiting Ghost SPNs and Kerberos Reflection for SMB Server Privilege Elevation (Semperis)"
+url = "https://semperis.com/blog/exploiting-ghost-spns-and-kerberos-reflection-for-smb-server-privilege-elevation/"
+kind = "research"
+
+[[references]]
+title = "[MS-DNSP]: dnsRecord"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dnsp/6912b338-5472-4f59-b912-0edb536b6ed8"
+kind = "spec"

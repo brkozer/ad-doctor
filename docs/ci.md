@@ -18,7 +18,8 @@ the URL as text to copy.
 
 Collection notes are also in the machine formats: JUnit `system-out`, and SARIF
 `invocations[0].toolConfigurationNotifications`, where a note about a check has the level
-`warning` and lists the check IDs under `properties.notJudged`. A note that names no check
+`warning` and lists the check IDs under `properties.notJudged`. A range such as
+`AD-DNS-001 to AD-DNS-003` names every check in it. A note that names no check
 (for example "SYSVOL not checked") does not change any test case.
 
 ## Exit codes and `--fail-on`

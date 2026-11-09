@@ -1,0 +1,65 @@
+id = "AD-DNS-006"
+aliases = ["wpad-record", "dns-name-shadowing", "isatap-record"]
+summary = "An ordinary account owns the DNS record of a name clients look up by themselves, such as wpad."
+severities = ["low", "high"]
+severity_logic = """
+**High** when the record holds an address or an alias, so clients are sent to its target. **Low**
+when it holds no address record, none can be read, its owner is in another domain, or its owner is
+a computer whose name matches the record.
+"""
+mitre = ["T1557"]
+data_sources = ["ldap"]
+attributes = ["name", "dnsRecord", "dNSTombstoned", "nTSecurityDescriptor"]
+related = ["AD-DNS-003", "AD-DNS-005"]
+since = "0.2.4"
+
+risk = """
+Browsers and the operating system look up `wpad` for proxy settings, older hosts look up `isatap`,
+and mail clients look up `autodiscover`. Whoever controls the record can receive that traffic and
+ask for credentials. A DNS server's global query block list stops `wpad` and `isatap` from being
+answered unless it was changed, and that setting cannot be read over LDAP, so this check does not
+assume it is on. It says nothing about `autodiscover`.
+"""
+
+detection = """
+A name counts when its first label is `wpad`, `isatap` or `autodiscover`, in any forward zone. It is
+reported when the owner read from its security descriptor is not tier 0, DnsAdmins, an operator or
+a domain controller. Tombstoned records are left out.
+
+A computer that owns its own name is listed at Low for review. It may be a host really called `wpad`,
+or one an ordinary user created under `ms-DS-MachineAccountQuota`. The snapshot does not record who
+created a computer, so the two cannot be told apart.
+
+A name whose owner cannot be read is not judged, and a note gives the number.
+"""
+
+false_positives = """
+- **A proxy or mail administrator** outside DnsAdmins who created the record by hand. Confirm it, and
+  have the record owned by an administrator so that the owner cannot redirect it.
+- **A host really called `wpad`** that registered its own name. Confirm who created the computer
+  account.
+"""
+
+remediation = """
+1. **Find out who created it**, from the owner on the record and your audit events.
+2. **Remove it** if nobody needs it:
+
+    ```powershell
+    Remove-DnsServerResourceRecord -ZoneName corp.example -Name wpad -RRType A -WhatIf
+    ```
+
+3. **Keep the block list on** with `Get-DnsServerGlobalQueryBlockList`. Note that a DNS server
+   removes these names from its list at first start if they already exist in a zone.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-DNS-006"
+
+[[references]]
+title = "Set-DnsServerGlobalQueryBlockList (Microsoft)"
+url = "https://learn.microsoft.com/en-us/powershell/module/dnsserver/set-dnsserverglobalqueryblocklist"
+kind = "vendor"
+
+[[references]]
+title = "Exploiting Active Directory-Integrated DNS (NetSPI)"
+url = "https://www.netspi.com/blog/technical-blog/network-pentesting/exploiting-adidns/"
+kind = "research"

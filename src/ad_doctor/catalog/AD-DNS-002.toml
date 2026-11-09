@@ -1,0 +1,71 @@
+id = "AD-DNS-002"
+aliases = ["dns-zone-acl"]
+summary = "Principals outside tier 0 and DnsAdmins can change DNS zones stored in Active Directory, their settings or the records in them."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when a broad group (Everyone, Authenticated Users, Domain Users and the like) holds write
+control over a forward lookup zone. **Medium** for any other principal, and for reverse zones.
+"""
+mitre = ["T1557"]
+data_sources = ["ldap"]
+attributes = ["nTSecurityDescriptor"]
+related = ["AD-DNS-001", "AD-DNS-003", "AD-PRIV-004"]
+since = "0.2.4"
+
+risk = """
+Control over a zone is control over where clients go. Whoever can change the zone can repoint any
+name in it, including those of servers and domain controllers, turn nonsecure updates on, or
+give the zone to someone else. Replacing a record leads to the same credential capture and relaying
+as any other name spoofing, but it holds for every client and lasts until someone notices.
+"""
+
+detection = """
+From the owner and DACL of every `dnsZone` object the scan account can read, in the DomainDnsZones
+and ForestDnsZones partitions and the domain partition. This check lists:
+
+- the owner, when it is outside tier 0;
+- holders of `GenericAll`, `GenericWrite`, `WriteDacl`, `WriteOwner` or write to all properties;
+- holders of write to `dnsProperty`, the zone's settings, or of `Delete`;
+- holders of `DeleteChild` or `DeleteTree` on the records, which lets them remove a name and claim it;
+- ACEs that the records inherit and that give write to `dnsRecord` or the takeover rights above.
+
+Not listed: the tier-0 groups and their members, operator groups, `CREATOR OWNER`, `SELF` and
+DnsAdmins with its direct members. Microsoft documents that DnsAdmins has full control of zones by default, and
+[AD-PRIV-004](AD-PRIV-004.md) reports its membership. The right to create records is
+[AD-DNS-003](AD-DNS-003.md).
+
+DnsAdmins is found by its name in this domain and in the forest root. A renamed group is then
+listed, and the finding says so. On a forest-wide zone a principal of another domain cannot be told
+from that domain's DnsAdmins, so it is named in a note and not reported. A zone whose
+descriptor does not come back is named in a note and not reported as passing.
+"""
+
+false_positives = """
+- **A delegated DNS team** may hold rights on some zones on purpose. Tier the team, or accept the finding
+  after review.
+- **Deny ACEs** are not read, which can only over-report.
+"""
+
+remediation = """
+1. **List who holds rights on the zone** (read-only):
+
+    ```powershell
+    (Get-Acl 'AD:DC=corp.example,CN=MicrosoftDNS,DC=DomainDnsZones,DC=corp,DC=example').Access |
+        Where-Object { $_.ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner|WriteProperty|Delete' }
+    ```
+
+2. **Remove the rights** that are not needed, and give ownership back to Domain Admins.
+3. **Review records and settings** for changes made while the rights were held.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-DNS-002"
+
+[[references]]
+title = "DNS zones in DNS Server on Windows Server: access to zones and names"
+url = "https://learn.microsoft.com/en-us/windows-server/networking/dns/zone-types"
+kind = "vendor"
+
+[[references]]
+title = "Exploiting Active Directory-Integrated DNS (NetSPI)"
+url = "https://www.netspi.com/blog/technical-blog/network-pentesting/exploiting-adidns/"
+kind = "research"

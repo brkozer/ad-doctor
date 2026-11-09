@@ -8,7 +8,7 @@
 Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
-(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 118
+(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 125
 checks for what attackers look for first: roastable accounts, risky delegation,
 exploitable certificate templates and CA settings (ESC1–9, 11, 13–17), DCSync and other takeover rights,
 shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync accounts,
@@ -159,6 +159,13 @@ against a live DC.
 | | AD-INF-019 | SYSVOL still replicated by FRS | low/medium |
 | | AD-INF-020 | Sites and subnets that need review | low |
 | | AD-INF-021 | Replication conflict objects and duplicate accounts | low/medium |
+| DNS | AD-DNS-001 | Zones that accept nonsecure dynamic updates | medium/high |
+| | AD-DNS-002 | Zones writable outside tier 0 | medium/high |
+| | AD-DNS-003 | Authenticated users can add records to zones (default) | info |
+| | AD-DNS-004 | DNS names carrying marshaled target information (Kerberos coercion) | medium/high |
+| | AD-DNS-005 | Wildcard DNS records | info/low/high |
+| | AD-DNS-006 | Well-known names (wpad, isatap, autodiscover) registered by ordinary accounts | low/high |
+| | AD-DNS-007 | SPN hosts with no DNS record that any user can register | low/medium |
 | Certificate services | AD-ADCS-001 | ESC1: enrollee-supplied subject on an authentication template | high |
 | | AD-ADCS-002 | ESC2: any-purpose or no-EKU template | high |
 | | AD-ADCS-003 | ESC3: enrollment agent template open to broad groups | high |
@@ -437,6 +444,15 @@ ports. A CES URL is reached on the port it names; only a URL with no port follow
   so a machine that stopped logging on but still rotates its password stays quiet. AD-INF-021
   searches the domain and Configuration partitions, not DNS or the schema, and only finds
   what the scan account can see. AD-INF-020 does not check DC addresses against subnets.
+- AD-DNS-001 to AD-DNS-003 read the zones stored in Active Directory, not file-backed
+  zones, and do not try a zone transfer. A DC that holds no copy of a DNS partition cannot
+  answer for it: the report has a note and those zones are not judged. DnsAdmins holds
+  every zone by default and is not reported by AD-DNS-002; its members are AD-PRIV-004.
+- AD-DNS-004 to AD-DNS-007 read the `dnsNode` objects of forward zones. Names are read one
+  at a time and only those a check needs are kept, so a large zone stays small in memory.
+  AD-DNS-007 cannot see a name served by another DNS server or by a hosts file. It reports
+  only accounts in use, and it complements AD-DEL-005, which is about delegation targets
+  no account holds. A zone whose records cannot be listed is named in a note, not passed.
 - AD-PRIV-012 compares `member` values with search results. A group whose `member`
   attribute is denied looks empty, and groups of other domains are not read.
 - An ordinary user cannot read fine-grained password policies; the report says so
@@ -454,6 +470,9 @@ ports. A CES URL is reached on the port it names; only a URL with no port follow
   days), a gMSA with a long interval (AD-ACC-015: the lab's has 30 days), FRS (AD-INF-019:
   the lab is DFS Replication only), sites and subnets (AD-INF-020: one site, no subnets),
   conflict objects and duplicates (AD-INF-021), identity collisions (AD-ACC-016),
+  nonsecure DNS zones and zone ACLs outside tier 0 (AD-DNS-001, AD-DNS-002: the lab has the
+  defaults), marshaled names, wildcards, shadowed names and ghost SPN hosts (AD-DNS-004 to
+  AD-DNS-007: not seeded, because the lab DC is not changed for these),
   password policy settings (AD-POL-003: `adreader` cannot read them), dMSA control
   (AD-ACL-009: `adreader` cannot see the dMSA and the lab has no migration), key age and
   look-alikes (AD-KRB-007), a missing backup (AD-INF-011 needs a week), a domain
@@ -478,7 +497,7 @@ flowchart LR
     P --> S
     S -- "collect -o / redact" --> F[(snapshot.json)]
     F --> A
-    S --> A[checks.py + paths.py<br/>118 pure functions]
+    S --> A[checks.py + paths.py<br/>125 pure functions]
     A --> I[invariants.py<br/>accept.py]
     I --> R[report.py<br/>text, JSON, Markdown,<br/>SARIF, JUnit]
     I --> W[viewer.py<br/>offline HTML viewer]
