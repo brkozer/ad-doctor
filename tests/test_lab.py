@@ -29,6 +29,10 @@ pytestmark = pytest.mark.lab
 # 2025 DC needs level 2016), AD-INF-013 and AD-ADCS-016 (need a host the probes cannot read)
 # and AD-PRIV-001 (not seeded: no tier-0 group here has more than five members).
 EXPECTED = {
+    "AD-ADCS-020": {
+        "Domain Controllers: DC01: no GPO sets CertificateMappingMethods or "
+        "StrongCertificateBindingEnforcement: unknown"
+    },
     "AD-KRB-002": {"legacy_app"},
     "AD-KRB-003": {"svc_sql", "svc_web"},
     "AD-KRB-004": {"des_user"},
@@ -503,3 +507,13 @@ def test_gpo_local_group_scope(snap: Snapshot) -> None:
 def test_https_endpoints_stay_out_of_the_http_list(snap: Snapshot) -> None:
     assert set(snap.probes.enrollment_https) == HTTPS_ENDPOINTS
     assert snap.probes.web_enrollment_ntlm == ["http://DC01.adlab.test/certsrv/"]
+
+
+def test_lab_policy_files_are_read_and_unset_is_unknown(snap: Snapshot) -> None:
+    """The lab's GPOs hold no audit.csv and no Registry.xml; absence stays unknown."""
+    assert snap.policy_files_collected and not snap.gpo_autologon
+    findings = {f.check_id: f for f in run_all(snap)}
+    assert findings["AD-GPO-013"].severity is Severity.INFO
+    assert findings["AD-ADCS-020"].severity is Severity.INFO
+    assert "unknown" in findings["AD-ADCS-020"].objects[0]
+    assert not {"AD-GPO-014", "AD-GPO-015", "AD-GPO-016"} & set(findings)

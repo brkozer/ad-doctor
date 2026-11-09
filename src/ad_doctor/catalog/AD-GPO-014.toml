@@ -1,0 +1,53 @@
+id = "AD-GPO-014"
+aliases = ["gpo-autologon", "defaultpassword"]
+summary = "A GPO stores a Winlogon DefaultPassword in SYSVOL, readable by every domain user, or turns on automatic logon."
+severities = ["info", "high"]
+severity_logic = """
+**High** when a GPO's `Registry.pol` or Preferences `Registry.xml` holds a literal Winlogon
+`DefaultPassword`, whether the GPO is linked or the item is enabled: the password is in the file.
+**Info** when a GPO sets `AutoAdminLogon` to 1 and has no password in that file.
+"""
+mitre = ["T1552.006"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "Machine\\Registry.pol and Machine\\Preferences\\Registry\\Registry.xml: Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon, AutoAdminLogon and DefaultPassword",
+]
+related = ["AD-GPP-001", "AD-GPP-002"]
+since = "0.2.3"
+
+risk = """
+Everything in SYSVOL is readable by every domain user. A `DefaultPassword` written there is a
+clear-text password for whatever account automatic logon uses, and it stays there when the GPO
+is unlinked or the item is disabled.
+"""
+
+detection = """
+`Registry.pol` and Preferences `Registry.xml` are read over SMB, as an ordinary user. The value of
+`DefaultPassword` is only tested for being present and literal (not empty, not a `%VARIABLE%`);
+it is never stored, printed or put in a finding, only the GPO and the file. Other Preferences
+values named like a password are reported in a note by location, and `Registry.xml` is in the
+`cpassword` scan ([AD-GPP-001](AD-GPP-001.md)).
+"""
+
+false_positives = """
+- **Passwords set outside Group Policy.** `DefaultPassword` set directly on a computer is not
+  visible here.
+"""
+
+remediation = """
+Remove the value from the GPO, change the password of the account it held (treat it as known) and
+avoid automatic logon. Where a kiosk needs it, use a restricted account and the Sysinternals
+Autologon tool, which stores the password as an LSA secret.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-014"
+
+[[references]]
+title = "Configure Windows to automate logon"
+url = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/user-profiles-and-logon/turn-on-automatic-logon"
+kind = "vendor"
+
+[[references]]
+title = "[MS-GPREG]: Group Policy: Registry Extension Encoding"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpreg/5c092c22-bf6b-4e7f-b180-b20743d368f5"
+kind = "spec"

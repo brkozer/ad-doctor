@@ -16,8 +16,9 @@ from dataclasses import dataclass, field
 import smbclient
 from smbprotocol.exceptions import SMBException
 
-from . import regpol
+from . import auditpol, regpol
 from .model import (
+    GpoAutologon,
     GpoLocalGroup,
     GpoSettings,
     GppPassword,
@@ -37,6 +38,7 @@ GPP_FILES = {
     "datasources.xml",
     "drives.xml",
     "printers.xml",
+    "registry.xml",
 }
 SCRIPT_EXTENSIONS = (".bat", ".cmd", ".ps1", ".psm1", ".vbs", ".kix", ".ini", ".txt")
 
@@ -60,6 +62,18 @@ LSA = r"MACHINE\System\CurrentControlSet\Control\Lsa"
 NETLOGON = r"MACHINE\System\CurrentControlSet\Services\Netlogon\Parameters"
 GPTTMPL = r"MACHINE\Microsoft\Windows NT\SecEdit\GptTmpl.inf"
 REGISTRY_POL = r"Machine\Registry.pol"
+AUDIT_CSV = r"Machine\Microsoft\Windows NT\Audit\audit.csv"
+REGISTRY_XML = r"Machine\Preferences\Registry\Registry.xml"
+MAX_XML_DEPTH = 64  # Collection elements inside one another
+HKLM = {"HKEY_LOCAL_MACHINE", "HKLM"}
+REG_TYPES = {
+    "REG_SZ": regpol.REG_SZ,
+    "REG_EXPAND_SZ": regpol.REG_EXPAND_SZ,
+    "REG_BINARY": regpol.REG_BINARY,
+    "REG_DWORD": regpol.REG_DWORD,
+    "REG_MULTI_SZ": regpol.REG_MULTI_SZ,
+    "REG_QWORD": regpol.REG_QWORD,
+}
 _GUID = r"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}"
 MACHINE_GROUPS = re.compile(
     rf"^Policies\\({_GUID})\\Machine\\Preferences\\Groups\\Groups\.xml$", re.I
@@ -89,6 +103,11 @@ class SysvolResult:
     registry: dict[str, list[RegistryEntry]] = field(default_factory=dict)
     # SYSVOL-relative Registry.pol files that could not be read
     registry_unread: list[str] = field(default_factory=list)
+    audit: dict[str, list[RegistryEntry]] = field(default_factory=dict)
+    preferences: dict[str, list[RegistryEntry]] = field(default_factory=dict)
+    autologon: list[GpoAutologon] = field(default_factory=list)
+    # SYSVOL-relative audit.csv and Registry.xml files that could not be read
+    policy_unread: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     # False when SYSVOL was not read, so "no local group settings" means "not collected"
     scanned: bool = False
@@ -150,6 +169,8 @@ def parse_gpttmpl(text: str) -> GpoSettings:
         elif section == "privilege rights":
             holders = [v.strip().lstrip("*") for v in value.split(",")]
             settings.privileges[key] = [h for h in holders if h]
+        elif section == "event audit" and key.lower() in auditpol.LEGACY_CATEGORIES:
+            settings.audit_categories.append(auditpol.LEGACY_CATEGORIES[key.lower()])
     return settings
 
 
@@ -274,6 +295,87 @@ def _group_item(
     return members
 
 
+def _gpp_number(value: str) -> int | None:
+    """A REG_DWORD or REG_QWORD of Registry.xml: hexadecimal digits, as GPMC writes it."""
+    text = value.strip()
+    if not (text and len(text) <= 16 and text.isascii()):
+        return None
+    try:
+        return int(text, 16)
+    except ValueError:
+        return None
+
+
+def _gpp_data(kind: int, value: str) -> int | str | None:
+    if kind in (regpol.REG_DWORD, regpol.REG_QWORD):
+        return _gpp_number(value)
+    if kind in (regpol.REG_SZ, regpol.REG_EXPAND_SZ):
+        return value[: regpol.MAX_TEXT]
+    return None
+
+
+def _registry_item(out: regpol.Parsed, item: ET.Element, disabled: bool, filtered: bool) -> None:
+    props = item.find("Properties")
+    if props is None:
+        return
+    key, name = props.get("key") or "", props.get("name") or ""
+    kind = REG_TYPES.get((props.get("type") or "").upper(), 0)
+    value = props.get("value") or ""
+    action = (props.get("action") or "U").upper()
+    text_type = kind in (regpol.REG_SZ, regpol.REG_EXPAND_SZ, regpol.REG_MULTI_SZ)
+    if action != "D" and text_type and regpol.SECRET_NAME.search(name) and value.strip():
+        out.secrets.append((key[:256], name[:128]))
+    if (props.get("hive") or "").upper() not in HKLM:
+        return
+    data = _gpp_data(kind, value)
+    if action != "D":
+        regpol.note_winlogon(out.autologon, key, name, data, not disabled)
+    if disabled:
+        return
+    if action == "D":
+        if props.get("default") == "1":
+            return
+        if not name:
+            if regpol.deletes_watched(key):
+                regpol.keep(out, RegistryEntry(key, "", "delete_key", filtered=filtered))
+        elif regpol.watched(key, name):
+            regpol.keep(out, RegistryEntry(key, name, "delete", filtered=filtered))
+    elif regpol.watched(key, name):
+        how = "soft" if action == "C" else "set"  # C writes only where no value exists
+        regpol.keep(out, RegistryEntry(key, name, how, kind, data, filtered))
+
+
+def parse_registry_xml(data: bytes) -> regpol.Parsed:
+    """Registry preference items of a Machine Registry.xml: what the checks read, in file order,
+    and the facts about values named like a password. Disabled items are not applied, but a
+    password in one is still in the file. Collections pass on disabled and filters."""
+    text = XML_DECLARATION.sub("", _decode(data), count=1)
+    if "<!doctype" in text.casefold():
+        raise MalformedXml("a document type declaration")
+    try:
+        root = ET.fromstring(text)
+    except (ET.ParseError, ValueError, RecursionError) as exc:
+        raise MalformedXml(str(exc)) from exc
+    out = regpol.Parsed()
+    # explicit stack: a hostile file can nest Collections far past Python's recursion limit
+    stack = [(iter(root), False, False)]
+    while stack:
+        child = next(stack[-1][0], None)
+        if child is None:
+            stack.pop()
+            continue
+        _, disabled, filtered = stack[-1]
+        off = disabled or child.get("disabled") == "1"
+        targeted = filtered or _has_filters(child)
+        if child.tag == "Collection":
+            if len(stack) >= MAX_XML_DEPTH:
+                raise MalformedXml("Collections nested too deeply")
+            stack.append((iter(child), off, targeted))
+        elif child.tag == "Registry":
+            _registry_item(out, child, off, targeted)
+    return out
+
+
 def machine_groups_gpo(rel: str, gpo_guids: set[str]) -> str | None:
     """GUID of the GPO whose Machine Groups.xml this SYSVOL path is, if it is a known GPO."""
     m = MACHINE_GROUPS.match(rel)
@@ -367,11 +469,13 @@ def scan(
             result.local_groups += parse_group_membership(text, guid.upper(), rel)
         for guid in gpo_guids:
             _read_registry(result, base, guid, port)
+            _read_audit(result, base, guid, port)
+            _read_preferences(result, base, guid, port)
         if gpp_registry:
             result.notes.append(
                 f"{len(gpp_registry)} GPOs set registry values through Preferences "
-                "(Machine\\Preferences\\Registry), not evaluated: they can change what "
-                f"Registry.pol sets: {', '.join(gpp_registry[:5])}"
+                "(Machine\\Preferences\\Registry): AD-GPO-009 to -012 do not evaluate them, and "
+                f"they can change what Registry.pol sets: {', '.join(gpp_registry[:5])}"
             )
         if user_side:
             result.notes.append(
@@ -407,9 +511,63 @@ def _read_registry(result: SysvolResult, base: str, guid: str, port: int) -> Non
         result.notes.append(f"{rel}: not a valid Registry.pol ({exc}), not evaluated")
         return
     result.registry[guid] = parsed.entries
+    _keep_facts(result, guid, rel, "pol", parsed)
+
+
+def _keep_facts(
+    result: SysvolResult, guid: str, rel: str, source: str, parsed: regpol.Parsed
+) -> None:
+    """The fact and the location only: the data never leaves the parser."""
     for key, name in parsed.secrets[:20]:
-        # the fact and the location only: the data never leaves regpol
         result.notes.append(f"{rel}: holds a value named like a password: {key}\\{name}")
+    found = parsed.autologon
+    if found.auto_on or found.password:
+        result.autologon.append(
+            GpoAutologon(guid.upper(), rel, source, found.password, found.auto_on)
+        )
+
+
+def _policy_file(result: SysvolResult, base: str, rel: str, port: int) -> bytes | None:
+    """A GPO file that may not exist: b"" when it does not, None when it could not be judged."""
+    try:
+        data = _read(rf"{base}\{rel}", port)
+    except (SMBException, OSError) as exc:
+        if getattr(exc, "errno", None) == errno.ENOENT:
+            return b""
+        result.policy_unread.append(f"{rel} ({type(exc).__name__})")
+        return None
+    if len(data) >= MAX_FILE:
+        result.notes.append(f"{rel}: over {MAX_FILE} bytes, not evaluated")
+        return None
+    return data
+
+
+def _read_audit(result: SysvolResult, base: str, guid: str, port: int) -> None:
+    rel = rf"Policies\{guid}\{AUDIT_CSV}"
+    data = _policy_file(result, base, rel, port)
+    if data is None:
+        return
+    try:
+        result.audit[guid] = auditpol.parse(_decode(data))
+    except auditpol.MalformedAudit as exc:
+        result.notes.append(f"{rel}: not a valid audit.csv ({exc}), not evaluated")
+
+
+def _read_preferences(result: SysvolResult, base: str, guid: str, port: int) -> None:
+    rel = rf"Policies\{guid}\{REGISTRY_XML}"
+    data = _policy_file(result, base, rel, port)
+    if data is None:
+        return
+    if not data:
+        result.preferences[guid] = []
+        return
+    try:
+        parsed = parse_registry_xml(data)
+    except (MalformedXml, regpol.MalformedPol) as exc:
+        result.notes.append(f"{rel}: not valid Registry.xml ({exc}), not evaluated")
+        return
+    result.preferences[guid] = parsed.entries
+    _keep_facts(result, guid, rel, "xml", parsed)
 
 
 def _read(path: str, port: int) -> bytes:

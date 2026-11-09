@@ -1,0 +1,68 @@
+id = "AD-GPO-013"
+aliases = ["dc-audit-policy", "advanced-audit-policy"]
+summary = "Group Policy does not give domain controllers Microsoft's baseline advanced audit policy. A subcategory no GPO sets may still be set on the DC itself."
+severities = ["info", "low", "medium"]
+severity_logic = """
+**Medium** when the effective Group Policy value turns a recommended subcategory off (setting
+value 4).
+**Low** when the effective value audits only one of the directions Microsoft recommends.
+**Info** when no GPO sets a subcategory, when only basic audit policy covers it, when the value
+is 0 (see Detection) or when the result cannot be decided.
+"""
+mitre = ["T1562.002"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "Machine\\Microsoft\\Windows NT\\Audit\\audit.csv: Subcategory GUID and Setting Value",
+    "Machine\\Microsoft\\Windows NT\\SecEdit\\GptTmpl.inf: [Event Audit]",
+    "gPLink, gPOptions and the GPO's status, version, extensions and DACL",
+]
+related = ["AD-GPO-011", "AD-ADCS-018"]
+since = "0.2.3"
+
+risk = """
+Domain controllers log the events that show an intrusion: failed and successful credential
+validation, group and account changes, directory changes and changes to the audit policy itself.
+A subcategory that is off leaves no trace of that activity to investigate or alert on.
+"""
+
+detection = """
+Each GPO's `audit.csv` is read over SMB, as an ordinary user, and played per subcategory GUID in
+the order Windows applies GPOs to each domain controller, as for `Registry.pol`
+([AD-GPO-009](AD-GPO-009.md)). A file that does not conform is ignored by Windows as a whole, so
+it is a note here and the subcategories stay undecided. Per-user rows are skipped.
+
+The 17 subcategories are the Baseline column for domain controllers of Microsoft's *System Audit
+Policy recommendations*. Kerberos subcategories appear only in its Stronger column, and are not
+checked.
+
+A setting value of 0 is not judged: GPMC writes it for "No Auditing" while [MS-GPAC] defines it
+as "unchanged". Where only `[Event Audit]` covers a subcategory, the row says so: whether basic
+audit policy applies depends on `SCENoApplyLegacyAuditPolicy` on the computer.
+"""
+
+false_positives = """
+- **A domain controller set outside Group Policy.** With `auditpol` or local policy, invisible to
+  an ordinary user. "No GPO sets it" says nothing about what the DC really audits.
+- **Basic and advanced policy together.** `SCENoApplyLegacyAuditPolicy` is not read, so a
+  subcategory judged from `audit.csv` could be overridden by basic audit policy.
+- **Deny ACEs on a GPO** are not read, so a GPO a "Deny Apply" keeps away still counts.
+"""
+
+remediation = """
+Under *Computer Configuration > Windows Settings > Security Settings > Advanced Audit Policy
+Configuration*, in a GPO linked to the Domain Controllers OU, set the subcategories named in the
+finding. Check the log size and forwarding before turning on more events, and confirm with
+`auditpol /get /category:*` on a DC.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-013"
+
+[[references]]
+title = "System Audit Policy recommendations"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/audit-policy-recommendations"
+kind = "vendor"
+
+[[references]]
+title = "[MS-GPAC]: Group Policy: Audit Configuration Extension"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpac/eda6a094-5d0a-4516-a3ab-7ee2d38b12b6"
+kind = "spec"

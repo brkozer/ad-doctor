@@ -47,10 +47,22 @@ MODULE_KEY = r"Software\Policies\Microsoft\Windows\PowerShell\ModuleLogging"
 MODULE_VALUE = "EnableModuleLogging"
 MODULE_NAMES_KEY = rf"{MODULE_KEY}\ModuleNames"
 HARDENED_KEY = r"Software\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths"
+SCHANNEL_KEY = r"System\CurrentControlSet\Control\SecurityProviders\Schannel"
+CERT_MAPPING = "CertificateMappingMethods"
+KDC_KEY = r"System\CurrentControlSet\Services\Kdc"
+STRONG_MAPPING = "StrongCertificateBindingEnforcement"
+DEFAULT_ENCTYPES = "DefaultDomainSupportedEncTypes"
+MSV1_0_KEY = r"System\CurrentControlSet\Control\Lsa\MSV1_0"
+BLOCK_NTLMV1_SSO = "BlockNtlmv1SSO"
+WINLOGON_KEY = r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+AUTO_LOGON = "AutoAdminLogon"
+DEFAULT_PASSWORD = "DefaultPassword"
 
 # a hardened path for one of the two shares Group Policy itself is read from
 _HARDENED_SHARE = re.compile(r"^\\\\[^\\]+\\(?:sysvol|netlogon)\\?$", re.IGNORECASE)
 _SECRET_NAME = re.compile(r"password|passwd|pwd", re.IGNORECASE)
+SECRET_NAME = _SECRET_NAME
+_VARIABLE = re.compile(r"\s*%[^%]+%\s*")  # not a password: expanded on the client
 _URL_USER = re.compile(r"^([a-z][a-z0-9+.-]*://)[^/@]*@", re.IGNORECASE)
 
 
@@ -65,9 +77,13 @@ _VALUES = {
     norm(WSUS_AU_KEY): {WSUS_USE.casefold()},
     norm(SCRIPT_BLOCK_KEY): {SCRIPT_BLOCK_VALUE.casefold()},
     norm(MODULE_KEY): {MODULE_VALUE.casefold()},
+    norm(SCHANNEL_KEY): {CERT_MAPPING.casefold()},
+    norm(KDC_KEY): {STRONG_MAPPING.casefold(), DEFAULT_ENCTYPES.casefold()},
+    norm(MSV1_0_KEY): {BLOCK_NTLMV1_SSO.casefold()},
 }
 _MODULE_NAMES = norm(MODULE_NAMES_KEY)
 _HARDENED = norm(HARDENED_KEY)
+_WINLOGON = norm(WINLOGON_KEY)
 # every key the checks read values from, for a **DeleteKeys above one of them
 _WATCHED_KEYS = (*_VALUES, _MODULE_NAMES, _HARDENED)
 
@@ -77,13 +93,33 @@ class MalformedPol(ValueError):
 
 
 @dataclass
+class Autologon:
+    """What one file says about Winlogon: the facts only, never the password."""
+
+    auto_on: bool = False  # AutoAdminLogon written as 1
+    password: bool = False  # a literal DefaultPassword is in the file
+
+
+@dataclass
 class Parsed:
     entries: list[RegistryEntry] = field(default_factory=list)
     # (key, value name) of values named like a password that hold data
     secrets: list[tuple[str, str]] = field(default_factory=list)
+    autologon: Autologon = field(default_factory=Autologon)
 
 
-def _watched(key: str, name: str) -> bool:
+def note_winlogon(found: Autologon, key: str, name: str, data: object, applied: bool) -> None:
+    """Records an AutoAdminLogon or DefaultPassword write; `data` itself is not kept. A
+    password counts even when the write is switched off: it is still in the file."""
+    if norm(key) != _WINLOGON:
+        return
+    if name.casefold() == AUTO_LOGON.casefold() and applied:
+        found.auto_on = found.auto_on or str(data).strip() == "1"
+    elif name.casefold() == DEFAULT_PASSWORD.casefold() and isinstance(data, str):
+        found.password = found.password or bool(data.strip() and not _VARIABLE.fullmatch(data))
+
+
+def watched(key: str, name: str) -> bool:
     k = norm(key)
     if k == _MODULE_NAMES:
         return True
@@ -97,7 +133,7 @@ def _watched_key(key: str) -> bool:
     return k in _VALUES or k in (_MODULE_NAMES, _HARDENED)
 
 
-def _deletes_watched(key: str) -> bool:
+def deletes_watched(key: str) -> bool:
     """Whether deleting this key also deletes a key the checks read."""
     k = norm(key)
     return any(w == k or w.startswith(k + "\\") for w in _WATCHED_KEYS)
@@ -141,14 +177,15 @@ def _value_data(reg_type: int, payload: bytes) -> int | str | list[str] | None:
     return None
 
 
-def _keep(out: Parsed, entry: RegistryEntry) -> None:
+def keep(out: Parsed, entry: RegistryEntry) -> None:
     if len(out.entries) >= MAX_KEPT:
         raise MalformedPol(f"more than {MAX_KEPT} entries for the settings read")
     out.entries.append(entry)
 
 
 def _set_value(out: Parsed, key: str, name: str, action: str, kind: int, payload: bytes) -> None:
-    if not _watched(key, name):
+    note_winlogon(out.autologon, key, name, _value_data(kind, payload), True)
+    if not watched(key, name):
         if kind in _TEXT_TYPES and _SECRET_NAME.search(name) and _text(payload).strip():
             out.secrets.append((key[:256], name[:128]))
         return
@@ -157,7 +194,7 @@ def _set_value(out: Parsed, key: str, name: str, action: str, kind: int, payload
         data = ""  # the value name is the module; the data repeats it
     elif isinstance(data, str) and name.casefold() == WSUS_SERVER.casefold():
         data = _URL_USER.sub(r"\1", data)
-    _keep(out, RegistryEntry(key, name, action, kind, data))
+    keep(out, RegistryEntry(key, name, action, kind, data))
 
 
 def _instruction(out: Parsed, key: str, name: str, kind: int, payload: bytes) -> None:
@@ -168,20 +205,20 @@ def _instruction(out: Parsed, key: str, name: str, kind: int, payload: bytes) ->
         _set_value(out, key, name.strip()[len("**soft.") :], "soft", kind, payload)
     elif marker.startswith("**del."):
         target = name.strip()[len("**del.") :]
-        if _watched(key, target):
-            _keep(out, RegistryEntry(key, target, "delete"))
+        if watched(key, target):
+            keep(out, RegistryEntry(key, target, "delete"))
     elif marker.startswith("**delvals"):
         if _watched_key(key):
-            _keep(out, RegistryEntry(key, "", "delete_all"))
+            keep(out, RegistryEntry(key, "", "delete_all"))
     elif marker == "**deletevalues":
         for target in (t.strip() for t in _text(payload).split(";")):
-            if target and _watched(key, target):
-                _keep(out, RegistryEntry(key, target, "delete"))
+            if target and watched(key, target):
+                keep(out, RegistryEntry(key, target, "delete"))
     elif marker == "**deletekeys":
         for target in (t.strip() for t in _text(payload).split(";")):
             full = f"{key.rstrip(chr(92))}\\{target}"
-            if target and _deletes_watched(full):
-                _keep(out, RegistryEntry(full, "", "delete_key"))
+            if target and deletes_watched(full):
+                keep(out, RegistryEntry(full, "", "delete_key"))
     # **SecureKey changes a key's ACL and sets no value; other markers set nothing either
 
 

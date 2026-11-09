@@ -1,0 +1,58 @@
+id = "AD-ADCS-020"
+aliases = ["esc10", "certificate-mapping"]
+summary = "Group Policy gives domain controllers a weak certificate mapping, or leaves it unknown: both values are commonly set locally on each DC."
+severities = ["info", "medium"]
+severity_logic = """
+**Medium** when the effective Group Policy value of `CertificateMappingMethods` has a weak bit
+(UPN 0x4, subject/issuer 0x1 or issuer 0x2) or `StrongCertificateBindingEnforcement` is 0 or 1.
+**Info** when no GPO sets one of them, so its value on the DC is unknown, when a value is not
+recognised or when the result cannot be decided.
+"""
+mitre = ["T1649"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "Machine\\Registry.pol and Machine\\Preferences\\Registry\\Registry.xml: System\\CurrentControlSet\\Control\\SecurityProviders\\Schannel, CertificateMappingMethods",
+    "the same files: System\\CurrentControlSet\\Services\\Kdc, StrongCertificateBindingEnforcement",
+    "gPLink, gPOptions and the GPO's status, version, extensions and DACL",
+]
+related = ["AD-ADCS-006", "AD-ADCS-015"]
+since = "0.2.3"
+
+risk = """
+Weak certificate mapping lets an attacker who can change a victim's `userPrincipalName` obtain a
+certificate that authenticates as the victim (ESC10). The Kerberos side needs
+`StrongCertificateBindingEnforcement` below full enforcement, on DCs without the September 2025
+updates; the Schannel side needs the UPN bit in `CertificateMappingMethods`.
+"""
+
+detection = """
+Only Group Policy is visible: `Registry.pol` and then Preferences `Registry.xml`, played in the
+order Windows applies GPOs to each domain controller. Both values are commonly set directly in
+each DC's registry, which an ordinary user cannot read, so a DC where no GPO sets them is reported
+as **unknown** (info), never as clean.
+"""
+
+false_positives = """
+- **A DC with the September 2025 updates** no longer reads `StrongCertificateBindingEnforcement`:
+  a value of 0 or 1 in a GPO is then stale. The patch level is not read here.
+- **A value set locally** is not visible, and overrides nothing here.
+- **`GptTmpl.inf`.** A value written through custom security template entries is not read.
+"""
+
+remediation = """
+Remove the values from the GPO, or set `StrongCertificateBindingEnforcement` to 2 and
+`CertificateMappingMethods` to `0x18`, and move accounts to strong mapping. Check the registry of
+each DC listed as unknown.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-020"
+
+[[references]]
+title = "KB5014754: Certificate-based authentication changes on Windows domain controllers"
+url = "https://support.microsoft.com/en-us/topic/kb5014754-certificate-based-authentication-changes-on-windows-domain-controllers-ad2c23b0-15d8-4340-a468-4d4f3b188f16"
+kind = "vendor"
+
+[[references]]
+title = "Certipy wiki: Privilege escalation (ESC10)"
+url = "https://github.com/ly4k/Certipy/wiki/06-%E2%80%90-Privilege-Escalation"
+kind = "tool"

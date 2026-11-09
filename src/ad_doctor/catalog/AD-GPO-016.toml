@@ -1,0 +1,47 @@
+id = "AD-GPO-016"
+aliases = ["default-enctypes", "defaultdomainsupportedenctypes"]
+summary = "Group Policy sets DefaultDomainSupportedEncTypes on domain controllers to a value that allows DES or RC4."
+severities = ["info", "low", "medium"]
+severity_logic = """
+**Medium** when the effective Group Policy value includes a DES bit (0x1 or 0x2).
+**Low** when it includes RC4 (0x4) and no DES.
+**Info** when the value is not a number or the result cannot be decided. A domain controller where
+no GPO sets it is not listed.
+"""
+mitre = ["T1558.003"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "Machine\\Registry.pol and Machine\\Preferences\\Registry\\Registry.xml: System\\CurrentControlSet\\Services\\Kdc, DefaultDomainSupportedEncTypes",
+    "gPLink, gPOptions and the GPO's status, version, extensions and DACL",
+]
+related = ["AD-KRB-005"]
+since = "0.2.3"
+
+risk = """
+Domain controllers use this value for accounts with an empty `msDS-SupportedEncryptionTypes`.
+When it allows RC4 or DES, service tickets for such accounts can be requested in those types,
+which are far cheaper to crack offline than AES.
+"""
+
+detection = """
+`Registry.pol` and then Preferences `Registry.xml` are played in the order Windows applies GPOs
+to each domain controller, as in [AD-GPO-009](AD-GPO-009.md).
+"""
+
+false_positives = """
+- **A value set outside Group Policy** is not visible, and a domain controller where no GPO sets
+  it is not listed, whatever it uses.
+"""
+
+remediation = """
+Set the value to `0x38` (AES only) once no account depends on RC4. `0x3C`, Microsoft's
+intermediate step for domains that still use RC4, has the RC4 bit and is reported as low.
+Domain controllers need no restart.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-016"
+
+[[references]]
+title = "KB5021131: How to manage the Kerberos protocol changes related to CVE-2022-37966"
+url = "https://support.microsoft.com/en-us/topic/kb5021131-how-to-manage-the-kerberos-protocol-changes-related-to-cve-2022-37966-fd837ac3-cdec-4e76-a6ec-86e67501407d"
+kind = "vendor"

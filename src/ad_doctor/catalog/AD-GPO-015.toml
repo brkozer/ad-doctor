@@ -1,0 +1,46 @@
+id = "AD-GPO-015"
+aliases = ["blockntlmv1sso"]
+summary = "Group Policy sets BlockNtlmv1SSO to 0, keeping single sign-on from NTLMv1-derived credentials in audit mode."
+severities = ["info", "low"]
+severity_logic = """
+**Low** when the effective Group Policy value is 0.
+**Info** when the value is not recognised or the result cannot be decided. A computer where no
+GPO sets it is not listed: Windows then blocks by default since the October 2026 updates.
+"""
+mitre = ["T1557"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "Machine\\Registry.pol and Machine\\Preferences\\Registry\\Registry.xml: System\\CurrentControlSet\\Control\\Lsa\\MSV1_0, BlockNtlmv1SSO",
+    "gPLink, gPOptions and the GPO's status, version, extensions and DACL",
+]
+related = ["AD-GPO-003"]
+since = "0.2.3"
+
+risk = """
+A value of 0 lets Windows answer single sign-on requests with NTLMv1-derived credentials, which
+are weak enough to crack or relay, and only logs a warning (event 4024). Microsoft treats setting
+it explicitly as a temporary exception.
+"""
+
+detection = """
+`Registry.pol` and then Preferences `Registry.xml` are played in the order Windows applies GPOs
+to each Windows computer, as in [AD-GPO-009](AD-GPO-009.md).
+"""
+
+false_positives = """
+- **Computers it does not affect.** The value applies to Windows 11 24H2 and later and Windows
+  Server 2025 where Credential Guard is off. The finding does not tell these apart.
+- **A value set outside Group Policy** is not visible.
+"""
+
+remediation = """
+Remove the value from the GPO or set it to 1, after moving what relies on it (MS-CHAPv2 Wi-Fi or
+VPN, for example) to certificate authentication. Watch event 4024 in the NTLM operational log first.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-015"
+
+[[references]]
+title = "Manage NTLMv1 changes and prevent network authentication issues in Windows"
+url = "https://support.microsoft.com/en-us/servicing/os/windows/docs/2025/08/upcoming-changes-to-ntlmv1-in-windows-11-version-24h2-and-windows-server-2025"
+kind = "vendor"

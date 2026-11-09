@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-from . import catalog, gpo_scope, regpol, sd
+from . import auditpol, catalog, gpo_scope, regpol, sd
 from .gpo_scope import LOCAL_GROUPS, Grant
 from .model import (
     EXCHANGE_GROUPS,
@@ -2481,6 +2481,173 @@ def unc_hardened_paths(snap: Snapshot) -> Finding | None:
     )
 
 
+def _dcs_of(view: gpo_scope.RegistryView) -> list[Account]:
+    return [a for a in view.targets() if a.is_registered_dc]
+
+
+_AUDIT_NOT_CHANGED = (
+    "setting value 0, which GPMC writes for 'No Auditing' and [MS-GPAC] calls unchanged"
+)
+
+
+def _audit_row(view: gpo_scope.RegistryView, a: Account) -> _PolicyRow | None:
+    off: list[str] = []
+    partial: list[str] = []
+    zero: list[str] = []
+    basic: list[str] = []
+    absent: list[str] = []
+    open_points: list[str] = []
+    categories = view.basic_audit(a)
+    for sub in auditpol.RECOMMENDED:
+        e = view.audit(a, sub.guid)
+        if not e.decided:
+            open_points.append(f"{sub.name} ({_undecided(e)})")
+        elif not e.present:
+            (basic if sub.legacy in categories else absent).append(sub.name)
+        elif e.value == auditpol.NONE:
+            off.append(f"{sub.name}{_gpo_note(e)}")
+        elif e.value == auditpol.NOT_CHANGED:
+            zero.append(f"{sub.name}{_gpo_note(e)}")
+        elif isinstance(e.value, int) and e.value & sub.wanted != sub.wanted:
+            missing = "failure" if e.value & auditpol.SUCCESS else "success"
+            partial.append(f"{sub.name} without {missing}{_gpo_note(e)}")
+    severity = Severity.MEDIUM if off else Severity.LOW if partial else Severity.INFO
+    parts = []
+    if off:
+        parts.append(f"set to no auditing: {', '.join(off)}")
+    if partial:
+        parts.append(f"partly set: {', '.join(partial)}")
+    if zero:
+        parts.append(f"not judged ({_AUDIT_NOT_CHANGED}): {', '.join(zero)}")
+    if open_points:
+        parts.append(f"not decided: {', '.join(open_points)}")
+    if basic:
+        parts.append(
+            "only basic audit policy covers these, and whether it applies depends on the "
+            f"computer's SCENoApplyLegacyAuditPolicy: {', '.join(basic)}"
+        )
+    if len(absent) == len(auditpol.RECOMMENDED):
+        parts.append(f"no GPO sets any of the {len(absent)} recommended subcategories")
+    elif absent:
+        parts.append(f"no GPO sets: {', '.join(absent)}")
+    return _PolicyRow(a, severity, "; ".join(parts)) if parts else None
+
+
+@check("AD-GPO-013", "Domain controllers' audit policy below Microsoft's recommendation")
+def dc_audit_policy(snap: Snapshot) -> Finding | None:
+    view = gpo_scope.policy_view(snap)
+    if view is None:
+        return None
+    rows = [row for a in _dcs_of(view) if (row := _audit_row(view, a))]
+    return _policy_finding(
+        snap,
+        "AD-GPO-013",
+        "The advanced audit policy Group Policy gives these domain controllers falls short of "
+        "Microsoft's baseline for domain controllers, or leaves it open. Where a subcategory is "
+        "not audited, the logon, group change and directory change events that show an intrusion "
+        f"are not written. {UNKNOWN_HOST}",
+        "Set the subcategories under Computer Configuration > Windows Settings > Security "
+        "Settings > Advanced Audit Policy Configuration in a GPO linked to the Domain Controllers "
+        "OU, as in Microsoft's System Audit Policy recommendations.",
+        rows,
+    )
+
+
+@check("AD-GPO-014", "Group Policy sets automatic logon or stores its password")
+def gpo_autologon(snap: Snapshot) -> Finding | None:
+    if not snap.gpo_autologon:
+        return None
+    names = {g.guid.upper(): g.name for g in snap.gpos}
+    objects = []
+    stored = False
+    for x in snap.gpo_autologon:
+        where = f"{names.get(x.gpo.upper(), x.gpo)} ({x.path})"
+        if x.password:
+            stored = True
+            state = "AutoAdminLogon is 1" if x.auto_on else "AutoAdminLogon not set in this file"
+            objects.append(f"{where}: DefaultPassword stored in the file; {state}")
+        else:
+            objects.append(f"{where}: AutoAdminLogon is 1, no password in this file")
+    return _finding(
+        "AD-GPO-014",
+        Severity.HIGH if stored else Severity.INFO,
+        "A GPO file holding Winlogon DefaultPassword is readable in clear text by every domain "
+        "user through SYSVOL, whether the GPO is linked or not (the value is not reproduced "
+        "here)."
+        if stored
+        else "Group Policy turns on automatic logon. The password it uses is not in these files, "
+        "and where it is kept on the computer cannot be seen from here.",
+        "Remove the DefaultPassword value from the GPO, change that account's password and "
+        "stop using automatic logon where possible.",
+        sorted(objects),
+    )
+
+
+@check("AD-GPO-015", "Group Policy keeps NTLMv1-derived single sign-on in audit mode")
+def block_ntlmv1_sso(snap: Snapshot) -> Finding | None:
+    view = gpo_scope.policy_view(snap)
+    if view is None:
+        return None
+    rows = []
+    for a in view.targets():
+        e = view.merged(a, regpol.MSV1_0_KEY, regpol.BLOCK_NTLMV1_SSO)
+        if not e.decided:
+            rows.append(_PolicyRow(a, Severity.INFO, f"not decided: {_undecided(e)}"))
+        elif not e.present or e.value == 1:
+            continue
+        elif e.value == 0:
+            rows.append(_PolicyRow(a, Severity.LOW, f"set to 0 (audit){_gpo_note(e)}"))
+        else:
+            rows.append(_PolicyRow(a, Severity.INFO, f"unrecognised value{_gpo_note(e)}"))
+    return _policy_finding(
+        snap,
+        "AD-GPO-015",
+        "Group Policy sets BlockNtlmv1SSO to 0 on these computers, which lets single sign-on use "
+        "NTLMv1-derived credentials, with a warning event only. It applies to Windows 11 24H2 and "
+        "later and Windows Server 2025 where Credential Guard is off; since the October 2026 "
+        "updates Windows blocks this when the value is absent. Computers where no GPO sets it "
+        "are not listed.",
+        "Remove the value from the GPO or set it to 1, and move what depends on it (MS-CHAPv2 "
+        "Wi-Fi or VPN, for example) to certificate authentication.",
+        rows,
+    )
+
+
+ENCTYPE_DES = 0x1 | 0x2
+ENCTYPE_RC4 = 0x4
+
+
+@check("AD-GPO-016", "Group Policy allows weak Kerberos types as the domain default")
+def default_enctypes(snap: Snapshot) -> Finding | None:
+    view = gpo_scope.policy_view(snap)
+    if view is None:
+        return None
+    rows = []
+    for a in _dcs_of(view):
+        e = view.merged(a, regpol.KDC_KEY, regpol.DEFAULT_ENCTYPES)
+        if not e.decided:
+            rows.append(_PolicyRow(a, Severity.INFO, f"not decided: {_undecided(e)}"))
+        elif not e.present:
+            continue
+        elif not isinstance(e.value, int):
+            rows.append(_PolicyRow(a, Severity.INFO, f"not a number{_gpo_note(e)}"))
+        elif e.value & ENCTYPE_DES:
+            rows.append(_PolicyRow(a, Severity.MEDIUM, f"{e.value:#x} allows DES{_gpo_note(e)}"))
+        elif e.value & ENCTYPE_RC4:
+            rows.append(_PolicyRow(a, Severity.LOW, f"{e.value:#x} allows RC4{_gpo_note(e)}"))
+    return _policy_finding(
+        snap,
+        "AD-GPO-016",
+        "Group Policy sets DefaultDomainSupportedEncTypes on these domain controllers to a value "
+        "with DES or RC4. It decides what an account with an empty "
+        "msDS-SupportedEncryptionTypes gets, so tickets for it can be requested in a type that "
+        "is cheap to crack. Domain controllers where no GPO sets it are not listed.",
+        "Set the value to 0x38 (AES only) once no account depends on RC4; 0x3C, Microsoft's "
+        "intermediate step, still allows RC4.",
+        rows,
+    )
+
+
 @check("AD-GPO-004", "GPOs editable outside tier 0")
 def gpo_edit_any(snap: Snapshot) -> Finding | None:
     tier0 = snap.tier0_sids()
@@ -3338,7 +3505,7 @@ PENDING_NOTE = (
     "which slows this down but does not stop a manager approving a forged request."
 )
 # KB5014754 strong certificate mapping, as the detail texts describe it
-STRONG_MAPPING = "StrongCertificateBindingEnforcement"
+STRONG_MAPPING = regpol.STRONG_MAPPING
 
 
 def _pending(c: CaConfig) -> bool:
@@ -3533,6 +3700,65 @@ def esc16(snap: Snapshot) -> Finding | None:
         f"certutil -config <host>\\<CA> -setreg policy\\DisableExtensionList "
         f"-{sd.SZOID_NTDS_CA_SECURITY_EXT}, then restart certsvc; keep every DC on current "
         "updates (full enforcement).",
+    )
+
+
+_WEAK_MAPPINGS = ((0x4, "UPN"), (0x1, "subject/issuer"), (0x2, "issuer"))
+
+
+def _esc10_row(view: gpo_scope.RegistryView, a: Account) -> _PolicyRow | None:
+    problems: list[str] = []
+    notes: list[str] = []
+    absent: list[str] = []
+    methods = view.merged(a, regpol.SCHANNEL_KEY, regpol.CERT_MAPPING)
+    if not methods.decided:
+        notes.append(f"{regpol.CERT_MAPPING} not decided ({_undecided(methods)})")
+    elif not methods.present:
+        absent.append(regpol.CERT_MAPPING)
+    elif not isinstance(methods.value, int):
+        notes.append(f"{regpol.CERT_MAPPING} is not a number{_gpo_note(methods)}")
+    else:
+        weak = [label for bit, label in _WEAK_MAPPINGS if methods.value & bit]
+        if weak:
+            problems.append(
+                f"{regpol.CERT_MAPPING} {methods.value:#x} allows {', '.join(weak)} "
+                f"mapping{_gpo_note(methods)}"
+            )
+    strong = view.merged(a, regpol.KDC_KEY, STRONG_MAPPING)
+    if not strong.decided:
+        notes.append(f"{STRONG_MAPPING} not decided ({_undecided(strong)})")
+    elif not strong.present:
+        absent.append(STRONG_MAPPING)
+    elif strong.value in (0, 1):
+        problems.append(f"{STRONG_MAPPING} set to {strong.value}{_gpo_note(strong)}")
+    elif strong.value != 2:
+        notes.append(f"{STRONG_MAPPING} has an unrecognised value{_gpo_note(strong)}")
+    if absent:
+        notes.append(f"no GPO sets {' or '.join(absent)}: unknown")
+    if not problems and not notes:
+        return None
+    severity = Severity.MEDIUM if problems else Severity.INFO
+    return _PolicyRow(a, severity, "; ".join([*problems, *notes]))
+
+
+@check("AD-ADCS-020", "ESC10: weak certificate mapping set by Group Policy on domain controllers")
+def esc10(snap: Snapshot) -> Finding | None:
+    view = gpo_scope.policy_view(snap)
+    if view is None:
+        return None
+    rows = [row for a in _dcs_of(view) if (row := _esc10_row(view, a))]
+    return _policy_finding(
+        snap,
+        "AD-ADCS-020",
+        "Whoever can change a victim's userPrincipalName can get a certificate that maps to the "
+        f"victim where these domain controllers accept weak mappings: {STRONG_MAPPING} at 0 or 1 "
+        "(Kerberos, DCs without the September 2025 updates, which no longer read it) or a "
+        f"{regpol.CERT_MAPPING} with the UPN bit (Schannel). This shows only what Group Policy "
+        "sets: both values are commonly set locally on each DC, so a DC listed as unknown may "
+        "be weak or not.",
+        f"Remove the values from the GPO, keep {STRONG_MAPPING} out of compatibility mode and "
+        f"keep {regpol.CERT_MAPPING} at 0x18; check the registry of each DC listed as unknown.",
+        rows,
     )
 
 

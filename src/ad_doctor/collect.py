@@ -492,6 +492,10 @@ class Collector:
             gpo_settings=gpo_settings,
             gpo_registry=sysvol_result.registry,
             registry_policy_collected=sysvol_result.scanned,
+            gpo_audit=sysvol_result.audit,
+            gpo_preferences=sysvol_result.preferences,
+            gpo_autologon=sysvol_result.autologon,
+            policy_files_collected=sysvol_result.scanned,
             script_secrets=sysvol_result.script_secrets,
             gmsas=gmsas,
             rodcs=[Rodc(a.sam, a_reveal, a_never) for a, a_reveal, a_never in self.rodc_policies],
@@ -537,6 +541,7 @@ class Collector:
         snap.notes += gpo_scope.filter_note(snap)
         snap.notes += _channel_notes(snap)
         snap.notes += _registry_notes(snap, sysvol_result.registry_unread)
+        snap.notes += _policy_file_notes(snap, sysvol_result.policy_unread)
         if self.pwd_unread:
             shown = ", ".join(sorted(self.pwd_unread)[:5])
             more = len(self.pwd_unread) - 5
@@ -1930,6 +1935,26 @@ def _registry_notes(snap: Snapshot, unread: list[str]) -> list[str]:
         notes.append(f"{REGISTRY_CHECKS} did not read the Registry.pol of: {', '.join(missing)}")
     if unread:
         notes.append(f"Registry.pol files not readable by this account: {', '.join(unread[:5])}")
+    return notes
+
+
+POLICY_FILE_CHECKS = "AD-GPO-013, AD-GPO-014, AD-GPO-015, AD-GPO-016 and AD-ADCS-020"
+
+
+def _policy_file_notes(snap: Snapshot, unread: list[str]) -> list[str]:
+    if not snap.policy_files_collected:
+        return [f"{POLICY_FILE_CHECKS} (audit.csv, Registry.xml) not judged: SYSVOL was not read"]
+    notes = []
+    missing = sorted(g.name for g in gpo_scope.unread_policy_gpos(snap))
+    if missing:
+        notes.append(
+            f"{POLICY_FILE_CHECKS} did not read the audit.csv or Registry.xml of: "
+            f"{', '.join(missing)}"
+        )
+    if unread:
+        notes.append(
+            f"audit.csv or Registry.xml not readable by this account: {', '.join(unread[:5])}"
+        )
     return notes
 
 

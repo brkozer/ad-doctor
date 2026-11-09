@@ -38,6 +38,11 @@ KEEP = {
     "oid", "default domain policy", "default domain controllers policy",
     "machine", "user", "preferences", "groups", "scripts", "logon", "logoff", "startup",
     "windows",  # in operatingSystem values, which AD-GPO-009 to -012 read
+    "registry", "registry.xml", "registry.pol", "audit", "audit.csv",
+    # the [Event Audit] categories AD-GPO-013 compares
+    "auditaccountlogon", "auditaccountmanage", "auditdsaccess", "auditlogonevents",
+    "auditobjectaccess", "auditpolicychange", "auditprivilegeuse", "auditprocesstracking",
+    "auditsystemevents",
     "shutdown", "microsoft", "windows nt", "secedit", "gpttmpl.inf", "groups.xml",
     "services.xml", "scheduledtasks.xml", "datasources.xml", "drives.xml", "printers.xml",
     # built-in certificate templates
@@ -105,12 +110,17 @@ FIXED_KEYS = {
                 model.DirObject, model.GpoSettings, model.Probes, model.DcProbe, model.CaConfig,
                 model.Gmsa, model.Rodc, model.Trust, model.Gpo, model.GppPassword,
                 model.ScriptSecret, model.GpoLocalGroup, model.GpLink, model.RegistryEntry,
+                model.GpoAutologon,
                 model.UnreadableMember, model.KeyCredential, model.Site, model.Subnet,
                 model.ConflictObject, model.Pso, model.Dmsa)
     for f in dataclasses.fields(cls)
 } | {"domain", "AdminSDHolder", "sid", "mask", "object_type", "inherited_object_type"}  # fmt: skip
 # values from a fixed list, which the checks compare: never data, whatever the names around
 FIXED_VALUES = {"kind", "source", "action"}
+
+
+# GUID -> RegistryEntry lists; a path or value name in them is vocabulary
+POLICY_STORES = ("gpo_registry", "gpo_audit", "gpo_preferences")
 
 
 class Redactor:
@@ -235,9 +245,10 @@ class Redactor:
         for s in data.get("gpo_settings", {}).values():
             for server in s.get("ntlm_exceptions", []):
                 words.update([server, *server.split(".")])
-        for entries in data.get("gpo_registry", {}).values():
-            for e in entries:
-                words.update(_registry_words(e))
+        for store in POLICY_STORES:
+            for entries in data.get(store, {}).values():
+                for e in entries:
+                    words.update(_registry_words(e))
         for m in data.get("unreadable_members", []):
             words.add(m["group"])
             words.update(_dn_values(m["dn"]))
@@ -415,9 +426,10 @@ def redact(data: dict[str, Any], key: bytes) -> dict[str, Any]:
                 credential["device_id"] = r.fake_guid(credential["device_id"])
             if credential.get("key_id"):
                 credential["key_id"] = r.fake_guid(credential["key_id"]).replace("-", "")[:16]
-    for guid, entries in data.get("gpo_registry", {}).items():
-        for before, after in zip(entries, out["gpo_registry"][r._key(guid)], strict=True):
-            _redact_registry(r, before, after)
+    for store in POLICY_STORES:
+        for guid, entries in data.get(store, {}).items():
+            for before, after in zip(entries, out[store][r._key(guid)], strict=True):
+                _redact_registry(r, before, after)
     # an address block names the network; 0.0.0.0/24 would make every subnet the same one
     for before, after in zip(data.get("subnets", []), out.get("subnets", []), strict=True):
         after["name"] = r.token(before["name"])

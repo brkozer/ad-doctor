@@ -282,6 +282,18 @@ class RegistryEntry:
     action: str  # "set", "soft", "delete", "delete_all" or "delete_key" (key is the one deleted)
     reg_type: int = 0  # REG_* of a set or soft
     data: int | str | list[str] | None = None  # None: binary or the wrong length for its type
+    filtered: bool = False  # Registry.xml only: item-level targeting may keep it from applying
+
+
+@dataclass
+class GpoAutologon:
+    """One GPO file that sets AutoAdminLogon or holds a DefaultPassword; never the password."""
+
+    gpo: str  # GPO GUID, upper case with braces
+    path: str  # SYSVOL-relative
+    source: str  # "pol" (Registry.pol) or "xml" (Preferences Registry.xml)
+    password: bool  # a literal DefaultPassword is stored in the file
+    auto_on: bool  # AutoAdminLogon is written as 1
 
 
 @dataclass
@@ -339,6 +351,8 @@ class GpoSettings:
     vulnerable_channel_allow: str | None = None
     # privilege constant -> SIDs (or names) granted
     privileges: dict[str, list[str]] = field(default_factory=dict)
+    # [Event Audit] categories this GPO configures (basic audit policy)
+    audit_categories: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -560,6 +574,13 @@ class Snapshot:
     gpo_registry: dict[str, list[RegistryEntry]] = field(default_factory=dict)
     # False in older snapshots and when SYSVOL was not read: registry policy is unknown
     registry_policy_collected: bool = False
+    # GUID -> the system settings read from audit.csv / the Registry items of Registry.xml;
+    # absent: not read or did not parse. Registry items that are disabled are left out.
+    gpo_audit: dict[str, list[RegistryEntry]] = field(default_factory=dict)
+    gpo_preferences: dict[str, list[RegistryEntry]] = field(default_factory=dict)
+    gpo_autologon: list[GpoAutologon] = field(default_factory=list)
+    # False in older snapshots and when SYSVOL was not read: those files are unknown
+    policy_files_collected: bool = False
     script_secrets: list[ScriptSecret] = field(default_factory=list)
     gmsas: list[Gmsa] = field(default_factory=list)
     rodcs: list[Rodc] = field(default_factory=list)
@@ -754,6 +775,15 @@ class Snapshot:
                 k: [RegistryEntry(**e) for e in v] for k, v in data.get("gpo_registry", {}).items()
             },
             registry_policy_collected=data.get("registry_policy_collected", False),
+            gpo_audit={
+                k: [RegistryEntry(**e) for e in v] for k, v in data.get("gpo_audit", {}).items()
+            },
+            gpo_preferences={
+                k: [RegistryEntry(**e) for e in v]
+                for k, v in data.get("gpo_preferences", {}).items()
+            },
+            gpo_autologon=[GpoAutologon(**x) for x in data.get("gpo_autologon", [])],
+            policy_files_collected=data.get("policy_files_collected", False),
             script_secrets=[ScriptSecret(**x) for x in data.get("script_secrets", [])],
             gmsas=[Gmsa(**x) for x in data.get("gmsas", [])],
             rodcs=[Rodc(**x) for x in data.get("rodcs", [])],
@@ -910,6 +940,11 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
             (
                 "registry_policy_collected",
                 "AD-GPO-009, AD-GPO-010, AD-GPO-011, AD-GPO-012 (registry policy)",
+            ),
+            (
+                "policy_files_collected",
+                "AD-GPO-013, AD-GPO-014, AD-GPO-015, AD-GPO-016 and AD-ADCS-020 "
+                "(audit.csv and Registry.xml)",
             ),
             ("tier0_members_checked", "AD-PRIV-012 (unreadable tier-0 members)"),
             ("trust_details_checked", "AD-INF-016 and the AES part of AD-INF-015 (trust details)"),

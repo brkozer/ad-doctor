@@ -22,6 +22,16 @@ logic or severity between versions, but an ID is never reused for something else
   hardened paths for SYSVOL and NETLOGON missing or weak), for domain controllers and other
   Windows computers. "No GPO sets it" never claims what the computer's own registry holds.
   Snapshots from earlier versions load and report these four as not evaluated.
+- **Advanced audit policy and Preferences registry items from SYSVOL.** `audit.csv` ([MS-GPAC])
+  and `Machine\Preferences\Registry\Registry.xml` are read with the same precedence; a file
+  that does not parse or cannot be read is a note and stays unknown. `Registry.xml` joins the
+  credential scan. A password in it never reaches the snapshot, only the fact and the location.
+- **AD-GPO-013** (domain controllers' audit policy below Microsoft's baseline), **AD-GPO-014**
+  (automatic logon or a stored DefaultPassword in a GPO), **AD-GPO-015** (BlockNtlmv1SSO kept
+  in audit mode), **AD-GPO-016** (DES or RC4 in DefaultDomainSupportedEncTypes) and
+  **AD-ADCS-020** (ESC10: weak certificate mapping set by Group Policy on domain controllers).
+  A value no GPO sets stays unknown and is reported as such where the check needs it. Snapshots
+  from earlier versions load and report these five as not evaluated.
 
 ## [0.2.2] - 2026-11-09
 

@@ -29,6 +29,8 @@ Approximations, each of which can only over-report:
 Registry policy is the exception to the precedence point: `RegistryView` plays each GPO's
 Registry.pol in processing order and gives the effective value per computer. There a GPO that
 may not apply (a caveat above) leaves the result undecided instead of being assumed to apply.
+The same machinery plays audit.csv per subcategory, and Registry.xml after every Registry.pol:
+Windows always runs the Registry extension first and the Preferences extensions later.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ import itertools
 import re
 from dataclasses import dataclass, field
 
-from . import regpol, sd
+from . import auditpol, regpol, sd
 from .model import (
     WELL_KNOWN_RIDS,
     Account,
@@ -55,7 +57,15 @@ from .model import (
 CSE_SECURITY = "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}"  # Restricted Groups, user rights
 CSE_GROUPS = "{17D89FEC-5C44-4972-B12D-241CAEF74509}"  # GPP Local Users and Groups
 CSE_REGISTRY = "{35378EAC-683F-11D2-A89A-00C04FBBCFA2}"  # Registry.pol (Administrative Templates)
-CSE_OF_SOURCE = {"restricted": CSE_SECURITY, "gpp": CSE_GROUPS, "registry": CSE_REGISTRY}
+CSE_AUDIT = "{F3CCC681-B74C-4060-9F26-CD84525DCA2A}"  # audit.csv ([MS-GPAC])
+CSE_GPP_REGISTRY = "{B087BE9D-ED37-454F-AF9C-04291E351182}"  # Preferences Registry.xml
+CSE_OF_SOURCE = {
+    "restricted": CSE_SECURITY,
+    "gpp": CSE_GROUPS,
+    "registry": CSE_REGISTRY,
+    "audit": CSE_AUDIT,
+    "gpp_registry": CSE_GPP_REGISTRY,
+}
 GPO_USER_DISABLED = 0x1
 GPO_COMPUTER_DISABLED = 0x2
 SIDES = (("computer", GPO_COMPUTER_DISABLED), ("user", GPO_USER_DISABLED))
@@ -535,6 +545,7 @@ class _Layer:
     gpo: Gpo
     caveats: tuple[str, ...]  # any caveat means the GPO may not apply here
     entries: tuple[RegistryEntry, ...] | None  # None: the file could not be read
+    file: str = "Registry.pol"
 
 
 def _concerns(entry: RegistryEntry, key: str, name: str) -> bool:
@@ -575,7 +586,7 @@ def effective_value(layers: tuple[_Layer, ...], key: str, name: str) -> Effectiv
     wanted_name = name.casefold()
     for layer in layers:
         if layer.entries is None:
-            unread = (f"Registry.pol of {layer.gpo.name} not readable",)
+            unread = (f"{layer.file} of {layer.gpo.name} not readable",)
             state = _distinct([*state, Outcome(False, None, layer.gpo.name, unread, True)])
             continue
         entries = [e for e in layer.entries if _concerns(e, wanted, wanted_name)]
@@ -592,7 +603,7 @@ class RegistryView:
     def __init__(self, snap: Snapshot) -> None:
         self.snap = snap
         self.r = _Resolver(snap)
-        self._layers: dict[str, tuple[_Layer, ...]] = {}
+        self._layers: dict[tuple[str, str], tuple[_Layer, ...]] = {}
         self._memo: dict[tuple[object, ...], Effective] = {}
 
     def targets(self) -> list[Account]:
@@ -608,16 +619,18 @@ class RegistryView:
             if not a.entra_kerberos and a.sam.upper() != "AZUREADSSOACC$" and windows(a)
         ]
 
-    def layers(self, a: Account) -> tuple[_Layer, ...]:
-        """The GPOs with registry policy that reach this computer, in processing order."""
-        found = self._layers.get(a.dn.lower())
+    def _source_layers(
+        self, a: Account, source: str, store: dict[str, list[RegistryEntry]], file: str
+    ) -> tuple[_Layer, ...]:
+        """The GPOs with this kind of settings that reach the computer, in processing order."""
+        found = self._layers.get((source, a.dn.lower()))
         if found is not None:
             return found
         out = []
         for g, caveats in self.r.processing_order(a):
-            if not computer_side_applies(g, "registry"):
+            if not computer_side_applies(g, source):
                 continue
-            entries = self.snap.gpo_registry.get(g.guid)
+            entries = store.get(g.guid)
             if entries is not None and not entries:
                 continue  # read, nothing the checks care about
             passes, assumed = self.r.filtered(g, a)
@@ -626,14 +639,54 @@ class RegistryView:
                     g,
                     caveats + assumed + _gpo_caveats(g),
                     tuple(entries) if entries is not None else None,
+                    file,
                 )
                 out.append(layer)
-        self._layers[a.dn.lower()] = tuple(out)
-        return self._layers[a.dn.lower()]
+        self._layers[(source, a.dn.lower())] = tuple(out)
+        return self._layers[(source, a.dn.lower())]
+
+    def layers(self, a: Account) -> tuple[_Layer, ...]:
+        """The GPOs with registry policy that reach this computer, in processing order."""
+        return self._source_layers(a, "registry", self.snap.gpo_registry, "Registry.pol")
+
+    def preference_layers(self, a: Account) -> tuple[_Layer, ...]:
+        """Registry.xml in processing order. An item behind item-level targeting may not apply,
+        so a run of them becomes a layer of its own with that caveat."""
+        out: list[_Layer] = []
+        source = self._source_layers(a, "gpp_registry", self.snap.gpo_preferences, "Registry.xml")
+        for layer in source:
+            if layer.entries is None:
+                out.append(layer)
+                continue
+            for filtered, run in itertools.groupby(layer.entries, key=lambda e: e.filtered):
+                caveats = (*layer.caveats, ILT_CAVEAT) if filtered else layer.caveats
+                out.append(_Layer(layer.gpo, caveats, tuple(run), layer.file))
+        return tuple(out)
 
     def value(self, a: Account, key: str, name: str) -> Effective:
-        layers = self.layers(a)
-        memo = (key, name, *[(x.gpo.guid, x.caveats) for x in layers])
+        """What Registry.pol alone leaves in a value."""
+        return self._played("pol", self.layers(a), key, name)
+
+    def merged(self, a: Account, key: str, name: str) -> Effective:
+        """What Registry.pol and then Registry.xml leave in a value."""
+        return self._played("all", self.layers(a) + self.preference_layers(a), key, name)
+
+    def audit(self, a: Account, subcategory: str) -> Effective:
+        """What audit.csv leaves for one subcategory GUID (lower case)."""
+        layers = self._source_layers(a, "audit", self.snap.gpo_audit, "audit.csv")
+        return self._played("audit", layers, auditpol.KEY, subcategory)
+
+    def basic_audit(self, a: Account) -> set[str]:
+        """[Event Audit] categories that a GPO which may reach this computer configures."""
+        found: set[str] = set()
+        for g, _ in self.r.applied(a, "restricted"):
+            settings = self.snap.gpo_settings.get(g.guid)
+            if settings:
+                found.update(settings.audit_categories)
+        return found
+
+    def _played(self, kind: str, layers: tuple[_Layer, ...], key: str, name: str) -> Effective:
+        memo = (kind, key, name, *[(x.gpo.guid, x.caveats) for x in layers])
         found = self._memo.get(memo)
         if found is None:
             found = effective_value(layers, key, name)
@@ -654,6 +707,22 @@ class RegistryView:
 def registry_view(snap: Snapshot) -> RegistryView | None:
     """None when registry policy was not collected: the checks then do not judge."""
     return RegistryView(snap) if snap.registry_policy_collected else None
+
+
+def policy_view(snap: Snapshot) -> RegistryView | None:
+    """None when audit.csv and Registry.xml were not collected: those checks do not judge."""
+    return RegistryView(snap) if snap.policy_files_collected else None
+
+
+def unread_policy_gpos(snap: Snapshot) -> list[Gpo]:
+    """GPOs Windows would process whose audit.csv or Registry.xml is not in the snapshot."""
+    missing = []
+    for g in snap.gpos:
+        no_audit = g.guid not in snap.gpo_audit and computer_side_applies(g, "audit")
+        no_xml = g.guid not in snap.gpo_preferences and computer_side_applies(g, "gpp_registry")
+        if no_audit or no_xml:
+            missing.append(g)
+    return missing
 
 
 def unread_registry_gpos(snap: Snapshot) -> list[Gpo]:

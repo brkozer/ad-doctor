@@ -8,7 +8,7 @@
 Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
-(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 113
+(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 118
 checks for what attackers look for first: roastable accounts, risky delegation,
 exploitable certificate templates and CA settings (ESC1–9, 11, 13–17), DCSync and other takeover rights,
 shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync accounts,
@@ -178,6 +178,7 @@ against a live DC.
 | | AD-ADCS-017 | ESC17: enrollee-supplied subject on a server authentication template | medium |
 | | AD-ADCS-018 | CA audit filter not fully on (registry probe) | low/medium |
 | | AD-ADCS-019 | HTTPS enrollment endpoints where EPA is not verified (probe) | low |
+| | AD-ADCS-020 | ESC10: weak certificate mapping set by Group Policy on domain controllers | info/medium |
 | Permissions | AD-ACL-001 | Non-default principals with DCSync rights | high |
 | | AD-ACL-002 | Non-default control over AdminSDHolder | high |
 | | AD-ACL-003 | Non-default control over the domain object | high |
@@ -199,6 +200,10 @@ against a live DC.
 | | AD-GPO-010 | Group Policy points computers to WSUS over HTTP | info/medium/high |
 | | AD-GPO-011 | PowerShell script block or module logging not set by Group Policy | info/low/medium |
 | | AD-GPO-012 | UNC hardened paths for SYSVOL and NETLOGON missing or weak | info/medium |
+| | AD-GPO-013 | Domain controllers' audit policy below Microsoft's recommendation | info/low/medium |
+| | AD-GPO-014 | Group Policy sets automatic logon or stores its password (values never reproduced) | info/high |
+| | AD-GPO-015 | Group Policy keeps NTLMv1-derived single sign-on in audit mode | info/low |
+| | AD-GPO-016 | Group Policy allows weak Kerberos types as the domain default | info/low/medium |
 | | AD-GPP-001 | Passwords in Group Policy Preferences (MS14-025) | high |
 | | AD-GPP-002 | Credentials in SYSVOL or NETLOGON scripts (values never reproduced) | high |
 | Attack paths | AD-PATH-001 | Control paths from non-tier-0 principals to tier 0 | high |
@@ -315,8 +320,9 @@ by a small built-in parser (`sd.py`). For Group Policy scope it also reads `gPLi
 `gPOptions` on the domain, OUs and sites, the GPOs' status, version and extension
 attributes, WMI filter names and which site each DC is in. From SYSVOL it reads Group
 Policy Preferences (passwords and Local Groups), `GptTmpl.inf` security templates
-(including Restricted Groups), `Machine\Registry.pol` and scripts, and keeps only paths,
-line numbers, account names and setting values, never a secret. From `Registry.pol` it keeps
+(including Restricted Groups), `Machine\Registry.pol`, advanced audit policy (`audit.csv`), Preferences
+`Registry.xml` and scripts, and keeps only paths, line numbers, account names and setting
+values, never a secret. From `Registry.pol` it keeps
 only the values its checks read; a value named like a password is reported by location alone.
 
 Active probes, each one connection per DC: an unsigned NTLM bind on 389 (LDAP signing),
@@ -352,8 +358,9 @@ ports. A CES URL is reached on the port it names; only a URL with no port follow
   group memberships. The admins of other domains in the forest are expected CA managers
   when a within-forest trust object gives their domain's SID; on a CA outside the scanned
   domain with no such trust object, any other domain's Administrator and Domain Admins are
-  accepted. ESC10 and ESC12 (DC certificate-mapping registry settings, a CA key on an HSM
-  reachable from a shell on the CA) are not checked. HTTPS web enrollment and the CES URLs
+  accepted. ESC10 is checked only as far as Group Policy shows it (AD-ADCS-020): both
+  values are commonly set locally on a DC, where an ordinary user cannot read them. ESC12
+  (a CA key on an HSM reachable from a shell on the CA) is not checked. HTTPS web enrollment and the CES URLs
   in the directory are found, but whether they enforce EPA is not determined: IIS shows that
   only to a client that authenticates, and the probe sends these endpoints no credentials,
   so AD-ADCS-019 lists them as unknown. Host settings beyond what the DC probes see remain
@@ -413,8 +420,16 @@ ports. A CES URL is reached on the port it names; only a URL with no port follow
   from `Registry.pol` with link order, Enforced, Block Inheritance and security filtering. A
   WMI filter, an assumed site or an unreadable GPO that could change the result gives an
   info row, not a verdict. Only GPOs are visible: "no GPO sets it" says nothing about a value
-  in a computer's own registry or local policy. Registry items in Group Policy Preferences are
-  not read; a note names the GPOs that have them. Deny ACEs on a GPO are not read.
+  in a computer's own registry or local policy. Registry items in Group Policy Preferences do
+  not count for these four; a note names the GPOs that have them. Deny ACEs on a GPO are not
+  read.
+- AD-GPO-013 to -016 and AD-ADCS-020 read `audit.csv` and `Registry.xml` with the same
+  precedence; `Registry.xml` is played after every `Registry.pol`. A file that does not parse
+  is a note and leaves its checks undecided. Audit policy is judged against Microsoft's
+  baseline for domain controllers; basic `[Event Audit]` policy alone gives an info row, as
+  whether it applies depends on a value on the computer. These checks and AD-GPO-009 to -012
+  see Group Policy only. Values set through `GptTmpl.inf` registry entries are not read for
+  certificate mapping, BlockNtlmv1SSO or the default Kerberos types.
 - AD-ADCS-018 reads the CA's audit filter only. Whether the Certification Services audit
   subcategory is on is not read, so 127 does not prove events are written. A CA where
   auditing was never configured has no such value, and is reported as not set.
@@ -463,7 +478,7 @@ flowchart LR
     P --> S
     S -- "collect -o / redact" --> F[(snapshot.json)]
     F --> A
-    S --> A[checks.py + paths.py<br/>113 pure functions]
+    S --> A[checks.py + paths.py<br/>118 pure functions]
     A --> I[invariants.py<br/>accept.py]
     I --> R[report.py<br/>text, JSON, Markdown,<br/>SARIF, JUnit]
     I --> W[viewer.py<br/>offline HTML viewer]
