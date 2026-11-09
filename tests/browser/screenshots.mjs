@@ -46,6 +46,11 @@ const SHOTS = [
     await page.locator(".compare .verdict").nth(1).waitFor();
   }],
   ["changes", "#changes"],
+  ["whatif", "#whatif", async (page) => {
+    const box = page.locator(".wl-row input:not(:disabled)").first();
+    if (await box.count()) await box.uncheck();
+    await page.evaluate(() => window.scrollTo(0, 0));
+  }],
   ["trend", "#trend"],
   ["accepted", "#accepted"],
   ["draft", "#findings?open=AD-PATH-001", async (page) => {

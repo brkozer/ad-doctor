@@ -430,7 +430,8 @@ def test_json_keys(lab: tuple[Path, Path], capsys: pytest.CaptureFixture[str]) -
         "n", "title", "changes", "exposed_after", "holders_after", "routes_after", "closes",
     }  # fmt: skip
     _, doc = run_json(capsys, "whatif", str(snap_path), "--plan", str(plan_path))
-    assert set(doc) == TOP_KEYS
+    assert set(doc) == TOP_KEYS | {"goal"}
+    assert doc["goal"] == "exposure"
 
 
 def test_text_markdown_and_ps1(lab: tuple[Path, Path], capsys: pytest.CaptureFixture[str]) -> None:

@@ -12,7 +12,9 @@ fix lines, the full graph), `sealed.html` (the same, encrypted with PASSPHRASE),
 `old-report.json` (the baseline as a JSON report, for the drag-and-drop diff). The second
 writes the compact graph and Python's blast radius of a set of accounts for each snapshot
 (the XSS fixture, the full fixture, a 3,000-user bench.py domain, and any given), which
-tests/js/blast.test.mjs compares with the JavaScript search.
+tests/js/blast.test.mjs compares with the JavaScript search, and `whatif-*.json`: the
+what-if model and Python's answer for every single removal, random sets and a plan's
+prefixes on each what-if fixture (and any snapshot given), for tests/js/whatif.test.mjs.
 """
 
 from __future__ import annotations
@@ -24,13 +26,14 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from ad_doctor import paths, sd, viewer_graph
+from ad_doctor import changes, cut, paths, sd, viewer_graph, whatif
 from ad_doctor.cli import main
 from ad_doctor.model import DirObject, Snapshot
 from ad_doctor.sd import Ace
@@ -175,10 +178,20 @@ def history(work: Path, old: Snapshot) -> Path:
 def build(out: Path) -> dict[str, Path]:
     """Write the pages (and the old report) into `out`; return their paths."""
     out.mkdir(parents=True, exist_ok=True)
-    pages = {
-        name: out / f"{name}.html"
-        for name in ("xss", "full", "sealed", "paths", "clean", "bench", "whatif")
-    }
+    names = [
+        "xss",
+        "full",
+        "sealed",
+        "paths",
+        "clean",
+        "bench",
+        "whatif",
+        "noplan",
+        "live",
+        "redacted",
+        "allpaths",
+    ]
+    pages = {name: out / f"{name}.html" for name in names}
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         xss = work / "xss.json"
@@ -237,6 +250,31 @@ def build(out: Path) -> dict[str, Path]:
         # large-domain mode on a small domain: only precomputed principals
         args = ["view", str(work / "new.json"), "--graph", "paths", "--no-encrypt"]
         assert main([*args, "-o", str(pages["paths"])]) == 0
+        # the full graph and no plan: the What-if screen starts from nothing
+        args = ["view", str(work / "new.json"), "--no-encrypt", "-o", str(pages["noplan"])]
+        assert main(args) == 0
+        # what the page's downloaded plan is checked against (tests/browser)
+        shutil.copy(work / "new.json", out / "full-snapshot.json")
+        shutil.copy(xss, out / "xss-snapshot.json")
+        shutil.copy(work / "new.json", out / "noplan-snapshot.json")
+        write_live_page(work, pages["live"], out / "live-snapshot.json")
+        # a redacted snapshot and no plan: the download does not resolve against the real one
+        red = out / "redacted-snapshot.json"
+        os.environ["AD_DOCTOR_REDACT_KEY"] = "fixture-only redaction key"
+        try:
+            assert main(["redact", str(work / "new.json"), "-o", str(red)]) == 0
+        finally:
+            os.environ.pop("AD_DOCTOR_REDACT_KEY", None)
+        args = ["view", str(red), "--no-encrypt", "-o", str(pages["redacted"])]
+        assert main(args) == 0
+        # the result of an all-paths plan: the goal has to reach the page without a recommendation
+        src, toml, result = str(work / "new.json"), work / "all.toml", work / "all-whatif.json"
+        args = ["plan", src, "--goal", "all-paths", "-f", "toml", "-o", str(toml)]
+        assert main(args) == 0
+        assert main(["whatif", src, "--plan", str(toml), "-f", "json", "-o", str(result)]) == 0
+        shutil.copy(work / "new.json", out / "allpaths-snapshot.json")
+        args = ["view", str(work / "new.json"), "--whatif", str(result), "--no-encrypt"]
+        assert main([*args, "-o", str(pages["allpaths"])]) == 0
         # a clean domain, as `analyze -f html` writes it (no graph, no findings)
         clean = work / "clean.json"
         clean.write_text(
@@ -253,6 +291,33 @@ def build(out: Path) -> dict[str, Path]:
         args = ["analyze", str(work / "old.json"), "--invariants", str(work / "inv.toml")]
         assert main([*args, "-f", "json", "-o", str(report)]) == 0
     return pages
+
+
+def write_live_page(work: Path, page: Path, snapshot_copy: Path) -> None:
+    """A domain with a plan, chokepoints, an edge no change can take out, and one change
+    of the plan that only the command line can evaluate (the edge a rebuild decides)."""
+    from .test_whatif import FIXTURES
+
+    snap = FIXTURES["gpo-local"]()
+    src = work / "live.json"
+    src.write_text(json.dumps(snap.to_json()))
+    shutil.copy(src, snapshot_copy)
+    plan = work / "live-plan.json"
+    assert main(["plan", str(src), "-f", "json", "-o", str(plan)]) == 0
+    doc = json.loads(plan.read_text(encoding="utf-8"))
+    g = paths.build(snap, provenance=True)
+    assert g.prov is not None
+    rebuild = next(p for p in range(len(g.prov.prims)) if g.prov.needs_rebuild(p))
+    plain = next(p for p, key in enumerate(g.prov.prims) if key[0] == "gpo-entry")
+    for p in (plain, rebuild):
+        key = g.prov.prims[p]
+        doc["changes"].append(
+            {"id": changes.change_id(key), "kind": key[0], "label": changes.describe(snap, key),
+             "class": "removable", "cost": 1, "status": "applied", "notes": [], "warnings": []}
+        )  # fmt: skip
+    plan.write_text(json.dumps(doc), encoding="utf-8")
+    args = ["view", str(src), "--whatif", str(plan), "--no-encrypt", "-o", str(page)]
+    assert main(args) == 0
 
 
 # --- parity data for the JavaScript graph search ------------------------------------------
@@ -314,6 +379,162 @@ def write_parity(out: Path, extra: list[Path]) -> list[Path]:
     for name, (snap, sample) in snaps.items():
         target = out / f"parity-{name}.json"
         target.write_text(json.dumps(parity(snap, sample)))
+        written.append(target)
+    written += write_whatif_parity(out, extra)
+    return written
+
+
+# --- parity data for the page's what-if ----------------------------------------------------
+
+
+def _digest(rows: list[str]) -> str:
+    return hashlib.sha256("\n".join(rows).encode()).hexdigest()
+
+
+def _whatif_case(
+    snap: Snapshot,
+    g: paths.Graph,
+    base: whatif.State,
+    index: dict[str, int],
+    numbers: dict[int, int],
+    removed: list[int],
+    sams: list[str],
+    reach: set[str],
+    m: cut.Model,
+    extra: list[str],
+) -> dict[str, Any]:
+    """Python's answer for one set of removals, for tests/js/whatif.test.mjs: digests over
+    everything order-sensitive, with enough raw rows to debug a difference."""
+    assert g.prov is not None
+    case: dict[str, Any] = {"removed": sorted(numbers[p] for p in removed)}
+    if not whatif.maskable(g.prov, removed):
+        case["rebuild"] = True
+        return case
+    mg = whatif.masked(g, snap, removed, extra)
+    after = whatif.state(snap, mg)
+    closed, rerouted, still = whatif.classify(base, after)
+    label = paths.edge_text
+    edge_rows = [
+        f"{index[src]} {index[dst]} {label(mg, src, dst, how)}"
+        for src in sorted(mg.edges, key=index.__getitem__)
+        for dst, how in mg.edges[src]
+    ]
+    found_rows = [f"{index[n]}\t{p.render(mg)}" for n, p in after.found.items()]
+    holder_rows = [f"{index[n]}\t{p.render(mg)}" for n, p in after.holders.items()]
+
+    def now(n: str) -> str:
+        return (after.holders.get(n) or after.found[n]).render(mg)
+
+    rerouted_rows = [
+        f"{index[n]}\t{base.holders[n].render(base.graph)}\t{now(n)}" for n in rerouted
+    ]
+    open_rows = [f"{index[n]}\t{now(n)}" for n in still]
+    new_rows = [
+        f"{index[n]}\t{p.render(mg)}" for n, p in after.holders.items() if n not in base.holders
+    ]
+    case.update(
+        routes=None if set(removed) & m.dropped else cut.routes(m, removed),
+        tier0=sorted(index[n] for n in mg.tier0),
+        edges=_digest(edge_rows),
+        edge_count=len(edge_rows),
+        order=[index[s] for s in mg.edges if s in reach],
+        found=_digest(found_rows),
+        found_count=len(found_rows),
+        found_first=found_rows[:10],
+        holders=_digest(holder_rows),
+        holder_count=len(holder_rows),
+        holders_first=holder_rows[:10],
+        exposed=after.exposed,
+        users=after.users,
+        closed=_digest([str(index[n]) for n in closed]),
+        closed_count=len(closed),
+        rerouted=_digest(rerouted_rows),
+        rerouted_count=len(rerouted_rows),
+        open=_digest(open_rows),
+        open_count=len(open_rows),
+        new=_digest(new_rows),
+        new_count=len(new_rows),
+        blast=[blast_case(mg, snap, sam, index) for sam in sams],
+    )
+    return case
+
+
+def whatif_parity(
+    snap: Snapshot,
+    singles: int,
+    sets: int,
+    with_plan: bool = True,
+    seed: int = 11,
+    assume: bool = False,
+    goal: str = "exposure",
+) -> dict[str, Any]:
+    """The model and Python's answers: every single removal (or `singles` of them), random
+    sets, and the plan's step prefixes. Rebuild cases only check the flag."""
+    from .whatif_fixtures import random_sets
+
+    g = paths.build(snap, provenance=True)
+    assert g.prov is not None
+    prims = len(g.prov.prims)
+    numbers = viewer_graph.prim_numbers(g)
+    data = viewer_graph.compact(g, snap)
+    extra = sorted(paths.direct_holders(g, paths.paths_to_tier0(g)))[:1] if assume else []
+    model = viewer_graph.whatif_model(g, snap, data, (), extra, goal)
+    index = {n: i for i, n in enumerate(viewer_graph.nodes_of(g))}
+    view = whatif.masked(g, snap, (), extra)
+    reach = whatif.reaching(view)
+    base = whatif.state(snap, view)
+    keeps = changes.default_keeps(snap, g.prov)
+    m = cut.build_model(snap, g, cut.sources_for(snap, view, goal), keeps, extra)
+    picked: list[list[int]] = []
+    if singles < 0 or singles >= prims:
+        picked += [[p] for p in range(prims)]
+    elif singles:
+        picked += random_sets(prims, singles, seed, most=1)
+    if prims:
+        picked += random_sets(prims, sets, seed + 1)
+    if with_plan and prims:
+        steps = cut.plan(snap, g).changes
+        picked += [steps[: k + 1] for k in range(len(steps))]
+    accounts = [a.sam for a in snap.accounts if a.sid][:3]
+    return {
+        "domain": snap.domain,
+        "graph": data,
+        "whatif": model,
+        "before": {
+            "exposed": base.exposed,
+            "users": base.users,
+            "holders": len(base.holders),
+            "found": len(base.found),
+            "routes": cut.routes(m),
+        },
+        "cases": [
+            _whatif_case(snap, g, base, index, numbers, removed, accounts, reach, m, extra)
+            for removed in picked
+        ],
+    }
+
+
+def write_whatif_parity(out: Path, extra: list[Path]) -> list[Path]:
+    from .test_whatif import FIXTURES
+
+    written = []
+    for name, make in FIXTURES.items():
+        target = out / f"whatif-{name}.json"
+        target.write_text(json.dumps(whatif_parity(make(), -1, 50)))
+        written.append(target)
+    for name, make in FIXTURES.items():
+        target = out / f"whatif-assume-{name}.json"
+        target.write_text(json.dumps(whatif_parity(make(), -1, 20, assume=True, goal="all-paths")))
+        written.append(target)
+    target = out / "whatif-bench3000.json"
+    target.write_text(json.dumps(whatif_parity(bench_snapshot(), 200, 50)))
+    written.append(target)
+    for path in extra:
+        snap = Snapshot.from_json(json.loads(path.read_text()))
+        big = len(snap.accounts) > 5000
+        data = whatif_parity(snap, 40 if big else -1, 20 if big else 200, with_plan=not big)
+        target = out / f"whatif-{path.stem}.json"
+        target.write_text(json.dumps(data))
         written.append(target)
     return written
 

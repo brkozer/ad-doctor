@@ -19,10 +19,10 @@ ad-doctor view 2026-11.json --baseline 2026-10.json --history reports/ \
 |---|---|
 | Overview | tier-0 exposure, score and grade (and the baseline's), severity and category, compound findings, top actions, acceptance and invariant tiles, what was not checked |
 | Findings | filters (severity, category, ATT&CK, new only) and search, kept in the URL; the evidence, objects with fingerprints, the catalog's explanation, the remediation and, with `--fixes`, the fix-script lines; CSV and JSON export; *Add to acceptance draft* |
-| Control paths | each path drawn as a chain, filters by edge kind (membership, ACL rights, ownership, containment, Group Policy, AD CS, DCSync, gMSA, Entra sync, delegation, SID history), a node inspector, the steps the most paths share ("break here first"), copy as Mermaid |
+| Control paths | each path drawn as a chain, filters by edge kind (membership, ACL rights, ownership, containment, Group Policy, AD CS, DCSync, gMSA, Entra sync, delegation, SID history), a node inspector, the steps the most paths share ("break here first"), copy as Mermaid; with the full graph, *Add to what-if* on every step and chokepoint, or the reason no change can take it out |
 | Blast radius | any account (typeahead over sAMAccountName and SID): whether it reaches tier 0, the paths that get it there, and everything else it controls grouped by kind with the step that reaches each object; two accounts side by side |
 | Changes | with `--baseline`, or with a JSON report dropped on the screen: score, exposure, and new, resolved and changed objects (a path that takes another route is *changed*, not new) |
-| What-if | with `--whatif plan.json` (the output of `plan -f json` or `whatif -f json` on the same snapshot file): exposure before and after, the steps with their change IDs, the fix lines with `--fixes`, the paths closed, still open or new, the sources no removal can close, and the findings that would clear or appear |
+| What-if | with the full graph, an interactive selection: the plan the file carries (or nothing), each change on or off, more added from Control paths; exposure, principals with a path, routes and the paths closed, rerouted, open and new, live; how the selection differs from the plan; *Download plan.toml* for `whatif --plan` ([details](whatif.md#in-the-viewer)). With `--whatif plan.json` (the output of `plan -f json` or `whatif -f json` on the same snapshot file): exposure before and after, the steps with their change IDs, the fix lines with `--fixes`, the paths closed, still open or new, the sources no removal can close, and the findings that would clear or appear |
 | Trend | with `--history`: severity counts and tier-0 exposure per scan, category scores as a heat map, and markers where the ad-doctor version or the set of checks changed |
 | Policy | an acceptance draft builder that downloads `accept-draft.toml`; the acceptance file with active, expiring, expired and stale entries; each invariant section, declared against actual |
 | About | what the file contains, the payload's SHA-256 and a check of it, the CSP in force and a self-check that requests are blocked, a print view for an executive PDF |
@@ -120,8 +120,9 @@ ad-doctor view snap.json --graph none -o summary.html   # no graph, not encrypte
   enforced where the browser supports them. The page links nowhere; documentation URLs
   are shown as text to copy.
 - **Minimum data.** The file holds what the report says plus the paths and what `--graph`,
-  `--history` and `--whatif` add, never the raw snapshot. A `--whatif` plan brings change
-  labels, path strings and, with `--fixes`, PowerShell lines; encryption follows the graph,
+  `--history` and `--whatif` add, never the raw snapshot. The full graph also brings the
+  identity (DNs, SIDs), label and ID of each change on a shown path. A `--whatif` plan
+  brings change labels, path strings and, with `--fixes`, PowerShell lines; encryption follows the graph,
   so pass `--encrypt` for a page with a plan and no graph. A redacted snapshot shows its pseudonyms
   only. Nothing is stored in the browser (no localStorage, IndexedDB or cookies). The file
   is written with mode 0600.
@@ -156,6 +157,12 @@ under 20 ms. Forcing `--graph full` on the 100,000-user domain gives a 6.3 MB fi
 before that. Encryption adds under half a second to the build (0.36 s on the lab, 0.3 s
 at 10,000 users). Object lists with
 thousands of rows are drawn as they scroll into view.
+
+With the full graph the page also carries what the What-if screen needs: on a 10,000-user
+bench domain that takes the file from 842 KB to 1,059 KB (26%) with no plan and 1,075 KB
+with a plan of 29 changes. Each tick recomputes exposure, holders, routes and every path:
+8 to 18 ms in headless Chromium on that page (1 to 5 ms on the lab). Above the full-graph
+limit (`paths` mode) that data is not embedded and the screen shows the plan only.
 
 ## Paths and chokepoints on the command line
 

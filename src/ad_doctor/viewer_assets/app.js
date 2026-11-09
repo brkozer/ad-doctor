@@ -41,6 +41,7 @@
     autoprint: false,
     pendingNode: undefined,
     draft: new Map(), // acceptance draft: check ID -> entry; never stored
+    wi: null, // the what-if selection; never stored
     adhoc: null, // a report dropped on the Changes screen, and the diff against it
     charts: [], // the Trend screen's charts, redrawn on resize
     focusEdge: "", // the edge filter to focus again after the paths screen redraws
@@ -382,6 +383,8 @@
     FINDINGS_BY_ID = new Map();
     state.draft.clear();
     state.adhoc = null;
+    state.wi = null;
+    WI_MODEL = null;
     document.getElementById("app").replaceChildren();
     history.replaceState(null, "", location.pathname + location.search);
     location.reload();
@@ -405,7 +408,10 @@
     if (route === "findings") return { n: VM.findings.length };
     if (route === "paths") return VM.paths ? { n: VM.paths.list.length, alert: true } : null;
     if (route === "changes") return VM.baseline ? { n: "+" + VM.baseline.new.length } : null;
-    if (route === "whatif") return VM.whatif ? { n: VM.whatif.changes.filter((c) => c.id).length } : null;
+    if (route === "whatif") {
+      if (state.wi) return { n: state.wi.on.size };
+      return VM.whatif ? { n: VM.whatif.changes.filter((c) => c.id).length } : null;
+    }
     if (route === "trend") return VM.trend ? { n: VM.trend.points.length } : null;
     if (route === "accepted") {
       const l = VM.lifecycle;
@@ -1138,6 +1144,10 @@
     if (state.node < 0 || !ids.includes(state.node)) state.node = p.start;
     const scroll = h("div", { class: "chain-scroll" });
     const inspector = h("div", null);
+    const stepsBox = VM.whatif_model ? h("ul", { class: "wl-edges", "aria-label": "Steps of this path, to add to the what-if" },
+      p.steps.map((st, k) => h("li", null,
+        h("span", { class: "mono" }, nodeAt(ids[k]).name, " ", h("span", { class: "how" }, "-[" + st.how + "]→"), " ", nodeAt(ids[k + 1]).name),
+        " ", wiEdgeControl([[ids[k], ids[k + 1], st.how]])))) : null;
     const start = nodeAt(p.start);
     const end = nodeAt(ids[ids.length - 1]);
     box.replaceChildren(
@@ -1148,6 +1158,7 @@
         h("div", { class: "no-print" }, copyButton(p.object, "Copy path", "path"),
           copyButton(p.fingerprint, "Copy fingerprint", "fingerprint"))),
       scroll,
+      stepsBox,
       h("div", { class: "section-title node-title" }, h("h2", null, "Selected node")),
       inspector);
     const render = () => {
@@ -1269,9 +1280,24 @@
         : h("span", { class: "mono" }, nodeAt(c.to).name);
       const bar = h("span");
       bar.style.width = Math.round((100 * c.count) / total) + "%";
+      let edges = [[c.from, c.to, c.how]];
+      if (c.from === undefined) {
+        edges = [];
+        const seen = new Set();
+        for (const p of P.list) {
+          const ids = pathNodes(p);
+          ids.forEach((n, k) => {
+            if (n !== c.to || k === 0 || seen.has(ids[k - 1] + ":" + p.steps[k - 1].how)) return;
+            seen.add(ids[k - 1] + ":" + p.steps[k - 1].how);
+            edges.push([ids[k - 1], n, p.steps[k - 1].how]);
+          });
+        }
+      }
+      const control = VM.whatif_model ? h("div", { class: "wl-choke" },
+        wiEdgeControl(edges, c.from === undefined ? "Add the edges into it" : null)) : null;
       const tr = h("tr", { class: "clickable", tabindex: "0", title: "Show the first path through it" },
         h("td", { class: "num muted" }, String(i + 1)),
-        h("td", null, what),
+        h("td", null, what, control),
         h("td", { class: "hide-sm" }, c.from !== undefined ? "Edge" : "Node"),
         h("td", { class: "num" }, h("span", { class: "share" }, num(c.count) + " of " + num(total),
           h("span", { class: "track", "aria-hidden": "true" }, bar))));
@@ -1368,10 +1394,19 @@
   function viewWhatif() {
     const W = VM.whatif;
     if (!W) {
+      const alone = whatifLive();
+      if (alone) {
+        return h("div", { class: "stack wi" },
+          pageHead("What-if", "What-if", "Simulated on the snapshot; Active Directory is unchanged and nothing was applied."),
+          alone,
+          h("div", { class: "empty" }, "No plan in this file. Build one with ", cmd("ad-doctor plan snap.json -f json -o plan.json"),
+            " and pass it with ", cmd("--whatif plan.json"), " to start from it."));
+      }
       return h("div", { class: "stack" }, pageHead("What-if", "What-if plan"), h("div", { class: "empty" },
         "No plan in this file. Build one with ", cmd("ad-doctor plan snap.json -f json -o plan.json"),
         " and pass it with ", cmd("--whatif plan.json"), "."));
     }
+    const live = whatifLive();
     const isPlan = W.kind === "plan";
     const rec = W.recommendation;
     const b = W.before || {}, a = W.after || {};
@@ -1498,7 +1533,327 @@
       pageHead("What-if", isPlan ? planTitle : "What-if",
         "Simulated on the snapshot; Active Directory is unchanged and nothing was applied. Made by ad-doctor " +
           (W.version || "?") + "."),
-      warn, stats, summary, sections);
+      warn, live ? [live, sectionTitle("The plan in this file")] : null, stats, summary, sections);
+  }
+
+  // ---- what-if, live -------------------------------------------------------------------
+
+  const FIXED_TEXT = {
+    contains: "an OU or container holds the object: ACL inheritance, not a right",
+    "gpo-scope": "GPO scope plumbing",
+    "sync-host": "a sync server holds the password of its sync account",
+    "filter-node": "the right into this GPO is the place to cut",
+    "default-gpo-link": "a link of a default domain policy",
+    "builtin-nesting": "nesting AD enforces",
+  };
+  const WL_LIMIT = 200; // rows drawn per list of paths; the count is always the whole list
+
+  function wiModel() {
+    if (!WI_MODEL && VM.whatif_model && graphOf()) WI_MODEL = CORE.whatifModel(graphOf(), VM.whatif_model);
+    return WI_MODEL;
+  }
+
+  // The selection: every row the screen lists, and the numbers of those that are on. It
+  // lives in this tab only, like the acceptance draft.
+  function wiState() {
+    if (state.wi) return state.wi;
+    const M = wiModel();
+    const rows = new Map();
+    const missing = [];
+    const on = new Set();
+    for (const c of VM.whatif ? VM.whatif.changes.filter((x) => x.id) : []) {
+      const info = M.names.get(M.plan[c.id]);
+      if (!info) { missing.push(c); continue; }
+      rows.set(info.num, { info: info, inPlan: true });
+      if (!info.rebuild) on.add(info.num);
+    }
+    state.wi = { rows: rows, on: on, missing: missing };
+    return state.wi;
+  }
+
+  function wiResetToPlan() {
+    state.wi = null;
+    wiState();
+  }
+
+  function wiClear() {
+    const wi = wiState();
+    wi.on.clear();
+    for (const [num, row] of wi.rows) if (!row.inPlan) wi.rows.delete(num);
+  }
+
+  function wiAdd(nums) {
+    const M = wiModel();
+    const wi = wiState();
+    for (const num of nums) {
+      if (!wi.rows.has(num)) wi.rows.set(num, { info: M.names.get(num), inPlan: false });
+      wi.on.add(num);
+    }
+  }
+
+  function wiDrop(nums) {
+    const wi = wiState();
+    for (const num of nums) {
+      wi.on.delete(num);
+      const row = wi.rows.get(num);
+      if (row && !row.inPlan) wi.rows.delete(num);
+    }
+  }
+
+  // What adding these graph edges would select: {nums} or {why} when no change can.
+  function wiEdgesChanges(edges) {
+    const M = wiModel();
+    const nums = new Set();
+    let why = "";
+    for (const [from, to, how] of edges) {
+      const a = M.pathNodes[from];
+      const b = M.pathNodes[to];
+      const e = a >= 0 && b >= 0 ? CORE.whatifFindEdge(graphOf(), a, b, how) : -1;
+      if (e < 0) { why = why || "not in the graph this page carries"; continue; }
+      const ch = CORE.whatifEdgeChanges(M, e);
+      if (ch.fixed) { why = why || "cannot be removed: " + FIXED_TEXT[ch.fixed]; continue; }
+      const infos = ch.prims.map((p) => M.names.get(p));
+      const stuck = infos.find((x) => !x || x.rebuild);
+      if (stuck) {
+        why = why || (stuck.rebuild ? "unavailable here: " + stuck.rebuild + "; run ad-doctor whatif on the snapshot" : "not named in this page");
+        continue;
+      }
+      for (const x of infos) nums.add(x.num);
+    }
+    return nums.size ? { nums: Array.from(nums) } : { why: why };
+  }
+
+  // A button that puts the changes behind some edges of a path in the selection or takes
+  // them out; when no change can, the reason instead.
+  function wiEdgeControl(edges, addLabel) {
+    if (!wiModel()) return null;
+    const got = wiEdgesChanges(edges);
+    if (!got.nums) return h("span", { class: "small muted wl-why no-print" }, got.why);
+    const btn = h("button", { type: "button", class: "btn ghost wl-add no-print" });
+    const has = () => got.nums.every((n) => wiState().on.has(n));
+    const paint = () => {
+      btn.textContent = has() ? "In what-if: remove" : addLabel || "Add to what-if";
+      btn.setAttribute("aria-pressed", String(has()));
+    };
+    WI_PAINT.set(btn, paint);
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (has()) wiDrop(got.nums); else wiAdd(got.nums);
+      // a step and a chokepoint can be the same change: every button on the screen follows
+      for (const other of document.querySelectorAll(".wl-add")) WI_PAINT.get(other)();
+      refreshNav();
+      const n = wiState().on.size;
+      announce(plural(n, "change") + " in the what-if selection");
+    });
+    btn.addEventListener("keydown", (ev) => ev.stopPropagation());
+    paint();
+    return btn;
+  }
+
+  // Where the keyboard goes when a row of the list is gone: the row now at that place, one
+  // before it at the end of the list, the list itself when no row has a control.
+  function wiFocusRow(list, at) {
+    const rows = Array.from(list.querySelectorAll(".wl-row"));
+    for (const row of rows.slice(at).concat(rows.slice(0, at).reverse())) {
+      const control = row.querySelector("button") || row.querySelector("input:not(:disabled)");
+      if (control) { control.focus(); return; }
+    }
+    list.focus();
+  }
+
+  function wiFocusList() {
+    const list = document.querySelector(".wl-list");
+    if (list) list.focus();
+  }
+
+  function wiPct(x, n) {
+    if (!n) return "–";
+    const p = Math.floor((100 * x) / n);
+    return x > 0 && p === 0 ? "<1%" : p + "%";
+  }
+
+  function wiNum(x) {
+    return x === null || x === undefined ? "–" : num(x);
+  }
+
+  function wiPaths(title, rows, cls, text) {
+    if (!rows.length) return [];
+    const shown = rows.slice(0, WL_LIMIT);
+    return [sectionTitle(title + " (" + num(rows.length) + ")"),
+      h("ul", { class: "wi-paths " + (cls || "") }, shown.map(text)),
+      rows.length > shown.length ? h("p", { class: "small muted" },
+        "The first " + num(shown.length) + " are drawn. Download the plan and run ad-doctor whatif for all of them.") : null];
+  }
+
+  function wiToml() {
+    const M = wiModel();
+    const wi = wiState();
+    const entries = [];
+    for (const [num_, row] of wi.rows) {
+      if (!wi.on.has(num_)) continue;
+      const info = row.info;
+      entries.push({ id: info.id, kind: info.kind, label: info.label,
+        fields: M.fieldNames[info.kind].map((name, i) => [name, info.values[i]]) });
+    }
+    const skipped = wi.missing.map((c) => c.id);
+    for (const row of wi.rows.values()) if (row.info.rebuild) skipped.push(row.info.id);
+    return CORE.whatifPlanToml(entries, {
+      domain: VM.meta.domain, domain_sid: VM.graph.domain_sid, made_against: VM.meta.collected_at,
+      made_by: "ad-doctor " + VM.meta.version + " viewer", goal: M.goal,
+      assume: M.assume.map((a) => a[1]), skipped: skipped, note: VM.whatif_model.redacted_note,
+    });
+  }
+
+  function wiChangeRow(row, draw, drawList) {
+    const wi = wiState();
+    const info = row.info;
+    const box = h("input", { type: "checkbox", disabled: info.rebuild ? true : null,
+      "aria-label": (info.rebuild ? "Unavailable: " : "Include: ") + info.label });
+    box.checked = wi.on.has(info.num);
+    box.addEventListener("change", () => {
+      if (box.checked) wi.on.add(info.num); else wi.on.delete(info.num);
+      draw();
+    });
+    const notes = [];
+    if (info.rebuild) {
+      notes.push(h("div", { class: "small warn-text wl-unavailable" },
+        "Unavailable here: " + info.rebuild + ". The page shows no number for it and leaves it out of the download; run ad-doctor whatif on the snapshot."));
+    }
+    if (info.warning) notes.push(h("div", { class: "small warn-text" }, "Warning: " + info.warning));
+    let drop = null;
+    if (!row.inPlan) {
+      drop = h("button", { type: "button", class: "btn ghost", "aria-label": "Remove from the selection: " + info.label }, "Remove");
+      drop.addEventListener("click", () => {
+        const at = Array.from(item.parentNode.children).indexOf(item);
+        wiDrop([info.num]);
+        drawList(at);
+        draw();
+      });
+    }
+    const item = h("li", { class: "wl-row" + (info.rebuild ? " off" : ""), "data-change": info.id },
+      box,
+      h("div", { class: "wl-text" },
+        h("div", null, h("code", null, info.id), " " + info.label,
+          h("span", { class: "small muted" }, "  " + (row.inPlan ? "in the plan" : "added") + ", cost " + info.cost)),
+        notes),
+      drop);
+    return item;
+  }
+
+  function wiDiff(wi, r) {
+    const W = VM.whatif;
+    if (!W) return null;
+    const rows = Array.from(wi.rows.values());
+    const out = rows.filter((x) => x.inPlan && !x.info.rebuild && !wi.on.has(x.info.num));
+    const added = rows.filter((x) => !x.inPlan && wi.on.has(x.info.num));
+    const lost = rows.filter((x) => x.inPlan && x.info.rebuild);
+    const a = W.after || {};
+    const same = !out.length && !added.length;
+    return h("div", { class: "panel wl-diff" },
+      h("h3", null, "Against the plan in this file"),
+      h("p", { class: "small" }, "The plan: " + wiNum(a.exposed) + " of " + wiNum(a.users) + " users exposed, " +
+        wiNum(a.holders) + " principals with a path, " + wiNum(a.routes) + " routes. This selection: " +
+        wiNum(r.after.exposed) + " exposed, " + wiNum(r.after.holders) + " principals, " + wiNum(r.after.routes) + " routes."),
+      same ? h("p", { class: "small ok-text wl-same" }, lost.length || wi.missing.length
+        ? "The selection is the plan, without the changes this page cannot evaluate."
+        : "The selection is the plan in this file.") : null,
+      added.length ? h("div", { class: "small" }, h("strong", null, "Added (" + added.length + "): "),
+        added.map((x, i) => [i ? "; " : null, x.info.label])) : null,
+      out.length ? h("div", { class: "small" }, h("strong", null, "Left out (" + out.length + "): "),
+        out.map((x, i) => [i ? "; " : null, x.info.label])) : null);
+  }
+
+  function wiResults(r) {
+    const W = VM.whatif;
+    const stats = h("div", { class: "stats" },
+      stat(wiPct(r.after.exposed, r.after.users), "users with a path to tier 0 (" + wiNum(r.after.exposed) + " of " + wiNum(r.after.users) + ")", wiPct(r.before.exposed, r.before.users)),
+      stat(wiNum(r.after.holders), "principals with a path", wiNum(r.before.holders)),
+      stat(wiNum(r.after.routes), "routes left (changes needed)", wiNum(r.before.routes)),
+      stat(num(r.closed.length), "paths closed", null));
+    const planDiffers = W && W.before && W.before.routes !== null && W.before.routes !== undefined && W.before.routes !== r.before.routes;
+    return h("div", { class: "wl-results", "data-exposed": r.after.exposed, "data-users": r.after.users,
+      "data-holders": r.after.holders, "data-routes": r.after.routes === null ? "" : r.after.routes,
+      "data-closed": r.closed.length, "data-rerouted": r.rerouted.length, "data-new": r.new.length },
+    stats,
+    r.after.routes === null ? h("p", { class: "small warn-text" },
+      "A change here has no place in the routes network: run ad-doctor whatif for that number.") : null,
+    planDiffers ? h("p", { class: "small warn-text" },
+      "The plan counted routes from other sources or with other kept changes than this page, so its route numbers are not comparable with these.") : null,
+    wiDiff(state.wi, r),
+    h("p", { class: "small muted" }, r.note, " Numbers change as you tick; AD is unchanged and nothing is applied."),
+    h("ul", { class: "small muted wl-limits", "aria-label": "Limits of these numbers" },
+      VM.whatif_model.limits.map((x) => h("li", null, x))));
+  }
+
+  function wiPathLists(r) {
+    return [wiPaths("Closes in the snapshot", r.closed, "good", (x) => h("li", null, h("code", null, x.path))),
+      wiPaths("New: not there before", r.new, "bad", (x) => h("li", null, h("code", null, x.path))),
+      wiPaths("Rerouted: still a path, another way", r.rerouted, "", (x) => h("li", null,
+        h("div", { class: "small muted" }, "was ", h("code", null, x.before)), h("code", null, x.after))),
+      wiPaths("Still open, same path", r.open, "", (x) => h("li", null, h("code", null, x.path)))].flat();
+  }
+
+  function whatifLive() {
+    const M = wiModel();
+    if (!M) return null;
+    const wi = wiState();
+    const G = graphOf();
+    const list = h("ul", { class: "wl-list", tabindex: "-1", "aria-label": "Changes in the selection" });
+    const results = h("div");
+    const pathLists = h("div");
+    const missing = h("div");
+    const dl = h("button", { type: "button", class: "btn primary" }, "Download plan.toml");
+    const count = h("span", { class: "small muted" });
+    const draw = () => {
+      const on = Array.from(wi.on).sort((a, b) => a - b);
+      const now = CORE.whatifEvaluate(G, M, on);
+      results.replaceChildren(wiResults(now));
+      pathLists.replaceChildren(...wiPathLists(now).filter(Boolean));
+      count.textContent = plural(on.length, "change") + " selected";
+      dl.disabled = on.length === 0;
+      copy.disabled = on.length === 0;
+      refreshNav();
+      const r = results.querySelector(".wl-results");
+      announce("Exposed " + r.getAttribute("data-exposed") + " of " + r.getAttribute("data-users") +
+        ", principals with a path " + r.getAttribute("data-holders") + ", routes " + (r.getAttribute("data-routes") || "unknown"));
+    };
+    const drawList = (focusAt) => {
+      const rows = Array.from(wi.rows.values()).map((row) => wiChangeRow(row, draw, drawList));
+      list.replaceChildren(...rows);
+      if (!rows.length && !wi.missing.length) {
+        list.replaceChildren(h("li", { class: "empty" }, "Nothing selected yet. Add changes from the chokepoints or the edges of a path on ",
+          h("a", { href: "#paths" }, "Control paths"), "."));
+      }
+      missing.replaceChildren(...wi.missing.map((c) => h("div", { class: "wl-row off", "data-change": c.id },
+        h("input", { type: "checkbox", disabled: true, "aria-label": "Unavailable: " + c.label }),
+        h("div", { class: "wl-text" },
+          h("div", null, h("code", null, c.id), " " + c.label),
+          h("div", { class: "small warn-text wl-unavailable" },
+            "Unavailable here: no edge in this graph comes from it, so it is not in the download. Run ad-doctor whatif on the snapshot.")))));
+      if (focusAt !== undefined) wiFocusRow(list, focusAt);
+    };
+    dl.addEventListener("click", () => download("plan.toml", wiToml(), "application/toml"));
+    const copy = copyButton(() => wiToml(), "Copy TOML", "plan file");
+    copy.classList.remove("ghost");
+    const reset = h("button", { type: "button", class: "btn" }, VM.whatif ? "Back to the plan" : "Clear");
+    reset.addEventListener("click", () => {
+      if (VM.whatif) wiResetToPlan(); else wiClear();
+      route();
+      wiFocusList();
+    });
+    const clear = VM.whatif ? h("button", { type: "button", class: "btn" }, "Start from nothing") : null;
+    if (clear) clear.addEventListener("click", () => { wiClear(); route(); wiFocusList(); });
+    drawList();
+    draw();
+    return h("div", { class: "stack wl" },
+      sectionTitle("Try changes", count),
+      h("div", { class: "actions wl-actions no-print" }, dl, copy, reset, clear),
+      VM.whatif_model.redacted_note
+        ? h("p", { class: "small warn-text wl-redacted no-print" }, "Note: " + VM.whatif_model.redacted_note + ".")
+        : null,
+      results,
+      h("div", null, sectionTitle("The selection"), list, missing),
+      pathLists);
   }
 
   function changeTable(kind, rows) {
@@ -1923,6 +2278,8 @@
   // ---- blast radius -----------------------------------------------------------------
 
   let GRAPH = null; // CORE.graph(VM.graph), built on first use
+  let WI_MODEL = null; // CORE.whatifModel over it, built on first use
+  const WI_PAINT = new WeakMap(); // an Add to what-if button -> what redraws its label
 
   function graphOf() {
     if (!GRAPH && VM.graph) GRAPH = CORE.graph(VM.graph);
