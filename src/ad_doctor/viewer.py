@@ -123,6 +123,7 @@ def viewmodel(r: Report, snap: Snapshot | None, opts: Options) -> dict[str, Any]
         "graph": None,
         "blast": None,
         "whatif": _whatif(opts.whatif, opts.fixes),
+        "whatif_model": None,
     }
     if snap is not None and opts.graph != "none":
         _graph(vm, snap, opts)
@@ -131,11 +132,14 @@ def viewmodel(r: Report, snap: Snapshot | None, opts: Options) -> dict[str, Any]
 
 
 def _graph(vm: dict[str, Any], snap: Snapshot, opts: Options) -> None:
-    analysis = paths.analyze(snap)
     if opts.graph == "full":
-        vm["graph"] = viewer_graph.compact(analysis.graph, snap)
+        g = paths.build(snap, provenance=True)
+        vm["graph"] = viewer_graph.compact(g, snap)
         vm["blast"] = {"mode": "full"}
+        plan_ids = [c["id"] for c in (vm["whatif"] or {}).get("changes", []) if c.get("id")]
+        vm["whatif_model"] = viewer_graph.whatif_model(g, snap, vm["graph"], plan_ids)
     else:
+        analysis = paths.analyze(snap)
         subjects = viewer_graph.precomputed(analysis.graph, snap, analysis, opts.blast_for or [])
         vm["blast"] = {
             "mode": "paths",

@@ -40,11 +40,11 @@ node screenshots.mjs ../../report.html shots    # every screen, desktop and phon
 
 cd ../..
 uv run python -m tests.viewer_fixtures parity tests/js/build   # Python's blast radius
-node --test tests/js/*.test.mjs   # the page's graph search, TOML drafts and diff against it
+node --test tests/js/*.test.mjs   # the page's graph search, TOML drafts, diff and what-if against it
 ```
 
-`core.js` holds the parts of the page that compute (the blast-radius search, acceptance
-drafts, the ad-hoc diff); it has no DOM access, and the Node tests load the same file.
+`core.js` holds the parts of the page that compute (the blast-radius search, the what-if
+mask and its numbers, acceptance drafts, the ad-hoc diff); it has no DOM access, and the Node tests load the same file.
 `uv run pytest` also runs `node` for the acceptance-draft round trip when Node is installed.
 
 The viewer's script must only ever write text: no `innerHTML` or other HTML sink, no

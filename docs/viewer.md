@@ -157,6 +157,10 @@ before that. Encryption adds under half a second to the build (0.36 s on the lab
 at 10,000 users). Object lists with
 thousands of rows are drawn as they scroll into view.
 
+With the full graph the page also carries what it needs to evaluate a set of what-if
+removals: on a 10,000-user bench domain that takes the file from 842 KB to 926 KB (10%).
+Above the full-graph limit (`paths` mode) that data is not embedded.
+
 ## Paths and chokepoints on the command line
 
 The same path data is available without the page:

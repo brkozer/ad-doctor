@@ -228,6 +228,33 @@ def delegation_snapshot() -> Snapshot:
     )
 
 
+def tier0_change_snapshot() -> Snapshot:
+    """Members who can leave tier 0: eve holds a right of her own on Domain Admins (a new
+    holder once she leaves), prim stays because Domain Admins is her primary group, deep
+    gets there through a nested group."""
+    eve = user("eve", sid=f"{DOM}-3500")
+    prim = user("prim", sid=f"{DOM}-3501", primary_group=512)
+    deep = user("deep", sid=f"{DOM}-3502")
+    team = DirObject(f"CN=Team,{LAB}", "Team", "group", sid=f"{DOM}-3503", members=[deep.dn])
+    da = DirObject(
+        f"CN=Domain Admins,CN=Users,{HEAD}",
+        "Domain Admins",
+        "group",
+        sid=DA,
+        members=[eve.dn, prim.dn, team.dn],
+        aces=[Ace(eve.sid, sd.GENERIC_ALL)],
+    )
+    return gsnap(
+        eve,
+        prim,
+        deep,
+        gpos=[],
+        entries=[],
+        objects=[team, da],
+        privileged={"Domain Admins": [eve.dn, prim.dn, deep.dn]},
+    )
+
+
 def lab_snapshots() -> list[Path]:
     value = os.environ.get("AD_DOCTOR_WHATIF_SNAPSHOTS", "")
     return [Path(p) for p in value.split(os.pathsep) if p]

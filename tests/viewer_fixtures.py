@@ -12,7 +12,9 @@ fix lines, the full graph), `sealed.html` (the same, encrypted with PASSPHRASE),
 `old-report.json` (the baseline as a JSON report, for the drag-and-drop diff). The second
 writes the compact graph and Python's blast radius of a set of accounts for each snapshot
 (the XSS fixture, the full fixture, a 3,000-user bench.py domain, and any given), which
-tests/js/blast.test.mjs compares with the JavaScript search.
+tests/js/blast.test.mjs compares with the JavaScript search, and `whatif-*.json`: the
+what-if model and Python's answer for every single removal, random sets and a plan's
+prefixes on each what-if fixture (and any snapshot given), for tests/js/whatif.test.mjs.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from ad_doctor import paths, sd, viewer_graph
+from ad_doctor import cut, paths, sd, viewer_graph, whatif
 from ad_doctor.cli import main
 from ad_doctor.model import DirObject, Snapshot
 from ad_doctor.sd import Ace
@@ -314,6 +316,144 @@ def write_parity(out: Path, extra: list[Path]) -> list[Path]:
     for name, (snap, sample) in snaps.items():
         target = out / f"parity-{name}.json"
         target.write_text(json.dumps(parity(snap, sample)))
+        written.append(target)
+    written += write_whatif_parity(out, extra)
+    return written
+
+
+# --- parity data for the page's what-if ----------------------------------------------------
+
+
+def _digest(rows: list[str]) -> str:
+    return hashlib.sha256("\n".join(rows).encode()).hexdigest()
+
+
+def _whatif_case(
+    snap: Snapshot,
+    g: paths.Graph,
+    base: whatif.State,
+    index: dict[str, int],
+    numbers: dict[int, int],
+    removed: list[int],
+    sams: list[str],
+    reach: set[str],
+) -> dict[str, Any]:
+    """Python's answer for one set of removals, for tests/js/whatif.test.mjs: digests over
+    everything order-sensitive, with enough raw rows to debug a difference."""
+    assert g.prov is not None
+    case: dict[str, Any] = {"removed": sorted(numbers[p] for p in removed)}
+    if not whatif.maskable(g.prov, removed):
+        case["rebuild"] = True
+        return case
+    mg = whatif.masked(g, snap, removed)
+    after = whatif.state(snap, mg)
+    closed, rerouted, still = whatif.classify(base, after)
+    label = paths.edge_text
+    edge_rows = [
+        f"{index[src]} {index[dst]} {label(mg, src, dst, how)}"
+        for src in sorted(mg.edges, key=index.__getitem__)
+        for dst, how in mg.edges[src]
+    ]
+    found_rows = [f"{index[n]}\t{p.render(mg)}" for n, p in after.found.items()]
+    holder_rows = [f"{index[n]}\t{p.render(mg)}" for n, p in after.holders.items()]
+
+    def now(n: str) -> str:
+        return (after.holders.get(n) or after.found[n]).render(mg)
+
+    rerouted_rows = [
+        f"{index[n]}\t{base.holders[n].render(base.graph)}\t{now(n)}" for n in rerouted
+    ]
+    open_rows = [f"{index[n]}\t{now(n)}" for n in still]
+    new_rows = [
+        f"{index[n]}\t{p.render(mg)}" for n, p in after.holders.items() if n not in base.holders
+    ]
+    case.update(
+        tier0=sorted(index[n] for n in mg.tier0),
+        edges=_digest(edge_rows),
+        edge_count=len(edge_rows),
+        order=[index[s] for s in mg.edges if s in reach],
+        found=_digest(found_rows),
+        found_count=len(found_rows),
+        found_first=found_rows[:10],
+        holders=_digest(holder_rows),
+        holder_count=len(holder_rows),
+        holders_first=holder_rows[:10],
+        exposed=after.exposed,
+        users=after.users,
+        closed=_digest([str(index[n]) for n in closed]),
+        closed_count=len(closed),
+        rerouted=_digest(rerouted_rows),
+        rerouted_count=len(rerouted_rows),
+        open=_digest(open_rows),
+        open_count=len(open_rows),
+        new=_digest(new_rows),
+        new_count=len(new_rows),
+        blast=[blast_case(mg, snap, sam, index) for sam in sams],
+    )
+    return case
+
+
+def whatif_parity(
+    snap: Snapshot, singles: int, sets: int, with_plan: bool = True, seed: int = 11
+) -> dict[str, Any]:
+    """The model and Python's answers: every single removal (or `singles` of them), random
+    sets, and the plan's step prefixes. Rebuild cases only check the flag."""
+    from .whatif_fixtures import random_sets
+
+    g = paths.build(snap, provenance=True)
+    assert g.prov is not None
+    prims = len(g.prov.prims)
+    numbers = viewer_graph.prim_numbers(g)
+    data = viewer_graph.compact(g, snap)
+    model = viewer_graph.whatif_model(g, snap, data)
+    index = {n: i for i, n in enumerate(viewer_graph.nodes_of(g))}
+    reach = whatif.reaching(g)
+    base = whatif.state(snap, g)
+    picked: list[list[int]] = []
+    if singles < 0 or singles >= prims:
+        picked += [[p] for p in range(prims)]
+    elif singles:
+        picked += random_sets(prims, singles, seed, most=1)
+    if prims:
+        picked += random_sets(prims, sets, seed + 1)
+    if with_plan and prims:
+        steps = cut.plan(snap, g).changes
+        picked += [steps[: k + 1] for k in range(len(steps))]
+    accounts = [a.sam for a in snap.accounts if a.sid][:3]
+    return {
+        "domain": snap.domain,
+        "graph": data,
+        "whatif": model,
+        "before": {
+            "exposed": base.exposed,
+            "users": base.users,
+            "holders": len(base.holders),
+            "found": len(base.found),
+        },
+        "cases": [
+            _whatif_case(snap, g, base, index, numbers, removed, accounts, reach)
+            for removed in picked
+        ],
+    }
+
+
+def write_whatif_parity(out: Path, extra: list[Path]) -> list[Path]:
+    from .test_whatif import FIXTURES
+
+    written = []
+    for name, make in FIXTURES.items():
+        target = out / f"whatif-{name}.json"
+        target.write_text(json.dumps(whatif_parity(make(), -1, 50)))
+        written.append(target)
+    target = out / "whatif-bench3000.json"
+    target.write_text(json.dumps(whatif_parity(bench_snapshot(), 200, 50)))
+    written.append(target)
+    for path in extra:
+        snap = Snapshot.from_json(json.loads(path.read_text()))
+        big = len(snap.accounts) > 5000
+        data = whatif_parity(snap, 40 if big else -1, 20 if big else 200, with_plan=not big)
+        target = out / f"whatif-{path.stem}.json"
+        target.write_text(json.dumps(data))
         written.append(target)
     return written
 

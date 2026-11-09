@@ -32,6 +32,7 @@ from .whatif_fixtures import (
     load,
     parity,
     random_sets,
+    tier0_change_snapshot,
 )
 
 FIXTURES: dict[str, Callable[[], Snapshot]] = {
@@ -44,6 +45,7 @@ FIXTURES: dict[str, Callable[[], Snapshot]] = {
     "xss": xss_snapshot,
     "delegation": delegation_snapshot,
     "adcs": adcs_snapshot,
+    "tier0-change": tier0_change_snapshot,
 }
 
 

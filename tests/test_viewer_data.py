@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from ad_doctor import accept, paths, sd, seal, trend, viewer_graph
+from ad_doctor import accept, changes, paths, sd, seal, trend, viewer_graph, whatif
 from ad_doctor.checks import REGISTRY, run_all
 from ad_doctor.cli import main
 from ad_doctor.model import Finding, Severity
@@ -216,6 +216,77 @@ def test_suggested_passphrases() -> None:
 
 
 # --- graph and blast radius ------------------------------------------------------------------
+
+
+def test_whatif_model_only_with_the_full_graph(pages: dict[str, Path]) -> None:
+    vm = _vm(pages["full"])
+    model = vm["whatif_model"]
+    assert model is not None and vm["graph"] is not None
+    # large-domain mode and no graph: no interactive what-if (design decision D13)
+    assert _vm(pages["paths"])["whatif_model"] is None
+    assert _vm(pages["whatif"])["whatif_model"] is None
+    assert _vm(pages["clean"])["whatif_model"] is None
+
+
+def test_whatif_model_of_the_page_matches_the_graph(pages: dict[str, Path]) -> None:
+    vm = _vm(pages["full"])
+    _, new = full_snapshots()
+    g = paths.build(new, provenance=True)
+    assert g.prov is not None
+    model = vm["whatif_model"]
+    numbers = viewer_graph.prim_numbers(g)
+    assert len(model["prim"]) == len(vm["graph"]["dst"])
+    assert len(model["prim_kind"]) == len(g.prov.prims)
+    kinds = {p: model["kinds"][model["prim_kind"][numbers[p]]] for p in range(len(g.prov.prims))}
+    assert kinds == {p: key[0] for p, key in enumerate(g.prov.prims)}
+    plan = vm["whatif"]["changes"]
+    ids = [c["id"] for c in plan if c.get("id")]
+    assert ids and set(model["plan"]) == set(ids)
+    assert {
+        numbers[g.prov.lookup(key)] for key in g.prov.prims if changes.change_id(key) in ids
+    } == set(model["plan"].values())
+
+
+def test_whatif_model_marks_what_needs_a_rebuild() -> None:
+    from .whatif_fixtures import kitchen_sink
+
+    snap = kitchen_sink()
+    g = paths.build(snap, provenance=True)
+    assert g.prov is not None
+    data = viewer_graph.compact(g, snap)
+    model = viewer_graph.whatif_model(g, snap, data)
+    numbers = viewer_graph.prim_numbers(g)
+    marked, at = set(), 0
+    for d in model["rebuild"]:
+        at += d
+        marked.add(at)
+    want = {numbers[p] for p in range(len(g.prov.prims)) if g.prov.needs_rebuild(p)}
+    assert marked == want and want
+    # the masked graph agrees that these cannot be masked
+    assert not whatif.maskable(g.prov, [next(p for p, n in numbers.items() if n in want)])
+
+
+def test_whatif_model_lists_each_edge_once() -> None:
+    """Every edge is coded: the next new primitive, an earlier one, or a fixed reason; the
+    edges with more than one reason are listed apart."""
+    from .whatif_fixtures import delegation_snapshot, kitchen_sink
+
+    for snap in (kitchen_sink(), delegation_snapshot()):
+        g = paths.build(snap, provenance=True)
+        assert g.prov is not None
+        data = viewer_graph.compact(g, snap)
+        model = viewer_graph.whatif_model(g, snap, data)
+        n = len(model["prim_kind"])
+        fresh = 0
+        for v in model["prim"]:
+            assert v < 0 or v <= fresh
+            fresh += v == 0
+        assert fresh <= n
+        for edge, items in model["options"]:
+            assert 0 <= edge < len(data["dst"])
+            assert all(p < n and 0 <= label < len(data["labels"]) for p, label in items)
+        for edge, p, gate in model["gated"]:
+            assert 0 <= edge < len(data["dst"]) and p < n and 0 <= gate < len(model["gates"])
 
 
 def test_full_graph_is_the_snapshot_graph(pages: dict[str, Path]) -> None:

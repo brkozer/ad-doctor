@@ -7,6 +7,14 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+### Added
+
+- `ad-doctor view` with the full graph embeds what the page needs to evaluate a set of
+  removals, and `core.js` ports the evaluation: masked graph, tier 0 after the changes,
+  exposure, holders, and paths closed, rerouted, open and new. Changes that need a rebuild
+  are marked and get no number; findings are not rechecked in the browser. There is no
+  screen for it yet, and no interactive what-if above the full-graph limit.
+
 ## [0.2.2] - 2026-11-09
 
 ### Added
