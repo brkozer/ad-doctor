@@ -19,6 +19,7 @@ nav = [
     { "HTML viewer" = "viewer.md" },
     { "CI integration" = "ci.md" },
     { "Snapshots and redaction" = "snapshots.md" },
+    { "Forest scan" = "forest.md" },
     { "Invariants (policy as code)" = "invariants.md" },
     { "What-if and plan" = "whatif.md" },
     { "Declared tier 0" = "declared-tier0.md" },

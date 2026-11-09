@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import html
 import re
+import ssl
 import struct
 from collections import Counter
 from collections.abc import Iterator
@@ -16,8 +17,10 @@ from urllib.parse import urlsplit
 
 import ldap3
 from ldap3.core.exceptions import (
+    LDAPBindError,
     LDAPException,
     LDAPInsufficientAccessRightsResult,
+    LDAPInvalidCredentialsResult,
     LDAPNoSuchObjectResult,
     LDAPOperationResult,
 )
@@ -227,6 +230,10 @@ class CollectError(Exception):
     pass
 
 
+class BindRejected(CollectError):
+    """The server refused these credentials: another DC would only count against lockout."""
+
+
 @dataclass
 class Target:
     host: str
@@ -255,6 +262,8 @@ class Target:
     dc_probes: bool = False
     # read the build and UBR of each DC and CA over the winreg pipe (part of the probes)
     patch_level: bool = True
+    # CA file to validate this host's LDAPS certificate and its name against
+    ca_file: str | None = None
 
 
 PATCH_CHECKS = {"dc": "AD-INF-029", "ca": "AD-ADCS-022"}
@@ -314,9 +323,13 @@ def _limits_sign_in(sddl: str) -> bool:
 
 
 class Collector:
-    def __init__(self, conn: ldap3.Connection, target: Target | None = None) -> None:
+    def __init__(
+        self, conn: ldap3.Connection, target: Target | None = None, root_sid: str = ""
+    ) -> None:
         self.conn = conn
         self.target = target
+        # the forest root's SID when the caller already knows it
+        self.root_sid = root_sid
         self.notes: list[str] = []
         self.ca_hosts: list[str] = []
         self.ca_dns_hosts: list[str] = []
@@ -440,7 +453,9 @@ class Collector:
         h = head[0]
         domain_sid = sid_to_str(h["objectsid"][0])
         root_sid = domain_sid
-        if root_dn and root_dn.lower() != domain_dn.lower():
+        if self.root_sid:
+            root_sid = self.root_sid
+        elif root_dn and root_dn.lower() != domain_dn.lower():
             forest_root = self.optional(root_dn, "(objectClass=*)", ["objectSid"], scope=ldap3.BASE)
             if forest_root and forest_root[0].get("objectsid"):
                 root_sid = sid_to_str(forest_root[0]["objectsid"][0])
@@ -3090,13 +3105,16 @@ def _policy_file_notes(snap: Snapshot, unread: list[str]) -> list[str]:
     return notes
 
 
-def connect(target: Target) -> ldap3.Connection:
+def connect(target: Target, auto_referrals: bool = True) -> ldap3.Connection:
     server = ldap3.Server(
         target.host,
         port=target.port,
         use_ssl=target.use_ssl,
         get_info=ldap3.DSA,
         connect_timeout=10,
+        tls=ldap3.Tls(validate=ssl.CERT_REQUIRED, ca_certs_file=target.ca_file)
+        if target.ca_file
+        else None,
     )
     try:
         if target.kerberos:
@@ -3106,6 +3124,7 @@ def connect(target: Target) -> ldap3.Connection:
                 sasl_mechanism=ldap3.KERBEROS,
                 read_only=True,
                 raise_exceptions=True,
+                auto_referrals=auto_referrals,
             )
             conn.bind()
         elif target.user and "\\" in target.user:
@@ -3116,11 +3135,12 @@ def connect(target: Target) -> ldap3.Connection:
                 authentication=ldap3.NTLM,
                 read_only=True,
                 raise_exceptions=True,
+                auto_referrals=auto_referrals,
             )
             conn.open()
             # LDAPS binds carry a channel binding token so DCs that enforce it accept them
             if not probes.ntlm_bind(conn, channel_binding=target.use_ssl):
-                raise CollectError(f"bind failed: {conn.result.get('message') or conn.result}")
+                raise BindRejected(f"bind failed: {conn.result.get('message') or conn.result}")
         elif target.user:
             conn = ldap3.Connection(
                 server,
@@ -3129,9 +3149,18 @@ def connect(target: Target) -> ldap3.Connection:
                 read_only=True,
                 auto_bind=True,
                 raise_exceptions=True,
+                auto_referrals=auto_referrals,
             )
         else:
-            conn = ldap3.Connection(server, read_only=True, auto_bind=True, raise_exceptions=True)
+            conn = ldap3.Connection(
+                server,
+                read_only=True,
+                auto_bind=True,
+                raise_exceptions=True,
+                auto_referrals=auto_referrals,
+            )
+    except (LDAPInvalidCredentialsResult, LDAPBindError) as exc:
+        raise BindRejected(f"bind to {target.host}:{target.port} failed: {exc}") from exc
     except LDAPException as exc:
         raise CollectError(f"bind to {target.host}:{target.port} failed: {exc}") from exc
     return conn

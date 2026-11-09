@@ -56,6 +56,26 @@ Configuration Manager objects in it. Of the AD FS DKM containers it asks for the
 never requests `thumbnailPhoto`, the attribute that holds the key. A plain user normally cannot
 read them, so that check is reported as not judged.
 
+## Forest scan
+
+With `--forest` the same account is used for every domain of the forest, so it must be able to
+sign in to each of them; a forest's own trusts normally allow that, and no extra right is needed.
+Besides the per-domain reads above it reads, as an ordinary user can:
+
+- the `cn`, `nCName`, `dnsRoot`, `nETBIOSName`, `systemFlags` and `Enabled` attributes of the
+  `crossRef` objects under `CN=Partitions`
+- the `msDS-HasDomainNCs`, `hasMasterNCs`, `msDS-hasMasterNCs` and `objectCategory` attributes of
+  `nTDSDSA` objects, and `dNSHostName` of `server` objects under `CN=Sites`
+- `objectSid`, `objectClass`, `sAMAccountName`, `member` and `userAccountControl` of Enterprise
+  Admins, of Schema Admins and of each of their members, with one BASE read each on a domain
+  controller of the member's own domain, at most 2000 per group, and accounts whose
+  `primaryGroupID` names one of these groups or a group nested in them
+
+A domain or member the account cannot read is reported as not evaluated or not resolved, never
+as clean. The account's credentials go to every domain controller named in the Configuration
+partition, so use an account you would accept that for: see
+[where the credentials go](forest.md#where-the-credentials-go).
+
 ## Scripts that GPOs run
 
 From SYSVOL it also reads `scripts.ini`, `psscripts.ini` and Preferences `ScheduledTasks.xml`,

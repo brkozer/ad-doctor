@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import sys
-from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,6 +18,7 @@ from . import (
     catalog,
     coverage,
     explain,
+    forest,
     invariants,
     opengraph,
     patches,
@@ -49,6 +49,9 @@ from .report import (
     render_sarif,
     render_text,
 )
+from .report import (
+    write_private as _write_private,
+)
 
 RENDERERS = {
     "json": render_json,
@@ -57,6 +60,8 @@ RENDERERS = {
     "junit": render_junit,
 }
 FORMATS = ["text", "json", "markdown", "html", "sarif", "junit"]
+# the run worked, but part of the forest was not read
+EXIT_INCOMPLETE = 3
 
 
 def _target(args: argparse.Namespace) -> Target:
@@ -114,21 +119,6 @@ def _run_checks(
     snap.notes.extend(decl.notes)
     with paths.lend(snap, decl.graph, decl.analysis):
         return run_all(snap, only), decl.summary()
-
-
-def _write_private(path: Path, text: str | Iterable[str]) -> None:
-    """Write a file only its owner can read: snapshots, reports and fix scripts describe
-    how to attack the domain they came from."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        if os.name == "posix":
-            os.fchmod(fd, 0o600)  # the mode above applies only to a new file
-        out = os.fdopen(fd, "w", encoding="utf-8")
-    except BaseException:
-        os.close(fd)
-        raise
-    with out:
-        out.writelines([text] if isinstance(text, str) else text)
 
 
 def _positive(text: str) -> int:
@@ -707,13 +697,113 @@ def _emit(text: str, output: Path | None) -> int:
 
 
 def cmd_rollup(args: argparse.Namespace) -> int:
-    doc = rollup.build(args.reports)
+    if args.forest is not None and args.reports:
+        raise ValueError("rollup: --forest reads a directory; do not name reports as well")
+    if args.forest is not None:
+        doc = rollup.build_forest(args.forest)
+    else:
+        doc = rollup.build(args.reports)
     render = {
         "text": rollup.render_text,
         "json": rollup.render_json,
         "markdown": rollup.render_markdown,
     }
-    return _emit(render[args.format](doc), args.output)
+    code = _emit(render[args.format](doc), args.output)
+    return EXIT_INCOMPLETE if "forest" in doc and not doc["forest"]["complete"] else code
+
+
+# one file per domain, so these answer a question about a single domain
+FOREST_REFUSES = {
+    "baseline": "--baseline",
+    "accept": "--accept",
+    "invariants": "--invariants",
+    "fixes": "--fixes",
+    "preflight": "--preflight",
+    "tier0": "--tier0",
+    "tier0_file": "--tier0-file",
+}
+REPORT_EXTENSIONS = {
+    "text": "txt",
+    "markdown": "md",
+    "html": "html",
+    "sarif": "sarif",
+    "junit": "xml",
+}
+
+
+def _forest_summary(manifest: dict[str, Any]) -> str:
+    rows = manifest["domains"]
+    done = sum(1 for d in rows if d["status"] == "read")
+    state = "complete" if manifest["complete"] else "INCOMPLETE"
+    lines = [f"forest {one_line(manifest['root'])}: {done} of {len(rows)} domains read, {state}"]
+    lines += [
+        f"  {one_line(d['domain'])}: not evaluated: {one_line(d['reason'])}"
+        for d in rows
+        if d["status"] != "read"
+    ]
+    lines += [f"  note: {one_line(n)}" for n in manifest["notes"]]
+    return "\n".join(lines)
+
+
+def _forest_allow(args: argparse.Namespace) -> list[str]:
+    allow = [name.strip(".").lower() for name in args.forest_allow_dns or []]
+    for name in allow:
+        if not forest.is_dns_name(name):
+            raise ValueError(f"--forest-allow-dns: {name!r} is not a DNS name")
+    return allow
+
+
+def _forest_ca_file(args: argparse.Namespace) -> str | None:
+    path: Path | None = args.forest_ca_file
+    if path is None:
+        return None
+    if not args.ldaps:
+        raise ValueError("--forest-ca-file validates LDAPS certificates: it needs --ldaps")
+    if not path.is_file():
+        raise ValueError(f"--forest-ca-file: {path} is not a file")
+    return str(path)
+
+
+def cmd_forest(args: argparse.Namespace) -> int:
+    """`collect --forest` and `scan --forest`: a directory with one snapshot per domain."""
+    for attr, flag in FOREST_REFUSES.items():
+        if getattr(args, attr, None):
+            raise ValueError(f"--forest does not take {flag}, which describes a single domain")
+    if args.output is None:
+        raise ValueError("--forest needs -o DIR: it writes one file per domain")
+    gate = [False]
+
+    def analyze(snap: Snapshot, stem: str) -> None:
+        found, decl = _run_checks(snap, args.only, [])
+        report, opts = _analyze(args, snap, found, declared=decl)
+        _write_private(args.output / f"{stem}{forest.REPORT_SUFFIX}", render_json(report) + "\n")
+        if args.format != "json":
+            text = _render(args, report, snap, opts, color=False)
+            _write_private(
+                args.output / f"{stem}.report.{REPORT_EXTENSIONS[args.format]}",
+                text if text.endswith("\n") else text + "\n",
+            )
+        gate[0] = gate[0] or _fails(report.findings, args.fail_on)
+
+    allow, ca_file = _forest_allow(args), _forest_ca_file(args)
+    manifest = forest.run(
+        _target(args),
+        args.output,
+        analyze if args.cmd == "scan" else None,
+        allow=allow,
+        ca_file=ca_file,
+    )
+    if args.cmd == "scan":
+        doc = rollup.build_forest(args.output)
+        complete = bool(doc["forest"]["complete"])
+        print(rollup.render_text(doc))
+    else:
+        complete = bool(manifest["complete"])
+        print(_forest_summary(manifest))
+    # a gate that fired is no reason to hide that part of the forest was not read
+    if not complete:
+        return EXIT_INCOMPLETE
+    return 2 if gate[0] else 0
 
 
 def cmd_views(args: argparse.Namespace) -> int:
@@ -814,6 +904,24 @@ def _explain(query: str, fmt: str, web: bool) -> int:
               "json": explain.render_json}[fmt]  # fmt: skip
     print(render(entry))
     return 0
+
+
+def _render(
+    args: argparse.Namespace,
+    report: Report,
+    snap: Snapshot,
+    opts: viewer.Options,
+    color: bool,
+) -> str:
+    if args.format == "text":
+        return render_text(report, color=color)
+    if args.format == "junit":
+        return render_junit(report)
+    if args.format == "html":
+        # the same page as `ad-doctor view`, with the defaults: no fix lines, nothing extra
+        opts.command = _command(args)
+        return viewer.render(viewer.viewmodel(report, snap, opts))
+    return RENDERERS[args.format](report)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -928,13 +1036,38 @@ def main(argv: list[str] | None = None) -> int:
 
     extended = "add this asset to the declared tier-0 targets, kept apart from built-in tier 0"
 
+    forest_help = (
+        "every domain of the forest, one at a time: -o names a directory that gets one file "
+        "per domain"
+    )
+
+    def forest_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--forest", action="store_true", help=forest_help)
+        p.add_argument(
+            "--forest-allow-dns",
+            action="append",
+            metavar="SUFFIX",
+            help="with --forest, send credentials only to DCs inside this DNS suffix, instead of "
+            "each DC having to lie inside its own domain's name (repeatable; for a disjoint "
+            "namespace, or to narrow the run to names you trust)",
+        )
+        p.add_argument(
+            "--forest-ca-file",
+            type=Path,
+            metavar="PEM",
+            help="with --forest --ldaps, validate the certificate and name of every DC the "
+            "directory named against this CA file",
+        )
+
     p_scan = sub.add_parser("scan", help="collect and analyze in one go")
     conn_args(p_scan)
     out_args(p_scan)
+    forest_args(p_scan)
     tier0_args(p_scan, extended + "; its owner and DACL are read too")
 
     p_collect = sub.add_parser("collect", help="save a snapshot for later analysis")
     conn_args(p_collect)
+    forest_args(p_collect)
     p_collect.add_argument("-o", "--output", type=Path, required=True)
     tier0_args(p_collect, "also read the owner and DACL of this account, for a later --tier0")
 
@@ -1133,7 +1266,13 @@ def main(argv: list[str] | None = None) -> int:
     tier0_args(p_view, extended)
 
     p_rollup = sub.add_parser("rollup", help="compare JSON reports of several domains")
-    p_rollup.add_argument("reports", type=Path, nargs="+", metavar="REPORT")
+    p_rollup.add_argument("reports", type=Path, nargs="*", metavar="REPORT")
+    p_rollup.add_argument(
+        "--forest",
+        type=Path,
+        metavar="DIR",
+        help="the directory of a --forest run: its reports plus the forest-level facts",
+    )
     p_rollup.add_argument("-f", "--format", choices=["text", "json", "markdown"], default="text")
     p_rollup.add_argument("-o", "--output", type=Path)
 
@@ -1171,6 +1310,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+    if args.cmd == "rollup" and not args.reports and args.forest is None:
+        p_rollup.error("the following arguments are required: REPORT")
+    if (
+        args.cmd in ("scan", "collect")
+        and not args.forest
+        and (args.forest_allow_dns or args.forest_ca_file)
+    ):
+        parser.error("--forest-allow-dns and --forest-ca-file need --forest")
 
     if args.cmd == "explain":
         return _explain(args.check, args.format, args.web)
@@ -1211,6 +1358,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_rollup(args)
         if args.cmd in ("service-accounts", "tier-scorecard"):
             return cmd_views(args)
+        if args.cmd in ("scan", "collect") and args.forest:
+            return cmd_forest(args)
         if args.cmd == "analyze":
             snap = Snapshot.from_json(_load_json(args.snapshot))
         else:
@@ -1230,16 +1379,7 @@ def main(argv: list[str] | None = None) -> int:
         _write_private(args.fixes, render_fixes(report.findings, snap))
     if args.preflight:
         _write_private(args.preflight, render_preflight(report.findings, snap))
-    if args.format == "text":
-        text = render_text(report, color=not args.output and _use_color(sys.stdout))
-    elif args.format == "junit":
-        text = render_junit(report)
-    elif args.format == "html":
-        # the same page as `ad-doctor view`, with the defaults: no fix lines, nothing extra
-        opts.command = _command(args)
-        text = viewer.render(viewer.viewmodel(report, snap, opts))
-    else:
-        text = RENDERERS[args.format](report)
+    text = _render(args, report, snap, opts, not args.output and _use_color(sys.stdout))
     if args.output:
         _write_private(args.output, text if text.endswith("\n") else text + "\n")
     else:
