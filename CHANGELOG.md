@@ -7,6 +7,8 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-09
+
 ### Added
 
 - **Active Directory-integrated DNS zones (`AD-DNS-001` to `AD-DNS-003`).** The scan reads the
