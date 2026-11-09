@@ -383,6 +383,7 @@ def blast_case(g: paths.Graph, snap: Snapshot, sam: str, index: dict[str, int]) 
     discovery order, the first rows for debugging, and the tier-0 paths."""
     starts = paths.identity_nodes(snap, sam)
     controlled, tier0 = paths.blast_radius(g, starts)
+
     # the page's blast radius shows no declared mark: only the path screens carry it
     def text(p: paths.Path) -> str:
         return p.render(g).removesuffix(paths.DECLARED_MARK)
