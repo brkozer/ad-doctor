@@ -328,7 +328,9 @@ ad-doctor rollup --forest forest-2026-11/
 | `--dc-probes` | also probe each DC for WebClient, SMBv1 and the TLS versions of LDAPS; off by default |
 | `--no-patch-level` | do not read each DC's and CA's build and UBR over `\pipe\winreg` |
 | `rollup REPORT ...` | one view over the JSON reports of several domains (`-f text\|json\|markdown`) |
-| `collect --forest`, `scan --forest`, `-o DIR` | every domain of the forest, one at a time: one snapshot and report per domain; exit 3 when part of the forest was not read ([forest scan](docs/forest.md)) |
+| `collect --forest`, `scan --forest`, `-o DIR` | every domain of the forest, one at a time: one snapshot and report per domain; exit 3 when part of the forest was not read, even if `--fail-on` matched ([forest scan](docs/forest.md)). The credentials go to every DC named in the Configuration partition, and whoever can write those objects can receive them ([where the credentials go](docs/forest.md#where-the-credentials-go)) |
+| `--forest-allow-dns SUFFIX` | with `--forest`, send credentials only to DCs inside this DNS suffix, in place of the default rule that a DC lies inside its own domain's name (repeatable) |
+| `--forest-ca-file PEM` | with `--forest --ldaps`, validate the certificate and name of every DC the directory named; without it `--ldaps` does not authenticate the server |
 | `rollup --forest DIR` | the rollup of that run, plus who holds Enterprise Admins and Schema Admins and which domains were not read |
 | `service-accounts FILE` | the service accounts of a snapshot (`-f text\|json`) |
 | `tier-scorecard FILE` | counts about tier 0 from a snapshot, with no score (`-f text\|json`) |

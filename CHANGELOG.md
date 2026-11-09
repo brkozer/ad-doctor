@@ -12,7 +12,10 @@ logic or severity between versions, but an ID is never reused for something else
 - **Forest scan** (`collect --forest`, `scan --forest`, `rollup --forest DIR`): every domain of the
   forest, listed from the `crossRef` objects and reached through the DCs named under `CN=Sites`,
   one domain at a time and one ordinary snapshot each. A domain that cannot be read is listed as
-  not evaluated, the result reads `INCOMPLETE` and the exit code is 3. The rollup adds who holds
+  not evaluated, the result reads `INCOMPLETE` and the exit code is 3, even if `--fail-on` matched
+  in what was read. The credentials go to every host named in the Configuration partition: a name
+  must be a plain DNS name inside its own domain, `--forest-allow-dns` replaces that rule and
+  `--forest-ca-file` validates LDAPS certificates of those hosts. The rollup adds who holds
   Enterprise Admins and Schema Admins across all domains; control paths are not joined across
   domains (see the Forest scan page). Only unit tests and a single-domain forest have
   exercised it so far.

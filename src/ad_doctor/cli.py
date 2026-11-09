@@ -745,6 +745,25 @@ def _forest_summary(manifest: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _forest_allow(args: argparse.Namespace) -> list[str]:
+    allow = [name.strip(".").lower() for name in args.forest_allow_dns or []]
+    for name in allow:
+        if not forest.is_dns_name(name):
+            raise ValueError(f"--forest-allow-dns: {name!r} is not a DNS name")
+    return allow
+
+
+def _forest_ca_file(args: argparse.Namespace) -> str | None:
+    path: Path | None = args.forest_ca_file
+    if path is None:
+        return None
+    if not args.ldaps:
+        raise ValueError("--forest-ca-file validates LDAPS certificates: it needs --ldaps")
+    if not path.is_file():
+        raise ValueError(f"--forest-ca-file: {path} is not a file")
+    return str(path)
+
+
 def cmd_forest(args: argparse.Namespace) -> int:
     """`collect --forest` and `scan --forest`: a directory with one snapshot per domain."""
     for attr, flag in FOREST_REFUSES.items():
@@ -766,7 +785,14 @@ def cmd_forest(args: argparse.Namespace) -> int:
             )
         gate[0] = gate[0] or _fails(report.findings, args.fail_on)
 
-    manifest = forest.run(_target(args), args.output, analyze if args.cmd == "scan" else None)
+    allow, ca_file = _forest_allow(args), _forest_ca_file(args)
+    manifest = forest.run(
+        _target(args),
+        args.output,
+        analyze if args.cmd == "scan" else None,
+        allow=allow,
+        ca_file=ca_file,
+    )
     if args.cmd == "scan":
         doc = rollup.build_forest(args.output)
         complete = bool(doc["forest"]["complete"])
@@ -774,9 +800,10 @@ def cmd_forest(args: argparse.Namespace) -> int:
     else:
         complete = bool(manifest["complete"])
         print(_forest_summary(manifest))
-    if gate[0]:
-        return 2
-    return 0 if complete else EXIT_INCOMPLETE
+    # a gate that fired is no reason to hide that part of the forest was not read
+    if not complete:
+        return EXIT_INCOMPLETE
+    return 2 if gate[0] else 0
 
 
 def cmd_views(args: argparse.Namespace) -> int:
@@ -1013,15 +1040,34 @@ def main(argv: list[str] | None = None) -> int:
         "every domain of the forest, one at a time: -o names a directory that gets one file "
         "per domain"
     )
+
+    def forest_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--forest", action="store_true", help=forest_help)
+        p.add_argument(
+            "--forest-allow-dns",
+            action="append",
+            metavar="SUFFIX",
+            help="with --forest, send credentials only to DCs inside this DNS suffix, instead of "
+            "each DC having to lie inside its own domain's name (repeatable; for a disjoint "
+            "namespace, or to narrow the run to names you trust)",
+        )
+        p.add_argument(
+            "--forest-ca-file",
+            type=Path,
+            metavar="PEM",
+            help="with --forest --ldaps, validate the certificate and name of every DC the "
+            "directory named against this CA file",
+        )
+
     p_scan = sub.add_parser("scan", help="collect and analyze in one go")
     conn_args(p_scan)
     out_args(p_scan)
-    p_scan.add_argument("--forest", action="store_true", help=forest_help)
+    forest_args(p_scan)
     tier0_args(p_scan, extended + "; its owner and DACL are read too")
 
     p_collect = sub.add_parser("collect", help="save a snapshot for later analysis")
     conn_args(p_collect)
-    p_collect.add_argument("--forest", action="store_true", help=forest_help)
+    forest_args(p_collect)
     p_collect.add_argument("-o", "--output", type=Path, required=True)
     tier0_args(p_collect, "also read the owner and DACL of this account, for a later --tier0")
 
@@ -1266,6 +1312,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "rollup" and not args.reports and args.forest is None:
         p_rollup.error("the following arguments are required: REPORT")
+    if (
+        args.cmd in ("scan", "collect")
+        and not args.forest
+        and (args.forest_allow_dns or args.forest_ca_file)
+    ):
+        parser.error("--forest-allow-dns and --forest-ca-file need --forest")
 
     if args.cmd == "explain":
         return _explain(args.check, args.format, args.web)

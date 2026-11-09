@@ -72,7 +72,9 @@ Besides the per-domain reads above it reads, as an ordinary user can:
   `primaryGroupID` names one of these groups or a group nested in them
 
 A domain or member the account cannot read is reported as not evaluated or not resolved, never
-as clean. See [Forest scan](forest.md).
+as clean. The account's credentials go to every domain controller named in the Configuration
+partition, so use an account you would accept that for: see
+[where the credentials go](forest.md#where-the-credentials-go).
 
 ## Scripts that GPOs run
 

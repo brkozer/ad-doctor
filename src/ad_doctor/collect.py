@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import html
 import re
+import ssl
 import struct
 from collections import Counter
 from collections.abc import Iterator
@@ -261,6 +262,8 @@ class Target:
     dc_probes: bool = False
     # read the build and UBR of each DC and CA over the winreg pipe (part of the probes)
     patch_level: bool = True
+    # CA file to validate this host's LDAPS certificate and its name against
+    ca_file: str | None = None
 
 
 PATCH_CHECKS = {"dc": "AD-INF-029", "ca": "AD-ADCS-022"}
@@ -320,9 +323,13 @@ def _limits_sign_in(sddl: str) -> bool:
 
 
 class Collector:
-    def __init__(self, conn: ldap3.Connection, target: Target | None = None) -> None:
+    def __init__(
+        self, conn: ldap3.Connection, target: Target | None = None, root_sid: str = ""
+    ) -> None:
         self.conn = conn
         self.target = target
+        # the forest root's SID when the caller already knows it
+        self.root_sid = root_sid
         self.notes: list[str] = []
         self.ca_hosts: list[str] = []
         self.ca_dns_hosts: list[str] = []
@@ -446,7 +453,9 @@ class Collector:
         h = head[0]
         domain_sid = sid_to_str(h["objectsid"][0])
         root_sid = domain_sid
-        if root_dn and root_dn.lower() != domain_dn.lower():
+        if self.root_sid:
+            root_sid = self.root_sid
+        elif root_dn and root_dn.lower() != domain_dn.lower():
             forest_root = self.optional(root_dn, "(objectClass=*)", ["objectSid"], scope=ldap3.BASE)
             if forest_root and forest_root[0].get("objectsid"):
                 root_sid = sid_to_str(forest_root[0]["objectsid"][0])
@@ -3103,6 +3112,9 @@ def connect(target: Target, auto_referrals: bool = True) -> ldap3.Connection:
         use_ssl=target.use_ssl,
         get_info=ldap3.DSA,
         connect_timeout=10,
+        tls=ldap3.Tls(validate=ssl.CERT_REQUIRED, ca_certs_file=target.ca_file)
+        if target.ca_file
+        else None,
     )
     try:
         if target.kerberos:

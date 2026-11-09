@@ -94,8 +94,9 @@ ad-doctor rollup reports/corp.json reports/child.json -f markdown -o rollup.md
 ```
 
 For a whole forest, `scan --forest -o DIR` writes one report per domain and prints the rollup,
-and `rollup --forest DIR` prints it again. Exit code `3` means part of the forest was not read: treat it
-as a failure, not as a passing run ([forest scan](forest.md)).
+and `rollup --forest DIR` prints it again. Exit code `3` means part of the forest was not read, and it
+takes precedence over `2`, so findings at the gate level may exist as well: treat it as a failure, not as
+a passing run ([forest scan](forest.md)).
 
 Scores stay per domain and are never averaged. A check that did not run in a domain, or that a
 note says could not judge everything, is listed as not judged there, not as clean. Older reports
