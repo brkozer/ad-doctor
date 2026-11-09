@@ -7,6 +7,8 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-11-10
+
 ### Added
 
 - **Forest scan** (`collect --forest`, `scan --forest`, `rollup --forest DIR`): every domain of the
