@@ -46,7 +46,7 @@ Steps (heuristic order; each closes in the snapshot what it says):
           SDProp removes the copies on 20 protected objects at its next run (60 minutes)
         ...
 
-16 changes (cost 20): proven minimum (for paths ad-doctor sees).
+Plan of 16 changes (cost 20); at least 14 changes (cost 16) are needed. 3 changes join routes the model cannot split, so this is not shown to be the minimum.
 ...
 Cannot be closed by removing a right (needs a decision):
     MSOL_0a1b2c3d4e5f -[DCSync (kept: Entra Connect needs DCSync)]-> adlab.test
@@ -353,7 +353,7 @@ at a time under a 5 GB limit. Times are the whole command, loading included.
 
 | Snapshot | Plan | Plan, paths only | What-if with findings (the plan file) | Peak | Result |
 |---|---|---|---|---|---|
-| lab (49 accounts) | 0.6 s | | 0.6 s | 50 MB | 16 changes, cost 20, proven minimum; 25 -> 1 users exposed |
+| lab (49 accounts) | 0.6 s | | 0.6 s | 50 MB | 16 changes, cost 20, at least cost 16; 25 -> 1 users exposed |
 | bench 10,000 users | 4.8 s | 3.7 s | 3.5 s | 0.14 GB | 29 changes, cost 29, proven minimum; 4,665 -> 0 users exposed |
 | bench 250,000 users | 85 s | 53 s | 84 s | 1.9 GB | 23 changes, cost 23, proven minimum; 6,735 -> 0 users exposed |
 
@@ -395,7 +395,9 @@ The commands work on the snapshot. What happens in AD after a change differs:
   A snapshot holds neither patch level, so they stay findings (AD-ADCS-006, AD-ADCS-008,
   AD-ADCS-012). ESC6 with ESC16 gets an edge only on a domain with one enterprise CA, as a
   snapshot does not say which CA publishes which template, and never for a CA that holds every
-  request for a manager; a template that requires a subject the enrollee cannot supply, and a
+  request for a manager. ESC13 gets no edge when every enterprise CA was read and each of them
+  holds every request for a manager, because the certificate is not issued on request; a
+  template that requires a subject the enrollee cannot supply, and a
   CA's own Enroll right, are not read, so those edges can exist for someone a CA would refuse.
   See [AD-PATH-001](checks/AD-PATH-001.md) for when a delegation or certificate edge is drawn.
 - Clearing `sIDHistory` cannot be undone with a Set command: it takes a migration tool

@@ -16,23 +16,31 @@ logic or severity between versions, but an ID is never reused for something else
   both flags of AD-CHAIN-004, to the template. Both need an issuable authentication
   certificate and the Enroll right itself. The ESC6 edge needs the domain's only enterprise
   CA (a snapshot does not say which CA publishes a template; with several CAs that is a note
-  and no edge) that does not hold every request for a manager. ESC6 without ESC16 is blocked
+  and no edge) that does not hold every request for a manager; the ESC13 edge also goes when
+  every enterprise CA was read and holds every request. ESC6 without ESC16 is blocked
   by strong mapping on a patched DC, ESC9 needs DCs out of full enforcement and ESC15 an
   unpatched CA: a snapshot holds neither patch level, so they stay findings, not edges. What-if and `plan` can remove each one: the new
   `oid-link` (`oid-link:<OID>`) and `ca-flag` (`ca-flag:<CA>:san-from-request|no-sid-extension`)
   changes with `-WhatIf` fix and rollback lines, `template-ace`, and `template-flag` for
   `require-approval` and `any-purpose-eku`. On the lab: Domain Computers gets a path through
-  ESC6+ESC16 (13 principals with a path, from 12), the plan is 16 changes (cost 20, proven
-  minimum), which now clears a CA flag, and the exposed users stay 25 of 26.
+  ESC6+ESC16 (13 principals with a path, from 12), the plan is 16 changes (cost 20; at least 14
+  changes, cost 16, are needed: a template flag that closes an ESC1-3 and an ESC6 edge of its
+  template joins routes the model cannot split, so it is not called the minimum), which now
+  clears a CA flag, and the exposed users stay 25 of 26.
 - **Delegation and SID history in the control graph.** Three new edges in AD-PATH-001,
   `blast-radius`, the viewer and the BloodHound export: `constrained delegation (protocol
   transition)` from the account to the computer holding the SPN, `resource-based delegation`
   from each principal in `msDS-AllowedToActOnBehalfOfOtherIdentity` to the computer, and `SID
   history` from the account to the SID's principal. An edge is drawn only when the attack
   works with what the source holds: an enabled computer with an SPN, an admin the KDC lets
-  a service impersonate (not sensitive, not in Protected Users), protocol transition and a
-  resolvable SPN for constrained delegation, a listed principal that can run S4U2self for
-  resource-based. Unconstrained delegation, constrained delegation without protocol
+  a service impersonate (not sensitive, and not in Protected Users from the 2012 R2 domain
+  functional level; a read-only DC needs such an admin, a writable DC's own account does not
+  open it), protocol transition and a resolvable SPN for constrained delegation, a principal
+  that can run S4U2self for resource-based: a listed computer or SPN holder, the members of a
+  listed group that are one of those, and for the broad groups only what can really run it
+  (Domain Computers, Everyone and Authenticated Users with a machine account quota, else their
+  computers and SPN holders; Domain Users its SPN holders; never Anonymous Logon or Domain
+  Guests). Unconstrained delegation, constrained delegation without protocol
   transition, delegation to `krbtgt` or a service account and resource-based delegation from
   an account with no SPN stay out, and the docs say why. The snapshot now keeps the
   resource-based principals (redacted like every SID); a snapshot from an older version has

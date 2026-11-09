@@ -253,7 +253,8 @@ class Facts:
     copies: int = 0  # other objects holding a copy (SDProp, inherited)
     member_dn: str = ""
     owner: str = ""  # the current owner SID
-    readers: list[str] = field(default_factory=list)  # gMSA readers that stay
+    readers: list[str] = field(default_factory=list)  # the list once the change set is done
+    listed: list[str] = field(default_factory=list)  # the list as it was: what rollback writes
     gpo_name: str = ""
     entry: GpoLocalGroup | None = None
     link: GpLink | None = None
@@ -268,6 +269,12 @@ def facts(snap: Snapshot, prov: Provenance, where: Where, prims: Iterable[int]) 
     sids = {prov.prims[p][-1] for p in wanted if prov.prims[p][0] in ACE_KINDS}
     by_key = {prov.prims[p]: p for p in wanted}
     holders: dict[int, set[str]] = {}
+    # the fix lines write a whole list, so each one leaves out every principal of the set
+    leaving: dict[tuple[str, str], set[str]] = {}
+    for key in by_key:
+        if key[0] in ("gmsa-reader", "rbcd-principal"):
+            leaving.setdefault((key[0], key[1]), set()).add(key[2])
+    cleared = {key[1] for key in by_key if key[0] == "delegation" and key[2] == "rbcd"}
     if sids:
         for dn, lists in where.lists.items():
             kind = where.kind.get(dn)
@@ -329,7 +336,8 @@ def facts(snap: Snapshot, prov: Provenance, where: Where, prims: Iterable[int]) 
         elif kind == "gmsa-reader":
             gm = next((x for x in snap.gmsas if x.dn.lower() == f.prim[1]), None)
             f.dn = gm.dn if gm else f.prim[1]
-            f.readers = [s for s in (gm.readers if gm else []) if s != f.prim[2]]
+            f.listed = list(gm.readers) if gm else []
+            f.readers = [s for s in f.listed if s not in leaving[(kind, f.prim[1])]]
         elif kind == "oid-link":
             f.dn = snap.oid_group_links.get(f.prim[1], f.prim[2])
         elif kind in ("delegation", "rbcd-principal", "sid-history"):
@@ -337,7 +345,13 @@ def facts(snap: Snapshot, prov: Provenance, where: Where, prims: Iterable[int]) 
             if kind == "rbcd-principal" or f.prim[2] == "rbcd":
                 held = next((x for x in snap.accounts if x.dn.lower() == f.prim[1]), None)
                 listed = (held.rbcd_principals if held else None) or []
-                f.readers = [s for s in listed if s != f.prim[2]]
+                f.listed = list(listed)
+                f.readers = list(listed)  # delegation:rbcd removes the attribute, not a principal
+                if kind == "rbcd-principal":
+                    going = leaving[(kind, f.prim[1])]
+                    f.readers = (
+                        [] if f.prim[1] in cleared else [s for s in listed if s not in going]
+                    )
     return out
 
 

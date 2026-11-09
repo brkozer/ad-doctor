@@ -161,20 +161,29 @@ def _edge_counts(
     g: Graph, before: whatif.State, prims: Iterable[int]
 ) -> dict[int, tuple[int, int, int]]:
     """(edges the change takes away, of which on a path to tier 0, objects they reach),
-    per change."""
+    per change. A change that closes a gate (with the rest of the set) takes the gate's edges."""
     prov = g.prov
     assert prov is not None
     idx = whatif._index(prov)
     on_path = set(before.found) | before.graph.tier0
+    wanted = list(prims)
+    gone = frozenset(wanted)
+    closed: dict[int, set[int]] = {}  # change -> gates it closes
+    for gi, gate in enumerate(prov.gates):
+        if gone.intersection(gate.flags) and not prov.gate_open(gi, gone):
+            for f in gone.intersection(gate.flags):
+                closed.setdefault(f, set()).add(gi)
     out = {}
-    for p in prims:
+    for p in wanted:
         total = hot = 0
         reached: set[str] = set()
-        for src in idx.srcs.get(p, ()):
+        gates = closed.get(p, set())
+        sources = [*idx.srcs.get(p, ()), *(s for gi in gates for s in idx.gate_srcs.get(gi, ()))]
+        for src in dict.fromkeys(sources):
             why = prov.why[src]
             for i, (dst, _) in enumerate(g.edges[src]):
-                found, _ = cut._instances(prov, src, i, why[i])
-                if p in found:
+                found, gate_of = cut._instances(prov, src, i, why[i])
+                if p in found or gate_of in gates:
                     total += 1
                     reached.add(dst)
                     if src in before.found and dst in on_path:
@@ -406,7 +415,7 @@ def lifecycle(ctx: Context, plan: planfile.PlanFile) -> list[Status]:
     """done, open, overdue or stale per [[change]] (ineffective comes later)."""
     out = []
     for e in plan.changes:
-        prim = e.prim
+        prim = ctx.resolver.as_stored(e.prim)
         problems = []
         if e.id and e.id != e.expected_id:
             problems.append(
@@ -474,7 +483,7 @@ def file_keeps(ctx: Context, plan: planfile.PlanFile | None) -> dict[int, str]:
                 f"keep {e.expected_id} ({e.reason}) expired on {e.expires}: a candidate again"
             )
             continue
-        p = ctx.g.prov.lookup(e.prim) if ctx.g.prov else None
+        p = ctx.g.prov.lookup(ctx.resolver.as_stored(e.prim)) if ctx.g.prov else None
         if p is not None:
             out[p] = e.reason
     return out

@@ -164,13 +164,16 @@ def test_rbcd_group_needs_a_member_that_can_run_s4u() -> None:
     )
     snap = domain(held, plain, target, objects=[useful, empty])
     g = paths.build(snap)
-    assert g.edges[f"sid:{DOM}-5000"] == [(f"sid:{target.sid}", paths.RESOURCE_BASED)]
-    assert f"sid:{DOM}-5001" not in g.edges
+    assert (f"sid:{target.sid}", paths.RESOURCE_BASED) in g.edges[f"sid:{held.sid}"]
+    assert f"sid:{DOM}-5000" not in g.edges
+    assert (f"sid:{target.sid}", paths.RESOURCE_BASED) not in g.edges[f"sid:{plain.sid}"]
 
 
 def test_rbcd_broad_group_and_unknown_principal() -> None:
     target = rbcd_target("S-1-5-11", "S-1-5-21-7-7-7-1104")
-    g = paths.build(domain(target))
+    snap = domain(target)
+    snap.policy.machine_account_quota = 10
+    g = paths.build(snap)
     assert g.edges["sid:S-1-5-11"] == [(f"sid:{target.sid}", paths.RESOURCE_BASED)]
     assert "sid:S-1-5-21-7-7-7-1104" not in g.edges
 

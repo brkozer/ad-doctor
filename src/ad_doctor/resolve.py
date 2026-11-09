@@ -320,6 +320,18 @@ class Resolver:
                     out[key] = None
         return list(out)
 
+    def as_stored(self, key: Prim) -> Prim:
+        """The change with a constrained SPN as the account stores it: SPNs do not depend
+        on case, and the graph knows the entry by what msDS-AllowedToDelegateTo holds."""
+        if key[0] != "delegation" or not key[2].startswith("constrained:"):
+            return key
+        spn = key[2].removeprefix("constrained:").lower()
+        a = next((x for x in self.snap.accounts if x.dn.lower() == key[1]), None)
+        for stored in a.allowed_to_delegate_to if a else ():
+            if stored.lower() == spn:
+                return (key[0], key[1], f"constrained:{stored}")
+        return key
+
     def exists(self, key: Prim) -> bool:
         """Whether the snapshot still holds the fact behind the change."""
         if self.prov.lookup(key) is not None and self._made_edges(key):
@@ -664,7 +676,7 @@ class Resolver:
                 refused = self.dc_delegation(dn, what)
                 if refused:
                     raise SpecError(refused)
-                return [("delegation", dn, what)], []
+                return [self.as_stored(("delegation", dn, what))], []
             if kind in ("rbcd", "rbcd-principal"):
                 need(2, "rbcd:<computer>:<principal>")
                 return [("rbcd-principal", obj(args[0]), principal(args[1]))], []

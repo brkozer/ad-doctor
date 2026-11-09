@@ -566,8 +566,8 @@ ad-doctor whatif snap.json --remove adminsdholder:helpdesk --account alice
 ad-doctor whatif new.json --plan plan.toml --check    # CI: 2 gate failed, 3 plan rot
 ```
 
-On the lab, 25 of 26 users have a path to tier 0. The plan is 16 changes (cost 20), a
-proven minimum: the three ESC templates Domain Users enrolls in and the CA's missing SID
+On the lab, 25 of 26 users have a path to tier 0. The plan is 16 changes (cost 20; at least
+cost 16 is needed, and it is not shown to be the minimum): the three ESC templates Domain Users enrolls in and the CA's missing SID
 extension go first as one step,
 helpdesk's ACE on AdminSDHolder is one change (SDProp removes its 20 copies), and the one
 user left reaches tier 0 only through the Entra sync account, whose DCSync is kept on

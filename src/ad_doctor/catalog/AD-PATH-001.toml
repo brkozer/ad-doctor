@@ -119,15 +119,27 @@ what the source holds:
   or in Protected Users. A member server needs an enabled, delegable member of Domain
   Admins, and the edge carries the caveat that Domain Admins is in its local
   Administrators. A domain controller also accepts one of Administrators or Enterprise
-  Admins, or a writable DC's own account, as which a service can replicate.
+  Admins, and a writable DC also its own account, as which a service can replicate (an
+  RODC replicates nothing outbound and a writable DC's account is no admin on it, so that
+  way is not open to an RODC). Protected Users counts from the Windows Server 2012 R2
+  domain functional level, below which the DCs do not enforce it; an account marked
+  sensitive counts at every level.
 - **Constrained delegation** needs protocol transition (`TRUSTED_TO_AUTH_FOR_DELEGATION`)
   and an SPN on a user source; a computer can give itself one. Without protocol transition
   S4U2self returns no forwardable ticket, so the attack needs a ticket from a victim: no
   edge. The target SPN must resolve to one computer, as written or through `sPNMappings`
   (`cifs/host` to `HOST/host`).
-- **Resource-based delegation** starts at a listed computer, an account with an SPN, a group
-  holding one of those, or a broad group. A user without an SPN gets no edge; the U2U
-  variant works but replaces its password with a session key, so it is not modelled.
+- **Resource-based delegation** starts at whoever can run S4U2self: a listed computer or an
+  account with an SPN. A listed group gives the edge to those of its members, nested ones
+  included, and not to the group: S4U2self is run by the account that holds the SPN, and
+  sharing a group with it gives no control of it. A user without an SPN gets no edge, on its
+  own or through a group; the U2U variant works but replaces its password with a session key,
+  so it is not modelled. Domain Computers qualifies as a group. Everyone and Authenticated
+  Users qualify as a group when `ms-DS-MachineAccountQuota` is above 0, because any user can
+  then create a computer; at quota 0 the edge goes only to the enabled computers and SPN
+  holders. Domain Users gives the edge to its enabled SPN holders only (a computer made
+  through the quota is in Domain Computers). Anonymous Logon and Domain Guests never qualify,
+  and any other built-in group counts through the members the snapshot lists for it.
 - **SID history** needs nothing more inside the domain: the holder's tickets carry the SID.
   Only domain SIDs count, not built-in ones. A foreign SID is an edge only to what that
   SID is granted in this domain, because a snapshot sees one domain.
@@ -137,7 +149,9 @@ A certificate edge is drawn only for a step that works with what the enrollee ho
 - **ESC13:** an issuable template valid for logon (no manager approval, no authorized
   signature, an authentication EKU), the Enroll right (AutoEnroll alone requests nothing) and
   an issuance policy linked to a group. The edge is to that group, so it only matters when the
-  group's own rights reach tier 0.
+  group's own rights reach tier 0. No edge when the configuration of every enterprise CA was
+  read and each holds every request for a manager (`REQDISP_PENDING`): the certificate is not
+  issued on request. A CA that could not be read counts as issuing.
 - **ESC6 with ESC16** ([AD-CHAIN-004](AD-CHAIN-004.md)): an issuable authentication template on
   a CA that sets the SAN flag and leaves out the SID extension, so the requester can name any
   user in a SAN URL and domain controllers accept it even in full enforcement. Only with one

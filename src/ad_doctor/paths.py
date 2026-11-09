@@ -44,6 +44,7 @@ from .checks import (
     _tier0_group_sids,
     ca_control,
     check,
+    every_ca_holds,
     linked_policies,
     officer_templates,
     san_ca,
@@ -65,6 +66,9 @@ ENROLL_ESC13 = "enroll (ESC13)"
 ENROLL_ESC6 = "enroll (ESC6+ESC16)"
 # a snapshot does not hold a member server's local groups
 LOCAL_ADMIN_CAVEAT = "assumes Domain Admins is in the local Administrators"
+# msDS-Behavior-Version of Windows Server 2012 R2, from which DCs apply Protected Users
+PROTECTED_USERS_LEVEL = 6
+EVERY_LOGON = ("S-1-1-0", "S-1-5-11")  # Everyone, Authenticated Users
 
 
 @dataclass
@@ -429,8 +433,10 @@ def build(snap: Snapshot, provenance: bool = False) -> Graph:
     # An issuance policy linked to a group (ESC13) adds that group to the ticket of whoever
     # logs on with the certificate. A CA with ESC6 and ESC16 issues a certificate for any
     # user from any authentication template (AD-CHAIN-004). Both need the Enroll right
-    # itself: AutoEnroll alone cannot request a certificate.
+    # itself: AutoEnroll alone cannot request a certificate. A CA that holds every request
+    # for a manager issues nothing on request, so neither edge exists through it.
     ca = san_ca(snap)
+    held = every_ca_holds(snap)
     for t in snap.templates:
         if not _issuable(t) or not _authenticates(t):
             continue
@@ -439,7 +445,7 @@ def build(snap: Snapshot, provenance: bool = False) -> Graph:
                 a.sid for a in t.aces if a.sid not in skip and a.extended_right(sd.CERT_ENROLL)
             )
         )
-        for oid in linked_policies(snap, t):
+        for oid in () if held else linked_policies(snap, t):
             linked = snap.oid_group_links[oid]
             target = node_of(linked)
             for sid in enrollers:
@@ -482,7 +488,7 @@ def build(snap: Snapshot, provenance: bool = False) -> Graph:
         for sid in gm.readers:
             add(principal(sid), target, "read gMSA password", rec and rec.gmsa(gm.dn, sid))
 
-    _delegation_edges(snap, add, principal, rec, edge_props)
+    _delegation_edges(snap, add, principal, node_of, rec, edge_props)
 
     tier0 = tier0_nodes(snap, node_of, domain_node, ca_nodes, names, snap.tier0_dns())
     names["tier0:dc-ou"] = "Domain Controllers OU"
@@ -495,6 +501,7 @@ def _delegation_edges(
     snap: Snapshot,
     add: Callable[[str, str, str, Any], None],
     principal: Callable[[str], str],
+    node_of: Callable[[str], str],
     rec: Provenance | None,
     edge_props: dict[tuple[str, str, str], dict[str, Any]],
 ) -> None:
@@ -504,8 +511,10 @@ def _delegation_edges(
     - constrained: protocol transition (without it S4U2self gives no forwardable ticket,
       so the source needs a victim's ticket) and an SPN of its own; the target SPN
       resolves to one computer, as the KDC would resolve it.
-    - resource-based: a listed principal that can run S4U2self: a computer (it can write
-      itself an SPN), an account with an SPN, or a group holding one of those.
+    - resource-based: the source can run S4U2self: a computer (it can write itself an
+      SPN) or an account with an SPN. S4U2self is run by the account holding the SPN, and
+      sharing a group with it gives no control of it, so a listed group gives the edge to
+      those of its members, not to the group (_s4u_sources says who, per well-known SID).
     - both: an enabled target with an SPN, and an admin of it that can be delegated.
     - SID history: nothing else inside the domain; the holder's tickets carry the SID.
     """
@@ -530,7 +539,7 @@ def _delegation_edges(
     groups = {o.dn.lower(): o for o in snap.objects if o.kind == "group"}
     if rec is not None:  # a membership change can open or close these edges
         rec.condition_groups = _condition_groups(snap, groups, resource)
-    server, dc = _impersonable(snap)
+    server, rodc, dc = _impersonable(snap)
 
     def host(a: Account | None) -> bool:
         return (
@@ -539,7 +548,7 @@ def _delegation_edges(
             and not a.managed
             and a.enabled
             and bool(a.spns)
-            and (dc if a.is_dc else server)
+            and (rodc if a.is_rodc else dc if a.is_dc else server)
         )
 
     def link(src: str, target: Account, how: str, why: Any) -> None:
@@ -570,30 +579,26 @@ def _delegation_edges(
                 target = holder(spn)
                 if target is not None and host(target):
                     link(_sid_node(a.sid), target, CONSTRAINED, rec and rec.constrained(a.dn, spn))
-    by_sid = {a.sid: a for a in snap.accounts if a.sid}
-    group_of = {o.sid: o for o in groups.values() if o.sid}
-    broad = snap.broad_sids()
-
-    def can_s4u(sid: str) -> bool:
-        account = by_sid.get(sid)
-        if account is not None:
-            return account.is_computer or bool(account.spns)
-        if sid in broad:
-            return True
-        return sid in group_of and _holds_s4u_member(snap, groups, group_of[sid])
-
+    sources: dict[str, list[str]] = {}
     for target in resource:
         if host(target):
             for sid in target.rbcd_principals or ():
-                if can_s4u(sid):
-                    link(principal(sid), target, RESOURCE_BASED, rec and rec.rbcd(target.dn, sid))
+                if sid not in sources:
+                    sources[sid] = _s4u_sources(snap, groups, node_of, sid)
+                for src in sources[sid]:
+                    link(principal(src), target, RESOURCE_BASED, rec and rec.rbcd(target.dn, sid))
 
 
-def _impersonable(snap: Snapshot) -> tuple[bool, bool]:
-    """(a member server, a domain controller) has an admin the KDC lets a service
-    impersonate: enabled, not marked sensitive, not in Protected Users. A writable DC's
-    own account counts on a DC: as that account a service can replicate."""
-    protected = {dn.lower() for dn in snap.protected_users}
+def _impersonable(snap: Snapshot) -> tuple[bool, bool, bool]:
+    """(a member server, a read-only DC, a writable DC) has an admin the KDC lets a service
+    impersonate: enabled, not marked sensitive, not in Protected Users (which the DCs apply
+    from the 2012 R2 domain functional level). A writable DC's own account counts on a
+    writable DC: as that account a service can replicate. It is no admin of an RODC, and an
+    RODC does not replicate outbound."""
+    level = snap.policy.functional_level
+    protected = (
+        {dn.lower() for dn in snap.protected_users} if level >= PROTECTED_USERS_LEVEL else set()
+    )
     accounts = snap.by_dn()
 
     def usable(dn: str) -> bool:
@@ -606,32 +611,62 @@ def _impersonable(snap: Snapshot) -> tuple[bool, bool]:
         )
 
     server = any(usable(dn) for dn in snap.privileged.get("Domain Admins", []))
-    dc = (
-        server
-        or any(
-            usable(dn)
-            for name in ("Administrators", "Enterprise Admins")
-            for dn in snap.privileged.get(name, [])
-        )
-        or any(a.is_registered_dc and not a.is_rodc and usable(a.dn) for a in snap.accounts)
+    rodc = server or any(
+        usable(dn)
+        for name in ("Administrators", "Enterprise Admins")
+        for dn in snap.privileged.get(name, [])
     )
-    return server, dc
+    dc = rodc or any(a.is_registered_dc and not a.is_rodc and usable(a.dn) for a in snap.accounts)
+    return server, rodc, dc
 
 
-def _holds_s4u_member(snap: Snapshot, groups: dict[str, DirObject], group: DirObject) -> bool:
-    """Whether the group holds a computer or an account with an SPN, nested or not."""
-    accounts = snap.by_dn()
-    seen, stack = {group.dn.lower()}, [group]
+def _s4u_sources(
+    snap: Snapshot, groups: dict[str, DirObject], node_of: Callable[[str], str], listed: str
+) -> list[str]:
+    """The SIDs a resource-based edge starts from when `listed` is in the attribute: those
+    that can run S4U2self as that principal.
+
+    - an account: itself, when it is a computer or holds an SPN;
+    - a group: those of its members, nested ones included;
+    - Domain Computers: the group, every member is a computer;
+    - Everyone, Authenticated Users: the group when the machine account quota lets any user
+      create a computer, else only the enabled computers and SPN holders;
+    - Domain Users: its enabled SPN holders, by membership or primary group. A computer made
+      through the quota is in Domain Computers, so the quota does not help;
+    - Anonymous Logon, Domain Guests: nobody, they have no such account.
+    """
+    by_sid = {a.sid: a for a in snap.accounts if a.sid}
+    group_of = {o.sid: o for o in groups.values() if o.sid}
+    runners = [a for a in snap.accounts if a.sid and a.enabled and (a.is_computer or a.spns)]
+    domain_users, domain_computers = f"{snap.domain_sid}-513", f"{snap.domain_sid}-515"
+    quota = snap.policy.machine_account_quota > 0
+    out: dict[str, None] = {}
+    seen, stack = {listed}, [listed]
     while stack:
-        for member in stack.pop().members:
-            key = member.lower()
-            a = accounts.get(key)
-            if a is not None and (a.is_computer or a.spns):
-                return True
-            if key in groups and key not in seen:
-                seen.add(key)
-                stack.append(groups[key])
-    return False
+        sid = stack.pop()
+        if sid in ("S-1-5-7", f"{snap.domain_sid}-514"):
+            continue
+        account = by_sid.get(sid)
+        if account is not None:
+            if account.is_computer or account.spns:
+                out[sid] = None
+            continue
+        if sid == domain_computers or (sid in EVERY_LOGON and quota):
+            out[sid] = None
+            continue
+        if sid in EVERY_LOGON:
+            out.update(dict.fromkeys(a.sid for a in runners))
+            continue
+        if sid == domain_users:
+            for a in runners:
+                if (a.primary_group or (515 if a.is_computer or a.managed else 513)) == 513:
+                    out[a.sid] = None
+        for member in group_of[sid].members if sid in group_of else ():
+            node = node_of(member)
+            if node.startswith("sid:") and node[4:] not in seen:
+                seen.add(node[4:])
+                stack.append(node[4:])
+    return list(out)
 
 
 def _condition_groups(

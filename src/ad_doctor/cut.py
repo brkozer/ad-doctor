@@ -166,6 +166,8 @@ class Model:
     # evaluation stays inside this set
     r0: set[str] = field(default_factory=set)
     rev0: dict[str, list[str]] | None = None  # reverse adjacency inside r0, built once
+    # flags left out of the network although they close a gate on it (see build_model)
+    dropped: set[int] = field(default_factory=set)
 
     def prim_cap(self, p: int) -> int:
         n1 = self.scale
@@ -317,13 +319,32 @@ def build_model(
     # gates: which flags can close each one, as arcs the network can hold
     gates_used = sorted({gt for _, _, _, gt, _ in inst if gt is not None})
     kills = {gi: prov.gate_kills(gi) for gi in gates_used}
+    dropped: set[int] = set()
+
+    def only_flags_close(gi: int) -> bool:
+        return all(
+            prov.prims[f][0] == "template-flag" or f in keeps for k in kills[gi] or [] for f in k
+        )
+
     for gi, ks in kills.items():
-        # a CA flag closes every ESC6 gate of the CA for less than a template flag closes one:
-        # a minimum cut never takes the template flag while a CA flag is free to choose
+        # A CA flag closes every ESC6 gate of the CA for less than a template flag closes
+        # one, and a template flag on no other gate costs the network nothing. One that also
+        # closes another gate has to end both gates (it joins them), so it stays only where
+        # that other gate needs a template flag anyway (ESC1-3: one flag can close both for
+        # less than a flag and a CA flag). An ESC13 gate has its policy link for 3.
         if ks and prov.gates[gi].kind == "esc6":
             ca = [k for k in ks if all(prov.prims[f][0] == "ca-flag" for f in k)]
             if any(next(iter(k)) not in keeps for k in ca):
-                kills[gi] = ca
+                stay = list(ca)
+                for k in ks:
+                    if k in ca:
+                        continue
+                    others = [o for o in gates_used if o != gi and k in (kills[o] or [])]
+                    if len(k) == 1 and (not others or any(only_flags_close(o) for o in others)):
+                        stay.append(k)
+                    else:
+                        dropped |= k
+                kills[gi] = stay
     inexact_gates = 0
     gate_plan: dict[int, tuple[list[int], list[int]]] = {}  # gate -> (series, parallel)
     appear: dict[int, int] = {}
@@ -356,6 +377,8 @@ def build_model(
             prov.prims[f][0] == "template-flag" for f in shared
         ):
             inexact_gates += 1  # its arcs reach the group, so a shared flag joins routes
+        if chain and shared and prov.gates[gi].kind == "esc6":
+            inexact_gates += 1  # the chain joins the gates of the CA, and this flag comes after it
         series = private + chain + shared  # a shared flag last
         gate_plan[gi] = (series, group)
     for gi, (series, group) in gate_plan.items():
@@ -539,6 +562,7 @@ def build_model(
         [u for u in _users(snap) if u[0] in reach or any(n in reach for n in u[1])],
         None,
         reach,
+        dropped=dropped,
     )
 
 
@@ -608,8 +632,10 @@ def decode(m: Model, flow: int) -> int:
 def routes(m: Model, removed: Iterable[int] = ()) -> int:
     """Changes still needed in the model with every change at cost 1: the progress
     measure while exposure does not move."""
-    cap = list(m.base_cap)
     gone = set(removed)
+    if gone & m.dropped:  # no arc for it here: build the network with the change made
+        return routes(build_model(m.snap, m.g, m.sources, m.keeps, m.tier0 - m.g.tier0, gone))
+    cap = list(m.base_cap)
     for p, e in m.prim_arc.items():
         cap[e] = 0 if p in gone else 1
     flow = m.net.maxflow(m.s, m.t, cap)

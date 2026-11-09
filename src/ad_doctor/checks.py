@@ -3419,6 +3419,15 @@ def san_ca(snap: Snapshot) -> CaConfig | None:
     return c if _esc6(c) and _esc16(c) and not _pending(c) else None
 
 
+def every_ca_holds(snap: Snapshot) -> bool:
+    """Every enterprise CA's configuration was read and each holds every request for a
+    manager: no certificate is issued on request, on any CA that could publish a template."""
+    configs = snap.probes.ca_configs
+    return (
+        bool(snap.ca_hosts) and len(configs) >= len(snap.ca_hosts) and all(map(_pending, configs))
+    )
+
+
 def san_note(snap: Snapshot) -> list[str]:
     """A note when AD-CHAIN-004 holds but the graph cannot place it on a template."""
     hits = [c.name for c in snap.probes.ca_configs if _esc6(c) and _esc16(c)]

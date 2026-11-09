@@ -482,7 +482,7 @@ def rollback_lines(change: Facts, snap: Snapshot) -> list[str]:
             )
         out.append(f"# run on the CA {host}, then Restart-Service certsvc")
     elif kind == "gmsa-reader":
-        everyone = ", ".join(_q(s) for s in [*change.readers, sid])
+        everyone = ", ".join(_q(s) for s in dict.fromkeys([*change.listed, sid]))
         out.append(
             f"Set-ADServiceAccount -Identity {_q(change.dn)} "
             f"-PrincipalsAllowedToRetrieveManagedPassword {everyone} -WhatIf"
@@ -516,7 +516,7 @@ def rollback_lines(change: Facts, snap: Snapshot) -> list[str]:
                 "# rbcd: put back the msDS-AllowedToActOnBehalfOfOtherIdentity value saved before"
             )
     elif kind == "rbcd-principal":
-        everyone = ", ".join(_q(s) for s in [*change.readers, sid])
+        everyone = ", ".join(_q(s) for s in dict.fromkeys([*change.listed, sid]))
         out.append(
             f"Set-ADComputer -Identity {_q(change.dn)} "
             f"-PrincipalsAllowedToDelegateToAccount {everyone} -WhatIf"
