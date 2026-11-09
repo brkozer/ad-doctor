@@ -7,6 +7,8 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-11-10
+
 ### Added
 
 - **Patch level** (AD-INF-029, AD-ADCS-022): each DC's and CA's build and UBR are read over the
