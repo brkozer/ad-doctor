@@ -1,0 +1,65 @@
+id = "AD-DNS-005"
+aliases = ["adidns-wildcard", "dns-wildcard-record"]
+summary = "A wildcard record exists in a DNS zone, so every name without its own record goes to the wildcard's host."
+severities = ["info", "low", "high"]
+severity_logic = """
+Decided by who owns the record and whether it answers address queries. **High**: an ordinary
+account owns it and it holds an address or an alias. **Low**: an ordinary account owns it but
+it has no address record or none can be read, or its owner cannot be read or is in another domain.
+**Information**: tier 0, a DNS administrator or the system owns it, which may be a deliberate reservation.
+"""
+mitre = ["T1557"]
+data_sources = ["ldap"]
+attributes = ["name", "dnsRecord", "dNSTombstoned", "nTSecurityDescriptor"]
+related = ["AD-DNS-003", "AD-DNS-006"]
+since = "0.2.3"
+
+risk = """
+A wildcard answers for any name in the zone that has no record of its own. Unlike broadcast name
+spoofing this works across subnets, so a mistyped server name or a retired host goes to the
+wildcard's target. An account that holds one receives connections meant for those names.
+"""
+
+detection = """
+A name counts when its first label is `*`, so `*` and `*.branch` are both wildcards. Tombstoned
+records are left out. The owner comes from one read of each record's security descriptor: tier-0
+groups and accounts, DnsAdmins, operators and domain controllers count as administrators.
+
+Owners outside these are ordinary. Address and alias records (A, AAAA, CNAME) are told from
+others by the `dnsRecord` header. Owner and record data that cannot be read are stated in the
+finding. An ordinary user can read both on a default zone, but a changed ACL can hide them.
+"""
+
+false_positives = """
+- **A wildcard kept as a reservation.** This is a recommended way of protecting a zone, and it is
+  why an administrator's wildcard is information only. A TXT record avoids answering address queries.
+- **A delegated DNS administrator** outside DnsAdmins is reported as an ordinary account.
+"""
+
+remediation = """
+1. **Check the record**:
+
+    ```powershell
+    Get-DnsServerResourceRecord -ZoneName corp.example -Name '*'
+    ```
+
+2. **Remove one nobody can account for**:
+
+    ```powershell
+    Remove-DnsServerResourceRecord -ZoneName corp.example -Name '*' -RRType A -WhatIf
+    ```
+
+3. **To keep the name reserved**, have an administrator create a TXT record for `*`.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-DNS-005"
+
+[[references]]
+title = "Exploiting Active Directory-Integrated DNS (NetSPI)"
+url = "https://www.netspi.com/blog/technical-blog/network-pentesting/exploiting-adidns/"
+kind = "research"
+
+[[references]]
+title = "[MS-DNSP]: dnsRecord"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dnsp/6912b338-5472-4f59-b912-0edb536b6ed8"
+kind = "spec"

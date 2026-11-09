@@ -1,4 +1,6 @@
-"""Bounded parser for the dnsProperty attribute of Active Directory-integrated DNS zones.
+"""Bounded parsers for the dnsProperty and dnsRecord attributes of Active Directory DNS.
+
+Any domain user can create a record, so everything here reads attacker-controlled bytes.
 
 [MS-DNSP] 2.3.2.1: DataLength, NameLength, Flag, Version and Id, four bytes each, then Data
 and one byte of Name. Every value holds one property. Anything that does not fit that layout
@@ -8,6 +10,7 @@ one that cannot be read must not pass as clean.
 
 from __future__ import annotations
 
+import re
 import struct
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
@@ -28,6 +31,63 @@ UPDATE_OFF = 0
 UPDATE_NONSECURE = 1
 UPDATE_SECURE = 2
 UPDATE_VALUES = frozenset((UPDATE_OFF, UPDATE_NONSECURE, UPDATE_SECURE))
+
+# dnsRecord, [MS-DNSP] 2.3.2.2: DataLength, Type, Version, Rank, Flags, Serial, TtlSeconds,
+# Reserved, TimeStamp, then Data. Only the type is read: the data is never needed.
+RECORD_HEADER = struct.Struct("<HHBBHIIII")
+RECORD_VERSION = 5
+MAX_RECORD_VALUES = 1024
+MAX_RECORD_BYTES = RECORD_HEADER.size + 0xFFFF
+# DNS_RECORD_TYPE, [MS-DNSP] 2.2.2.1.1; 0 marks a record the server has tombstoned
+TYPE_TOMBSTONE = 0
+TYPE_A = 1
+TYPE_NS = 2
+TYPE_CNAME = 5
+TYPE_AAAA = 28
+ADDRESS_TYPES = frozenset((TYPE_A, TYPE_AAAA, TYPE_CNAME))
+
+# why a name is kept in the snapshot; decided when collected, redaction replaces the name
+KIND_MARSHALED = "marshaled"
+KIND_WILDCARD = "wildcard"
+KIND_WELL_KNOWN = "well-known"
+NODE_KINDS = (KIND_MARSHALED, KIND_WILDCARD, KIND_WELL_KNOWN)
+MAX_NAME_LENGTH = 255
+# a marshaled CREDENTIAL_TARGET_INFORMATION in a host name: the structure has a fixed part, so
+# what lies between the two constant ends is never short. DNS ignores case, so this does too.
+MARSHALED = re.compile(r"uwhrc[a-z0-9#-]{20,}baaaa", re.IGNORECASE)
+# wpad and isatap are the default DNS global query block list; autodiscover is what mail
+# clients ask for by themselves
+WELL_KNOWN_NAMES = frozenset(("wpad", "isatap", "autodiscover"))
+
+
+def record_type(raw: bytes) -> int | None:
+    """The type of one dnsRecord value, None when it does not follow the layout."""
+    if not RECORD_HEADER.size <= len(raw) <= MAX_RECORD_BYTES:
+        return None
+    length, kind, version, *_ = RECORD_HEADER.unpack_from(raw)
+    if version != RECORD_VERSION or length > len(raw) - RECORD_HEADER.size:
+        return None
+    return int(kind)
+
+
+def record_types(values: Sequence[bytes]) -> list[int] | None:
+    """The types of the readable values, or None when none is readable. A malformed value
+    beside a valid one cannot hide the valid one."""
+    found = {record_type(raw) for raw in values[:MAX_RECORD_VALUES]}
+    found.discard(None)
+    return sorted(t for t in found if t is not None) or None
+
+
+def node_kind(name: str) -> str | None:
+    """Why the checks need this name, or None for an ordinary name."""
+    if len(name) > MAX_NAME_LENGTH:
+        return None
+    if MARSHALED.search(name):
+        return KIND_MARSHALED
+    first = name.split(".", 1)[0].lower()
+    if first == "*":
+        return KIND_WILDCARD
+    return KIND_WELL_KNOWN if first in WELL_KNOWN_NAMES else None
 
 
 @dataclass(frozen=True)

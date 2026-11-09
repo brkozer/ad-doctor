@@ -21,6 +21,7 @@ from .model import (
     CaConfig,
     CertTemplate,
     Dmsa,
+    DnsNode,
     DnsZone,
     Finding,
     KeyCredential,
@@ -2858,8 +2859,18 @@ def dns_nonsecure_updates(snap: Snapshot) -> Finding | None:
     )
 
 
+def _dns_trusted_sids(snap: Snapshot) -> set[str]:
+    """Who is expected to hold DNS zones and create records by hand."""
+    held = snap.tier0_dns() | {dn.lower() for dn in snap.dns_admins}
+    allowed = _tier0_group_sids(snap) | set(snap.dns_admin_sids)
+    allowed |= {CREATOR_OWNER, PRINCIPAL_SELF}
+    allowed |= {a.sid for a in snap.accounts if a.sid and a.dn.lower() in held}
+    allowed |= {o.sid for o in snap.objects if o.sid and o.dn.lower() in held}
+    return allowed
+
+
 def foreign_zone_trustee(
-    zone: DnsZone, sid: str, domain_sid: str, root_sid: str, admin_sids: list[str]
+    zone: DnsZone | DnsNode, sid: str, domain_sid: str, root_sid: str, admin_sids: list[str]
 ) -> bool:
     """A principal of another domain on a forest-wide zone: its DnsAdmins group, which
     holds the zone by default, cannot be told from any other group there."""
@@ -2895,11 +2906,7 @@ def _zone_writers(zone: DnsZone) -> set[str]:
 def dns_zone_control(snap: Snapshot) -> Finding | None:
     if not snap.dns_zones_checked:
         return None
-    held = snap.tier0_dns() | {dn.lower() for dn in snap.dns_admins}
-    allowed = _tier0_group_sids(snap) | set(snap.dns_admin_sids)
-    allowed |= {CREATOR_OWNER, PRINCIPAL_SELF}
-    allowed |= {a.sid for a in snap.accounts if a.sid and a.dn.lower() in held}
-    allowed |= {o.sid for o in snap.objects if o.sid and o.dn.lower() in held}
+    allowed = _dns_trusted_sids(snap)
     broad = snap.broad_sids()
     hits = []
     broad_forward = False
@@ -2962,6 +2969,257 @@ def dns_zone_create_child(snap: Snapshot) -> Finding | None:
         "including a wildcard, and clients that look that name up go to its host.",
         "Create the names that should not be claimable (for example a wildcard and wpad) as "
         "static records, and watch for new dnsNode objects.",
+        sorted(hits),
+    )
+
+
+def _node_label(node: DnsNode) -> str:
+    return f"{node.name} in {node.zone} ({node.source})"
+
+
+def _dns_nodes(snap: Snapshot, kind: str) -> list[DnsNode]:
+    return [n for n in snap.dns_nodes if n.kind == kind]
+
+
+def _node_creator(snap: Snapshot, node: DnsNode, trusted: set[str]) -> tuple[str, str]:
+    """("trusted" | "unread" | "foreign" | "ordinary", name of the owner)."""
+    if node.owner is None:
+        return "unread", ""
+    name = snap.name_of(node.owner)
+    if node.owner in trusted:
+        return "trusted", name
+    root = snap.root_sid or snap.domain_sid
+    if foreign_zone_trustee(node, node.owner, snap.domain_sid, root, snap.dns_admin_sids):
+        return "foreign", name
+    return "ordinary", name
+
+
+def _answers_clients(node: DnsNode) -> bool:
+    return bool(dnsprop.ADDRESS_TYPES.intersection(node.record_types or ()))
+
+
+@check("AD-DNS-004", "DNS names carrying marshaled target information")
+def dns_marshaled_names(snap: Snapshot) -> Finding | None:
+    if not snap.dns_nodes_checked:
+        return None
+    nodes = _dns_nodes(snap, dnsprop.KIND_MARSHALED)
+    if not nodes:
+        return None
+    return _finding(
+        "AD-DNS-004",
+        Severity.MEDIUM if all(n.is_tombstoned for n in nodes) else Severity.HIGH,
+        "These names hold a marshaled target structure, which has no use in a host name. It "
+        "lets an attacker coerce a host into authenticating and relay its Kerberos ticket "
+        "back to it. Treat this as a sign of an attack or a penetration test.",
+        "Find out who created each record, remove it, and install the June 2025 or later "
+        "Windows updates (CVE-2025-33073).",
+        sorted(f"{_node_label(n)}{' (tombstoned)' if n.is_tombstoned else ''}" for n in nodes),
+    )
+
+
+@check("AD-DNS-005", "Wildcard DNS records")
+def dns_wildcards(snap: Snapshot) -> Finding | None:
+    if not snap.dns_nodes_checked:
+        return None
+    trusted = _dns_trusted_sids(snap)
+    severity = Severity.INFO
+    hits = []
+    for node in _dns_nodes(snap, dnsprop.KIND_WILDCARD):
+        if node.is_tombstoned:
+            continue
+        kind, owner = _node_creator(snap, node, trusted)
+        if kind == "trusted":
+            hits.append(f"{_node_label(node)}: created by {owner}")
+        elif kind != "ordinary":
+            severity = max(severity, Severity.LOW)
+            why = "owner not readable" if kind == "unread" else f"owner in another domain: {owner}"
+            hits.append(f"{_node_label(node)}: {why}, review")
+        elif _answers_clients(node):
+            severity = Severity.HIGH
+            hits.append(f"{_node_label(node)}: created by {owner}")
+        else:
+            severity = max(severity, Severity.LOW)
+            what = "no address record" if node.readable else "records not readable"
+            hits.append(f"{_node_label(node)}: created by {owner}, {what}")
+    if not hits:
+        return None
+    return _finding(
+        "AD-DNS-005",
+        severity,
+        "A wildcard answers every name in the zone that has no record of its own, so clients "
+        "that look up a mistyped or retired name reach its host. One created by an ordinary "
+        "account points at a host that account chose. One created by an administrator is "
+        "listed for review, and may be a deliberate reservation.",
+        "Remove a wildcard nobody can account for. To reserve the name, use a TXT record, which "
+        "does not answer address queries.",
+        sorted(hits),
+    )
+
+
+@check("AD-DNS-006", "Well-known DNS names registered by ordinary accounts")
+def dns_shadowed_names(snap: Snapshot) -> Finding | None:
+    if not snap.dns_nodes_checked:
+        return None
+    trusted = _dns_trusted_sids(snap)
+    by_sid = {a.sid: a for a in snap.accounts if a.sid and a.is_computer}
+    severity = Severity.LOW
+    hits = []
+    for node in _dns_nodes(snap, dnsprop.KIND_WELL_KNOWN):
+        kind, owner = _node_creator(snap, node, trusted)
+        if node.is_tombstoned or kind in ("trusted", "unread"):
+            continue  # an unread owner is a note from the collector
+        computer = by_sid.get(node.owner or "")
+        if computer and computer.sam.rstrip("$").lower() == node.name.split(".", 1)[0].lower():
+            continue  # a host that really has this name registered itself
+        if kind == "foreign":
+            hits.append(f"{_node_label(node)}: owner in another domain: {owner}, review")
+        elif _answers_clients(node):
+            severity = Severity.HIGH
+            hits.append(f"{_node_label(node)}: created by {owner}")
+        else:
+            what = "no address record" if node.readable else "records not readable"
+            hits.append(f"{_node_label(node)}: created by {owner}, {what}")
+    if not hits:
+        return None
+    return _finding(
+        "AD-DNS-006",
+        severity,
+        "An ordinary account owns these names. Clients look them up on their own, for proxy "
+        "settings or mail configuration, so whoever controls the record receives that traffic.",
+        "Remove the record, or replace it with one an administrator owns, and find out who "
+        "created it.",
+        sorted(hits),
+    )
+
+
+# service classes whose instance is a host name, even with no dots in it; other classes can
+# name anything there (kadmin/changepw, a replication GUID, an application name)
+SHORT_HOST_CLASSES = frozenset(("host", "cifs", "http", "www", "ldap", "wsman"))
+# the classes the reflection attack turns into SYSTEM on the computer that holds the SPN
+GHOST_REFLECTION_CLASSES = frozenset(("host", "cifs"))
+HOST_NAME = re.compile(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*")
+
+
+def _computer_label(account: Account) -> str:
+    return account.sam.rstrip("$").lower()
+
+
+def _spn_dns_name(account: Account, spn: str, domain: str) -> str | None:
+    """The name a client looks up for this SPN, when that can be told."""
+    service, host = _spn_parts(spn)
+    if not HOST_NAME.fullmatch(host) or IP_LIKE.fullmatch(host):
+        return None
+    if "." in host:
+        return host
+    if service not in SHORT_HOST_CLASSES or host == _computer_label(account):
+        return None
+    return f"{host}.{domain.lower()}"
+
+
+def _own_dns_names(account: Account, domain: str) -> set[str]:
+    names = {f"{_computer_label(account)}.{domain.lower()}"}
+    if account.dns_host:
+        names.add(account.dns_host.lower().rstrip("."))
+    return names
+
+
+def _may_hold_ghost(account: Account) -> bool:
+    return account.enabled and account.sam.lower() != "krbtgt"
+
+
+def dns_lookup_hosts(accounts: Iterable[Account], domain: str) -> set[str]:
+    """Every name AD-DNS-007 asks about, so the collector keeps only those of a zone."""
+    wanted: set[str] = set()
+    for account in accounts:
+        if not _may_hold_ghost(account):
+            continue
+        if account.is_computer:
+            wanted |= _own_dns_names(account, domain)
+        for spn in account.spns:
+            name = _spn_dns_name(account, spn, domain)
+            if name:
+                wanted.add(name)
+    return wanted
+
+
+def _under(name: str, parent: str) -> bool:
+    return name == parent or name.endswith(f".{parent}")
+
+
+def _covered_by_wildcard(name: str, wildcards: list[str]) -> bool:
+    return any(name.endswith(suffix) for suffix in wildcards)
+
+
+def _zone_claimable(zone: DnsZone, broad: set[str]) -> bool:
+    """Whether any domain account can add a new name to this zone."""
+    if zone.zone_type != dnsprop.ZONE_TYPE_PRIMARY:
+        return False
+    if zone.allow_update == dnsprop.UPDATE_NONSECURE:
+        return True
+    return zone.acl_read and any(a.sid in broad and a.creates(sd.DNS_NODE_CLASS) for a in zone.aces)
+
+
+def _account_is_live(account: Account, snap: Snapshot, seen: set[str]) -> bool:
+    """A dead host's account cannot be relayed to, so its leftovers are not this finding."""
+    if account.last_logon is None or snap.collected_at - account.last_logon > STALE_AFTER:
+        return False
+    return not account.is_computer or bool(_own_dns_names(account, snap.domain) & seen)
+
+
+@check("AD-DNS-007", "SPN hosts with no DNS record that any user can register")
+def dns_ghost_spns(snap: Snapshot) -> Finding | None:
+    if not snap.dns_nodes_checked:
+        return None
+    zones = sorted((z for z in snap.dns_zones if not z.reverse), key=lambda z: -len(z.name))
+    seen = {h.lower() for h in snap.dns_spn_hosts}
+    broad = snap.broad_sids()
+    wildcards = [
+        f"{n.name[1:]}.{n.zone}".lower()
+        for n in _dns_nodes(snap, dnsprop.KIND_WILDCARD)
+        if not n.is_tombstoned
+    ]
+    severity = Severity.LOW
+    hits = set()
+    for account in snap.accounts:
+        if not account.spns or not _may_hold_ghost(account):
+            continue
+        if not _account_is_live(account, snap, seen):
+            continue
+        for spn in account.spns:
+            name = _spn_dns_name(account, spn, snap.domain)
+            if name is None or name in seen or name.split(".", 1)[0] in seen:
+                continue
+            if account.is_computer and name in _own_dns_names(account, snap.domain):
+                continue
+            home = [z for z in zones if _under(name, z.name.lower())]
+            copies = [z for z in home if len(z.name) == len(home[0].name)]
+            if (
+                not copies
+                or not any(z.nodes_read for z in copies)
+                or not any(_zone_claimable(z, broad) for z in copies)
+                or _covered_by_wildcard(name, wildcards)
+                # a child zone stored here is delegated to itself: it is not somewhere else
+                or any(
+                    _under(name, d.lower()) and d.lower() != copies[0].name.lower()
+                    for d in snap.dns_delegations
+                )
+            ):
+                continue
+            if account.is_computer and _spn_parts(spn)[0] in GHOST_REFLECTION_CLASSES:
+                severity = Severity.MEDIUM
+            hits.add(f"{account.sam}: {spn} (zone {copies[0].label})")
+    if not hits:
+        return None
+    return _finding(
+        "AD-DNS-007",
+        severity,
+        "No DNS record exists for these service names, and any domain user can add one. The "
+        "attacker points the name at a host of their own and coerces a client to it. The "
+        "Kerberos ticket that arrives is for the account holding the SPN, and it can be relayed "
+        "to that account's services. Without SMB signing on a computer, that means SYSTEM.",
+        "Remove the SPNs nothing uses with 'setspn -D', or create the DNS record the service "
+        "needs. Enforce SMB signing, and install the October 2025 or later Windows updates "
+        "(CVE-2025-58726).",
         sorted(hits),
     )
 

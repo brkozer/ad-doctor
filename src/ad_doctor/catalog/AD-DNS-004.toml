@@ -1,0 +1,69 @@
+id = "AD-DNS-004"
+aliases = ["marshaled-dns-name", "kerberos-reflection-dns", "credmarshaltargetinfo"]
+summary = "A DNS name in a zone holds marshaled target information, the technique that coerces a host into a Kerberos or NTLM authentication it then has reflected back to it."
+severities = ["medium", "high"]
+severity_logic = """
+**High** while the record exists or its state cannot be read. **Medium** when every such name is
+tombstoned: it no longer answers, but someone created it.
+"""
+mitre = ["T1557", "T1187"]
+data_sources = ["ldap"]
+attributes = ["name", "dnsRecord", "dNSTombstoned"]
+related = ["AD-DNS-003", "AD-DNS-005", "AD-DNS-007"]
+since = "0.2.3"
+
+risk = """
+A Windows client strips a marshaled `CREDENTIAL_TARGET_INFORMATION` from a host name before it
+builds the SPN. A record such as `srv1` followed by the marshaled text therefore resolves to the
+attacker while the client asks for a ticket for `srv1`. Coerced to that name, a machine sends the
+attacker an authentication that can be relayed back to it, which was the basis of CVE-2025-33073.
+
+Any domain user can create such a record by default, see [AD-DNS-003](AD-DNS-003.md). The name has
+no legitimate use, so this finding is evidence of an attack or a test rather than of a weak setting.
+"""
+
+detection = """
+Every `dnsNode` of each forward zone is read over LDAP, one at a time. A name is reported when it
+contains the two constant ends of a marshaled structure, `UWhRC` and `BAAAA`, with at least 20
+characters between them. Case is ignored, as it is in DNS.
+
+The name alone decides, so a record whose data cannot be read is still reported. Only the header of
+`dnsRecord` is parsed, within fixed limits, and record data is never stored. At most 200 such names
+are kept, and a note gives the number left out.
+"""
+
+false_positives = """
+- **A penetration test** that left its record behind. Remove it anyway.
+- **Other marshaled forms** are not matched: this looks for the form the public detections use.
+"""
+
+remediation = """
+1. **Find who created it** in your Directory Service Changes audit events (event 5137), and treat
+   an unexplained one as an incident.
+2. **List the records** and review them:
+
+    ```powershell
+    Get-ADObject -SearchBase 'DC=corp.example,CN=MicrosoftDNS,DC=DomainDnsZones,DC=corp,DC=example' `
+        -LDAPFilter '(name=*UWhRC*BAAAA*)' -Properties whenCreated, nTSecurityDescriptor
+    ```
+
+3. **Remove the record** once you have what you need from it:
+
+    ```powershell
+    Remove-DnsServerResourceRecord -ZoneName corp.example -Name '<name>' -RRType A -WhatIf
+    ```
+
+4. **Install the June 2025 or later Windows updates** and enforce SMB signing.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-DNS-004"
+
+[[references]]
+title = "Potential Kerberos Coercion via DNS-Based SPN Spoofing (Elastic detection rule)"
+url = "https://www.elastic.co/guide/en/security/8.19/prebuilt-rule-8-19-23-potential-kerberos-coercion-via-dns-based-spn-spoofing.html"
+kind = "vendor"
+
+[[references]]
+title = "[MS-DNSP]: dnsRecord"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dnsp/6912b338-5472-4f59-b912-0edb536b6ed8"
+kind = "spec"

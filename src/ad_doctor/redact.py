@@ -107,7 +107,7 @@ FIXED_KEYS = {
                 model.Gmsa, model.Rodc, model.Trust, model.Gpo, model.GppPassword,
                 model.ScriptSecret, model.GpoLocalGroup, model.GpLink,
                 model.UnreadableMember, model.KeyCredential, model.Site, model.Subnet,
-                model.ConflictObject, model.Pso, model.Dmsa, model.DnsZone)
+                model.ConflictObject, model.Pso, model.Dmsa, model.DnsZone, model.DnsNode)
     for f in dataclasses.fields(cls)
 } | {"domain", "AdminSDHolder", "sid", "mask", "object_type", "inherited_object_type"}  # fmt: skip
 # values from a fixed list, which the checks compare: never data, whatever the names around
@@ -224,6 +224,9 @@ class Redactor:
         # the whole name only: the labels of a reverse zone are the digits of its network
         for zone in data.get("dns_zones", []):
             words.update([zone["name"], *_dn_values(zone["dn"])])
+        for node in data.get("dns_nodes", []):
+            words.add(node["zone"])
+            words.update(label for label in node["name"].split(".") if label != "*")
         for o in data.get("objects", []):
             words.add(o["name"])
             words.update(_dn_values(o["dn"]))

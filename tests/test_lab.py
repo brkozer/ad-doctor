@@ -9,12 +9,13 @@ import dataclasses
 import os
 from datetime import timedelta
 
+import ldap3
 import pytest
 
-from ad_doctor import gpo_scope, opengraph, paths
+from ad_doctor import dnsprop, gpo_scope, opengraph, paths
 from ad_doctor.checks import run_all, tier0_hosts
-from ad_doctor.collect import Target, collect
-from ad_doctor.model import Severity, Snapshot
+from ad_doctor.collect import Collector, DnsNodeScan, Target, collect, connect
+from ad_doctor.model import DnsNode, Severity, Snapshot
 
 pytestmark = pytest.mark.lab
 
@@ -23,7 +24,8 @@ pytestmark = pytest.mark.lab
 # (need a real second domain), AD-ACC-014 and AD-INF-018 (need time to pass), AD-ACC-015,
 # AD-INF-019, AD-INF-020 and AD-INF-021 (not in the lab, read in the test below), AD-ACC-016,
 # AD-POL-003, AD-ACL-009 and AD-KRB-007 (not in the lab or not readable by adreader), AD-DNS-001
-# and AD-DNS-002 (the lab's zones have the default settings), AD-INF-012
+# and AD-DNS-002 (the lab's zones have the default settings), AD-DNS-004 to AD-DNS-007
+# (not seeded: no such record exists, read in the test below), AD-INF-012
 # (needs an RODC), AD-ACC-009 (confidential on 2025),
 # AD-INF-008 (DCs require SMB signing), AD-INF-009 and the high grade of AD-CHAIN-002/003
 # (no spooler on Server Core 2025), AD-INF-011 (needs a week without backup), AD-INF-003 (a
@@ -170,12 +172,11 @@ EXPECTED = {
 }
 
 
-@pytest.fixture(scope="module")
-def snap() -> Snapshot:
+def lab_target() -> Target:
     host = os.environ.get("AD_DOCTOR_LAB_HOST")
     if not host:
         pytest.skip("AD_DOCTOR_LAB_HOST not set")
-    target = Target(
+    return Target(
         host=host,
         port=int(os.environ.get("AD_DOCTOR_LAB_PORT", "636")),
         user=os.environ["AD_DOCTOR_LAB_USER"],
@@ -186,7 +187,11 @@ def snap() -> Snapshot:
         http_port=int(os.environ.get("AD_DOCTOR_LAB_HTTP_PORT", "80")),
         https_port=int(os.environ.get("AD_DOCTOR_LAB_HTTPS_PORT", "0")),
     )
-    snap = collect(target)
+
+
+@pytest.fixture(scope="module")
+def snap() -> Snapshot:
+    snap = collect(lab_target())
     assert snap.domain == "adlab.test"
     # an ordinary user cannot see fine-grained password policies or dMSAs; nothing else may fail
     ok = ("fine-grained", "dMSA", "by choice", "userPrincipalName")
@@ -284,6 +289,39 @@ def test_plain_user_reads_dns_zones(snap: Snapshot, findings: dict[str, set[str]
         assert zones[label].acl_read and not zones[label].reverse
     assert not {"AD-DNS-001", "AD-DNS-002"} & findings.keys()
     assert not any("DNS zone" in n for n in snap.notes)
+
+
+def test_plain_user_reads_dns_records(snap: Snapshot, findings: dict[str, set[str]]) -> None:
+    assert snap.dns_nodes_checked
+    forward = [z for z in snap.dns_zones if z.name.lower() != "rootdnsservers"]
+    assert forward and all(z.nodes_read for z in forward)
+    assert "dc01.adlab.test" in snap.dns_spn_hosts
+    assert "web01.adlab.test" not in snap.dns_spn_hosts  # svc_web never logged on: not a ghost
+    assert not {"AD-DNS-004", "AD-DNS-005", "AD-DNS-006", "AD-DNS-007"} & findings.keys()
+    assert not any("dnsRecord" in n or "could not be listed" in n for n in snap.notes)
+
+
+def test_records_and_owners_read_from_a_real_zone(snap: Snapshot) -> None:
+    conn = connect(lab_target())
+    try:
+        c = Collector(conn, lab_target())
+        zone = next(z for z in snap.dns_zones if z.name == "adlab.test")
+        seen = {}
+        for e in c.stream(
+            zone.dn,
+            "(objectClass=dnsNode)",
+            ["name", "dnsRecord"],
+            scope=ldap3.LEVEL,
+        ):
+            seen[e["name"][0].decode().lower()] = dnsprop.record_types(e.get("dnsrecord", []))
+        assert dnsprop.TYPE_A in (seen["dc01"] or ())
+        assert all(types is not None for types in seen.values())
+        node = DnsNode("dc01", zone.name, zone.source, dnsprop.KIND_WELL_KNOWN)
+        scan = DnsNodeScan(set(), set(), kept=[(f"DC=dc01,{zone.dn}", node)])
+        c._read_node_owners(scan)
+        assert node.owner is not None and node.owner.startswith("S-1-")
+    finally:
+        conn.unbind()
 
 
 def test_every_dc_probed(snap: Snapshot) -> None:

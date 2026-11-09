@@ -423,10 +423,37 @@ class DnsZone:
     aces: list[Ace] = field(default_factory=list)
     # ACEs the records of the zone inherit
     inheritable: list[Ace] = field(default_factory=list)
+    # False when its records could not be listed, and in older snapshots
+    nodes_read: bool = False
 
     @property
     def label(self) -> str:
         return f"{self.name} ({self.source})"
+
+
+@dataclass
+class DnsNode:
+    """A dnsNode the checks judge. Only these are kept: a zone can hold many thousands."""
+
+    name: str
+    zone: str
+    source: str
+    kind: str  # dnsprop.KIND_*: decided when collected, a redacted name no longer shows it
+    # DNS_RECORD_TYPE of the readable dnsRecord values; None when none could be read
+    record_types: list[int] | None = None
+    # dNSTombstoned; None when not returned
+    tombstoned: bool | None = None
+    # None when the security descriptor did not come back or could not be parsed
+    owner: str | None = None
+
+    @property
+    def is_tombstoned(self) -> bool:
+        types = self.record_types or []
+        return self.tombstoned is True or (bool(types) and set(types) == {0})
+
+    @property
+    def readable(self) -> bool:
+        return self.is_tombstoned or self.record_types is not None
 
 
 @dataclass
@@ -638,6 +665,14 @@ class Snapshot:
     dns_zones_checked: bool = False
     # SIDs of the DnsAdmins groups read: this domain's and the forest root's
     dns_admin_sids: list[str] = field(default_factory=list)
+    # names with a marshaled target, wildcards and well-known names, whoever created them
+    dns_nodes: list[DnsNode] = field(default_factory=list)
+    # False in older snapshots and when the records of no zone could be listed
+    dns_nodes_checked: bool = False
+    # lower-cased host names of SPNs that a dnsNode exists for; the rest of a zone is not kept
+    dns_spn_hosts: list[str] = field(default_factory=list)
+    # names delegated to other DNS servers (NS records) that some SPN host lies under
+    dns_delegations: list[str] = field(default_factory=list)
     # parts of the collection that could not run (no AD CS, SYSVOL unreachable, ...)
     notes: list[str] = field(default_factory=list)
     # False in older snapshots: Ace.inherited was not kept, so an inherited copy looks
@@ -815,6 +850,10 @@ class Snapshot:
             ],
             dns_zones_checked=data.get("dns_zones_checked", False),
             dns_admin_sids=data.get("dns_admin_sids", []),
+            dns_nodes=[DnsNode(**n) for n in data.get("dns_nodes", [])],
+            dns_nodes_checked=data.get("dns_nodes_checked", False),
+            dns_spn_hosts=data.get("dns_spn_hosts", []),
+            dns_delegations=data.get("dns_delegations", []),
             dns_admins=data.get("dns_admins", []),
             pre2k_members=data.get("pre2k_members", []),
             ds_heuristics=data.get("ds_heuristics", ""),
@@ -940,6 +979,7 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
             ("dmsas_checked", "AD-ACL-009 (control over dMSAs)"),
             ("krbtgt_links_checked", "AD-KRB-007 (Entra Kerberos objects)"),
             ("dns_zones_checked", "AD-DNS-001 to AD-DNS-003 (DNS zones)"),
+            ("dns_nodes_checked", "AD-DNS-004 to AD-DNS-007 (DNS records)"),
         )
         if key not in data
     ]

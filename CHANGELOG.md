@@ -19,6 +19,18 @@ logic or severity between versions, but an ID is never reused for something else
   is a note and is not reported as passing, and snapshots from older versions say these
   checks were not evaluated. No zone transfer is attempted. On the lab: the two default zones
   use secure updates, neither check fires, and AD-DNS-003 lists both zones.
+- **DNS records (`AD-DNS-004` to `AD-DNS-007`).** The scan walks the `dnsNode` objects of the
+  forward zones one at a time, with a bounded parser for the `dnsRecord` header ([MS-DNSP]
+  2.3.2.2), and keeps only the names a check needs. AD-DNS-004 reports names carrying
+  marshaled target information (high, medium when all are tombstoned). AD-DNS-005 reports
+  wildcards (high when an ordinary account owns one that answers address queries, low when
+  unclear, information when an administrator owns it). AD-DNS-006 reports `wpad`, `isatap`
+  and `autodiscover` owned by ordinary accounts (high, or low without an address). AD-DNS-007
+  reports SPN hosts of accounts in use that have no DNS record, in zones where any domain
+  user can add one; it is about held SPNs and does not repeat AD-DEL-005. Unreadable zones,
+  records and owners are notes and are not reported as passing, and snapshots from older
+  versions say these checks were not evaluated. On the lab none of the four fires: the
+  SPN hosts without a record belong to accounts that have never logged on.
 
 ## [0.2.2] - 2026-11-09
 
