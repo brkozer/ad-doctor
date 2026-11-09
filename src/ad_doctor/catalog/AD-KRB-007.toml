@@ -10,7 +10,7 @@ mitre = ["T1558"]
 data_sources = ["ldap"]
 attributes = ["msDS-KrbTgtLink", "userAccountControl", "pwdLastSet", "sAMAccountName"]
 related = ["AD-KRB-001", "AD-KRB-006", "AD-INF-014"]
-since = "0.3.0"
+since = "0.2.2"
 
 risk = """
 Microsoft Entra Kerberos, used for cloud Kerberos trust and FIDO2 sign-in to on-premises resources,

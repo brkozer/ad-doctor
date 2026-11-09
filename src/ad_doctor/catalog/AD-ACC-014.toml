@@ -10,7 +10,7 @@ mitre = ["T1078.002"]
 data_sources = ["ldap"]
 attributes = ["lastLogonTimestamp", "pwdLastSet", "whenCreated", "userAccountControl"]
 related = ["AD-ACC-005", "AD-INF-001", "AD-INF-018"]
-since = "0.3.0"
+since = "0.2.2"
 
 risk = """
 A computer account that nobody uses keeps its membership in Domain Computers and whatever

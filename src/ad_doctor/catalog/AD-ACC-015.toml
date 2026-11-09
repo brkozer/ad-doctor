@@ -10,7 +10,7 @@ mitre = ["T1078.002"]
 data_sources = ["ldap"]
 attributes = ["msDS-ManagedPasswordInterval"]
 related = ["AD-ACL-006"]
-since = "0.3.0"
+since = "0.2.2"
 
 risk = """
 The domain rotates a gMSA password every `msDS-ManagedPasswordInterval` days (30 by default).

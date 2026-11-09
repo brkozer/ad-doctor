@@ -10,7 +10,7 @@ mitre = ["T1078.002"]
 data_sources = ["ldap"]
 attributes = ["pwdLastSet", "msDS-ReplAttributeMetaData", "userAccountControl"]
 related = ["AD-INF-014", "AD-KRB-001", "AD-ACC-014"]
-since = "0.3.0"
+since = "0.2.2"
 
 risk = """
 A DC's machine account can replicate the directory, so its password is a tier-0 credential.

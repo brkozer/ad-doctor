@@ -10,7 +10,7 @@ mitre = ["T1098"]
 data_sources = ["ldap"]
 attributes = ["userPrincipalName", "sAMAccountName", "servicePrincipalName", "dNSHostName"]
 related = ["AD-INF-021", "AD-DEL-005"]
-since = "0.3.0"
+since = "0.2.2"
 
 risk = """
 Kerberos finds an account by more than one name, and the names are not all checked against each other.

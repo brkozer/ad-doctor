@@ -20,7 +20,7 @@ attributes = [
     "msDS-GroupMSAMembership",
 ]
 related = ["AD-INF-007", "AD-ACL-004", "AD-ACL-006"]
-since = "0.3.0"
+since = "0.2.2"
 
 risk = """
 After a migration a delegated managed service account has access to everything the old account

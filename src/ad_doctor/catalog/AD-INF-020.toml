@@ -10,7 +10,7 @@ mitre = []
 data_sources = ["ldap"]
 attributes = ["siteObject", "siteList", "site, subnet and server objects"]
 related = ["AD-INF-013"]
-since = "0.3.0"
+since = "0.2.2"
 
 risk = """
 Sites decide which DC a client uses and how DCs replicate. A client on a subnet with no site

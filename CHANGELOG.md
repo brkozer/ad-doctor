@@ -7,6 +7,8 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-09
+
 ### Added
 
 - **ESC13 and ESC6 in the control graph.** Two new edges in AD-PATH-001, `blast-radius`, the

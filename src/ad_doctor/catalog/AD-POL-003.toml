@@ -20,7 +20,7 @@ attributes = [
     "primaryGroupID",
 ]
 related = ["AD-POL-001", "AD-ACC-011"]
-since = "0.3.0"
+since = "0.2.2"
 
 risk = """
 A fine-grained password policy overrides the default domain policy for the users it applies to.

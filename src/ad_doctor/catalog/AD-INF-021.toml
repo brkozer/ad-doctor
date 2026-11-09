@@ -10,7 +10,7 @@ mitre = []
 data_sources = ["ldap"]
 attributes = ["name", "sAMAccountName", "objectSid"]
 related = ["AD-ACC-007"]
-since = "0.3.0"
+since = "0.2.2"
 
 risk = """
 When two DCs create the same object before they replicate, Active Directory keeps both and
