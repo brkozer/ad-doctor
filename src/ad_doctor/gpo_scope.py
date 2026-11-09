@@ -25,6 +25,10 @@ Approximations, each of which can only over-report:
   although a higher-precedence X__Members can remove what a lower one adds.
 - A holder of the remote logon right that could not be resolved to a SID is assumed to
   cover the member (with a caveat).
+
+Registry policy is the exception to the precedence point: `RegistryView` plays each GPO's
+Registry.pol in processing order and gives the effective value per computer. There a GPO that
+may not apply (a caveat above) leaves the result undecided instead of being assumed to apply.
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ import itertools
 import re
 from dataclasses import dataclass, field
 
-from . import sd
+from . import regpol, sd
 from .model import (
     WELL_KNOWN_RIDS,
     Account,
@@ -43,13 +47,15 @@ from .model import (
     GpLink,
     Gpo,
     GpoLocalGroup,
+    RegistryEntry,
     Snapshot,
     well_known_sid,
 )
 
 CSE_SECURITY = "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}"  # Restricted Groups, user rights
 CSE_GROUPS = "{17D89FEC-5C44-4972-B12D-241CAEF74509}"  # GPP Local Users and Groups
-CSE_OF_SOURCE = {"restricted": CSE_SECURITY, "gpp": CSE_GROUPS}
+CSE_REGISTRY = "{35378EAC-683F-11D2-A89A-00C04FBBCFA2}"  # Registry.pol (Administrative Templates)
+CSE_OF_SOURCE = {"restricted": CSE_SECURITY, "gpp": CSE_GROUPS, "registry": CSE_REGISTRY}
 GPO_USER_DISABLED = 0x1
 GPO_COMPUTER_DISABLED = 0x2
 SIDES = (("computer", GPO_COMPUTER_DISABLED), ("user", GPO_USER_DISABLED))
@@ -67,6 +73,7 @@ RDN_SEPARATOR = re.compile(r"(?<!\\)(?:\\\\)*,")
 ILT_CAVEAT = "item-level targeting not evaluated"
 FILTER_CAVEAT = "filter group not in this snapshot"
 SITE_CAVEAT = "site membership assumed"
+SOFT_CAVEAT = "set only where no value exists"
 UNRESOLVED_LOGON = "remote logon right holders not resolved"
 MAX_FILTER_NAMES = 3  # groups named on a filtered scope node
 
@@ -174,6 +181,7 @@ class _Resolver:
         self._tokens: dict[str, set[str]] = {}
         self._known = {o.sid for o in snap.objects if o.sid} | {a.sid for a in snap.accounts}
         self._unresolved: dict[str, set[str]] = {}
+        self._ordered: dict[str, list[tuple[GpLink, Gpo]]] | None = None
 
     def unresolved(self, g: Gpo) -> set[str]:
         """SIDs in the GPO's filter whose members the snapshot cannot show: nobody can say
@@ -230,6 +238,53 @@ class _Resolver:
             if g.guid.upper() not in found or not caveats:
                 found[g.guid.upper()] = (g, caveats)
         return list(found.values())
+
+    def _links_in_order(self, container: str) -> list[tuple[GpLink, Gpo]]:
+        """The enabled links of a container with their GPOs, in gPLink order."""
+        if self._ordered is None:
+            self._ordered = {}
+            for g in self.snap.gpos:
+                for link in g.links:
+                    self._ordered.setdefault(link.container.lower(), []).append((link, g))
+            for links in self._ordered.values():
+                links.sort(key=lambda item: item[0].index)
+        return [(link, g) for link, g in self._ordered.get(container, []) if link.enabled]
+
+    def processing_order(self, a: Account) -> list[tuple[Gpo, tuple[str, ...]]]:
+        """The GPOs linked where they reach this computer, in the order Windows applies them:
+        whatever comes later overwrites what came before.
+
+        Not enforced: site, domain, then OUs from the top down, stopping at Block Inheritance.
+        Enforced: after all of those, from the computer's own OU up to the site, so that the
+        highest one wins ([MS-GPOL] GPO Search and GPO Processing Order). Within one container
+        the gPLink value is applied left to right: a new link is inserted at the front and has
+        the lowest precedence, so the rightmost entry is link order 1 and goes last ("Group
+        Policy scope in Windows", New-GPLink -Order, and the lab's gPLink values; the wording of
+        [MS-GPOL] GPO Search reads the other way round for links that are not enforced).
+
+        The same computers and caveats as `linked`; a site link's caveat is its own.
+        """
+        plain: list[tuple[Gpo, tuple[str, ...]]] = []
+        enforced: list[tuple[Gpo, tuple[str, ...]]] = []
+        blocked = False
+        for c in containers(a.dn, self.snap.domain_dn):
+            links = self._links_in_order(c)
+            enforced += [(g, ()) for x, g in links if x.enforced]
+            if not blocked:
+                plain = [(g, ()) for x, g in links if not x.enforced] + plain
+            if c in self.blocked:
+                blocked = True
+        site = self.snap.dc_sites.get(a.dn.lower(), "").lower() if a.is_dc else ""
+        caveats: tuple[str, ...] = () if site or self.snap.site_count <= 1 else (SITE_CAVEAT,)
+        site_plain: list[tuple[Gpo, tuple[str, ...]]] = []
+        for container in sorted({c for c, _, _, _ in self.site_links}):
+            if site and container != site:
+                continue
+            links = self._links_in_order(container)
+            enforced += [(g, caveats) for x, g in links if x.enforced]
+            if not blocked:
+                site_plain += [(g, caveats) for x, g in links if not x.enforced]
+        return site_plain + plain + enforced
 
     def token(self, a: Account) -> set[str]:
         """SIDs in the account's token: its own, the well-known ones, the primary group
@@ -427,6 +482,187 @@ def dc_channel_allow(snap: Snapshot) -> tuple[list[ChannelAllow], list[str]]:
         for g, sddl, dcs, caveats in found.values()
     ]
     return sorted(hits, key=lambda h: h.gpo.name.lower()), sorted(unread)
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """One value a registry setting can end up with."""
+
+    present: bool  # False: Group Policy leaves no value there
+    data: int | str | list[str] | None = None
+    gpo: str = ""  # the GPO that decided this; "" when no GPO touches the setting
+    caveats: tuple[str, ...] = ()
+    unknown: bool = False  # a GPO that could not be read comes in here
+
+
+NOT_SET = Outcome(False)
+
+
+@dataclass(frozen=True)
+class Effective:
+    """What Group Policy leaves in one registry value on one computer.
+
+    A value Group Policy leaves absent says nothing about the computer: its own registry
+    or local policy may hold anything.
+    """
+
+    outcomes: tuple[Outcome, ...]
+
+    @property
+    def decided(self) -> bool:
+        return len(self.outcomes) == 1 and not self.outcomes[0].unknown
+
+    @property
+    def present(self) -> bool:
+        return self.decided and self.outcomes[0].present
+
+    @property
+    def value(self) -> int | str | list[str] | None:
+        return self.outcomes[0].data if self.present else None
+
+    @property
+    def gpo(self) -> str:
+        return self.outcomes[0].gpo if self.decided else ""
+
+    @property
+    def why(self) -> list[str]:
+        """Why this could not be decided, or what the decided value depends on."""
+        return sorted({c for o in self.outcomes for c in o.caveats})
+
+
+@dataclass(frozen=True)
+class _Layer:
+    gpo: Gpo
+    caveats: tuple[str, ...]  # any caveat means the GPO may not apply here
+    entries: tuple[RegistryEntry, ...] | None  # None: the file could not be read
+
+
+def _concerns(entry: RegistryEntry, key: str, name: str) -> bool:
+    k = regpol.norm(entry.key)
+    if entry.action == "delete_key":
+        return key == k or key.startswith(k + "\\")
+    if k != key:
+        return False
+    return entry.action == "delete_all" or entry.name.casefold() == name
+
+
+def _after(start: Outcome, entries: list[RegistryEntry], layer: _Layer) -> Outcome:
+    current = start
+    for e in entries:
+        if e.action == "set":
+            current = Outcome(True, e.data, layer.gpo.name, layer.caveats)
+        elif e.action == "soft":
+            if not current.present and not current.unknown:
+                caveats = (*layer.caveats, SOFT_CAVEAT)
+                current = Outcome(True, e.data, layer.gpo.name, caveats)
+        else:
+            current = Outcome(False, None, layer.gpo.name, layer.caveats)
+    return current
+
+
+def _distinct(outcomes: list[Outcome]) -> tuple[Outcome, ...]:
+    seen: dict[tuple[bool, bool, str], Outcome] = {}
+    for o in outcomes:
+        seen.setdefault((o.unknown, o.present, repr(o.data)), o)
+    return tuple(seen.values())
+
+
+def effective_value(layers: tuple[_Layer, ...], key: str, name: str) -> Effective:
+    """Plays the GPOs in processing order over one value. A GPO that may not apply adds its
+    result to what is possible and takes nothing away; one that surely applies replaces it."""
+    state: tuple[Outcome, ...] = (NOT_SET,)
+    wanted = regpol.norm(key)
+    wanted_name = name.casefold()
+    for layer in layers:
+        if layer.entries is None:
+            unread = (f"Registry.pol of {layer.gpo.name} not readable",)
+            state = _distinct([*state, Outcome(False, None, layer.gpo.name, unread, True)])
+            continue
+        entries = [e for e in layer.entries if _concerns(e, wanted, wanted_name)]
+        if not entries:
+            continue
+        after = [_after(o, entries, layer) for o in state]
+        state = _distinct([*state, *after] if layer.caveats else after)
+    return Effective(state)
+
+
+class RegistryView:
+    """Effective registry policy per computer, computed once per distinct set of GPOs."""
+
+    def __init__(self, snap: Snapshot) -> None:
+        self.snap = snap
+        self.r = _Resolver(snap)
+        self._layers: dict[str, tuple[_Layer, ...]] = {}
+        self._memo: dict[tuple[object, ...], Effective] = {}
+
+    def targets(self) -> list[Account]:
+        """Computers that process Windows Group Policy. A computer object with no operating
+        system recorded is pre-staged or a cluster name, not a host; DCs count regardless."""
+
+        def windows(a: Account) -> bool:
+            return bool(a.os and "windows" in a.os.lower()) or (a.is_registered_dc and not a.os)
+
+        return [
+            a
+            for a in _computers(self.snap)
+            if not a.entra_kerberos and a.sam.upper() != "AZUREADSSOACC$" and windows(a)
+        ]
+
+    def layers(self, a: Account) -> tuple[_Layer, ...]:
+        """The GPOs with registry policy that reach this computer, in processing order."""
+        found = self._layers.get(a.dn.lower())
+        if found is not None:
+            return found
+        out = []
+        for g, caveats in self.r.processing_order(a):
+            if not computer_side_applies(g, "registry"):
+                continue
+            entries = self.snap.gpo_registry.get(g.guid)
+            if entries is not None and not entries:
+                continue  # read, nothing the checks care about
+            passes, assumed = self.r.filtered(g, a)
+            if passes:
+                layer = _Layer(
+                    g,
+                    caveats + assumed + _gpo_caveats(g),
+                    tuple(entries) if entries is not None else None,
+                )
+                out.append(layer)
+        self._layers[a.dn.lower()] = tuple(out)
+        return self._layers[a.dn.lower()]
+
+    def value(self, a: Account, key: str, name: str) -> Effective:
+        layers = self.layers(a)
+        memo = (key, name, *[(x.gpo.guid, x.caveats) for x in layers])
+        found = self._memo.get(memo)
+        if found is None:
+            found = effective_value(layers, key, name)
+            self._memo[memo] = found
+        return found
+
+    def names(self, a: Account, key: str) -> list[str]:
+        """Value names any GPO reaching the computer sets under this key."""
+        wanted = regpol.norm(key)
+        out: dict[str, str] = {}
+        for layer in self.layers(a):
+            for e in layer.entries or ():
+                if e.action in ("set", "soft") and regpol.norm(e.key) == wanted:
+                    out.setdefault(e.name.casefold(), e.name)
+        return list(out.values())
+
+
+def registry_view(snap: Snapshot) -> RegistryView | None:
+    """None when registry policy was not collected: the checks then do not judge."""
+    return RegistryView(snap) if snap.registry_policy_collected else None
+
+
+def unread_registry_gpos(snap: Snapshot) -> list[Gpo]:
+    """GPOs Windows would process whose Registry.pol is not in the snapshot."""
+    return [
+        g
+        for g in snap.gpos
+        if g.guid not in snap.gpo_registry and computer_side_applies(g, "registry")
+    ]
 
 
 def _dcs(snap: Snapshot) -> list[Account]:

@@ -1,6 +1,6 @@
 """SYSVOL over SMB: Group Policy Preferences passwords (MS14-025), GPO security templates
-(GptTmpl.inf), local group membership set by Group Policy (Restricted Groups and GPP Local
-Groups) and credentials written into logon scripts.
+(GptTmpl.inf), registry policy (Machine\\Registry.pol), local group membership set by Group
+Policy (Restricted Groups and GPP Local Groups) and credentials written into logon scripts.
 
 Only file names, line numbers, account names and setting values are kept; secrets never
 leave this module.
@@ -16,7 +16,15 @@ from dataclasses import dataclass, field
 import smbclient
 from smbprotocol.exceptions import SMBException
 
-from .model import GpoLocalGroup, GpoSettings, GppPassword, ScriptSecret, well_known_sid
+from . import regpol
+from .model import (
+    GpoLocalGroup,
+    GpoSettings,
+    GppPassword,
+    RegistryEntry,
+    ScriptSecret,
+    well_known_sid,
+)
 
 MAX_FILE = 1_000_000
 CPASSWORD = re.compile(rb'\bcpassword="([^"]+)"')
@@ -51,9 +59,13 @@ SECRET_PATTERNS = [
 LSA = r"MACHINE\System\CurrentControlSet\Control\Lsa"
 NETLOGON = r"MACHINE\System\CurrentControlSet\Services\Netlogon\Parameters"
 GPTTMPL = r"MACHINE\Microsoft\Windows NT\SecEdit\GptTmpl.inf"
+REGISTRY_POL = r"Machine\Registry.pol"
 _GUID = r"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}"
 MACHINE_GROUPS = re.compile(
     rf"^Policies\\({_GUID})\\Machine\\Preferences\\Groups\\Groups\.xml$", re.I
+)
+MACHINE_REGISTRY_XML = re.compile(
+    rf"^Policies\\({_GUID})\\Machine\\Preferences\\Registry\\Registry\.xml$", re.I
 )
 USER_GROUPS = re.compile(rf"^Policies\\({_GUID})\\User\\Preferences\\Groups\\Groups\.xml$", re.I)
 XML_DECLARATION = re.compile(r"^\s*<\?xml[^>]*\?>")
@@ -74,6 +86,9 @@ class SysvolResult:
     script_secrets: list[ScriptSecret] = field(default_factory=list)
     unreadable: list[str] = field(default_factory=list)
     local_groups: list[GpoLocalGroup] = field(default_factory=list)
+    registry: dict[str, list[RegistryEntry]] = field(default_factory=dict)
+    # SYSVOL-relative Registry.pol files that could not be read
+    registry_unread: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     # False when SYSVOL was not read, so "no local group settings" means "not collected"
     scanned: bool = False
@@ -290,6 +305,7 @@ def scan(
     result = SysvolResult()
     known = {g.upper() for g in gpo_guids}
     user_side: list[str] = []
+    gpp_registry: list[str] = []
     try:
         smbclient.register_session(
             host,
@@ -310,6 +326,8 @@ def scan(
                     rel = rf"{dirpath}\{name}"[len(base) + 1 :]
                     wanted = top == "Policies" and lower in GPP_FILES
                     script = lower.endswith(SCRIPT_EXTENSIONS) and lower != "gpt.ini"
+                    if (m := MACHINE_REGISTRY_XML.match(rel)) and m.group(1).upper() in known:
+                        gpp_registry.append(rel)
                     if not wanted and not script:
                         continue
                     try:
@@ -347,6 +365,14 @@ def scan(
                 continue
             result.gpo_settings[guid] = parse_gpttmpl(text)
             result.local_groups += parse_group_membership(text, guid.upper(), rel)
+        for guid in gpo_guids:
+            _read_registry(result, base, guid, port)
+        if gpp_registry:
+            result.notes.append(
+                f"{len(gpp_registry)} GPOs set registry values through Preferences "
+                "(Machine\\Preferences\\Registry), not evaluated: they can change what "
+                f"Registry.pol sets: {', '.join(gpp_registry[:5])}"
+            )
         if user_side:
             result.notes.append(
                 f"{len(user_side)} GPOs set local groups in the user context "
@@ -358,6 +384,32 @@ def scan(
         raise SysvolError(str(exc) or type(exc).__name__) from exc
     finally:
         smbclient.reset_connection_cache()
+
+
+def _read_registry(result: SysvolResult, base: str, guid: str, port: int) -> None:
+    """One GPO's computer-side Registry.pol. A failed read or a bad file stays out of
+    `result.registry`, which the checks take as unknown."""
+    rel = rf"Policies\{guid}\{REGISTRY_POL}"
+    try:
+        data = _read(rf"{base}\{rel}", port)
+    except (SMBException, OSError) as exc:
+        if getattr(exc, "errno", None) == errno.ENOENT:
+            result.registry[guid] = []  # read, and this GPO sets no registry policy
+        else:
+            result.registry_unread.append(f"{rel} ({type(exc).__name__})")
+        return
+    if len(data) >= MAX_FILE:
+        result.notes.append(f"{rel}: over {MAX_FILE} bytes, not evaluated")
+        return
+    try:
+        parsed = regpol.parse(data)
+    except regpol.MalformedPol as exc:
+        result.notes.append(f"{rel}: not a valid Registry.pol ({exc}), not evaluated")
+        return
+    result.registry[guid] = parsed.entries
+    for key, name in parsed.secrets[:20]:
+        # the fact and the location only: the data never leaves regpol
+        result.notes.append(f"{rel}: holds a value named like a password: {key}\\{name}")
 
 
 def _read(path: str, port: int) -> bytes:

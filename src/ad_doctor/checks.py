@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-from . import catalog, gpo_scope, sd
+from . import catalog, gpo_scope, regpol, sd
 from .gpo_scope import LOCAL_GROUPS, Grant
 from .model import (
     EXCHANGE_GROUPS,
@@ -2211,6 +2211,274 @@ def netlogon_allow_list(snap: Snapshot) -> Finding | None:
     )
     finding.keys = objects
     return finding
+
+
+# --- registry policy: the effective value per computer ----------------------------------------
+
+
+UNKNOWN_HOST = (
+    "This reads Group Policy only: a value in a computer's own registry or local policy is not "
+    "visible, so 'no GPO sets it' does not say what the computer really does."
+)
+MAX_NAMES = 5  # computers named on one row
+
+
+@dataclass(frozen=True)
+class _PolicyRow:
+    account: Account
+    severity: Severity
+    text: str  # what this says about the computer; it groups the computers of a row
+
+
+def _container_of(snap: Snapshot, dn: str) -> str:
+    """An account's OU as a path from the domain head; the head as the domain's name."""
+    parts = gpo_scope.RDN_SEPARATOR.split(dn, maxsplit=1)
+    parent = parts[1] if len(parts) > 1 else ""
+    if parent.lower() == snap.domain_dn.lower() or not parent:
+        return snap.domain
+    tail = parent[: -len(snap.domain_dn) - 1]
+    return "/".join(p.split("=", 1)[-1] for p in reversed(gpo_scope.RDN_SEPARATOR.split(tail)))
+
+
+def _policy_finding(
+    snap: Snapshot, check_id: str, detail: str, remediation: str, rows: list[_PolicyRow]
+) -> Finding | None:
+    """One line per OU and per thing said: a domain can have thousands of computers."""
+    if not rows:
+        return None
+    groups: dict[tuple[str, str], list[_PolicyRow]] = {}
+    for row in rows:
+        groups.setdefault((_container_of(snap, row.account.dn), row.text), []).append(row)
+    objects: dict[str, str] = {}
+    for (where, text), members in groups.items():
+        names = sorted(r.account.sam.rstrip("$") for r in members)
+        shown = ", ".join(names[:MAX_NAMES])
+        more = f" +{len(names) - MAX_NAMES} more" if len(names) > MAX_NAMES else ""
+        objects[f"{where}: {shown}{more}: {text}"] = f"{where}: {text}"
+    finding = _finding(
+        check_id,
+        max(r.severity for r in rows),
+        detail,
+        remediation,
+        sorted(objects),
+    )
+    finding.keys = objects
+    return finding
+
+
+def _undecided(effective: gpo_scope.Effective) -> str:
+    return "; ".join(effective.why) or "not decided"
+
+
+def _gpo_note(effective: gpo_scope.Effective) -> str:
+    return f" by {effective.gpo}" if effective.gpo else ""
+
+
+@check("AD-GPO-009", "LLMNR not disabled by Group Policy")
+def llmnr_not_disabled(snap: Snapshot) -> Finding | None:
+    view = gpo_scope.registry_view(snap)
+    if view is None:
+        return None
+    rows = []
+    for a in view.targets():
+        e = view.value(a, regpol.LLMNR_KEY, regpol.LLMNR_VALUE)
+        if not e.decided:
+            rows.append(_PolicyRow(a, Severity.INFO, f"not decided: {_undecided(e)}"))
+        elif not e.present:
+            text = f"value deleted{_gpo_note(e)}" if e.gpo else "no GPO disables LLMNR"
+            rows.append(_PolicyRow(a, Severity.LOW, text))
+        elif e.value == 0:
+            continue
+        elif isinstance(e.value, int):
+            text = f"EnableMulticast set to {e.value}{_gpo_note(e)}"
+            rows.append(_PolicyRow(a, Severity.MEDIUM, text))
+        else:
+            rows.append(
+                _PolicyRow(a, Severity.INFO, f"EnableMulticast is not a number{_gpo_note(e)}")
+            )
+    return _policy_finding(
+        snap,
+        "AD-GPO-009",
+        "Group Policy does not turn off LLMNR on these computers. Windows answers it by default, "
+        "and anyone on the subnet can answer a failed name lookup and capture the NTLM "
+        f"authentication that follows. {UNKNOWN_HOST}",
+        "Enable 'Turn off multicast name resolution' (Computer Configuration > Administrative "
+        "Templates > Network > DNS Client) in a GPO that reaches these computers.",
+        rows,
+    )
+
+
+def _is_http(data: object) -> bool:
+    return isinstance(data, str) and data.strip().lower().startswith("http://")
+
+
+@check("AD-GPO-010", "Group Policy points computers to WSUS over HTTP")
+def wsus_over_http(snap: Snapshot) -> Finding | None:
+    view = gpo_scope.registry_view(snap)
+    if view is None:
+        return None
+    rows = []
+    for a in view.targets():
+        url = view.value(a, regpol.WSUS_KEY, regpol.WSUS_SERVER)
+        use = view.value(a, regpol.WSUS_AU_KEY, regpol.WSUS_USE)
+        plain = [o for o in url.outcomes if o.present and _is_http(o.data)]
+        turned_on = any(o.unknown or (o.present and o.data == 1) for o in use.outcomes)
+        if not plain or not turned_on:
+            continue
+        server = str(plain[0].data).strip()
+        if url.decided and use.decided:
+            severity = Severity.HIGH if a.is_registered_dc else Severity.MEDIUM
+            rows.append(_PolicyRow(a, severity, f"{server}{_gpo_note(url)}"))
+        else:
+            why = "; ".join(sorted({*url.why, *use.why})) or "not decided"
+            rows.append(_PolicyRow(a, Severity.INFO, f"{server} not decided: {why}"))
+    return _policy_finding(
+        snap,
+        "AD-GPO-010",
+        "These computers are told to fetch updates from WSUS over plain HTTP. Anyone who can get "
+        "between them and the server can answer with a Microsoft-signed binary that runs as "
+        "SYSTEM.",
+        "Configure the WSUS server for HTTPS and change 'Specify intranet Microsoft update "
+        "service location' to https:// in the GPO.",
+        rows,
+    )
+
+
+def _powershell_row(view: gpo_scope.RegistryView, a: Account) -> _PolicyRow | None:
+    problems: list[tuple[Severity, str]] = []
+    open_points: list[str] = []
+    block = view.value(a, regpol.SCRIPT_BLOCK_KEY, regpol.SCRIPT_BLOCK_VALUE)
+    if not block.decided:
+        open_points.append(f"script block logging ({_undecided(block)})")
+    elif not block.present:
+        problems.append((Severity.LOW, "script block logging not set"))
+    elif block.value != 1:
+        problems.append((Severity.MEDIUM, f"script block logging off{_gpo_note(block)}"))
+    module = view.value(a, regpol.MODULE_KEY, regpol.MODULE_VALUE)
+    if not module.decided:
+        open_points.append(f"module logging ({_undecided(module)})")
+    elif not module.present:
+        problems.append((Severity.LOW, "module logging not set"))
+    elif module.value != 1:
+        problems.append((Severity.MEDIUM, f"module logging off{_gpo_note(module)}"))
+    else:
+        names = [
+            view.value(a, regpol.MODULE_NAMES_KEY, n)
+            for n in view.names(a, regpol.MODULE_NAMES_KEY)
+        ]
+        if not any(e.present for e in names):
+            if any(not e.decided for e in names):
+                reasons = sorted({w for e in names for w in e.why})
+                open_points.append(f"module names ({'; '.join(reasons)})")
+            else:
+                problems.append((Severity.LOW, "module logging on with no module listed"))
+    if not problems and not open_points:
+        return None
+    parts = [text for _, text in problems]
+    parts += [f"not decided: {point}" for point in open_points]
+    severity = max((s for s, _ in problems), default=Severity.INFO)
+    return _PolicyRow(a, severity, "; ".join(parts))
+
+
+@check("AD-GPO-011", "PowerShell script block or module logging not set by Group Policy")
+def powershell_logging(snap: Snapshot) -> Finding | None:
+    view = gpo_scope.registry_view(snap)
+    if view is None:
+        return None
+    rows = [row for a in view.targets() if (row := _powershell_row(view, a))]
+    return _policy_finding(
+        snap,
+        "AD-GPO-011",
+        "Group Policy does not record PowerShell on these computers, so what an attacker runs "
+        f"there is mostly lost. {UNKNOWN_HOST}",
+        "Enable 'Turn on PowerShell Script Block Logging' and 'Turn on Module Logging' with "
+        "module name * (Computer Configuration > Administrative Templates > Windows Components "
+        "> Windows PowerShell).",
+        rows,
+    )
+
+
+HARDENED_SHARES = ("SYSVOL", "NETLOGON")
+# Windows 10 and Server 2016 require both protections on these shares without any policy
+PRE_HARDENING_OS = re.compile(
+    r"windows (?:server )?(?:2003|2008|2012|xp|vista|7|8(?:\.1)?)\b", re.I
+)
+
+
+def _hardened(data: object) -> bool:
+    """Whether a hardened path's flags require mutual authentication and integrity
+    (RequirePrivacy implies integrity: SMB encryption protects the message as well)."""
+    if not isinstance(data, str):
+        return False
+    flags: dict[str, str] = {}
+    for part in data.split(","):
+        name, sep, value = part.partition("=")
+        if sep:
+            flags[name.strip().lower()] = value.strip()
+    integrity = flags.get("requireintegrity") == "1" or flags.get("requireprivacy") == "1"
+    return flags.get("requiremutualauthentication") == "1" and integrity
+
+
+def _named_hosts(view: gpo_scope.RegistryView, a: Account, share: str) -> list[str]:
+    """Hardened paths that name particular servers for this share."""
+    out = []
+    for name in view.names(a, regpol.HARDENED_KEY):
+        host, _, rest = name.lstrip("\\").partition("\\")
+        if host != "*" and rest.rstrip("\\").lower() == share.lower():
+            e = view.value(a, regpol.HARDENED_KEY, name)
+            if e.present and _hardened(e.value):
+                out.append(host)
+    return sorted(out)
+
+
+def _share_state(
+    view: gpo_scope.RegistryView, a: Account, share: str
+) -> tuple[Severity, str] | None:
+    e = view.value(a, regpol.HARDENED_KEY, rf"\\*\{share}")
+    if not e.decided:
+        return Severity.INFO, f"not decided ({_undecided(e)})"
+    if e.present:
+        if _hardened(e.value):
+            return None
+        return Severity.MEDIUM, f"set without mutual authentication and integrity{_gpo_note(e)}"
+    hosts = _named_hosts(view, a, share)
+    if hosts:
+        return Severity.INFO, f"hardened only for named servers ({', '.join(hosts)})"
+    if PRE_HARDENING_OS.search(re.sub("[\u00ae\u2122]", "", a.os or "")):
+        return Severity.MEDIUM, "no GPO hardens it and this Windows version has no default"
+    return Severity.INFO, "no GPO sets it (Windows 10 and Server 2016 harden it by default)"
+
+
+@check("AD-GPO-012", "UNC hardened paths for SYSVOL and NETLOGON missing or weak")
+def unc_hardened_paths(snap: Snapshot) -> Finding | None:
+    view = gpo_scope.registry_view(snap)
+    if view is None:
+        return None
+    rows = []
+    for a in view.targets():
+        states = {share: _share_state(view, a, share) for share in HARDENED_SHARES}
+        found = {share: state for share, state in states.items() if state}
+        if not found:
+            continue
+        if len(set(found.values())) == 1 and len(found) == len(HARDENED_SHARES):
+            severity, text = next(iter(found.values()))
+            rows.append(_PolicyRow(a, severity, f"SYSVOL and NETLOGON: {text}"))
+        else:
+            severity = max(state[0] for state in found.values())
+            text = "; ".join(f"{share}: {state[1]}" for share, state in sorted(found.items()))
+            rows.append(_PolicyRow(a, severity, text))
+    return _policy_finding(
+        snap,
+        "AD-GPO-012",
+        "Group Policy does not require mutual authentication and integrity for these computers' "
+        "connections to SYSVOL and NETLOGON. Where the connection is not protected, someone in "
+        "the middle can serve their own group policy and scripts (MS15-011). "
+        f"{UNKNOWN_HOST}",
+        "Set Hardened UNC Paths (Computer Configuration > Administrative Templates > Network > "
+        "Network Provider) for \\\\*\\SYSVOL and \\\\*\\NETLOGON to "
+        "RequireMutualAuthentication=1, RequireIntegrity=1.",
+        rows,
+    )
 
 
 @check("AD-GPO-004", "GPOs editable outside tier 0")

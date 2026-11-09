@@ -1,0 +1,71 @@
+id = "AD-GPO-011"
+aliases = ["powershell-logging", "script-block-logging"]
+summary = "Group Policy does not turn on PowerShell script block or module logging on these computers. No finding means a GPO turns on both, which says nothing of retention."
+severities = ["info", "low", "medium"]
+severity_logic = """
+**Medium** when the effective policy turns script block or module logging off: a GPO removes
+the logging.
+**Low** when no GPO sets it, or module logging is on with no module named: the computer's own
+setting cannot be seen from here.
+**Info** when the result cannot be decided (see Detection).
+"""
+mitre = ["T1059.001", "T1562.002"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "Machine\\Registry.pol: Software\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging, value EnableScriptBlockLogging",
+    "Machine\\Registry.pol: Software\\Policies\\Microsoft\\Windows\\PowerShell\\ModuleLogging, value EnableModuleLogging, and its ModuleNames subkey",
+    "gPLink, gPOptions and the GPO's status, version, extensions and DACL",
+]
+related = ["AD-GPO-009"]
+since = "0.2.3"
+
+risk = """
+Without these, what an attacker runs in PowerShell mostly leaves no trace. Script block logging
+records the code that ran, after deobfuscation (event 4104). Module logging records pipeline
+execution (event 4103). Windows logs some suspicious script blocks by itself; that is not a
+substitute for logging everything.
+"""
+
+detection = """
+Each GPO's `Machine\\Registry.pol` is read over SMB, as an ordinary user, and played in the order
+Windows applies GPOs to each computer: site, domain, OUs from the top down, then enforced links
+from the computer's own OU upwards; the rightmost entry of a `gPLink` is link order 1. Block
+Inheritance, disabled links, the GPO's status, version and Registry client-side extension, and
+security filtering count. `**del.`, `**delvals.`, `**DeleteValues`, `**DeleteKeys` and `**soft.`
+markers are honoured.
+
+Where a WMI filter, an assumed site, a filter group the snapshot does not hold or an unreadable
+file could change the result, the computer gets an **info** row that says why instead of a
+verdict. Computers without a Windows `operatingSystem` value (pre-staged objects, cluster names,
+appliances) are skipped; domain controllers always count.
+
+
+Windows PowerShell's policy keys only. PowerShell 7 has its own under `PowerShellCore`, which can
+be told to follow these. Where events are sent and how long they are kept is not read.
+"""
+
+false_positives = """
+- **A computer set outside Group Policy.** A value in its own registry or local policy is not
+  visible to an ordinary user, so "no GPO sets it" says nothing about what the computer does.
+- **Group Policy Preferences.** Registry items under `Machine\\Preferences\\Registry` are not read;
+  the scan says so in a note when a GPO has them.
+- **Deny ACEs on a GPO** are not read, so a GPO a "Deny Apply" keeps away still counts.
+"""
+
+remediation = """
+Under *Computer Configuration > Administrative Templates > Windows Components > Windows
+PowerShell*, enable *Turn on PowerShell Script Block Logging* and *Turn on Module Logging* with
+module name `*`. Forward the events: an attacker with admin rights can clear a local log.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-011"
+
+[[references]]
+title = "about_Logging (Windows PowerShell 5.1)"
+url = "https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_logging?view=powershell-5.1"
+kind = "vendor"
+
+[[references]]
+title = "[MS-GPREG]: Group Policy: Registry Extension Encoding"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpreg/5c092c22-bf6b-4e7f-b180-b20743d368f5"
+kind = "spec"

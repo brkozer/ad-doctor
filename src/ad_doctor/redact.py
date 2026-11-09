@@ -21,7 +21,7 @@ import uuid
 from typing import Any
 from urllib.parse import urlsplit
 
-from . import model
+from . import model, regpol
 
 KEEP = {
     "administrator", "guest", "krbtgt", "defaultaccount", "wdagutilityaccount",
@@ -37,6 +37,7 @@ KEEP = {
     "public key services", "certificate templates", "enrollment services", "ntauthcertificates",
     "oid", "default domain policy", "default domain controllers policy",
     "machine", "user", "preferences", "groups", "scripts", "logon", "logoff", "startup",
+    "windows",  # in operatingSystem values, which AD-GPO-009 to -012 read
     "shutdown", "microsoft", "windows nt", "secedit", "gpttmpl.inf", "groups.xml",
     "services.xml", "scheduledtasks.xml", "datasources.xml", "drives.xml", "printers.xml",
     # built-in certificate templates
@@ -103,7 +104,7 @@ FIXED_KEYS = {
     for cls in (model.Snapshot, model.Account, model.DomainPolicy, model.CertTemplate,
                 model.DirObject, model.GpoSettings, model.Probes, model.DcProbe, model.CaConfig,
                 model.Gmsa, model.Rodc, model.Trust, model.Gpo, model.GppPassword,
-                model.ScriptSecret, model.GpoLocalGroup, model.GpLink,
+                model.ScriptSecret, model.GpoLocalGroup, model.GpLink, model.RegistryEntry,
                 model.UnreadableMember, model.KeyCredential, model.Site, model.Subnet,
                 model.ConflictObject, model.Pso, model.Dmsa)
     for f in dataclasses.fields(cls)
@@ -234,6 +235,9 @@ class Redactor:
         for s in data.get("gpo_settings", {}).values():
             for server in s.get("ntlm_exceptions", []):
                 words.update([server, *server.split(".")])
+        for entries in data.get("gpo_registry", {}).values():
+            for e in entries:
+                words.update(_registry_words(e))
         for m in data.get("unreadable_members", []):
             words.add(m["group"])
             words.update(_dn_values(m["dn"]))
@@ -350,6 +354,39 @@ def _url_words(url: str) -> list[str]:
     return [p for p in found if len(p) > 1 and not p.isdigit()]
 
 
+def _registry_words(entry: dict[str, Any]) -> list[str]:
+    """Names in a registry entry: a WSUS server, the host of a hardened path, a module."""
+    key = regpol.norm(entry["key"])
+    if key == regpol.norm(regpol.WSUS_KEY) and isinstance(entry.get("data"), str):
+        return _url_words(entry["data"])
+    if key == regpol.norm(regpol.HARDENED_KEY):
+        host = entry["name"].lstrip("\\").split("\\")[0]
+        return [] if "*" in host or not host else [host, *host.split(".")]
+    if key == regpol.norm(regpol.MODULE_NAMES_KEY) and entry["name"] != "*":
+        return [entry["name"]]
+    return []
+
+
+def _redact_registry(r: Redactor, before: dict[str, Any], after: dict[str, Any]) -> None:
+    """Paths, fixed value names and flags are vocabulary the checks compare, whatever an OU
+    happens to be called; only what `_registry_words` learned is replaced."""
+    after["key"] = before["key"]
+    key = regpol.norm(before["key"])
+    data = before.get("data")
+    if key == regpol.norm(regpol.WSUS_KEY) and isinstance(data, str):
+        scheme, sep, rest = data.partition("://")
+        after["data"] = f"{scheme}{sep}{r.text(rest)}" if sep else r.text(data)
+    else:
+        after["data"] = data
+    if key == regpol.norm(regpol.HARDENED_KEY) and before["name"]:
+        host, _, share = before["name"].lstrip("\\").partition("\\")
+        after["name"] = f"\\\\{r.text(host)}\\{share}"
+    elif key == regpol.norm(regpol.MODULE_NAMES_KEY):
+        after["name"] = before["name"] if before["name"] == "*" else r.text(before["name"])
+    else:
+        after["name"] = before["name"]
+
+
 def _keep_invisible(original: str, redacted: str) -> str:
     """The invisible characters of an SPN, moved to its end: a name token drops them, and
     AD-ACC-016 must still see that they were there. They identify nobody."""
@@ -378,6 +415,9 @@ def redact(data: dict[str, Any], key: bytes) -> dict[str, Any]:
                 credential["device_id"] = r.fake_guid(credential["device_id"])
             if credential.get("key_id"):
                 credential["key_id"] = r.fake_guid(credential["key_id"]).replace("-", "")[:16]
+    for guid, entries in data.get("gpo_registry", {}).items():
+        for before, after in zip(entries, out["gpo_registry"][r._key(guid)], strict=True):
+            _redact_registry(r, before, after)
     # an address block names the network; 0.0.0.0/24 would make every subnet the same one
     for before, after in zip(data.get("subnets", []), out.get("subnets", []), strict=True):
         after["name"] = r.token(before["name"])

@@ -8,7 +8,7 @@
 Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
-(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 109
+(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 113
 checks for what attackers look for first: roastable accounts, risky delegation,
 exploitable certificate templates and CA settings (ESC1–9, 11, 13–17), DCSync and other takeover rights,
 shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync accounts,
@@ -195,6 +195,10 @@ against a live DC.
 | | AD-GPO-006 | GPOs make non-tier-0 principals admins of tier-0 servers (DCs, CAs, Entra Connect, Exchange) | high |
 | | AD-GPO-007 | GPOs grant RDP, WinRM or DCOM to broad groups (medium) or on tier-0 servers (high) | medium/high |
 | | AD-GPO-008 | Onelogon: GPOs set the Netlogon vulnerable channel allow list on DCs | medium/high |
+| | AD-GPO-009 | LLMNR not turned off by Group Policy | info/low/medium |
+| | AD-GPO-010 | Group Policy points computers to WSUS over HTTP | info/medium/high |
+| | AD-GPO-011 | PowerShell script block or module logging not set by Group Policy | info/low/medium |
+| | AD-GPO-012 | UNC hardened paths for SYSVOL and NETLOGON missing or weak | info/medium |
 | | AD-GPP-001 | Passwords in Group Policy Preferences (MS14-025) | high |
 | | AD-GPP-002 | Credentials in SYSVOL or NETLOGON scripts (values never reproduced) | high |
 | Attack paths | AD-PATH-001 | Control paths from non-tier-0 principals to tier 0 | high |
@@ -311,8 +315,9 @@ by a small built-in parser (`sd.py`). For Group Policy scope it also reads `gPLi
 `gPOptions` on the domain, OUs and sites, the GPOs' status, version and extension
 attributes, WMI filter names and which site each DC is in. From SYSVOL it reads Group
 Policy Preferences (passwords and Local Groups), `GptTmpl.inf` security templates
-(including Restricted Groups) and scripts, and keeps only paths, line numbers, account
-names and setting values, never a secret.
+(including Restricted Groups), `Machine\Registry.pol` and scripts, and keeps only paths,
+line numbers, account names and setting values, never a secret. From `Registry.pol` it keeps
+only the values its checks read; a value named like a password is reported by location alone.
 
 Active probes, each one connection per DC: an unsigned NTLM bind on 389 (LDAP signing),
 an NTLM bind on LDAPS without a channel binding token, an SMB negotiate plus an attempt
@@ -404,6 +409,12 @@ ports. A CES URL is reached on the port it names; only a URL with no port follow
   `VulnerableChannelAllowList`: a value in a DC's own registry needs admin rights to read.
   Precedence between GPOs is not worked out, and a Deny for a group does not take its
   members off the list.
+- AD-GPO-009 to -012 use the effective value of a registry policy per computer, worked out
+  from `Registry.pol` with link order, Enforced, Block Inheritance and security filtering. A
+  WMI filter, an assumed site or an unreadable GPO that could change the result gives an
+  info row, not a verdict. Only GPOs are visible: "no GPO sets it" says nothing about a value
+  in a computer's own registry or local policy. Registry items in Group Policy Preferences are
+  not read; a note names the GPOs that have them. Deny ACEs on a GPO are not read.
 - AD-ADCS-018 reads the CA's audit filter only. Whether the Certification Services audit
   subcategory is on is not read, so 127 does not prove events are written. A CA where
   auditing was never configured has no such value, and is reported as not set.
@@ -452,7 +463,7 @@ flowchart LR
     P --> S
     S -- "collect -o / redact" --> F[(snapshot.json)]
     F --> A
-    S --> A[checks.py + paths.py<br/>109 pure functions]
+    S --> A[checks.py + paths.py<br/>113 pure functions]
     A --> I[invariants.py<br/>accept.py]
     I --> R[report.py<br/>text, JSON, Markdown,<br/>SARIF, JUnit]
     I --> W[viewer.py<br/>offline HTML viewer]

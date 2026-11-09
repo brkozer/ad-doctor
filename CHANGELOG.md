@@ -7,6 +7,22 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+### Added
+
+- **Registry policy from SYSVOL.** Each GPO's computer-side `Machine\Registry.pol` is read
+  ([MS-GPREG] format, delete and soft markers included) and only the values the checks need are
+  kept. A file that does not parse or cannot be read is a note and stays unknown. A value named
+  like a password is reported by its location; its data is never read into the snapshot.
+- **Group Policy precedence for registry settings.** `gpo_scope` works out the effective value
+  of a registry setting per computer from link order, Enforced, Block Inheritance and security
+  filtering. A WMI filter, an assumed site, a filter group the snapshot does not hold or an
+  unreadable GPO that could change the result leaves it undecided, with the reason.
+- **AD-GPO-009** (LLMNR not turned off by Group Policy), **AD-GPO-010** (WSUS over HTTP),
+  **AD-GPO-011** (PowerShell script block or module logging not set) and **AD-GPO-012** (UNC
+  hardened paths for SYSVOL and NETLOGON missing or weak), for domain controllers and other
+  Windows computers. "No GPO sets it" never claims what the computer's own registry holds.
+  Snapshots from earlier versions load and report these four as not evaluated.
+
 ## [0.2.2] - 2026-11-09
 
 ### Added

@@ -1,0 +1,72 @@
+id = "AD-GPO-010"
+aliases = ["wsus-http", "wsus-over-http"]
+summary = "Group Policy points these computers to a WSUS server over plain HTTP, so someone in the network path can answer with a signed binary that runs as SYSTEM."
+severities = ["info", "medium", "high"]
+severity_logic = """
+**High** when the effective policy gives a domain controller `UseWUServer = 1` and an `http://`
+`WUServer`.
+**Medium** for the same on any other computer.
+**Info** when an `http://` server is possible but whether it applies cannot be decided (see
+Detection).
+"""
+mitre = ["T1557", "T1072"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "Machine\\Registry.pol: Software\\Policies\\Microsoft\\Windows\\WindowsUpdate, value WUServer",
+    "Machine\\Registry.pol: Software\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU, value UseWUServer",
+    "gPLink, gPOptions and the GPO's status, version, extensions and DACL",
+]
+related = ["AD-GPO-012"]
+since = "0.2.3"
+
+risk = """
+Windows Update fetches its metadata from the WSUS server. Over plain HTTP nothing protects that
+metadata, and it can make the client run a Microsoft-signed program with arguments of the
+attacker's choice, as SYSTEM. Anyone who can put themselves in the path, with ARP or a rogue proxy
+for example, can do it. On a domain controller that is the domain.
+"""
+
+detection = """
+Each GPO's `Machine\\Registry.pol` is read over SMB, as an ordinary user, and played in the order
+Windows applies GPOs to each computer: site, domain, OUs from the top down, then enforced links
+from the computer's own OU upwards; the rightmost entry of a `gPLink` is link order 1. Block
+Inheritance, disabled links, the GPO's status, version and Registry client-side extension, and
+security filtering count. `**del.`, `**delvals.`, `**DeleteValues`, `**DeleteKeys` and `**soft.`
+markers are honoured.
+
+Where a WMI filter, an assumed site, a filter group the snapshot does not hold or an unreadable
+file could change the result, the computer gets an **info** row that says why instead of a
+verdict. Computers without a Windows `operatingSystem` value (pre-staged objects, cluster names,
+appliances) are skipped; domain controllers always count.
+
+
+Only the policy is read. A computer with a local WSUS setting, or using HTTPS through some other
+means, is not visible. `WUStatusServer` is not judged.
+"""
+
+false_positives = """
+- **A computer set outside Group Policy.** A value in its own registry or local policy is not
+  visible to an ordinary user, so "no GPO sets it" says nothing about what the computer does.
+- **Group Policy Preferences.** Registry items under `Machine\\Preferences\\Registry` are not read;
+  the scan says so in a note when a GPO has them.
+- **Deny ACEs on a GPO** are not read, so a GPO a "Deny Apply" keeps away still counts.
+"""
+
+remediation = """
+1. Bind HTTPS on the WSUS server with a certificate the clients trust.
+
+2. Change *Computer Configuration > Administrative Templates > Windows Components > Windows
+   Update > Specify intranet Microsoft update service location* to the `https://` URL.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-010"
+
+[[references]]
+title = "Step 2: Configure WSUS (Secure WSUS with the TLS protocol)"
+url = "https://learn.microsoft.com/en-us/windows-server/administration/windows-server-update-services/deploy/2-configure-wsus#23-secure-wsus-with-the-tls-protocol"
+kind = "vendor"
+
+[[references]]
+title = "[MS-GPREG]: Group Policy: Registry Extension Encoding"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpreg/5c092c22-bf6b-4e7f-b180-b20743d368f5"
+kind = "spec"

@@ -369,6 +369,24 @@ def test_netlogon_allow_list_from_the_dc_gpo(snap: Snapshot) -> None:
     assert f.objects == ["LabDCPolicy: Domain Controllers, helpdesk on DC01$"]
 
 
+def test_registry_policy_read_from_the_lab_sysvol(snap: Snapshot) -> None:
+    """The lab's GPOs set no registry policy: every GPO reads as an empty Registry.pol, and
+    the two Windows hosts it has are reported as "no GPO sets it"."""
+    assert snap.registry_policy_collected
+    assert {g.guid for g in snap.gpos} == set(snap.gpo_registry)
+    assert not any(snap.gpo_registry.values())
+    findings = {f.check_id: f for f in run_all(snap)}
+    assert findings["AD-GPO-009"].severity is Severity.LOW
+    assert findings["AD-GPO-009"].objects == [
+        "Domain Controllers: DC01: no GPO disables LLMNR",
+        "Lab: OLD2008: no GPO disables LLMNR",
+    ]
+    assert "AD-GPO-010" not in findings
+    assert findings["AD-GPO-011"].severity is Severity.LOW
+    assert findings["AD-GPO-012"].severity is Severity.MEDIUM  # OLD2008 predates the default
+    assert any("OLD2008" in o and "no default" in o for o in findings["AD-GPO-012"].objects)
+
+
 def test_hidden_domain_admin_shows_up_as_a_member_value(snap: Snapshot) -> None:
     assert snap.tier0_members_checked
     (member,) = snap.unreadable_members

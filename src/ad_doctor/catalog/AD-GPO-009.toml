@@ -1,0 +1,64 @@
+id = "AD-GPO-009"
+aliases = ["llmnr", "multicast-name-resolution"]
+summary = "Group Policy does not turn off LLMNR on these computers. No finding means every computer is covered by a GPO, and says nothing about one set by hand."
+severities = ["info", "low", "medium"]
+severity_logic = """
+**Medium** when the effective policy value sets `EnableMulticast` to something other than 0: the
+policy turns LLMNR on.
+**Low** when no GPO reaching the computer sets the value, or the winning GPO deletes it: Windows
+answers LLMNR by default, but the computer's own setting cannot be seen from here.
+**Info** when the result cannot be decided (see Detection) or the value is not a number.
+"""
+mitre = ["T1557.001"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "Machine\\Registry.pol: Software\\Policies\\Microsoft\\Windows NT\\DNSClient, value EnableMulticast",
+    "gPLink, gPOptions and the GPO's status, version, extensions and DACL",
+]
+related = ["AD-GPO-012", "AD-INF-008"]
+since = "0.2.3"
+
+risk = """
+LLMNR is a name-resolution fallback Windows uses when DNS has no answer. Anyone on the same
+subnet can answer it, for example with Responder, and the computer then authenticates to them.
+The attacker cracks or relays the NTLM response.
+"""
+
+detection = """
+Each GPO's `Machine\\Registry.pol` is read over SMB, as an ordinary user, and played in the order
+Windows applies GPOs to each computer: site, domain, OUs from the top down, then enforced links
+from the computer's own OU upwards; the rightmost entry of a `gPLink` is link order 1. Block
+Inheritance, disabled links, the GPO's status, version and Registry client-side extension, and
+security filtering count. `**del.`, `**delvals.`, `**DeleteValues`, `**DeleteKeys` and `**soft.`
+markers are honoured.
+
+Where a WMI filter, an assumed site, a filter group the snapshot does not hold or an unreadable
+file could change the result, the computer gets an **info** row that says why instead of a
+verdict. Computers without a Windows `operatingSystem` value (pre-staged objects, cluster names,
+appliances) are skipped; domain controllers always count.
+"""
+
+false_positives = """
+- **A computer set outside Group Policy.** A value in its own registry or local policy is not
+  visible to an ordinary user, so "no GPO sets it" says nothing about what the computer does.
+- **Group Policy Preferences.** Registry items under `Machine\\Preferences\\Registry` are not read;
+  the scan says so in a note when a GPO has them.
+- **Deny ACEs on a GPO** are not read, so a GPO a "Deny Apply" keeps away still counts.
+"""
+
+remediation = """
+Enable *Computer Configuration > Administrative Templates > Network > DNS Client > Turn off
+multicast name resolution* in a GPO that reaches these computers. It writes `EnableMulticast = 0`.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-009"
+
+[[references]]
+title = "[MS-GPREG]: Group Policy: Registry Extension Encoding"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpreg/5c092c22-bf6b-4e7f-b180-b20743d368f5"
+kind = "spec"
+
+[[references]]
+title = "Group Policy scope in Windows"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/group-policy/group-policy-scope"
+kind = "vendor"

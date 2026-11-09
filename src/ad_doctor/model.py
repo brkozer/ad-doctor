@@ -274,6 +274,17 @@ class Gpo:
 
 
 @dataclass
+class RegistryEntry:
+    """One instruction of a GPO's Machine\\Registry.pol that a check reads, in file order."""
+
+    key: str  # registry path under HKLM, as written
+    name: str  # value name without its marker; "" for delete_all and delete_key
+    action: str  # "set", "soft", "delete", "delete_all" or "delete_key" (key is the one deleted)
+    reg_type: int = 0  # REG_* of a set or soft
+    data: int | str | list[str] | None = None  # None: binary or the wrong length for its type
+
+
+@dataclass
 class GpoLocalGroup:
     """One membership entry of Restricted Groups (GptTmpl.inf) or GPP Local Groups."""
 
@@ -544,6 +555,11 @@ class Snapshot:
     # groups, OUs, tier-0 objects, GPOs, the domain head: DACLs, owners, members
     objects: list[DirObject] = field(default_factory=list)
     gpo_settings: dict[str, GpoSettings] = field(default_factory=dict)
+    # GUID -> the instructions read from Machine/Registry.pol; a GPO that is absent was not
+    # read or did not parse, and a GPO with no file has an empty list
+    gpo_registry: dict[str, list[RegistryEntry]] = field(default_factory=dict)
+    # False in older snapshots and when SYSVOL was not read: registry policy is unknown
+    registry_policy_collected: bool = False
     script_secrets: list[ScriptSecret] = field(default_factory=list)
     gmsas: list[Gmsa] = field(default_factory=list)
     rodcs: list[Rodc] = field(default_factory=list)
@@ -734,6 +750,10 @@ class Snapshot:
                 for o in data.get("objects", [])
             ],
             gpo_settings={k: GpoSettings(**v) for k, v in data.get("gpo_settings", {}).items()},
+            gpo_registry={
+                k: [RegistryEntry(**e) for e in v] for k, v in data.get("gpo_registry", {}).items()
+            },
+            registry_policy_collected=data.get("registry_policy_collected", False),
             script_secrets=[ScriptSecret(**x) for x in data.get("script_secrets", [])],
             gmsas=[Gmsa(**x) for x in data.get("gmsas", [])],
             rodcs=[Rodc(**x) for x in data.get("rodcs", [])],
@@ -887,6 +907,10 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
             ("pwd_metadata_checked", "AD-ACC-012 (pwdLastSet against replication metadata)"),
             ("key_credentials_checked", "the key credential part of AD-ACC-013"),
             ("channel_policy_collected", "AD-GPO-008 (Netlogon allow list)"),
+            (
+                "registry_policy_collected",
+                "AD-GPO-009, AD-GPO-010, AD-GPO-011, AD-GPO-012 (registry policy)",
+            ),
             ("tier0_members_checked", "AD-PRIV-012 (unreadable tier-0 members)"),
             ("trust_details_checked", "AD-INF-016 and the AES part of AD-INF-015 (trust details)"),
             ("spn_mappings", "the part of AD-DEL-005 about hosts that exist (SPN aliases)"),

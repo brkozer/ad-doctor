@@ -1,0 +1,84 @@
+id = "AD-GPO-012"
+aliases = ["unc-hardened-paths", "ms15-011"]
+summary = "Group Policy does not require mutual authentication and integrity for SYSVOL and NETLOGON. Absent on Windows 10 or Server 2016 and later, Windows applies them by default."
+severities = ["info", "medium"]
+severity_logic = """
+**Medium** when the effective policy sets the path without both protections, on any Windows
+version, or when no GPO sets it on a Windows older than Windows 10 and Server 2016, which have
+no default.
+**Info** when no GPO sets it on a newer or unrecorded Windows (which applies the hardening by
+default), when only named servers are hardened, or when the result cannot be decided (see
+Detection).
+"""
+mitre = ["T1557"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "Machine\\Registry.pol: Software\\Policies\\Microsoft\\Windows\\NetworkProvider\\HardenedPaths, the SYSVOL and NETLOGON values",
+    "operatingSystem of each computer",
+    "gPLink, gPOptions and the GPO's status, version, extensions and DACL",
+]
+related = ["AD-GPO-009", "AD-GPO-010"]
+since = "0.2.3"
+
+risk = """
+Computers pull group policy and logon scripts from SYSVOL and NETLOGON. If those connections
+are not protected, someone in the network path can serve their own policy or script and run code
+as SYSTEM (MS15-011). Hardened UNC paths make the client require mutual authentication and
+integrity. Windows 10 and Server 2016 do this by default for these two shares; older systems do
+it only when told to.
+"""
+
+detection = """
+Each GPO's `Machine\\Registry.pol` is read over SMB, as an ordinary user, and played in the order
+Windows applies GPOs to each computer: site, domain, OUs from the top down, then enforced links
+from the computer's own OU upwards; the rightmost entry of a `gPLink` is link order 1. Block
+Inheritance, disabled links, the GPO's status, version and Registry client-side extension, and
+security filtering count. `**del.`, `**delvals.`, `**DeleteValues`, `**DeleteKeys` and `**soft.`
+markers are honoured.
+
+Where a WMI filter, an assumed site, a filter group the snapshot does not hold or an unreadable
+file could change the result, the computer gets an **info** row that says why instead of a
+verdict. Computers without a Windows `operatingSystem` value (pre-staged objects, cluster names,
+appliances) are skipped; domain controllers always count.
+
+
+The value names read are the two wildcard paths for SYSVOL and NETLOGON. Host-specific entries
+count only as "hardened for named servers".
+"""
+
+false_positives = """
+- **A computer set outside Group Policy.** A value in its own registry or local policy is not
+  visible to an ordinary user, so "no GPO sets it" says nothing about what the computer does.
+- **Group Policy Preferences.** Registry items under `Machine\\Preferences\\Registry` are not read;
+  the scan says so in a note when a GPO has them.
+- **Deny ACEs on a GPO** are not read, so a GPO a "Deny Apply" keeps away still counts.
+"""
+
+remediation = """
+Under *Computer Configuration > Administrative Templates > Network > Network Provider > Hardened
+UNC Paths*, add both paths with `RequireMutualAuthentication=1, RequireIntegrity=1`. Mutual
+authentication needs Kerberos: check that clients reach the DCs by name and test on a few
+computers first.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-012"
+
+[[references]]
+title = "Mitigate threats by using Windows 10 security features (SMB hardening for SYSVOL and NETLOGON)"
+url = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/overview-of-threat-mitigations-in-windows-10"
+kind = "vendor"
+
+[[references]]
+title = "MS15-011: Vulnerability in Group Policy could allow remote code execution"
+url = "https://support.microsoft.com/en-us/topic/ms15-011-vulnerability-in-group-policy-could-allow-remote-code-execution-february-10-2015-91b4bda2-945d-455b-ebbb-01d1ec191328"
+kind = "vendor"
+
+[[references]]
+title = "Guidance on Deployment of MS15-011 and MS15-014"
+url = "https://techcommunity.microsoft.com/blog/coreinfrastructureandsecurityblog/guidance-on-deployment-of-ms15-011-and-ms15-014/257759"
+kind = "vendor"
+
+[[references]]
+title = "[MS-GPREG]: Group Policy: Registry Extension Encoding"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpreg/5c092c22-bf6b-4e7f-b180-b20743d368f5"
+kind = "spec"

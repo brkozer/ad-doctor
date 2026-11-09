@@ -490,6 +490,8 @@ class Collector:
             probes=self._probes(dc_dns_host, accounts),
             objects=objects,
             gpo_settings=gpo_settings,
+            gpo_registry=sysvol_result.registry,
+            registry_policy_collected=sysvol_result.scanned,
             script_secrets=sysvol_result.script_secrets,
             gmsas=gmsas,
             rodcs=[Rodc(a.sam, a_reveal, a_never) for a, a_reveal, a_never in self.rodc_policies],
@@ -534,6 +536,7 @@ class Collector:
         snap.notes += gpo_scope.site_note(snap)
         snap.notes += gpo_scope.filter_note(snap)
         snap.notes += _channel_notes(snap)
+        snap.notes += _registry_notes(snap, sysvol_result.registry_unread)
         if self.pwd_unread:
             shown = ", ".join(sorted(self.pwd_unread)[:5])
             more = len(self.pwd_unread) - 5
@@ -1913,6 +1916,21 @@ def _channel_notes(snap: Snapshot) -> list[str]:
         "no GPO reaching a DC sets VulnerableChannelAllowList; a value set in a DC's own "
         "registry cannot be seen by this scan (AD-GPO-008)"
     ]
+
+
+REGISTRY_CHECKS = "AD-GPO-009, AD-GPO-010, AD-GPO-011 and AD-GPO-012"
+
+
+def _registry_notes(snap: Snapshot, unread: list[str]) -> list[str]:
+    if not snap.registry_policy_collected:
+        return [f"{REGISTRY_CHECKS} (registry policy) not judged: SYSVOL was not read"]
+    notes = []
+    missing = sorted(g.name for g in gpo_scope.unread_registry_gpos(snap))
+    if missing:
+        notes.append(f"{REGISTRY_CHECKS} did not read the Registry.pol of: {', '.join(missing)}")
+    if unread:
+        notes.append(f"Registry.pol files not readable by this account: {', '.join(unread[:5])}")
+    return notes
 
 
 def connect(target: Target) -> ldap3.Connection:

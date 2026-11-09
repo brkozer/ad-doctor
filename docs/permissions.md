@@ -33,8 +33,10 @@ For the local-group and remote-logon checks (AD-GPO-005 to -007) ad-doctor also 
 `gPLink` and `gPOptions` on the domain, every OU and every site, each GPO's status, version
 and client-side-extension attributes, WMI filter names, and which site each DC is in. From
 SYSVOL it reads Group Policy Preferences (passwords and Local Groups), `GptTmpl.inf`
-security templates (including Restricted Groups) and logon scripts, keeping only paths, line
-numbers, account names and setting values &mdash; never a secret.
+security templates (including Restricted Groups), `Machine\Registry.pol` and logon scripts,
+keeping only paths, line numbers, account names and setting values &mdash; never a secret. From
+`Registry.pol` it keeps only the values its checks read; a value named like a password is
+reported by location alone.
 
 ## Authentication
 
