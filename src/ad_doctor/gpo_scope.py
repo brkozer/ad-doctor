@@ -73,6 +73,8 @@ SIDES = (("computer", GPO_COMPUTER_DISABLED), ("user", GPO_USER_DISABLED))
 EVERYONE = "S-1-1-0"
 AUTHENTICATED_USERS = "S-1-5-11"
 THIS_ORGANIZATION = "S-1-5-15"
+ANYONE_SIDS = frozenset({EVERYONE, AUTHENTICATED_USERS, THIS_ORGANIZATION})
+LOCAL_ADMIN_CAVEAT = "assumes Domain Admins is in the local Administrators"
 ENTERPRISE_DCS = "S-1-5-9"
 INTERACTIVE = "S-1-5-4"
 ADMINISTRATORS = "S-1-5-32-544"
@@ -311,7 +313,7 @@ class _Resolver:
         if known is not None:
             return known
         dom = self.snap.domain_sid
-        sids = {a.sid, EVERYONE, AUTHENTICATED_USERS, THIS_ORGANIZATION}
+        sids = {a.sid, *ANYONE_SIDS}
         sids.add(f"{dom}-{a.primary_group or (515 if a.is_computer else 513)}")
         if a.is_dc:
             sids |= {ENTERPRISE_DCS, f"{dom}-{521 if a.is_rodc else 516}"}
@@ -321,6 +323,12 @@ class _Resolver:
         todo += [
             self.sid_dn.get(s, f"cn={s.lower()},cn=foreignsecurityprincipals,{head}") for s in sids
         ]
+        self._add_holders(todo, sids)
+        self._tokens[a.dn.lower()] = sids
+        return sids
+
+    def _add_holders(self, todo: list[str], sids: set[str]) -> None:
+        """Add the SID of every group that holds one of these DNs, through nesting."""
         seen = set(todo)
         while todo:
             for group in self.member_of.get(todo.pop(), []):
@@ -330,7 +338,11 @@ class _Resolver:
                     if group.sid:
                         sids.add(group.sid)
                     todo.append(key)
-        self._tokens[a.dn.lower()] = sids
+
+    def nested_in(self, dn: str, sid: str) -> set[str]:
+        """The SID of a group and of every group that holds it."""
+        sids = {sid} - {""}
+        self._add_holders([dn.lower()], sids)
         return sids
 
     def applied(self, a: Account, source: str) -> list[tuple[Gpo, tuple[str, ...]]]:
@@ -752,6 +764,24 @@ class RegistryView:
 def logon_rights_view(snap: Snapshot) -> RegistryView | None:
     """None when the deny logon rights were not collected: the check then does not judge."""
     return RegistryView(snap) if snap.logon_rights_collected else None
+
+
+Resolver = _Resolver
+
+
+def member_computer_token(token: set[str], domain_sid: str) -> set[str]:
+    """A domain token as a member computer sees it. There S-1-5-32-* names the computer's own
+    groups, so what the domain's Builtin groups hold says nothing about them. Joining the
+    domain puts Domain Admins in the local Administrators and Domain Users in the local Users
+    (Microsoft's default groups); Enterprise Admins and the members of the domain's
+    Administrators are not added. That default is all that can be seen from here, the same
+    assumption as LOCAL_ADMIN_CAVEAT."""
+    out = {sid for sid in token if not sid.startswith("S-1-5-32-")}
+    if f"{domain_sid}-512" in token:
+        out.add("S-1-5-32-544")
+    if f"{domain_sid}-513" in token:
+        out.add("S-1-5-32-545")
+    return out
 
 
 def denied_accounts(

@@ -26,7 +26,7 @@ import gzip
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from functools import cache
 from importlib import resources
@@ -39,6 +39,8 @@ from .invariants import IDS as INVARIANT_IDS
 from .model import Finding, Severity, Snapshot
 from .report import (
     Report,
+    compare,
+    declared_nodes,
     finding_keys,
     fingerprint,
     grade_of,
@@ -72,6 +74,8 @@ class Baseline:
     findings: list[Finding]
     collected_at: str | None  # ISO time, when the file says
     name: str  # the file name, for the Changes screen
+    unknown: set[str] = field(default_factory=set)  # check IDs the earlier run did not evaluate
+    declared: set[str] | None = None  # nodes it declared; None: what this run declares
 
 
 @dataclass
@@ -552,6 +556,8 @@ def _baseline(r: Report, opts: Options) -> dict[str, Any] | None:
     if opts.entries is not None:  # judge the old run by the same acceptances
         entries = copy.deepcopy(opts.entries)
         old = accept.apply(old, entries, r.snap.collected_at.date(), None)[0]
+    unknown = coverage.unevaluated(r.statuses())
+    changes = compare(old, r.findings, b.unknown, unknown, b.declared, declared_nodes(r.declared))
     before = {(f.check_id, f.key(o)): (f, o) for f in old for o in f.objects}
     after = {(f.check_id, f.key(o)): (f, o) for f in r.findings for o in f.objects}
 
@@ -571,17 +577,18 @@ def _baseline(r: Report, opts: Options) -> dict[str, Any] | None:
             changed.append({**row(nf, no), "before": oo, "before_severity": str(of.severity)})
     old_paths = next((f for f in old if f.check_id == "AD-PATH-001"), None)
     score = score_of(old)
-    unknown = coverage.unevaluated(r.statuses())
-    gone = [row(*before[k]) for k in sorted(before.keys() - after.keys())]
     return {
         "name": b.name,
         "collected_at": b.collected_at,
         "score": score,
         "grade": grade_of(score),
-        "new": [row(*after[k]) for k in sorted(after.keys() - before.keys())],
+        "new": [row(*after[k]) for k in changes.added],
         # a finding of a check this run could not evaluate is not known to be gone
-        "resolved": [g for g in gone if g["id"] not in unknown],
-        "not_evaluated": [g for g in gone if g["id"] in unknown],
+        "resolved": [row(*before[k]) for k in changes.resolved],
+        "not_evaluated": [row(*before[k]) for k in changes.not_evaluated_now],
+        # nor is one the earlier run could not evaluate known to be new
+        "not_evaluated_before": [row(*after[k]) for k in changes.not_evaluated_before],
+        "declaration_changed": [row(*(after.get(k) or before[k])) for k in changes.declaration],
         "changed": changed,
         "unchanged": len(finding_keys(r.findings) & finding_keys(old)) - len(changed),
         "exposed": old_paths.data.get("exposed") if old_paths else None,

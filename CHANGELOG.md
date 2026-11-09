@@ -20,8 +20,11 @@ logic or severity between versions, but an ID is never reused for something else
   so does a run where the data could not be read.
 - **Declared tier 0.** `--tier0-file` (and `--tier0 NAME`) on `analyze`, `scan`, `paths` and
   `view` adds your own tier-0 assets as extended targets, in a set of their own: built-in paths,
-  numbers and every other check stay as they were, paths that end at a declared asset carry
-  `[declared tier 0]` and the report lists each asset (`declared_tier0` in the JSON). `collect`
+  `exposed`, `users` and every other check stay as they were, paths that end at a declared asset
+  carry `[declared tier 0]` and the report lists each asset (`declared_tier0` in the JSON). A
+  path to one is an AD-PATH-001 object, so on a domain with no built-in path a declaration can
+  raise that HIGH finding and the score. `diff` and `--baseline` keep a path to an asset only one
+  run declared apart. A SID the snapshot does not hold is refused like a name. `collect`
   and `scan` read the owner and DACL of declared accounts; without that the asset is reported as
   **not evaluated**, with a note naming AD-PATH-001, and paths that need no DACL of its own are
   a lower bound. `whatif` and `plan` take the file too and use the same lookup and the same test.
@@ -32,7 +35,9 @@ logic or severity between versions, but an ID is never reused for something else
   snapshots from earlier versions get one too. A check that was not evaluated never counts as
   passed: JUnit marks it skipped, its earlier findings stay out of "resolved" in `diff`,
   `--baseline` and the viewer, an acceptance of it is not reported as stale, and the risk score is
-  then labelled a minimum. Findings are unchanged. `--no-sysvol`, `--no-probes` and
+  then labelled a minimum. A check the older run did not evaluate is kept out of "new" the same
+  way. `paths`, `whatif`, `plan` and the viewer say so when AD-PATH-001 could not judge everything,
+  and `whatif --fail-if-exposed` fails on such a graph. Findings are unchanged. `--no-sysvol`, `--no-probes` and
   `--http-port 0` now leave a note saying what they skipped.
 - **Registry policy from SYSVOL.** Each GPO's computer-side `Machine\Registry.pol` is read
   ([MS-GPREG] format, delete and soft markers included) and only the values the checks need are

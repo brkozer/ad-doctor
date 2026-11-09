@@ -30,13 +30,14 @@ from . import (
 )
 from .checks import MITRE, REGISTRY, run_all
 from .collect import CollectError, Target, collect
-from .fixes import render_fixes
+from .fixes import one_line, render_fixes
 from .model import DomainPolicy, Finding, Severity, Snapshot
 from .report import (
     Accepted,
     Report,
+    compare,
     declared_lines,
-    finding_keys,
+    declared_nodes,
     legacy_keys,
     mermaid_paths,
     render_json,
@@ -170,9 +171,10 @@ def _findings_from(
     only: list[str] | None = None,
     spec: dict[str, Any] | None = None,
     groups: list[tuple[str, list[str]]] | None = None,
-) -> tuple[str, list[Finding], set[str]]:
-    """Findings from either a saved snapshot (analyzed like the current run) or a
-    JSON report, and the checks that could not be evaluated there."""
+) -> tuple[str, list[Finding], set[str], set[str] | None]:
+    """Findings from either a saved snapshot (analyzed like the current run) or a JSON report,
+    the checks that could not be evaluated there, and the nodes it declared as tier 0 (None
+    when `groups` were applied to it, so it declares what the current run does)."""
     data = _load_json(path)
     if data.get("tool") == "ad-doctor":
         findings = _report_findings(data)
@@ -184,8 +186,10 @@ def _findings_from(
                 {f.check_id for f in findings},
                 ran=ran if isinstance(ran, list) else None,
                 use_data=False,
+                version=str(data.get("version", "")),
             )
-        return data["domain"], findings, coverage.unevaluated(recorded)
+        declared = declared_nodes(data.get("declared_tier0"))
+        return data["domain"], findings, coverage.unevaluated(recorded), declared
     snap = Snapshot.from_json(data)
     # a name the earlier snapshot does not hold is no reason to refuse the comparison
     findings, _ = _run_checks(snap, only, groups or [], lenient=True)
@@ -194,7 +198,7 @@ def _findings_from(
     wanted = {i.upper() for i in only} if only else None
     ran = None if wanted is None else [c.id for c in REGISTRY if c.id in wanted]
     statuses = coverage.compute(snap, {f.check_id for f in findings}, ran=ran)
-    return snap.domain, findings, coverage.unevaluated(statuses)
+    return snap.domain, findings, coverage.unevaluated(statuses), None if groups else set()
 
 
 def _fails(findings: list[Finding], level: str | None) -> bool:
@@ -202,14 +206,12 @@ def _fails(findings: list[Finding], level: str | None) -> bool:
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
-    domain, old, _ = _findings_from(args.old)
-    _, new, unknown = _findings_from(args.new)
-    before, after = finding_keys(old), finding_keys(new)
-    added = sorted(after - before)
-    gone = sorted(before - after)
-    # the newer run did not judge the check, so nothing says these are gone
-    removed = [k for k in gone if k[0] not in unknown]
-    unverified = [k for k in gone if k[0] in unknown]
+    domain, old, old_unknown, old_declared = _findings_from(args.old)
+    _, new, unknown, new_declared = _findings_from(args.new)
+    changes = compare(old, new, old_unknown, unknown, old_declared, new_declared)
+    added, removed = changes.added, changes.resolved
+    unverified, earlier = changes.not_evaluated_now, changes.not_evaluated_before
+    declaration = changes.declaration
     sev = {f.check_id: f.severity for f in [*old, *new]}
     title = {f.check_id: f.title for f in [*old, *new]}
     # keys are identities; show the object text (a path's identity is only its start)
@@ -224,12 +226,21 @@ def cmd_diff(args: argparse.Namespace) -> int:
                     ],
                     "resolved": [{"id": c, "object": shown[c, o]} for c, o in removed],
                     "not_evaluated": [{"id": c, "object": shown[c, o]} for c, o in unverified],
+                    "not_evaluated_before": [
+                        {"id": c, "object": shown[c, o], "severity": str(sev[c])}
+                        for c, o in earlier
+                    ],
+                    "declaration_changed": [
+                        {"id": c, "object": shown[c, o]} for c, o in declaration
+                    ],
                 },
                 indent=2,
             )
         )
     else:
         tail = f", {len(unverified)} not evaluated in the newer run" if unverified else ""
+        tail += f", {len(earlier)} not evaluated in the older run" if earlier else ""
+        tail += f", {len(declaration)} from a changed tier-0 declaration" if declaration else ""
         print(f"{domain}: {len(added)} new, {len(removed)} resolved{tail}")
         for c, o in added:
             print(f"+ [{str(sev[c]).upper():6}] {c}  {shown[c, o]}  ({title[c]})")
@@ -237,6 +248,12 @@ def cmd_diff(args: argparse.Namespace) -> int:
             print(f"- [{str(sev[c]).upper():6}] {c}  {shown[c, o]}  ({title[c]})")
         for c, o in unverified:
             print(f"? [{str(sev[c]).upper():6}] {c}  {shown[c, o]}  ({title[c]})")
+        for c, o in earlier:
+            print(
+                f"? [{str(sev[c]).upper():6}] {c}  {shown[c, o]}  (not evaluated in the older run)"
+            )
+        for c, o in declaration:
+            print(f"~ [{str(sev[c]).upper():6}] {c}  {shown[c, o]}  (declared in one run only)")
     fresh = set(added)
     new_findings = [f for f in new for o in f.objects if (f.check_id, f.key(o)) in fresh]
     return 2 if _fails(new_findings, args.fail_on) else 0
@@ -287,8 +304,9 @@ def cmd_paths(args: argparse.Namespace) -> int:
         notes = []
     g = a.graph
     extended = a.declared.paths if a.declared else []
+    gap = coverage.path_gaps([*snap.notes, *notes], bool(a.paths or extended))
     if args.chokepoints:
-        return _print_chokepoints(args, snap, a, extended, summary)
+        return _print_chokepoints(args, snap, a, extended, summary, gap)
     if args.format == "json":
         print(
             json.dumps(
@@ -297,6 +315,7 @@ def cmd_paths(args: argparse.Namespace) -> int:
                     "exposed_users": a.exposed,
                     "enabled_users": a.users,
                     "paths": [_path_json(g, p) for p in a.paths],
+                    **gap,
                     **(
                         {
                             "declared_tier0": summary,
@@ -312,8 +331,7 @@ def cmd_paths(args: argparse.Namespace) -> int:
     elif args.format == "mermaid":
         shown = [p.render(g) for p in [*a.paths, *extended]]
         print("\n".join(mermaid_paths(shown, limit=len(shown))))
-        for note in notes:  # stdout stays one diagram
-            print(f"note: {note}", file=sys.stderr)
+        _print_gap(gap, sys.stderr)  # stdout stays one diagram
     else:
         print(
             f"{snap.domain}: {len(a.paths)} principals reach tier 0; {a.exposed} of {a.users} "
@@ -325,7 +343,13 @@ def cmd_paths(args: argparse.Namespace) -> int:
             print(line)
         for p in extended:
             print(f"  {len(p.steps)} hop{'s' if len(p.steps) != 1 else ' '}  {p.render(g)}")
+        _print_gap(gap, sys.stdout)
     return 0
+
+
+def _print_gap(gap: dict[str, Any], stream: Any) -> None:
+    for line in coverage.path_gap_lines(gap):
+        print(f"note: {one_line(line)}", file=stream)
 
 
 def _print_chokepoints(
@@ -334,6 +358,7 @@ def _print_chokepoints(
     a: paths.Analysis,
     extended: list[paths.Path],
     summary: dict[str, Any] | None,
+    gap: dict[str, Any],
 ) -> int:
     from .resolve import edge_id
 
@@ -354,7 +379,7 @@ def _print_chokepoints(
                 for c in found
             ]
 
-        out: dict[str, Any] = {"paths": len(a.paths), "chokepoints": rows(points)}
+        out: dict[str, Any] = {"paths": len(a.paths), "chokepoints": rows(points), **gap}
         if summary is not None:
             out["declared_tier0"] = summary
             out["declared_paths"] = len(extended)
@@ -380,6 +405,7 @@ def _print_chokepoints(
             print(line)
         print(f"{len(extended)} paths to declared tier 0; shared by {args.minimum} or more:")
         show(declared_points, len(extended))
+    _print_gap(gap, sys.stdout)
     return 0
 
 
@@ -530,6 +556,7 @@ def _analyze(
     if from_report and report_data is not None:
         report.declared = report_data.get("declared_tier0")
         report.recorded = coverage.from_report(report_data)
+        report.report_version = str(report_data.get("version", ""))
         checks = report_data.get("checks")
         report.ran = list(checks) if isinstance(checks, list) else None
     if not from_report:
@@ -556,10 +583,30 @@ def _analyze(
         snap.notes.extend(notes)
         opts.entries, opts.ran = entries, ran
     if args.baseline:
-        _, old, _ = _findings_from(args.baseline, only, spec, _tier0_groups(args))
-        report.new = finding_keys(report.findings) - finding_keys(old)
+        _, old, was_unknown, was_declared = _findings_from(
+            args.baseline, only, spec, _tier0_groups(args)
+        )
+        changes = compare(
+            old,
+            report.findings,
+            was_unknown,
+            unknown,
+            was_declared,
+            declared_nodes(report.declared),
+        )
+        report.new = set(changes.added)
+        if changes.not_evaluated_before:
+            snap.notes.append(
+                f"--baseline: {len(changes.not_evaluated_before)} findings are not marked new "
+                "because the baseline did not evaluate their check"
+            )
+        if changes.declaration:
+            snap.notes.append(
+                f"--baseline: {len(changes.declaration)} paths are not marked new or resolved "
+                "because only one of the two runs declared the asset they reach"
+            )
         stamp = _load_json(args.baseline).get("collected_at")
-        opts.baseline = viewer.Baseline(old, stamp, args.baseline.name)
+        opts.baseline = viewer.Baseline(old, stamp, args.baseline.name, was_unknown, was_declared)
     return report, opts
 
 

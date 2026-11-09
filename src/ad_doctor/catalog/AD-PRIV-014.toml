@@ -43,6 +43,11 @@ false_positives = """
   allows listing, the check reports none. Run with an account that can read it to tell.
 - **An authentication policy assigned directly to an account** without a silo is not counted. It
   limits tickets too, but the check looks at silos.
+- **A sign-in limit that limits little.** The policy counts unless
+  `msDS-UserAllowedToAuthenticateFrom` is an unconditional allow for Everyone or Authenticated
+  Users. What a condition says is not evaluated, so a condition every device meets still counts.
+- **A tier-0 member the scan cannot read** was not tested, so the check is not evaluated, or judged
+  in part when it fires.
 - Domains below the Windows Server 2012 R2 functional level cannot have silos and are reported as
   not applicable.
 """

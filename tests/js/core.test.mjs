@@ -55,6 +55,44 @@ test("draft entries are checked before they are written", () => {
   assert.match(text, /\[\[accept\]\]\ncheck = "AD-KRB-003"\nreason = "r"\nexpires = 2027-01-31\nowner = "o"\n$/);
 });
 
+test("ad-hoc diff keeps what the old report could not judge out of new", () => {
+  const base = { tool: "ad-doctor", domain: "d", collected_at: "2026-10-01T00:00:00+00:00", findings: [] };
+  const now = [{ id: "AD-PRIV-014", title: "s", severity: "low", objects: ["adm"], keys: ["adm"] }];
+  const status = CORE.parseReport(JSON.stringify(Object.assign({}, base, {
+    check_status: [{ id: "AD-PRIV-014", status: "not_evaluated" }],
+  })));
+  const held = CORE.diffReports(status, now);
+  assert.deepEqual(held.new, []);
+  assert.deepEqual(held.not_evaluated_before.map((r) => r.id), ["AD-PRIV-014"]);
+  // a schema 2 report only lists the checks it ran
+  const listed = CORE.parseReport(JSON.stringify(Object.assign({}, base, { schema: 2, checks: ["AD-ACC-001"] })));
+  assert.deepEqual(CORE.diffReports(listed, now).not_evaluated_before.map((r) => r.id), ["AD-PRIV-014"]);
+  // a report that judged it: the finding is new
+  const judged = CORE.parseReport(JSON.stringify(Object.assign({}, base, {
+    check_status: [{ id: "AD-PRIV-014", status: "judged", outcome: "no_finding" }],
+  })));
+  assert.deepEqual(CORE.diffReports(judged, now).new.map((r) => r.id), ["AD-PRIV-014"]);
+});
+
+test("ad-hoc diff lists a path to an asset one run declared apart", () => {
+  const object = "outsider -[full control]-> JUMP01$ [declared tier 0]";
+  const base = { tool: "ad-doctor", domain: "d", collected_at: "2026-10-01T00:00:00+00:00" };
+  const path = { id: "AD-PATH-001", title: "p", severity: "high", objects: [object], keys: { [object]: "declared:o" } };
+  const now = [{ id: "AD-PATH-001", title: "p", severity: "high", objects: [object], keys: ["declared:o"] }];
+  const none = CORE.parseReport(JSON.stringify(Object.assign({}, base, { findings: [] })));
+  const added = CORE.diffReports(none, now, new Set(), ["JUMP01$"]);
+  assert.deepEqual(added.new, []);
+  assert.deepEqual(added.declaration_changed.map((r) => r.object), [object]);
+  const had = CORE.parseReport(JSON.stringify(Object.assign({}, base, {
+    findings: [path], declared_tier0: { assets: [{ name: "JUMP01$", set: "declared" }] },
+  })));
+  const gone = CORE.diffReports(had, [], new Set(), []);
+  assert.deepEqual(gone.resolved, []);
+  assert.deepEqual(gone.declaration_changed.map((r) => r.object), [object]);
+  // declared on both sides: an ordinary change
+  assert.deepEqual(CORE.diffReports(had, [], new Set(), ["JUMP01$"]).resolved.map((r) => r.object), [object]);
+});
+
 test("ad-hoc diff keys paths by their start, like ad-doctor diff", () => {
   const old = CORE.parseReport(JSON.stringify({
     tool: "ad-doctor", domain: "d", collected_at: "2026-10-01T00:00:00+00:00", score: 21,

@@ -245,6 +245,12 @@ def _generalized_time(value: str) -> datetime | None:
         return None
 
 
+def _limits_sign_in(sddl: str) -> bool:
+    """Set, and not an allow for everyone. Only this fact is kept: the descriptor holds SIDs
+    and a claim expression a snapshot meant for sharing has no use for."""
+    return bool(sddl) and not sd.sddl_opens_to_anyone(sddl)
+
+
 class Collector:
     def __init__(self, conn: ldap3.Connection, target: Target | None = None) -> None:
         self.conn = conn
@@ -1273,7 +1279,7 @@ class Collector:
                 name=_first(e, "name") or e["distinguishedname"][0],
                 dn=e["distinguishedname"][0],
                 enforced=_optional_bool(e, "msDS-AuthNPolicyEnforced") is True,
-                limits_user_from=bool(e.get("msds-userallowedtoauthenticatefrom")),
+                limits_user_from=_limits_sign_in(_first(e, "msDS-UserAllowedToAuthenticateFrom")),
             )
             for e in policies
         ]

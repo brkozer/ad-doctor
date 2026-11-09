@@ -417,7 +417,8 @@ class AuthPolicy:
     dn: str
     # msDS-AuthNPolicyEnforced: False means audit only
     enforced: bool = False
-    # msDS-UserAllowedToAuthenticateFrom is set: the policy limits where its users sign in
+    # msDS-UserAllowedToAuthenticateFrom is set and is not an unconditional allow for everyone:
+    # the policy limits where its users sign in (what its condition says is not evaluated)
     limits_user_from: bool = False
 
 

@@ -65,7 +65,7 @@ SID_HISTORY = "SID history"
 ENROLL_ESC13 = "enroll (ESC13)"
 ENROLL_ESC6 = "enroll (ESC6+ESC16)"
 # a snapshot does not hold a member server's local groups
-LOCAL_ADMIN_CAVEAT = "assumes Domain Admins is in the local Administrators"
+LOCAL_ADMIN_CAVEAT = gpo_scope.LOCAL_ADMIN_CAVEAT
 # msDS-Behavior-Version of Windows Server 2012 R2, from which DCs apply Protected Users
 PROTECTED_USERS_LEVEL = 6
 EVERY_LOGON = ("S-1-1-0", "S-1-5-11")  # Everyone, Authenticated Users

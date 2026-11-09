@@ -305,3 +305,37 @@ def sddl_trustees(text: str, domain_sid: str, root_sid: str = "") -> tuple[list[
         sid = _sddl_sid(ace.group(2), domain_sid, root_sid)
         (allow if kind == "A" else deny).append(sid)
     return allow, deny
+
+
+_ANYONE_SDDL = {"WD", "AU", "S-1-1-0", "S-1-5-11"}
+
+
+def _sddl_aces(text: str) -> list[str]:
+    """The ACE strings of an SDDL DACL; a condition can hold parentheses of its own."""
+    out: list[str] = []
+    depth, start = 0, 0
+    dacl = text.partition("D:")[2]
+    for i, ch in enumerate(dacl):
+        if ch == "(":
+            depth, start = depth + 1, i + 1 if depth == 0 else start
+        elif ch == ")" and depth:
+            depth -= 1
+            if depth == 0:
+                out.append(dacl[start:i])
+    return out
+
+
+def sddl_opens_to_anyone(text: str) -> bool:
+    """Whether an access check in SDDL lets every account through: an unconditional allow of
+    control access to Everyone or Authenticated Users, and no deny ACE to narrow it. What a
+    condition says is not evaluated, so any other descriptor counts as a limit."""
+    aces = [ace.split(";") for ace in _sddl_aces(text)]
+    if any(ace[0].upper() in ("D", "XD") for ace in aces):
+        return False
+    return any(
+        len(ace) >= 6
+        and ace[0].upper() == "A"
+        and ace[5].upper() in _ANYONE_SDDL
+        and ("CR" in ace[2].upper() or "GA" in ace[2].upper())
+        for ace in aces
+    )

@@ -14,7 +14,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .checks import REGISTRY, ca_unjudged
+from . import catalog
+from .checks import REGISTRY, ca_unjudged, hidden_tier0, tier0_deny_unknown
 from .invariants import IDS as INVARIANTS
 from .model import CATEGORIES, SILO_LEVEL, CaConfig, Snapshot
 
@@ -35,6 +36,7 @@ def _ids(prefix: str, *numbers: int) -> tuple[str, ...]:
 
 LOCAL_GROUP_CHECKS = _ids("GPO", 5, 6, 7)
 LOGON_RIGHTS_CHECK = "AD-PRIV-013"
+PATHS_CHECK = "AD-PATH-001"
 SYSVOL_CHECKS = (*_ids("GPP", 1, 2), *_ids("GPO", 3), *LOCAL_GROUP_CHECKS, LOGON_RIGHTS_CHECK)
 REGISTRY_POL_CHECKS = _ids("GPO", 9, 10, 11, 12)
 POLICY_FILE_CHECKS = (*_ids("GPO", 13, 14, 15, 16), "AD-ADCS-020")
@@ -69,7 +71,7 @@ NOTE_RULES: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = tuple(
         (r"malformed XML, not evaluated$", LOCAL_GROUP_CHECKS),
         (r"GPOs set local groups in the user context", LOCAL_GROUP_CHECKS),
         (r"local group settings in GPOs reaching read-only DCs", LOCAL_GROUP_CHECKS),
-        (r"name principals that could not be resolved", LOCAL_GROUP_CHECKS),
+        (r"^GPO group-membership .*name principals that could not be resolved", LOCAL_GROUP_CHECKS),
         (r"AD-GPO-009 to -012 do not evaluate", REGISTRY_POL_CHECKS),
         (r"(Registry\.pol: over \d+ bytes|not a valid Registry\.pol)", REGISTRY_POL_CHECKS),
         (r"^Registry\.pol files not readable", REGISTRY_POL_CHECKS),
@@ -182,6 +184,31 @@ def note_gaps(notes: Iterable[str]) -> dict[str, list[str]]:
     return out
 
 
+def path_gaps(notes: Iterable[str], found: bool) -> dict[str, Any]:
+    """What `paths`, `whatif` and `plan` say about AD-PATH-001 when the notes hold it back; `found`
+    is whether any path was found. Empty when the control graph is complete."""
+    held = note_gaps(notes).get(PATHS_CHECK, [])
+    if not held:
+        return {}
+    return {
+        "status": "partial" if found else NOT_EVALUATED,
+        "reason": _pick([note_reason(n) for n in held]),
+        "notes": held,
+    }
+
+
+def path_gap_lines(gap: dict[str, Any]) -> list[str]:
+    """`path_gaps` as text: why the numbers beside it are only a lower bound."""
+    if not gap:
+        return []
+    state = "not evaluated" if gap["status"] == NOT_EVALUATED else "judged in part"
+    return [
+        f"{PATHS_CHECK} {state} ({REASON_TEXT[gap['reason']]}): the control graph is incomplete, "
+        "so a path that is not shown can exist",
+        *gap["notes"],
+    ]
+
+
 def unattributed(notes: Iterable[str]) -> list[str]:
     """Failed searches that no rule ties to a check: something is unknown, but not what."""
     return [n for n in notes if _SEARCH_FAILURE.search(n) and not note_checks(n)]
@@ -238,6 +265,10 @@ def _part_unjudged(c: CaConfig, part: str) -> bool:
     return any(esc == part for _, esc in ca_unjudged(c))
 
 
+def _hidden_outside_silos(snap: Snapshot) -> bool:
+    return not 0 < snap.policy.functional_level < SILO_LEVEL and bool(hidden_tier0(snap))
+
+
 _ESC_CHECKS = {"ESC6": "AD-ADCS-012", "ESC7": "AD-ADCS-013", "ESC11": "AD-ADCS-014",
                "ESC16": "AD-ADCS-015", "audit": "AD-ADCS-018"}  # fmt: skip
 
@@ -261,6 +292,10 @@ DATA_GAPS: tuple[tuple[tuple[str, ...], Callable[[Snapshot], bool], str], ...] =
     ((LOGON_RIGHTS_CHECK,), lambda s: not s.logon_rights_collected and not _sysvol_unread(s),
      "deny logon rights were not collected"),
     (("AD-PRIV-014",), lambda s: not s.silos_checked, "silo objects were not read"),
+    ((LOGON_RIGHTS_CHECK,), tier0_deny_unknown,
+     "a member of a tier-0 group could not be read, and no deny entry names a group holding it"),
+    (("AD-PRIV-014",), _hidden_outside_silos,
+     "a member of a tier-0 group could not be read, so its silo was not tested"),
     (("AD-PRIV-015",), lambda s: not s.member_changes_checked,
      "tier-0 member metadata was not read"),
     (("AD-ACL-010",), lambda s: not s.admin_sd_holder_checked,
@@ -317,16 +352,40 @@ def _category(check_id: str) -> str:
     return CATEGORIES[check_id.split("-")[1]]
 
 
+def _version(text: str) -> tuple[int, ...] | None:
+    try:
+        return tuple(int(part) for part in text.split("."))
+    except ValueError:
+        return None
+
+
+def _full_run_of(version: str | None, ran: set[str]) -> bool:
+    """Whether a report that lists the checks it ran was a run of everything its version had,
+    not an --only. A report before schema 3 does not say; every check the catalog dates at or
+    before that version being there does."""
+    made = _version(version or "")
+    if made is None:
+        return False
+    for c in REGISTRY:
+        entry = catalog.get(c.id)
+        since = _version(entry.since) if entry else None
+        if since is not None and since <= made and c.id not in ran:
+            return False
+    return True
+
+
 def compute(
     snap: Snapshot,
     fired: Iterable[str],
     accepted: Iterable[str] = (),
     ran: Iterable[str] | None = None,
     use_data: bool = True,
+    version: str | None = None,
 ) -> dict[str, CheckStatus]:
     """Every check of this run by ID. `fired` and `accepted` are the check IDs behind the
     findings; `ran` the IDs that ran, or None for every registered check. `use_data` is False
-    for a JSON report, which has only the notes of a snapshot."""
+    for a JSON report, which has only the notes of a snapshot; `version` is the ad-doctor
+    version that wrote such a report."""
     found, signed_off = set(fired), set(accepted)
     wanted = None if ran is None else set(ran)
     titles = {c.id: c.title for c in REGISTRY}
@@ -334,6 +393,7 @@ def compute(
     sysvol_off = any(n.startswith("SYSVOL not checked by choice") for n in snap.notes)
     data = data_gaps(snap) if use_data else {}
     absent = not_applicable(snap, use_data)
+    older_run = not use_data and wanted is not None and _full_run_of(version, wanted)
     out: dict[str, CheckStatus] = {}
     extra = (found | signed_off | (wanted or set())) - titles.keys()
     for check_id in sorted(titles.keys() | extra):
@@ -348,8 +408,12 @@ def compute(
             st.notes = held_back
             st.reason = _pick(reasons)
         elif wanted is not None and check_id not in wanted:
-            st.status, st.reason = NOT_EVALUATED, SWITCHED_OFF
-            st.notes = ["not selected by --only"]
+            if older_run:
+                st.status, st.reason = NOT_EVALUATED, OLDER_SNAPSHOT
+                st.notes = [f"the report is from ad-doctor {version}, which did not run this check"]
+            else:
+                st.status, st.reason = NOT_EVALUATED, SWITCHED_OFF
+                st.notes = ["not selected by --only"]
         elif held_back:
             st.status, st.reason, st.notes = NOT_EVALUATED, _pick(reasons), held_back
         elif check_id in absent:

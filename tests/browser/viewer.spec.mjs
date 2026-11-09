@@ -413,6 +413,45 @@ test("a clean domain reads as good news, and says why there is no graph", async 
   expect(seen.errors).toEqual([]);
 });
 
+test("a failed search no rule ties to a check keeps the page from reading as clean", async ({ page }) => {
+  const seen = watch(page);
+  await page.goto(url("minimum") + "#findings");
+  await expect(page.locator(".empty").first()).toContainText("No findings in the checks judged: a failed search was not tied to a check.");
+  await expect(page.locator(".empty.good")).toHaveCount(0);
+  await page.evaluate(() => { location.hash = "#overview"; });
+  const panel = page.locator(".panel").filter({ hasText: "Check coverage" });
+  await expect(panel).toContainText("A failed search was not tied to a check");
+  await expect(panel).not.toContainText("Every check that applies was judged.");
+  await expect(page.locator(".empty.good")).toHaveCount(0);
+  expect(seen.errors).toEqual([]);
+});
+
+test("no control path is only claimed when the check gave an answer", async ({ page }) => {
+  const seen = watch(page);
+  await page.goto(url("unevaluated") + "#paths");
+  await expect(page.locator(".empty").last()).toContainText("Control paths were not evaluated");
+  await expect(page.locator(".empty").last()).toContainText("resource-based");
+  await expect(page.getByText("No principal outside tier 0 has a control path")).toHaveCount(0);
+  await page.evaluate(() => { location.hash = "#overview"; });
+  await expect(page.locator(".exposure .hero-num")).toHaveText("–");
+  await expect(page.locator(".exposure")).toContainText("Control paths were not evaluated");
+  await page.goto(url("partial") + "#paths");
+  await expect(page.locator(".banner", { hasText: "Judged in part." })).toContainText("resource-based");
+  expect(seen.errors).toEqual([]);
+});
+
+test("a check the baseline did not evaluate is not new", async ({ page }) => {
+  const seen = watch(page);
+  await page.goto(url("older") + "#changes");
+  const before = page.getByRole("tab", { name: /Not evaluated before/ });
+  await expect(before).toContainText("1");
+  await before.click();
+  await expect(page.locator("tbody")).toContainText("AD-PRIV-014");
+  await page.getByRole("tab", { name: /^New/ }).click();
+  await expect(page.locator(".empty").last()).toContainText("Nothing new since the baseline.");
+  expect(seen.errors).toEqual([]);
+});
+
 test("declared tier 0: paths and assets say which set they belong to", async ({ page }) => {
   await page.goto(url("declared") + "#paths");
   const panel = page.locator(".panel", { hasText: "Declared tier 0 (extended targets)" });

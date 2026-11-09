@@ -47,6 +47,8 @@ class Report:
     from_snapshot: bool = True
     # declared.Declaration.summary() when tier-0 assets were declared; None otherwise
     declared: dict[str, Any] | None = None
+    # the ad-doctor version that wrote the JSON report this is built from
+    report_version: str | None = None
 
     def statuses(self) -> dict[str, coverage.CheckStatus]:
         """Every check of this run: judged, not applicable, or not evaluated and why."""
@@ -58,6 +60,7 @@ class Report:
             [a.check_id for a in self.accepted],
             self.ran,
             use_data=self.from_snapshot,
+            version=self.report_version,
         )
 
     @property
@@ -98,6 +101,76 @@ def fingerprint(check_id: str, obj: str) -> str:
 
 def finding_keys(findings: list[Finding]) -> set[tuple[str, str]]:
     return {(f.check_id, f.key(o)) for f in findings for o in f.objects}
+
+
+Key = tuple[str, str]
+
+
+@dataclass
+class Changes:
+    """Two runs compared. Only `added` and `resolved` are changes in the domain."""
+
+    added: list[Key]
+    resolved: list[Key]
+    # gone, but the newer run did not judge the check
+    not_evaluated_now: list[Key]
+    # there now, but the older run did not judge the check
+    not_evaluated_before: list[Key]
+    # a path to an asset one of the two runs did not declare
+    declaration: list[Key]
+
+
+def declared_nodes(summary: dict[str, Any] | None) -> set[str]:
+    """The graph nodes a run declared as tier 0, from its `declared_tier0` block."""
+    assets = summary.get("assets", []) if summary else []
+    return {str(a["node"]) for a in assets if a.get("set") == "declared"}
+
+
+def _declared_ends(findings: list[Finding]) -> dict[Key, str]:
+    """The key of each path to a declared asset -> the node it ends at."""
+    return {
+        (f.check_id, f.key(p["object"])): str(p["steps"][-1]["id"])
+        for f in findings
+        for p in f.data.get("declared_paths", [])
+        if p.get("steps")
+    }
+
+
+def compare(
+    old: list[Finding],
+    new: list[Finding],
+    old_unknown: set[str],
+    new_unknown: set[str],
+    old_declared: set[str] | None,
+    new_declared: set[str] | None,
+) -> Changes:
+    """What changed between two runs. A check one side did not judge says nothing about the
+    other side's findings, and a path to an asset only one side declared is a change in the
+    declaration, not in the domain. A declaration of None means the same as the other side's."""
+
+    def moved(key: Key, ends: dict[Key, str], other: set[str] | None) -> bool:
+        return other is not None and key in ends and ends[key] not in other
+
+    before, after = finding_keys(old), finding_keys(new)
+    ends_old, ends_new = _declared_ends(old), _declared_ends(new)
+    out = Changes([], [], [], [], [])
+    unknown = old_declared is None or new_declared is None
+    for key in sorted(after - before):
+        if not unknown and moved(key, ends_new, old_declared):
+            out.declaration.append(key)
+        elif key[0] in old_unknown:
+            out.not_evaluated_before.append(key)
+        else:
+            out.added.append(key)
+    for key in sorted(before - after):
+        if not unknown and moved(key, ends_old, new_declared):
+            out.declaration.append(key)
+        elif key[0] in new_unknown:
+            out.not_evaluated_now.append(key)
+        else:
+            out.resolved.append(key)
+    out.declaration.sort()
+    return out
 
 
 def legacy_keys(check_id: str, objects: list[str]) -> dict[str, str]:

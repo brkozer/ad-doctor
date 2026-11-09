@@ -33,7 +33,11 @@ reach it are played in the order Windows applies them, with Block Inheritance, E
 links, status flags and security filtering, as in [AD-GPO-009](AD-GPO-009.md). A user right is not
 merged across GPOs: the GPO applied last that defines the right decides the whole list. The
 result is compared with the token of each enabled user in Domain Admins, Enterprise Admins, Schema
-Admins and Administrators, nesting and foreign security principals included. Domain controllers
+Admins and Administrators, nesting and foreign security principals included. On the computers
+judged, a deny for Administrators (S-1-5-32-544) names the computer's own local group: only
+members of Domain Admins count for it, which assumes the default that joining a domain adds Domain
+Admins there and nobody else from tier 0. A member of a tier-0 group the scan cannot read leaves
+the check not evaluated unless the deny names a group that holds it. Domain controllers
 and computers known to be tier 0 (CA, Entra Connect and Exchange servers, and tier-0 members) are
 not judged. One line is written per OU and per result.
 

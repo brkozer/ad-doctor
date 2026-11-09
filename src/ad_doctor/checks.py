@@ -4166,6 +4166,13 @@ def gpo_remote_logon(snap: Snapshot) -> Finding | None:
 # --- tier-0 logon restrictions, silos and change history ----------------------------------
 
 _TIER0_LOGON_GROUPS = ("Domain Admins", "Enterprise Admins", "Schema Admins", "Administrators")
+# their SIDs, or the part after the domain's
+_TIER0_LOGON_SIDS = {
+    "Domain Admins": "-512",
+    "Enterprise Admins": "-519",
+    "Schema Admins": "-518",
+    "Administrators": "S-1-5-32-544",
+}
 _DENY_LABELS = {
     "SeDenyInteractiveLogonRight": "local logon",
     "SeDenyRemoteInteractiveLogonRight": "RDP",
@@ -4182,6 +4189,50 @@ def _tier0_users(snap: Snapshot) -> list[Account]:
     """Enabled user accounts of the groups that administer the domain."""
     members = {dn.lower() for g in _TIER0_LOGON_GROUPS for dn in snap.privileged.get(g, [])}
     return [a for a in snap.accounts if a.enabled and not a.is_computer and a.dn.lower() in members]
+
+
+def _logon_judged(snap: Snapshot, view: gpo_scope.RegistryView) -> list[Account]:
+    """The computers AD-PRIV-013 judges: none is a DC, so S-1-5-32-* is their own groups."""
+    roles = tier0_hosts(snap)
+    return [a for a in view.targets() if not a.is_registered_dc and a.dn.lower() not in roles]
+
+
+def hidden_tier0(snap: Snapshot, resolver: gpo_scope.Resolver | None = None) -> dict[str, set[str]]:
+    """Members of the groups of `_tier0_users`, nesting included, that the scan could not read:
+    DN -> the SIDs of the groups they are known to be in."""
+    if not snap.unreadable_members:
+        return {}
+    r = resolver or gpo_scope.Resolver(snap)
+    seeds = {
+        name: sid if sid.startswith("S-1-") else f"{snap.domain_sid}{sid}"
+        for name, sid in _TIER0_LOGON_SIDS.items()
+    }
+    groups = {o.name.lower(): o for o in snap.objects if o.kind == "group"}
+    out: dict[str, set[str]] = {}
+    for m in snap.unreadable_members:
+        group = groups.get(m.group.lower())
+        held = r.nested_in(group.dn, group.sid) if group else {seeds.get(m.group, "")} - {""}
+        if held & set(seeds.values()):
+            out[m.dn] = held
+    return out
+
+
+def tier0_deny_unknown(snap: Snapshot) -> bool:
+    """Whether a hidden tier-0 member is outside what AD-PRIV-013 proves. A deny that names a
+    group holding it covers it, unseen; a deny by account or by another group says nothing."""
+    view = gpo_scope.logon_rights_view(snap) if snap.unreadable_members else None
+    hidden = hidden_tier0(snap, view.r) if view is not None else {}
+    if view is None or not hidden:
+        return False
+    tokens = {
+        dn: gpo_scope.member_computer_token(held | gpo_scope.ANYONE_SIDS, snap.domain_sid)
+        for dn, held in hidden.items()
+    }
+    return any(
+        gpo_scope.denied_accounts(view.user_right(a, right), tokens)[0] is not True
+        for a in _logon_judged(snap, view)
+        for right in gpo_scope.DENY_LOGON_RIGHTS
+    )
 
 
 def _deny_row(
@@ -4223,15 +4274,11 @@ def tier0_logon_not_denied(snap: Snapshot) -> Finding | None:
     users = _tier0_users(snap)
     if not users:
         return None
-    tokens = {a.sam: view.r.token(a) for a in users}
-    roles = tier0_hosts(snap)
-    rows = [
-        row
-        for a in view.targets()
-        if not a.is_registered_dc
-        and a.dn.lower() not in roles
-        and (row := _deny_row(view, a, tokens))
-    ]
+    # the computers judged are members, whose Administrators is their own local group
+    tokens = {
+        a.sam: gpo_scope.member_computer_token(view.r.token(a), snap.domain_sid) for a in users
+    }
+    rows = [row for a in _logon_judged(snap, view) if (row := _deny_row(view, a, tokens))]
     return _policy_finding(
         snap,
         "AD-PRIV-013",
@@ -4240,7 +4287,8 @@ def tier0_logon_not_denied(snap: Snapshot) -> Finding | None:
         "control of one workstation becomes control of the domain. Domain controllers and the "
         "computers ad-doctor knows to be tier 0 are left out; a computer's own local policy "
         "cannot be seen from here, and a privileged access workstation you declare yourself is "
-        "not known to this check.",
+        "not known to this check. A deny entry for Administrators names the computer's own "
+        f"group, so it counts for members of Domain Admins only ({gpo_scope.LOCAL_ADMIN_CAVEAT}).",
         "In a GPO linked to the lower-tier OUs, add the tier-0 groups to 'Deny log on locally', "
         "'Deny log on through Remote Desktop Services', 'Deny log on as a batch job' and 'Deny "
         "log on as a service'. Exclude the OUs of tier-0 servers and admin workstations.",

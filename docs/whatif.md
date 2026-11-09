@@ -195,7 +195,7 @@ An expired `[[keep]]` is a candidate again, with a note.
 |---|---|
 | 0 | ok |
 | 1 | error: usage, an ambiguous name, an absent change under `--strict` or `--check`, a model mismatch |
-| 2 | a gate failed: `[expect]` under `--check`, `--fail-if-exposed N` (more than N users exposed after the changes), `--fail-on SEVERITY` (a finding at that level would appear) |
+| 2 | a gate failed: `[expect]` under `--check`, `--fail-if-exposed N` (more than N users exposed after the changes, or a control graph with edges missing: a limit cannot be met on it), `--fail-on SEVERITY` (a finding at that level would appear) |
 | 3 | plan rot under `--check`: a stale or ineffective change, an edited `id`, or a snapshot of another domain |
 
 ## Fix lines

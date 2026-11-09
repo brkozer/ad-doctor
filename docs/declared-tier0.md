@@ -19,22 +19,28 @@ ad-doctor view snap.json --tier0-file tier0.toml
 
 `scan` takes the same flag and does both steps. `--tier0 NAME` (repeatable) adds one name
 on the command line. A name is a sAMAccountName (with or without the `$` of a computer), a
-SID, a DN or an object's name; a name the snapshot does not hold, or one that fits two objects,
-stops the run with an error, so a typo cannot read as "nothing reaches it".
+SID, a DN or an object's name; a name or SID the snapshot does not hold, or one that fits two
+objects, stops the run with an error, so a typo cannot read as "nothing reaches it".
 
 ## Two sets
 
 The built-in set and the declared set stay apart.
 
-- **Built-in tier 0 does not change.** Every path and number you get without the file stays the
-  same with it, and every check other than AD-PATH-001 gives the same answer. A declared group
-  does not become an allowed holder of anything, so a declaration can never silence a finding.
+- **Built-in tier 0 does not change.** Every built-in path, and `exposed` and `users`, stay the
+  same with the file, and every check other than AD-PATH-001 gives the same answer. A declared
+  group does not become an allowed holder of anything, so a declaration can never silence a
+  finding.
 - **Paths to a declared asset are added**, and each one ends with `[declared tier 0]`:
 
   ```text
   outsider -[full control]-> JUMP01$ [declared tier 0]
   ```
 
+- **A path to a declared asset is an ordinary AD-PATH-001 object.** The check is HIGH, so on a
+  domain with no built-in path a declaration can raise it: the score goes up by 15, the grade can
+  change and `--fail-on high` fails. Where a built-in path exists the check has fired already and
+  counts once, so the score stays; the objects of the finding, and the object total of a trend
+  point, go up by one per path.
 - **Paths are searched separately.** Nothing passes through built-in tier 0 on the way to a
   declared asset (whoever gets that far already has a built-in path, which is listed), and
   a principal declared as tier 0 is not listed as a start. A principal can hold a path to each
@@ -46,7 +52,7 @@ is in, its status and how many principals have a path to it. It also gives
 `exposed_with_declared` of `users_with_declared`: the enabled users outside both sets with a
 path to either (a declared user is left out, as a tier-0 user always is, so this count can be
 lower than the built-in one). `exposed` and `users` in the finding's `data` stay built-in only,
-so a trend does not jump when you add a line to the file.
+so the exposure line of a trend does not jump when you add a line to the file.
 
 A name that is built-in tier 0 already is listed as `built-in`, with no paths of its own.
 
@@ -70,6 +76,13 @@ Rights over a group, an OU, a GPO or a top-level container are collected anyway,
 are evaluated from any snapshot. Names on the file that are not accounts do not change the
 collection. Reading the DACL of an extra account can reveal a path to *built-in* tier 0 that runs
 through that account: that is new information, and it appears as an ordinary built-in path.
+
+## Comparing runs
+
+A path to an asset that only one of two reports declared is a change in the declaration, not
+in the domain. `diff`, `--baseline` and the viewer's Changes screen list it apart ("declared in
+one run only") and keep it out of new, resolved and `--fail-on`. A path to an asset both runs
+declared compares like any other.
 
 ## What-if and plan
 

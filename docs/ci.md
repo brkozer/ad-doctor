@@ -44,6 +44,10 @@ viewer's Changes screen keep its earlier findings out of "resolved". An acceptan
 check is not reported as stale, and the score is the sum of findings as always: nothing is
 added for what was not judged, which is why it can only be a minimum.
 
+The other direction works the same way: a finding of a check the *older* run did not evaluate
+(a check newer than that version, or data it could not read) is listed as "not evaluated in the
+older run", is not new and does not fail `--fail-on`, in `diff`, `--baseline` and the viewer.
+
 ## Exit codes and `--fail-on`
 
 `ad-doctor` exits `0` when it ran, `2` when `--fail-on high|medium|low` is set and a finding

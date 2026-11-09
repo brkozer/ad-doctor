@@ -178,7 +178,20 @@ def build(out: Path) -> dict[str, Path]:
     out.mkdir(parents=True, exist_ok=True)
     pages = {
         name: out / f"{name}.html"
-        for name in ("xss", "full", "sealed", "paths", "clean", "bench", "whatif", "declared")
+        for name in (
+            "xss",
+            "full",
+            "sealed",
+            "paths",
+            "clean",
+            "bench",
+            "whatif",
+            "declared",
+            "minimum",
+            "unevaluated",
+            "partial",
+            "older",
+        )
     }
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
@@ -244,6 +257,37 @@ def build(out: Path) -> dict[str, Path]:
             json.dumps(with_sids(snapshot(user("alice", NORMAL), computer("WS1"))).to_json())
         )
         assert main(["analyze", str(clean), "-f", "html", "-o", str(pages["clean"])]) == 0
+        # every check judged, and a failed search no rule ties to a check
+        report_of_clean = work / "clean-report.json"
+        assert main(["analyze", str(clean), "-f", "json", "-o", str(report_of_clean)]) == 0
+        data = json.loads(report_of_clean.read_text(encoding="utf-8"))
+        for row in data["check_status"]:
+            row.update(status="judged", outcome="no_finding", notes=[])
+            row.pop("reason", None)
+        data["notes"] = ["search CN=Foo,DC=example,DC=test failed: insufficientAccessRights"]
+        report_of_clean.write_text(json.dumps(data), encoding="utf-8")
+        args = ["view", str(report_of_clean), "--no-encrypt", "-o", str(pages["minimum"])]
+        assert main(args) == 0
+        # the control graph is missing the resource-based delegation edges
+        gap = "the resource-based delegation edges of the control graph not evaluated"
+        snap = with_sids(snapshot(user("alice", NORMAL), computer("WS1")))
+        snap.notes.append(f"snapshot from an older version: {gap}")
+        (work / "gap.json").write_text(json.dumps(snap.to_json()))
+        args = ["view", str(work / "gap.json"), "--graph", "none", "--no-encrypt"]
+        assert main([*args, "-o", str(pages["unevaluated"])]) == 0
+        partly = json.loads((work / "new.json").read_text(encoding="utf-8"))
+        partly["notes"] = [*partly.get("notes", []), f"snapshot from an older version: {gap}"]
+        (work / "partly.json").write_text(json.dumps(partly))
+        args = ["view", str(work / "partly.json"), "--graph", "none", "--no-encrypt"]
+        assert main([*args, "-o", str(pages["partial"])]) == 0
+        # a check the baseline did not evaluate, and a finding it brings now
+        admin = user("adm_x", sid="S-1-5-21-1-2-3-1500")
+        groups = {"Domain Admins": [admin.dn]}
+        for name, checked in (("was.json", False), ("now.json", True)):
+            made = snapshot(admin, privileged=groups, silos_checked=checked)
+            (work / name).write_text(json.dumps(made.to_json()))
+        args = ["view", str(work / "now.json"), "--baseline", str(work / "was.json")]
+        assert main([*args, "--graph", "none", "--no-encrypt", "-o", str(pages["older"])]) == 0
         from .test_declared_tier0 import declared_snapshot
 
         extended = work / "declared.json"

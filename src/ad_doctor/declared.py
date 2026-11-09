@@ -59,11 +59,20 @@ def nodes(resolver: Resolver, names: Iterable[str], lenient: bool = False) -> li
     out = []
     for name in names:
         node = resolver.node(name)
+        if node is not None and not _sid_held(resolver, name, node):
+            node = None
         if node is not None:
             out.append(node)
         elif not lenient:
             raise SpecError(f"--tier0 / [assume] tier0: no {name!r} in this snapshot")
     return list(dict.fromkeys(out))
+
+
+def _sid_held(resolver: Resolver, name: str, node: str) -> bool:
+    """False for a SID that appears nowhere in the snapshot: it is taken as written, so a typo
+    would otherwise pass as an asset nothing reaches."""
+    sid = name.strip()
+    return not sid.lower().startswith("s-1-") or node in resolver.g.names or resolver.sid_known(sid)
 
 
 def _objects(snap: Snapshot, g: paths.Graph) -> dict[str, DirObject]:

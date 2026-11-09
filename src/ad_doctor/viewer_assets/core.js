@@ -311,7 +311,13 @@ const CORE = (function () {
       }
     }
     const score = Number.isInteger(data.score) ? data.score : scoreOf(findings);
+    const assets = data.declared_tier0 && Array.isArray(data.declared_tier0.assets) ? data.declared_tier0.assets : [];
     return {
+      // what the report could not judge; a report of schema 2 only lists the checks it ran
+      unknown: Array.isArray(data.check_status)
+        ? data.check_status.filter((c) => c && c.status === "not_evaluated").map((c) => String(c.id)) : null,
+      checks: Array.isArray(data.checks) ? data.checks.map(String) : null,
+      declared: assets.filter((a) => a && a.set === "declared").map((a) => String(a.name)),
       domain: String(data.domain || ""), collected_at: String(data.collected_at || ""),
       version: String(data.version || ""), score: score, grade: gradeOf(Math.min(Math.max(score, 0), 100)),
       findings: findings, paths: (findings.find((f) => f.id === "AD-PATH-001") || { objects: [] }).objects.length,
@@ -338,6 +344,8 @@ const CORE = (function () {
     return out;
   }
 
+  const DECLARED_MARK = " [declared tier 0]";
+
   function bySortKey(a, b) {
     for (let i = 0; i < 2; i++) {
       if (a.sort[i] < b.sort[i]) return -1;
@@ -349,17 +357,36 @@ const CORE = (function () {
   // The old report against the current findings ({id, title, severity, objects, keys}),
   // like the --baseline comparison: new, resolved, and changed (same identity, other
   // object text or severity). `unknown` holds check IDs this run could not evaluate: their
-  // findings are not known to be gone, so they stay out of resolved.
-  function diffReports(old, current, unknown) {
+  // findings are not known to be gone, so they stay out of resolved. A check the old report
+  // could not evaluate stays out of new the same way, and a path to an asset only one side
+  // declared (`declared`: this run's asset names) is a change in the declaration.
+  function declaredEnd(o) {
+    if (!o.endsWith(DECLARED_MARK)) return null;
+    const at = o.lastIndexOf("]-> ");
+    return at < 0 ? null : o.slice(at + 4, -DECLARED_MARK.length);
+  }
+
+  function diffReports(old, current, unknown, declared) {
     const before = index(old.findings);
     const after = index(current);
     const row = (x) => ({ id: x.f.id, title: x.f.title, severity: x.f.severity, object: x.o });
+    const was = old.unknown ? new Set(old.unknown) : null;
+    const ran = old.checks ? new Set(old.checks) : null;
+    const wasUnknown = (id) => (was ? was.has(id) : ran ? !ran.has(id) : false);
+    const namesOld = new Set(old.declared || []);
+    const namesNow = new Set(declared || []);
+    const moved = (o, names) => {
+      const end = declaredEnd(o);
+      return end !== null && !names.has(end);
+    };
     const fresh = [];
     const changed = [];
+    const older = [];
+    const declaration = [];
     let unchanged = 0;
     for (const [k, x] of after) {
       const y = before.get(k);
-      if (!y) fresh.push(x);
+      if (!y) (moved(x.o, namesOld) ? declaration : wasUnknown(x.f.id) ? older : fresh).push(x);
       else if (y.o !== x.o || y.f.severity !== x.f.severity) {
         changed.push(Object.assign(row(x), { before: y.o, before_severity: y.f.severity, sort: x.sort }));
       } else unchanged++;
@@ -367,14 +394,19 @@ const CORE = (function () {
     const resolved = [];
     const notEvaluated = [];
     for (const [k, y] of before) {
-      if (!after.has(k)) (unknown && unknown.has(y.f.id) ? notEvaluated : resolved).push(y);
+      if (!after.has(k)) {
+        (moved(y.o, namesNow) ? declaration : unknown && unknown.has(y.f.id) ? notEvaluated : resolved).push(y);
+      }
     }
+    older.sort(bySortKey);
+    declaration.sort(bySortKey);
     fresh.sort(bySortKey);
     resolved.sort(bySortKey);
     notEvaluated.sort(bySortKey);
     changed.sort(bySortKey);
     return {
       new: fresh.map(row), resolved: resolved.map(row), not_evaluated: notEvaluated.map(row),
+      not_evaluated_before: older.map(row), declaration_changed: declaration.map(row),
       changed: changed.map((c) => { delete c.sort; return c; }), unchanged: unchanged,
     };
   }

@@ -18,7 +18,18 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from . import __version__, accept, changes, cut, declared, invariants, paths, planfile, whatif
+from . import (
+    __version__,
+    accept,
+    changes,
+    coverage,
+    cut,
+    declared,
+    invariants,
+    paths,
+    planfile,
+    whatif,
+)
 from .checks import run_all
 from .model import Finding, Severity, Snapshot
 from .paths import Graph
@@ -661,6 +672,12 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         problems_rot += [f"{s.entry.id or s.entry.expected_id}: {x}" for x in s.problems]
     if plan is not None and args.check:
         problems_gate += expect_problems(plan.expect, res, closes_all)
+    gap = coverage.path_gaps(ctx.snap.notes, bool(res.before.holders))
+    if gap and (args.fail_if_exposed is not None or (plan is not None and args.check)):
+        problems_gate.append(
+            "the control graph is incomplete, so a limit on who is exposed cannot be met: "
+            + gap["notes"][0]
+        )
     if args.fail_if_exposed is not None and res.after.exposed > args.fail_if_exposed:
         problems_gate.append(
             f"{res.after.exposed} users exposed after the changes; --fail-if-exposed allows "
@@ -680,6 +697,9 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         )
     if args.paths_only:
         notes.append("--paths-only: findings were not rechecked")
+    notes += coverage.path_gap_lines(gap)
+    if gap:
+        doc["path_check"] = gap
     if plan_tier0 and args.check:
         notes.append(
             f"the plan file treats {len(plan_tier0)} nodes as tier 0 ([assume] tier0): the "
@@ -902,6 +922,10 @@ def run_plan(args: argparse.Namespace) -> tuple[dict[str, Any], int, planfile.Pl
             "a change can move GPO scope or who can be impersonated, so the paths after it "
             "come from a rebuilt graph"
         )
+    gap = coverage.path_gaps(ctx.snap.notes, bool(res.before.holders))
+    notes += coverage.path_gap_lines(gap)
+    if gap:
+        doc["path_check"] = gap
     doc["notes"] = notes
     doc["caveats"] = caveats(ctx.snap, "ad-doctor whatif NEW.json --plan plan.toml --check")
     out = planfile.PlanFile(

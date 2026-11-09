@@ -451,11 +451,17 @@ ports. A CES URL is reached on the port it names; only a URL with no port follow
 - AD-PRIV-013 plays each computer's security templates with Group Policy precedence; a
   right is not merged across GPOs, the one applied last wins. A deny set in the computer's
   own local policy is not visible. An admin workstation you declare yourself is not known to
-  the check: accept that OU by ID and fingerprint.
+  the check: accept that OU by ID and fingerprint. On those computers a deny for Administrators
+  names the computer's own group: it counts for Domain Admins only, assuming the default local
+  membership. A member of a tier-0 group the scan cannot read leaves the check not evaluated,
+  unless the deny names a group that holds it.
 - AD-PRIV-014: the schema gives Authenticated Users read and list on silos and policies, and
   the lab returns the containers to `adreader`. It is reported as not evaluated when the
   container's DACL no longer lets ordinary users list it. The built-in Administrator is left
-  out, and an authentication policy assigned to an account without a silo does not count.
+  out, and an authentication policy assigned to an account without a silo does not count. The
+  user policy's sign-in limit counts unless it is an unconditional allow for Everyone or
+  Authenticated Users; what a condition says is not evaluated. A member of a tier-0 group the
+  scan cannot read leaves the check not evaluated.
 - AD-PRIV-015, AD-ACL-010 and AD-ACC-017 are indicators from replication metadata, with a
   stated window: 30 days before the snapshot, not counting the domain's first 24 hours.
   The metadata says when, not who or what. The extra cost is one BASE read per tier-0 group,

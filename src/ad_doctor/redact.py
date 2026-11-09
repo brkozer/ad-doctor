@@ -21,7 +21,7 @@ import uuid
 from typing import Any
 from urllib.parse import urlsplit
 
-from . import model, regpol
+from . import gpo_scope, model, regpol
 
 KEEP = {
     "administrator", "guest", "krbtgt", "defaultaccount", "wdagutilityaccount",
@@ -258,6 +258,11 @@ class Redactor:
         for s in data.get("gpo_settings", {}).values():
             for server in s.get("ntlm_exceptions", []):
                 words.update([server, *server.split(".")])
+            for right in gpo_scope.DENY_LOGON_RIGHTS:
+                for holder in s.get("privileges", {}).get(right, []):
+                    # a name that did not resolve stays as written, and a note repeats it
+                    if not holder.upper().startswith("S-1-") and not model.well_known_sid(holder):
+                        words.update([holder, *re.split(r"[\\@]", holder)])
         for store in POLICY_STORES:
             for entries in data.get(store, {}).values():
                 for e in entries:

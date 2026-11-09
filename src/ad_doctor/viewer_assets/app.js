@@ -602,9 +602,9 @@
     } else {
       exposure = h("div", { class: "panel exposure" },
         h("div", { class: "eyebrow" }, "Tier-0 exposure"),
-        h("div", { class: "lead" }, h("div", { class: "hero-num" }, "0"),
+        h("div", { class: "lead" }, h("div", { class: "hero-num" }, !p && pathsNotEvaluated() ? "–" : "0"),
           h("p", null, p ? "Control paths are listed, but this report does not carry the user count."
-            : "No principal outside tier 0 has a control path to it in this snapshot.")),
+            : noPathsText("snapshot"))),
         p ? h("div", { class: "link-row" }, h("a", { href: "#paths" }, "Open control paths →")) : null);
     }
 
@@ -673,6 +673,28 @@
     return VM.coverage ? VM.coverage.not_evaluated : 0;
   }
 
+  // AD-PATH-001's status: "no path" is only an answer when the check gave one
+  function pathCheck() {
+    return (VM.check_status || []).find((c) => c.id === "AD-PATH-001") || null;
+  }
+
+  function pathsNotEvaluated() {
+    const c = pathCheck();
+    return Boolean(c && c.status === "not_evaluated");
+  }
+
+  function noPathsText(where) {
+    if (!pathsNotEvaluated()) return "No principal outside tier 0 has a control path to it in this " + where + ".";
+    return "Control paths were not evaluated, so a path that is not shown can exist: " + (pathCheck().notes || []).join("; ");
+  }
+
+  function pathGapBanner() {
+    const c = pathCheck();
+    if (!c || !c.partial) return null;
+    return h("div", { class: "banner medium" }, h("div", null, h("strong", null, "Judged in part. "),
+      "More paths can exist than are listed: " + (c.notes || []).join("; ")));
+  }
+
   const REASON = { unreadable: "Data unreadable", older_snapshot: "Older snapshot", switched_off: "Switched off" };
 
   function coveragePanel() {
@@ -688,7 +710,9 @@
       h("span", { class: "small muted" }, cov.judged + " judged · " + cov.not_applicable + " not applicable · " +
         cov.not_evaluated + " not evaluated")),
     rows.length ? table(rows, (c) => [REASON[c.reason] || c.reason, h("div", { class: "small muted" }, (c.notes || []).join("; "))]) :
-      h("div", { class: "empty good" }, "Every check that applies was judged."),
+      h("div", { class: "empty" + (minimumScore() ? "" : " good") }, minimumScore()
+        ? "A failed search was not tied to a check, so what it left out is unknown."
+        : "Every check that applies was judged."),
     cov.partial ? h("p", { class: "small muted" }, plural(cov.partial, "check") + " found something but could not judge everything it covers; see the notes.") : null,
     (cov.unattributed_notes || []).length ? h("p", { class: "small warn-text" }, plural(cov.unattributed_notes.length, "failed search") + " could not be tied to a check; the score is a minimum.") : null,
     na.length ? h("details", { class: "row-top" }, h("summary", null, "Not applicable (" + na.length + ")"),
@@ -799,10 +823,12 @@
   function viewFindings(r) {
     if (!VM.findings.length) {
       return h("div", null, pageHead("Findings", "Findings"),
-        h("div", { class: "empty" + (notEvaluatedCount() ? "" : " good") },
+        h("div", { class: "empty" + (minimumScore() ? "" : " good") },
           h("strong", null, notEvaluatedCount()
             ? "No findings in the checks judged: " + plural(notEvaluatedCount(), "check") + " not evaluated. "
-            : "No findings: every check that ran passed. "),
+            : minimumScore()
+              ? "No findings in the checks judged: a failed search was not tied to a check. "
+              : "No findings: every check that ran passed. "),
           "What this run could not check is listed under ", h("a", { href: "#about" }, "About this file"),
           VM.notes.length ? [" and in the ", h("a", { href: "#overview" }, "notes on the overview")] : null, "."));
     }
@@ -1071,7 +1097,7 @@
     if (!P) {
       return h("div", null, pageHead("Control paths", "Control paths to tier 0"), banners(),
         declaredPanel(),
-        h("div", { class: "empty" }, "No principal outside tier 0 has a control path to it in this report."));
+        h("div", { class: "empty" }, noPathsText("report")));
     }
     const wanted = parseInt(r.arg, 10);
     if (!isNaN(wanted) && wanted >= 0 && wanted < P.list.length) {
@@ -1160,6 +1186,7 @@
     return h("div", { class: "stack" },
       pageHead("Control paths", "Control paths to tier 0", P.detail, [copyMermaid]),
       banners(),
+      pathGapBanner(),
       declaredPanel(),
       P.broad ? h("div", { class: "banner high" }, h("div", null, h("strong", null, "Broad groups have a path. "),
         "Every user is effectively tier 0: fix those first.")) : null,
@@ -1411,6 +1438,8 @@
       stat(c.resolved.length ? "−" + c.resolved.length : "0", "resolved"));
     const tabs = [["new", "New", c.new], ["resolved", "Resolved", c.resolved], ["changed", "Changed", c.changed]];
     if ((c.not_evaluated || []).length) tabs.push(["not_evaluated", "Not evaluated now", c.not_evaluated]);
+    if ((c.not_evaluated_before || []).length) tabs.push(["not_evaluated_before", "Not evaluated before", c.not_evaluated_before]);
+    if ((c.declaration_changed || []).length) tabs.push(["declaration_changed", "Declaration changed", c.declaration_changed]);
     const body = h("div", null);
     const bar = h("div", { class: "tabs", role: "tablist" });
     const show = (key) => {
@@ -1572,7 +1601,7 @@
   function changeTable(kind, rows) {
     if (!rows.length) {
       const text = { new: "Nothing new since the baseline.", resolved: "Nothing was resolved.",
-        changed: "No finding changed shape or severity.", not_evaluated: "Nothing here." }[kind];
+        changed: "No finding changed shape or severity." }[kind] || "Nothing here.";
       return h("div", { class: "empty" }, text);
     }
     const head = kind === "changed"
@@ -1582,7 +1611,7 @@
       h("thead", null, h("tr", null, head.map((x) => h("th", null, x)))),
       h("tbody", null, rows.map((r) => h("tr", null,
         h("td", null, sevTag(r.severity)),
-        h("td", { class: "nowrap" }, kind === "resolved" || kind === "not_evaluated" ? h("span", { class: "mono" }, r.id) :
+        h("td", { class: "nowrap" }, kind === "resolved" || kind === "not_evaluated" || kind === "declaration_changed" ? h("span", { class: "mono" }, r.id) :
           h("a", { class: "mono", href: hrefFor("findings", { open: r.id }) }, r.id)),
         h("td", null, h("span", { class: "mono" }, r.object)),
         kind === "changed"
@@ -2372,7 +2401,9 @@
     try {
       const rep = CORE.parseReport(await file.text());
       const unknown = new Set((VM.check_status || []).filter((x) => x.status === "not_evaluated").map((x) => x.id));
-      state.adhoc = { name: file.name, report: rep, diff: CORE.diffReports(rep, currentFindings(), unknown) };
+      const assets = (VM.declared_tier0 && VM.declared_tier0.assets) || [];
+      const declared = assets.filter((a) => a.set === "declared").map((a) => a.name);
+      state.adhoc = { name: file.name, report: rep, diff: CORE.diffReports(rep, currentFindings(), unknown, declared) };
       state.tab = "new";
       announce("Compared with " + file.name);
       route();
