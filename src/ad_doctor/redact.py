@@ -113,7 +113,8 @@ FIXED_KEYS = {
                 model.ScriptSecret, model.GpoLocalGroup, model.GpLink, model.RegistryEntry,
                 model.GpoAutologon,
                 model.UnreadableMember, model.KeyCredential, model.Site, model.Subnet,
-                model.ConflictObject, model.Pso, model.Dmsa)
+                model.ConflictObject, model.Pso, model.Dmsa, model.AuthSilo,
+                model.AuthPolicy, model.MemberChange, model.SidHistoryChange)
     for f in dataclasses.fields(cls)
 } | {"domain", "AdminSDHolder", "sid", "mask", "object_type", "inherited_object_type"}  # fmt: skip
 # values from a fixed list, which the checks compare: never data, whatever the names around
@@ -231,6 +232,17 @@ class Redactor:
             words.update([dmsa["name"], *_dn_values(dmsa["dn"])])
             if dmsa.get("preceded_by"):
                 words.update(_dn_values(dmsa["preceded_by"]))
+        for silo in data.get("auth_silos", []):
+            words.update([silo["name"], *_dn_values(silo["dn"])])
+            for dn in [*silo["members"], *silo["assigned"], silo["user_policy"]]:
+                words.update(_dn_values(dn))
+        for policy in data.get("auth_policies", []):
+            words.update([policy["name"], *_dn_values(policy["dn"])])
+        for change in data.get("member_changes", []):
+            words.update([change["group"], *_dn_values(change["group_dn"])])
+            words.update(_dn_values(change["member_dn"]))
+        for change in data.get("sid_history_changes", []):
+            words.update(_dn_values(change["dn"]))
         for o in data.get("objects", []):
             words.add(o["name"])
             words.update(_dn_values(o["dn"]))

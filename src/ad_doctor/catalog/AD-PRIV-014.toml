@@ -1,0 +1,67 @@
+id = "AD-PRIV-014"
+aliases = ["authentication-policy-silos", "authn-silo"]
+summary = "No authentication policy silo exists, or tier-0 accounts sit outside an enforced silo whose user policy limits where they can sign in."
+severities = ["low"]
+severity_logic = """
+Always **low**: a silo is an extra control that many well-run domains do not have, and its absence
+is not a compromise. A silo that exists but is only in audit mode does not count as covering.
+"""
+mitre = ["T1078.002", "T1550"]
+data_sources = ["ldap"]
+attributes = [
+    "msDS-AuthNPolicySilo: msDS-AuthNPolicySiloEnforced, msDS-AuthNPolicySiloMembers, msDS-AssignedAuthNPolicySiloBL, msDS-UserAuthNPolicy",
+    "msDS-AuthNPolicy: msDS-AuthNPolicyEnforced, msDS-UserAllowedToAuthenticateFrom",
+    "nTSecurityDescriptor of CN=AuthN Silos (to tell \"none\" from \"not visible\")",
+]
+related = ["AD-PRIV-013", "AD-PRIV-010"]
+since = "0.2.4"
+
+risk = """
+Group Policy deny rights depend on every computer having the right policy applied. An
+authentication policy silo is enforced by the KDC: an account in an enforced silo can only get a
+ticket from the devices its policy allows, wherever it tries to sign in. Without one, nothing at
+the authentication level keeps tier-0 accounts off lower-tier computers.
+"""
+
+detection = """
+Silos and policies are read under `CN=AuthN Policy Configuration,CN=Services,CN=Configuration`.
+The schema gives Authenticated Users read and list on these objects, so an ordinary user can read
+them unless someone changed that; `AD-PRIV-014` is not evaluated when `CN=AuthN Silos` is not
+visible, the search is refused, or the container's DACL no longer lets ordinary users list it
+and nothing came back.
+
+An account counts as covered when it is both a permitted member (`msDS-AuthNPolicySiloMembers`)
+and assigned (it appears in `msDS-AssignedAuthNPolicySiloBL`), the silo is enforced, and the
+silo's user policy is enforced and sets where users may sign in from. The accounts are the
+enabled users of Domain Admins, Enterprise Admins, Schema Admins and Administrators. The built-in
+Administrator (RID 500) is left out: it is the way back in when a silo breaks.
+"""
+
+false_positives = """
+- **A silo whose DACL was changed** so the scanning account cannot read it is invisible. Then
+  either the accounts show as outside a silo, or, if every silo is hidden and the container still
+  allows listing, the check reports none. Run with an account that can read it to tell.
+- **An authentication policy assigned directly to an account** without a silo is not counted. It
+  limits tickets too, but the check looks at silos.
+- Domains below the Windows Server 2012 R2 functional level cannot have silos and are reported as
+  not applicable.
+"""
+
+remediation = """
+Create an authentication policy with a limit on where users may sign in (for example the tier-0
+device group), create a silo with that user policy, enforce both, and permit and assign each
+tier-0 account. Run it in audit mode first and read the KDC logs. Keep one break-glass account
+outside and watch it closely.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-014"
+
+[[references]]
+title = "Authentication policies and authentication policy silos"
+url = "https://learn.microsoft.com/en-us/windows-server/security/credentials-protection-and-management/authentication-policies-and-authentication-policy-silos"
+kind = "vendor"
+
+[[references]]
+title = "Authentication policy silos operations guide"
+url = "https://microsoft.github.io/ActiveDirectoryTierModel/auth-silos-operations-guide/"
+kind = "vendor"

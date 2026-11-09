@@ -1,0 +1,72 @@
+id = "AD-PRIV-013"
+aliases = ["deny-logon-per-ou", "tier0-logon-restriction"]
+summary = "Group Policy does not deny tier-0 accounts the logon rights that leave credentials on lower-tier computers, judged per computer with Group Policy precedence."
+severities = ["info", "low", "medium"]
+severity_logic = """
+**Medium** when local logon or RDP is not denied to every tier-0 account on the computer.
+**Low** when only the batch or service right is missing.
+**Info** when the result cannot be decided: a GPO that may not apply (WMI filter, security filter
+naming a group the snapshot lacks, several sites), a security template that could not be read, or
+a name in the right that did not resolve to a SID. Undecided rights are listed and are not passes.
+"""
+mitre = ["T1078.002", "T1003.001"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "Machine\\Microsoft\\Windows NT\\SecEdit\\GptTmpl.inf: [Privilege Rights] SeDenyInteractiveLogonRight, SeDenyRemoteInteractiveLogonRight, SeDenyBatchLogonRight, SeDenyServiceLogonRight",
+    "gPLink, gPOptions and the GPO's status, version, extensions and DACL",
+    "member of the tier-0 groups, nesting included",
+]
+related = ["AD-PRIV-010", "AD-PRIV-014", "AD-GPO-007"]
+since = "0.2.4"
+
+risk = """
+A tier-0 account that signs in on a workstation or member server leaves credentials in that
+computer's memory or LSA secrets. Anyone who is an administrator there can take them, so control
+of one lower-tier computer becomes control of the domain. Microsoft's guidance for securing
+Domain Admins, Enterprise Admins and the Administrators group is to deny these logon rights on
+every computer below tier 0.
+"""
+
+detection = """
+For each Windows computer that processes Group Policy, the security templates of the GPOs that
+reach it are played in the order Windows applies them, with Block Inheritance, Enforced, disabled
+links, status flags and security filtering, as in [AD-GPO-009](AD-GPO-009.md). A user right is not
+merged across GPOs: the GPO applied last that defines the right decides the whole list. The
+result is compared with the token of each enabled user in Domain Admins, Enterprise Admins, Schema
+Admins and Administrators, nesting and foreign security principals included. Domain controllers
+and computers known to be tier 0 (CA, Entra Connect and Exchange servers, and tier-0 members) are
+not judged. One line is written per OU and per result.
+
+Four rights are read: local logon, Remote Desktop, batch and service. Those logon types are the
+ones Microsoft lists as leaving reusable credentials on the target. `SeDenyNetworkLogonRight` is
+not required, because a network logon does not, and many tier models keep it.
+"""
+
+false_positives = """
+- **Tier-0 admin workstations and other tier-0 servers you declare yourself.** Checks read only
+  the tier-0 assets the snapshot proves, so a privileged access workstation in its own OU is
+  listed. Accept that OU by ID and fingerprint.
+- **A local policy on the computer.** Only Group Policy is visible; a deny set in the computer's
+  own local security policy is not. The text says "not denied" by Group Policy.
+- **Tier-0 accounts of another domain.** Only accounts in this snapshot are judged.
+"""
+
+remediation = """
+In a GPO linked to the OUs of the lower tiers, add the tier-0 groups to *Deny log on locally*,
+*Deny log on through Remote Desktop Services*, *Deny log on as a batch job* and *Deny log on as a
+service* (Computer Configuration > Windows Settings > Security Settings > Local Policies > User
+Rights Assignment). Keep it out of the OUs of tier-0 servers and admin workstations. Check that
+no GPO applied later defines the same right with a different list.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-013"
+
+[[references]]
+title = "Appendix F: Securing Domain Admins groups in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-f--securing-domain-admins-groups-in-active-directory"
+kind = "vendor"
+
+[[references]]
+title = "Administrative tools and logon types"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/securing-privileged-access/securing-privileged-access-reference-material"
+kind = "vendor"

@@ -24,6 +24,11 @@ the directory.
 - `msDS-AllowedToActOnBehalfOfOtherIdentity` (who may delegate to a computer; a list the scan cannot parse is a note, and its edges are left out)
 - one BASE read of each `member` value of a tier-0 group that no search returned, at most 500
   per scan
+- `msDS-ReplValueMetaData` and `msDS-ReplAttributeMetaData` of each tier-0 group (at most 200), of
+  `CN=AdminSDHolder,CN=System`, and of each account with `sIDHistory` (at most 500)
+- `msDS-AuthNPolicySilo` and `msDS-AuthNPolicy` objects under `CN=AuthN Policy Configuration`
+  (Authenticated Users may read them by the schema's default), and the DACL of `CN=AuthN Silos`
+  when none comes back
 
 Security descriptors are requested with the SD-flags control for owner and DACL, which
 ordinary users may read, and parsed by a small built-in parser (`sd.py`).

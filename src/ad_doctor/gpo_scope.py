@@ -78,6 +78,13 @@ INTERACTIVE = "S-1-5-4"
 ADMINISTRATORS = "S-1-5-32-544"
 RDP_USERS = "S-1-5-32-555"
 REMOTE_LOGON_RIGHT = "SeRemoteInteractiveLogonRight"
+DENY_LOGON_RIGHTS = (
+    "SeDenyInteractiveLogonRight",
+    "SeDenyRemoteInteractiveLogonRight",
+    "SeDenyBatchLogonRight",
+    "SeDenyServiceLogonRight",
+)
+USER_RIGHTS_KEY = "GptTmpl\\Privilege Rights"  # not a registry path: names the store in a layer
 # a comma that ends an RDN: not escaped, i.e. after an even number of backslashes
 RDN_SEPARATOR = re.compile(r"(?<!\\)(?:\\\\)*,")
 ILT_CAVEAT = "item-level targeting not evaluated"
@@ -614,6 +621,7 @@ class RegistryView:
         self.r = _Resolver(snap)
         self._layers: dict[tuple[str, str], tuple[_Layer, ...]] = {}
         self._memo: dict[tuple[object, ...], Effective] = {}
+        self._rights: dict[str, list[RegistryEntry]] | None = None
 
     def targets(self) -> list[Account]:
         """Computers that process Windows Group Policy. A computer object with no operating
@@ -707,6 +715,21 @@ class RegistryView:
                     found.setdefault(category, False)
         return found
 
+    def user_right(self, a: Account, right: str) -> Effective:
+        """What the GPOs' security templates leave in one user right. Windows does not merge a
+        right across GPOs: the one applied last that defines it decides the whole list."""
+        if self._rights is None:
+            self._rights = {
+                guid: [
+                    RegistryEntry(USER_RIGHTS_KEY, name, "set", data=holders)
+                    for name, holders in s.privileges.items()
+                    if name in DENY_LOGON_RIGHTS
+                ]
+                for guid, s in self.snap.gpo_settings.items()
+            }
+        layers = self._source_layers(a, "restricted", self._rights, "GptTmpl.inf")
+        return self._played("rights", layers, USER_RIGHTS_KEY, right)
+
     def _played(self, kind: str, layers: tuple[_Layer, ...], key: str, name: str) -> Effective:
         memo = (kind, key, name, *[(x.gpo.guid, x.caveats) for x in layers])
         found = self._memo.get(memo)
@@ -724,6 +747,39 @@ class RegistryView:
                 if e.action in ("set", "soft") and regpol.norm(e.key) == wanted:
                     out.setdefault(e.name.casefold(), e.name)
         return list(out.values())
+
+
+def logon_rights_view(snap: Snapshot) -> RegistryView | None:
+    """None when the deny logon rights were not collected: the check then does not judge."""
+    return RegistryView(snap) if snap.logon_rights_collected else None
+
+
+def denied_accounts(
+    effective: Effective, tokens: dict[str, set[str]]
+) -> tuple[bool | None, list[str]]:
+    """Whether what a right can end up holding denies every account in `tokens` (name -> SIDs in
+    its token), and who is left out. None: it depends on something that cannot be decided, or
+    on a name that could not be resolved to a SID."""
+    states: set[bool | None] = set()
+    left: set[str] = set()
+    for o in effective.outcomes:
+        if o.unknown:
+            states.add(None)
+        elif not o.present or not isinstance(o.data, list):
+            states.add(False)
+            left |= tokens.keys()
+        else:
+            holders = {_holder(h) for h in o.data}
+            missed = {name for name, token in tokens.items() if not holders & token}
+            if missed and any(not h.startswith("S-1-") for h in holders):
+                states.add(None)
+            else:
+                states.add(not missed)
+                left |= missed
+    if len(states) == 1:
+        state = states.pop()
+        return state, sorted(left) if state is False else []
+    return None, []
 
 
 def registry_view(snap: Snapshot) -> RegistryView | None:

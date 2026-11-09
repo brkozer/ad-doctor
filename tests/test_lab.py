@@ -29,6 +29,9 @@ pytestmark = pytest.mark.lab
 # (no spooler on Server Core 2025), AD-INF-011 (needs a week without backup), AD-INF-003 (a
 # 2025 DC needs level 2016), AD-INF-013 and AD-ADCS-016 (need a host the probes cannot read)
 # and AD-PRIV-001 (not seeded: no tier-0 group here has more than five members).
+# AD-ACL-010 and AD-ACC-017 (need a change after the domain's first day, or SID history,
+# and the lab has neither), AD-PRIV-015 (read in the test below; its seeded additions age
+# out of the 30-day window). AD-PRIV-013 and -014 fire here, see the test below.
 EXPECTED = {
     "AD-ADCS-020": {
         "Domain Controllers: DC01: no GPO sets CertificateMappingMethods or "
@@ -522,6 +525,19 @@ def test_gpo_local_group_scope(snap: Snapshot) -> None:
 def test_https_endpoints_stay_out_of_the_http_list(snap: Snapshot) -> None:
     assert set(snap.probes.enrollment_https) == HTTPS_ENDPOINTS
     assert snap.probes.web_enrollment_ntlm == ["http://DC01.adlab.test/certsrv/"]
+
+
+def test_tier0_logon_silo_and_change_history_read(snap: Snapshot) -> None:
+    found = {f.check_id: f for f in run_all(snap)}
+    assert snap.logon_rights_collected and snap.silos_checked
+    assert snap.auth_silos == [] and snap.auth_policies == []
+    assert any("OLD2008" in o for o in found["AD-PRIV-013"].objects)
+    assert {"adm_bob", "svc_sql"} <= set(found["AD-PRIV-014"].objects)
+    assert snap.member_changes_checked
+    members = {(c.group, c.member_dn.split(",")[0]) for c in snap.member_changes}
+    assert ("Domain Admins", "CN=veiled_admin") in members
+    assert snap.admin_sd_holder_checked and snap.admin_sd_holder_changed is not None
+    assert snap.sid_history_checked
 
 
 def test_lab_policy_files_are_read_and_unset_is_unknown(snap: Snapshot) -> None:

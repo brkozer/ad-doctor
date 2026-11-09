@@ -9,6 +9,15 @@ logic or severity between versions, but an ID is never reused for something else
 
 ### Added
 
+- **Tier-0 logon restrictions, silos and change history.** **AD-PRIV-013** reports the
+  computers, per OU, where Group Policy does not deny tier-0 accounts local logon, RDP,
+  batch or service logon, using each computer's own processing order. **AD-PRIV-014** reports
+  tier-0 accounts outside an enforced authentication policy silo whose user policy limits
+  where they sign in, or that no silo exists. **AD-PRIV-015**, **AD-ACL-010** and
+  **AD-ACC-017** read replication metadata for members added to tier-0 groups, a change to
+  AdminSDHolder's ACL and `sIDHistory` writes in the 30 days before the snapshot, leaving out
+  the domain's first 24 hours. Older snapshots load and report these as not evaluated, and
+  so does a run where the data could not be read.
 - **Declared tier 0.** `--tier0-file` (and `--tier0 NAME`) on `analyze`, `scan`, `paths` and
   `view` adds your own tier-0 assets as extended targets, in a set of their own: built-in paths,
   numbers and every other check stay as they were, paths that end at a declared asset carry

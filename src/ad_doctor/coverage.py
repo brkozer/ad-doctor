@@ -16,7 +16,7 @@ from typing import Any
 
 from .checks import REGISTRY, ca_unjudged
 from .invariants import IDS as INVARIANTS
-from .model import CATEGORIES, CaConfig, Snapshot
+from .model import CATEGORIES, SILO_LEVEL, CaConfig, Snapshot
 
 JUDGED, NOT_APPLICABLE, NOT_EVALUATED = "judged", "not_applicable", "not_evaluated"
 UNREADABLE, OLDER_SNAPSHOT, SWITCHED_OFF = "unreadable", "older_snapshot", "switched_off"
@@ -34,13 +34,15 @@ def _ids(prefix: str, *numbers: int) -> tuple[str, ...]:
 
 
 LOCAL_GROUP_CHECKS = _ids("GPO", 5, 6, 7)
-SYSVOL_CHECKS = (*_ids("GPP", 1, 2), *_ids("GPO", 3), *LOCAL_GROUP_CHECKS)
+LOGON_RIGHTS_CHECK = "AD-PRIV-013"
+SYSVOL_CHECKS = (*_ids("GPP", 1, 2), *_ids("GPO", 3), *LOCAL_GROUP_CHECKS, LOGON_RIGHTS_CHECK)
 REGISTRY_POL_CHECKS = _ids("GPO", 9, 10, 11, 12)
 POLICY_FILE_CHECKS = (*_ids("GPO", 13, 14, 15, 16), "AD-ADCS-020")
 GPO_APPLIED_CHECKS = (
     *_ids("GPO", 3, 5, 6, 7, 8),
     *REGISTRY_POL_CHECKS,
     *POLICY_FILE_CHECKS,
+    LOGON_RIGHTS_CHECK,
 )
 ALL_GPO_CHECKS = (*GPO_APPLIED_CHECKS, *_ids("GPO", 1, 2, 4))
 CA_CONFIG_CHECKS = (*_ids("ADCS", 12, 13, 14, 15, 16, 18), "AD-CHAIN-004")
@@ -256,6 +258,14 @@ DATA_GAPS: tuple[tuple[tuple[str, ...], Callable[[Snapshot], bool], str], ...] =
      lambda s: bool(s.ca_hosts) and _no_probe_ran(s), "no web enrollment probe ran"),
     (CA_CONFIG_CHECKS, _no_ca_config, "no CA configuration in the snapshot"),
     (SYSVOL_CHECKS, _sysvol_unread, "SYSVOL was not read"),
+    ((LOGON_RIGHTS_CHECK,), lambda s: not s.logon_rights_collected and not _sysvol_unread(s),
+     "deny logon rights were not collected"),
+    (("AD-PRIV-014",), lambda s: not s.silos_checked, "silo objects were not read"),
+    (("AD-PRIV-015",), lambda s: not s.member_changes_checked,
+     "tier-0 member metadata was not read"),
+    (("AD-ACL-010",), lambda s: not s.admin_sd_holder_checked,
+     "AdminSDHolder's metadata was not read"),
+    (("AD-ACC-017",), lambda s: not s.sid_history_checked, "sIDHistory metadata was not read"),
     (LOCAL_GROUP_CHECKS, lambda s: not s.local_groups_collected and not _sysvol_unread(s),
      "local group settings were not collected"),
     *(((check_id,), (lambda p: lambda s: _ca_part(s, p))(part), f"{part} not read on every CA")
@@ -295,6 +305,8 @@ def not_applicable(snap: Snapshot, use_data: bool) -> dict[str, str]:
         if _no_2025(snap):
             why = "no Windows Server 2025 DC, so no dMSA can exist"
             out.update(dict.fromkeys(("AD-INF-007", "AD-ACL-009"), why))
+        if snap.silos_checked and 0 < snap.policy.functional_level < SILO_LEVEL:
+            out["AD-PRIV-014"] = "the domain functional level is below Windows Server 2012 R2"
     return out
 
 

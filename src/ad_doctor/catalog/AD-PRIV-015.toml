@@ -1,0 +1,56 @@
+id = "AD-PRIV-015"
+aliases = ["recent-tier0-member-additions"]
+summary = "A current member of a tier-0 group was added in the 30 days before the snapshot, by replication metadata."
+severities = ["low"]
+severity_logic = """
+Always **low**: this asks for a review. Adding an administrator is routine; the question is
+whether someone can account for this one.
+"""
+mitre = ["T1098", "T1078.002"]
+data_sources = ["ldap"]
+attributes = [
+    "msDS-ReplValueMetaData of each tier-0 group, nesting included: pszObjectDn, ftimeDeleted, ftimeLastOriginatingChange",
+    "msDS-ReplAttributeMetaData of each group (shows that metadata is readable at all)",
+    "whenCreated of the domain head",
+]
+related = ["AD-PRIV-007", "AD-PRIV-012", "AD-ACL-004"]
+since = "0.2.4"
+
+risk = """
+Adding an account to a tier-0 group is the simplest way to keep domain control after a compromise.
+The group shows the member today, but not since when. The directory's replication metadata does,
+and an ordinary user can read it.
+"""
+
+detection = """
+One BASE read per tier-0 group: the seed groups of AD-PRIV-012 and every group nested in them. Each
+live `member` value in `msDS-ReplValueMetaData` gives the time of its last originating change, which
+for a live value is when it last became a member (`ftimeCreated` can be older when a value was
+removed and added again).
+
+The window is stated rather than tunable: **30 days before the snapshot was collected**, about one
+monthly review. A change in the **first 24 hours of the domain** (whenCreated of the domain head)
+is the install and is left out.
+
+A member with no metadata row dates from before linked-value replication and cannot be recent. A
+group whose metadata cannot be read is named in a note and marks this check not evaluated.
+"""
+
+false_positives = """
+- **Planned changes.** Every onboarding of an administrator shows up for 30 days. Accepting the
+  finding by fingerprint is the intended way to mark one as reviewed.
+- **Removed and re-added members**, which metadata cannot tell from a first addition.
+- **A domain restored from backup** keeps the original timestamps.
+"""
+
+remediation = """
+Match each addition to a change record. If there is none, remove the member, and look for who made
+the change in the DC's security log (events 4728, 4732 and 4756).
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-015"
+
+[[references]]
+title = "ADTimeline: timeline of Active Directory changes from replication metadata"
+url = "https://github.com/ANSSI-FR/ADTimeline"
+kind = "tool"
