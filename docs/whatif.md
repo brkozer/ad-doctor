@@ -74,6 +74,7 @@ one became.
 | AD CS | `template:LabESC1:enroll:"Domain Users"`, `template:LabESC1:enrollee-supplies-subject`, `pki:NTAuthCertificates:helpdesk`, `ca:<CA>:helpdesk:ManageCertificates`, `oid-link:<OID>`, `ca-flag:<CA>:san-from-request` (or `no-sid-extension`) |
 | gMSA, delegation | `gmsa:<gMSA>:<reader>`, `delegation:<account>:unconstrained` (or `protocol-transition`, `rbcd`, `constrained:<SPN>`), `rbcd:<computer>:<principal>` |
 | SID history | `sid-history:<account>:<SID>`, `sid-history:<account>` (every SID the account holds) |
+| files GPOs run | `script-ace:"<SYSVOL path>":<trustee>`, `script-host:"<GPO>":"<path as the GPO writes it>"` |
 | every right of a trustee | `all-rights-of:helpdesk`, `all-rights-of:helpdesk:tier0` (only those on a path) |
 
 Names are a sAMAccountName, a name, a DN or a SID. Two matches are an error that lists
@@ -170,7 +171,9 @@ max_holders = 4
 The kind and its identity fields decide; `id` is a checksum of them, so an `id` that does
 not match means the file was edited. Strings are escaped like the viewer's accept drafts.
 `plan` writes `[expect]` from what the plan reaches. With `--keep` or `--allow KIND` it
-leaves `closes_all` out, because the file does not record them.
+leaves `closes_all` out, because the file does not record them. On a snapshot whose control
+graph is incomplete, such as one from an older version, it writes no `[expect]`: an
+incomplete graph cannot prove a limit, and `--check` fails any limit written by hand.
 
 Against any later snapshot each `[[change]]` is:
 
@@ -235,6 +238,8 @@ at the place where the edge is made. The graph itself is the same with and witho
 | `delegation` | account, kind | `constrained:<SPN>`: the edge to the computer holding that SPN; `protocol-transition`: every constrained edge of the account; `rbcd`: every resource-based edge into the computer; `unconstrained`: no edge, only findings change | 1 |
 | `rbcd-principal` | computer, principal | `resource-based delegation` from that principal | 1 |
 | `sid-history` | account, SID | `SID history` to that principal | 1, 10 (warn) for a SID from outside this forest |
+| `script-ace` | SYSVOL path, trustee | `can change a file GPO runs` from that trustee, for that file or folder | 1 |
+| `script-host` | GPO, path | `hosts a file GPO runs` from the host that serves it | 3 |
 
 The flags of `template-flag` are `require-approval`, `enrollee-supplies-subject`,
 `any-purpose-eku` and `request-agent-eku` (an EKU only goes when another one stays,
@@ -288,6 +293,8 @@ resolve through and what "expected to clear" in the output and fix lines come fr
 | `member` | AD-PRIV-003, AD-PRIV-004, AD-PRIV-006, AD-PRIV-008, AD-PRIV-009, AD-INV-001 | AD-ACC-006 |
 | `delegation`, `rbcd-principal` | AD-DEL-001 to AD-DEL-005, AD-CHAIN-002 | |
 | `sid-history` | AD-ACC-007 when the account holds no other SID | |
+| `script-ace` | AD-GPO-017 for that trustee on that path | |
+| `script-host` | AD-GPO-018 for that GPO and path | |
 | any | AD-PATH-001 objects whose holder loses its path | AD-INV-* |
 
 Settings, probes, account hygiene, policies, trusts, the other CA registry flags and SYSVOL

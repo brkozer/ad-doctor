@@ -6,17 +6,22 @@
   their authentication methods (ESC8). No credentials go to these endpoints.
 - LDAPS: an NTLM bind without channel binding (is channel binding enforced?).
 - MS-RRP over \\pipe\\winreg: read the CA's configuration (ESC6, ESC7, ESC11, ESC16, audit
-  filter).
+  filter), and the build and UBR of each DC and CA (--no-patch-level turns that off).
+- The DC probe pack (--dc-probes): open the WebClient pipe, offer only the SMB1 dialect in
+  a negotiate, and try a TLS handshake of each version on the LDAPS port. None of them
+  sends a request past the handshake.
 """
 
 from __future__ import annotations
 
 import hashlib
 import http.client
+import socket
 import ssl
 import struct
 import time
 import uuid
+import warnings
 from collections.abc import Callable
 from contextlib import suppress
 from typing import Any, Protocol
@@ -40,12 +45,167 @@ from spnego.channel_bindings import GssChannelBindings
 from spnego.exceptions import SpnegoError
 
 from . import sd, winreg
-from .model import DEFAULT_POLICY_MODULE, CaConfig
+from .model import DEFAULT_POLICY_MODULE, CaConfig, HostPatch
 
 TIMEOUT = 10
 SEC_E_BAD_BINDINGS = "80090346"
 CA_CONFIGURATION = r"SYSTEM\CurrentControlSet\Services\CertSvc\Configuration"
 CONFIG_KEY = r"CertSvc\Configuration"
+CURRENT_VERSION = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+
+
+WEBCLIENT_PIPE = "DAV RPC SERVICE"
+SMB1_NEGOTIATE = (
+    b"\xffSMB\x72"  # protocol, SMB_COM_NEGOTIATE ([MS-CIFS] 2.2.4.52)
+    + bytes(4)  # status
+    + b"\x18\x01\xc8"  # flags, flags2 (long names, NT status, Unicode)
+    + bytes(12)  # PID high, security features, reserved
+    + b"\xff\xff\xfe\xff"  # TID, PID low
+    + bytes(4)  # UID, MID
+    + b"\x00\x0c\x00"  # no parameter words, 12 bytes of data
+    + b"\x02NT LM 0.12\x00"
+)
+SMB1_MAGIC = b"\xffSMB"
+TLS_VERSIONS = (
+    ("tls10", ssl.TLSVersion.TLSv1),
+    ("tls11", ssl.TLSVersion.TLSv1_1),
+    ("tls12", ssl.TLSVersion.TLSv1_2),
+    ("tls13", ssl.TLSVersion.TLSv1_3),
+)
+# OpenSSL refused on its own side: says nothing about the server
+TLS_CLIENT_LIMITS = ("NO_PROTOCOLS_AVAILABLE", "NO_CIPHERS_AVAILABLE", "UNSUPPORTED_PROTOCOL")
+
+
+def smb_signing(host: str, port: int) -> tuple[bool | None, str | None]:
+    """(signing required, why not known) from an SMB negotiate: no credentials are sent."""
+    conn = Connection(uuid.uuid4(), host, port, require_signing=False)
+    try:
+        conn.connect(timeout=TIMEOUT)
+    except (SMBException, OSError, ValueError) as exc:
+        return None, str(exc) or type(exc).__name__
+    required = bool(conn.require_signing)
+    with suppress(Exception):
+        conn.disconnect(close=True)
+    return required, None
+
+
+def _pipe_listens(tree: TreeConnect, name: str) -> bool | None:
+    """Open a named pipe for reading and close it; None when the answer does not tell."""
+    pipe = Open(tree, name)
+    try:
+        pipe.create(
+            ImpersonationLevel.Impersonation,
+            FilePipePrinterAccessMask.FILE_READ_DATA,
+            0,
+            ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE,
+            CreateDisposition.FILE_OPEN,
+            CreateOptions.FILE_NON_DIRECTORY_FILE,
+        )
+    except SMBException as exc:
+        # STATUS_OBJECT_NAME_NOT_FOUND: nothing listens on the pipe
+        text = str(exc).lower()
+        return False if "0xc0000034" in text or "not found" in text else None
+    pipe.close()
+    return True
+
+
+def webclient(
+    host: str, port: int, user: str | None, password: str | None, kerberos: bool = False
+) -> bool | None:
+    """Whether the WebClient service listens on its named pipe."""
+    conn = Connection(uuid.uuid4(), host, port, require_signing=False)
+    try:
+        conn.connect(timeout=TIMEOUT)
+        session = Session(
+            conn,
+            user,
+            password,
+            require_encryption=False,
+            auth_protocol="kerberos" if kerberos else "negotiate",
+        )
+        session.connect()
+        tree = TreeConnect(session, rf"\\{host}\IPC$")
+        tree.connect()
+        return _pipe_listens(tree, WEBCLIENT_PIPE)
+    except (SMBException, OSError, ValueError):
+        return None
+    finally:
+        with suppress(Exception):
+            conn.disconnect(close=True)
+
+
+def smb1_enabled(host: str, port: int, timeout: float = TIMEOUT) -> bool | None:
+    """Offer only the SMB1 dialect in a negotiate. True when the server picks it, False when
+    it refuses or hangs up, None when no connection could be made or the answer never came."""
+    message = struct.pack(">I", len(SMB1_NEGOTIATE)) + SMB1_NEGOTIATE
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(message)
+            answer = b""
+            while len(answer) < 41:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                answer += chunk
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+        return False  # hung up on the dialect
+    except (TimeoutError, OSError, ValueError):
+        return None
+    if answer[4:8] != SMB1_MAGIC or len(answer) < 39:
+        return False  # empty (it hung up), or another protocol's answer
+    words = answer[36]  # at 4 (NetBIOS) + 32 (SMB header)
+    status = struct.unpack_from("<I", answer, 9)[0]
+    dialect = struct.unpack_from("<H", answer, 37)[0]
+    return status == 0 and words > 0 and dialect == 0
+
+
+def _tls_context(version: ssl.TLSVersion) -> ssl.SSLContext:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)  # that is the point of the probe
+        context.minimum_version = version
+        context.maximum_version = version
+    context.set_ciphers("ALL:@SECLEVEL=0")
+    return context
+
+
+def _tls_handshake(host: str, port: int, version: ssl.TLSVersion) -> bool | None:
+    """True when the server completes a handshake of exactly this version, False when it
+    answers with an alert or hangs up, None when nothing can be said."""
+    try:
+        context = _tls_context(version)
+    except (ssl.SSLError, ValueError):
+        return None
+    try:
+        with (
+            socket.create_connection((host, port), timeout=TIMEOUT) as raw,
+            context.wrap_socket(raw, do_handshake_on_connect=True) as tls,
+        ):
+            return tls.version() == version.name.replace("_", ".")
+    except ssl.SSLError as exc:
+        reason = getattr(exc, "reason", None) or ""
+        if any(limit in reason.upper() for limit in TLS_CLIENT_LIMITS):
+            return None
+        if isinstance(exc, ssl.SSLCertVerificationError):
+            return None
+        return False
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+        return False
+    except (TimeoutError, OSError, ValueError):
+        return None
+
+
+def ldaps_tls_versions(host: str, port: int) -> dict[str, bool | None]:
+    """A handshake per TLS version on the LDAPS port, nothing sent after it. A refused
+    version counts only when another one was accepted: otherwise the port may simply not
+    answer TLS, and every version stays unknown."""
+    found = {name: _tls_handshake(host, port, version) for name, version in TLS_VERSIONS}
+    if not any(found.values()):
+        return dict.fromkeys(found)
+    return found
 
 
 def smb_posture(
@@ -70,22 +230,7 @@ def smb_posture(
         session.connect()
         tree = TreeConnect(session, rf"\\{host}\IPC$")
         tree.connect()
-        pipe = Open(tree, "spoolss")
-        try:
-            pipe.create(
-                ImpersonationLevel.Impersonation,
-                FilePipePrinterAccessMask.FILE_READ_DATA,
-                0,
-                ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE,
-                CreateDisposition.FILE_OPEN,
-                CreateOptions.FILE_NON_DIRECTORY_FILE,
-            )
-            spooler = True
-            pipe.close()
-        except SMBException as exc:
-            # STATUS_OBJECT_NAME_NOT_FOUND: nothing listens on the pipe
-            text = str(exc).lower()
-            spooler = False if "0xc0000034" in text or "not found" in text else None
+        spooler = _pipe_listens(tree, "spoolss")
     except (SMBException, OSError, ValueError):
         spooler = None
     finally:
@@ -346,11 +491,70 @@ def read_ca_config(reg: RegistryReader, host: str, fallback_name: str) -> CaConf
             reg.close_key(key)
 
 
+def read_patch_level(reg: RegistryReader, name: str, roles: list[str]) -> HostPatch:
+    """CurrentBuildNumber and UBR of one host from an open registry."""
+    try:
+        key = reg.open_key(reg.hklm, CURRENT_VERSION)
+    except (winreg.RegistryError, winreg.RpcFault) as exc:
+        code = _win32_code(exc)
+        why = (
+            "access denied to the CurrentVersion key (winreg AllowedPaths or key ACL hardened)"
+            if code == winreg.ERROR_ACCESS_DENIED
+            else f"CurrentVersion key not readable: {exc}"
+        )
+        return HostPatch(name, roles, error=why)
+    try:
+        build, ubr = reg.query_value(key, "CurrentBuildNumber"), reg.query_value(key, "UBR")
+    except (winreg.RegistryError, winreg.RpcFault) as exc:
+        return HostPatch(name, roles, error=f"build or UBR not readable: {exc}")
+    finally:
+        reg.close_key(key)
+    if not (isinstance(build, str) and build.isdigit() and isinstance(ubr, int)):
+        return HostPatch(name, roles, error="build or UBR has an unexpected type")
+    return HostPatch(name, roles, int(build), ubr)
+
+
 def _smb_reason(exc: Exception) -> str:
     status = getattr(exc, "status", None)
     if isinstance(status, int):
         return f"NTSTATUS 0x{status:08x}"
     return str(exc) or type(exc).__name__
+
+
+def patch_level(
+    connect_host: str,
+    port: int,
+    name: str,
+    roles: list[str],
+    user: str | None,
+    password: str | None,
+    kerberos: bool = False,
+    sleep: Callable[[float], None] = time.sleep,
+) -> HostPatch:
+    """One host's build and UBR over the winreg pipe; failures end up in `error`.
+
+    Opening the pipe trigger-starts RemoteRegistry on the host if it is stopped.
+    """
+    try:
+        pipe = winreg.SmbPipe(connect_host, port, user, password, kerberos, sleep)
+    except winreg.PipeUnavailable:
+        return HostPatch(name, roles, error="RemoteRegistry not running or disabled")
+    except (SMBException, SpnegoError, OSError, ValueError) as exc:
+        return HostPatch(name, roles, error=f"SMB failed: {_smb_reason(exc)}")
+    try:
+        return read_patch_level(winreg.Registry(winreg.RpcClient(pipe)), name, roles)
+    except (
+        winreg.RpcError,
+        winreg.RegistryError,
+        SMBException,
+        OSError,
+        ValueError,
+        IndexError,
+        struct.error,
+    ) as exc:
+        return HostPatch(name, roles, error=f"remote registry read failed: {exc}")
+    finally:
+        pipe.close()
 
 
 def ca_registry(

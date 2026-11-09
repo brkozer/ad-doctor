@@ -21,16 +21,19 @@ from . import (
     explain,
     invariants,
     opengraph,
+    patches,
     paths,
     redact,
+    rollup,
     seal,
     trend,
     viewer,
     viewer_graph,
+    views,
 )
 from .checks import MITRE, REGISTRY, run_all
 from .collect import CollectError, Target, collect
-from .fixes import one_line, render_fixes
+from .fixes import one_line, render_fixes, render_preflight
 from .model import DomainPolicy, Finding, Severity, Snapshot
 from .report import (
     Accepted,
@@ -78,6 +81,8 @@ def _target(args: argparse.Namespace) -> Target:
         kerberos=args.kerberos,
         all_dcs=not args.single_dc,
         ca_registry=not args.no_ca_registry,
+        dc_probes=args.dc_probes,
+        patch_level=not args.no_patch_level,
     )
 
 
@@ -552,6 +557,8 @@ def _analyze(
             raise ValueError("--invariants needs a snapshot, not a JSON report")
         findings += invariants.evaluate(snap, spec)
         findings.sort(key=lambda f: (-f.severity, f.check_id))
+    if not from_report:
+        snap.notes = [*snap.notes, *patches.notes(snap)]
     report = Report(snap, findings, from_snapshot=not from_report, declared=declared)
     if from_report and report_data is not None:
         report.declared = report_data.get("declared_tier0")
@@ -689,6 +696,33 @@ def _passphrase(graph: str, explicit: bool) -> str:
             f"({seal.suggestion_bits()} bits)"
         )
     return text
+
+
+def _emit(text: str, output: Path | None) -> int:
+    if output:
+        _write_private(output, text + "\n")
+    else:
+        print(text)
+    return 0
+
+
+def cmd_rollup(args: argparse.Namespace) -> int:
+    doc = rollup.build(args.reports)
+    render = {
+        "text": rollup.render_text,
+        "json": rollup.render_json,
+        "markdown": rollup.render_markdown,
+    }
+    return _emit(render[args.format](doc), args.output)
+
+
+def cmd_views(args: argparse.Namespace) -> int:
+    snap = Snapshot.from_json(_load_json(args.snapshot))
+    if args.cmd == "service-accounts":
+        text = views.render_service_accounts(views.service_accounts(snap), args.format)
+    else:
+        text = views.render_scorecard(views.tier0_scorecard(snap, run_all(snap)), args.format)
+    return _emit(text, args.output)
 
 
 def cmd_view(args: argparse.Namespace) -> int:
@@ -833,6 +867,18 @@ def main(argv: list[str] | None = None) -> int:
             "Identity may alert on remote registry access",
         )
         p.add_argument(
+            "--dc-probes",
+            action="store_true",
+            help="also probe each DC for WebClient (named pipe), SMBv1 (one negotiate) and the "
+            "TLS versions of LDAPS (handshakes only); off by default, and --no-probes wins",
+        )
+        p.add_argument(
+            "--no-patch-level",
+            action="store_true",
+            help="do not read each DC's and CA's build and UBR over the winreg pipe (AD-INF-029, "
+            "AD-ADCS-022); opening it starts RemoteRegistry if it is stopped",
+        )
+        p.add_argument(
             "--single-dc",
             action="store_true",
             help="probe only the DC being scanned, not every DC in the domain",
@@ -866,6 +912,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         p.add_argument(
             "--fixes", type=Path, metavar="PS1", help="write a reviewable remediation script"
+        )
+        p.add_argument(
+            "--preflight",
+            type=Path,
+            metavar="PS1",
+            help="write a read-only script to run before the fixes (first 10 fixes only)",
         )
         p.add_argument(
             "--invariants",
@@ -1080,6 +1132,21 @@ def main(argv: list[str] | None = None) -> int:
     p_view.add_argument("--open", action="store_true", help="open it in the default browser")
     tier0_args(p_view, extended)
 
+    p_rollup = sub.add_parser("rollup", help="compare JSON reports of several domains")
+    p_rollup.add_argument("reports", type=Path, nargs="+", metavar="REPORT")
+    p_rollup.add_argument("-f", "--format", choices=["text", "json", "markdown"], default="text")
+    p_rollup.add_argument("-o", "--output", type=Path)
+
+    p_service = sub.add_parser("service-accounts", help="list the service accounts of a snapshot")
+    p_service.add_argument("snapshot", type=Path)
+    p_service.add_argument("-f", "--format", choices=["text", "json"], default="text")
+    p_service.add_argument("-o", "--output", type=Path)
+
+    p_card = sub.add_parser("tier-scorecard", help="tier-0 counts from a snapshot, without a score")
+    p_card.add_argument("snapshot", type=Path)
+    p_card.add_argument("-f", "--format", choices=["text", "json"], default="text")
+    p_card.add_argument("-o", "--output", type=Path)
+
     p_redact = sub.add_parser("redact", help="pseudonymize a snapshot for sharing")
     p_redact.add_argument("snapshot", type=Path)
     p_redact.add_argument("-o", "--output", type=Path, required=True)
@@ -1140,6 +1207,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_paths(args)
         if args.cmd == "view":
             return cmd_view(args)
+        if args.cmd == "rollup":
+            return cmd_rollup(args)
+        if args.cmd in ("service-accounts", "tier-scorecard"):
+            return cmd_views(args)
         if args.cmd == "analyze":
             snap = Snapshot.from_json(_load_json(args.snapshot))
         else:
@@ -1157,6 +1228,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.fixes:
         _write_private(args.fixes, render_fixes(report.findings, snap))
+    if args.preflight:
+        _write_private(args.preflight, render_preflight(report.findings, snap))
     if args.format == "text":
         text = render_text(report, color=not args.output and _use_color(sys.stdout))
     elif args.format == "junit":

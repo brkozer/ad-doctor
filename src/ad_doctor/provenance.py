@@ -552,6 +552,14 @@ class Provenance:
     def sid_history(self, dn: str, sid: str) -> int:
         return self.prim(("sid-history", dn.lower(), sid))
 
+    def script_ace(self, path: str, sid: str) -> int:
+        """A trustee's rights (and ownership) on one SYSVOL file or folder."""
+        return self.prim(("script-ace", path.lower(), sid))
+
+    def script_host(self, guid: str, path: str) -> int:
+        """A GPO running a file from another host."""
+        return self.prim(("script-host", guid.upper(), path.lower()))
+
     def _fact_gate(self, kind: str, dn: str, what: str) -> int:
         found = self._gate_of.get((kind, dn))
         if found is None:

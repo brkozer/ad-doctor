@@ -34,6 +34,7 @@ KEEP = {
     "allowed rodc password replication group", "pre-windows 2000 compatible access",
     "computers", "system", "builtin", "policies", "adminsdholder", "managed service accounts",
     "foreignsecurityprincipals", "configuration", "schema", "services", "sites",
+    "displayspecifiers",
     "public key services", "certificate templates", "enrollment services", "ntauthcertificates",
     "oid", "default domain policy", "default domain controllers policy",
     "machine", "user", "preferences", "groups", "scripts", "logon", "logoff", "startup",
@@ -46,6 +47,7 @@ KEEP = {
     "auditsystemevents",
     "shutdown", "microsoft", "windows nt", "secedit", "gpttmpl.inf", "groups.xml",
     "services.xml", "scheduledtasks.xml", "datasources.xml", "drives.xml", "printers.xml",
+    "scheduledtasks", "scripts.ini", "psscripts.ini", "sysvol",
     # built-in certificate templates
     "domaincontroller", "domaincontrollerauthentication", "webserver", "subca", "efs",
     "efsrecovery", "kerberosauthentication", "directoryemailreplication", "workstation",
@@ -116,11 +118,16 @@ FIXED_KEYS = {
                 model.GpoAutologon,
                 model.UnreadableMember, model.KeyCredential, model.Site, model.Subnet,
                 model.ConflictObject, model.Pso, model.Dmsa, model.DnsZone, model.DnsNode,
-                model.AuthSilo, model.AuthPolicy, model.MemberChange, model.SidHistoryChange)
+                model.AuthSilo, model.AuthPolicy, model.MemberChange, model.SidHistoryChange,
+                model.SccmObject, model.CaCertificate, model.DisplaySpecifierCommand,
+                model.GpoScript, model.SysvolAcl, model.HostSmb, model.HostPatch)
     for f in dataclasses.fields(cls)
-} | {"domain", "AdminSDHolder", "sid", "mask", "object_type", "inherited_object_type"}  # fmt: skip
+} | {"domain", "AdminSDHolder", "sid", "mask", "object_type", "inherited_object_type",
+     *model.CONFIG_ACL_LABELS}  # fmt: skip
 # values from a fixed list, which the checks compare: never data, whatever the names around
-FIXED_VALUES = {"kind", "source", "action"}
+# (stores: where a CA certificate is published; attribute: a display specifier's attribute name)
+FIXED_VALUES = {"kind", "source", "action", "stores", "attribute", "key_type", "signature_hash",
+                "side", "phase", "location", "run_as"}  # fmt: skip
 
 
 # GUID -> RegistryEntry lists; a path or value name in them is vocabulary
@@ -201,9 +208,9 @@ class Redactor:
                 if slash:
                     words.add(service)
         for d in data.get("probes", {}).get("dcs", []):
-            words.update([d["name"], *d["name"].split(".")])
+            words.update(_host_words(d["name"]))
         for c in data.get("probes", {}).get("ca_configs", []):
-            words.update([c["name"], c["host"], *c["host"].split(".")])
+            words.update([c["name"], *_host_words(c["host"])])
             if c.get("policy_module"):
                 words.add(c["policy_module"])  # a vendor name; Microsoft's is in KEEP
         probes = data.get("probes", {})
@@ -251,6 +258,28 @@ class Redactor:
             words.update(_dn_values(change["member_dn"]))
         for change in data.get("sid_history_changes", []):
             words.update(_dn_values(change["dn"]))
+        for held in [data.get("sccm_container"), *data.get("dkm_containers", [])]:
+            if held:
+                words.update([held["name"], *_dn_values(held["dn"])])
+        for x in data.get("sccm_objects", []):
+            words.update(_dn_values(x["dn"]))
+            words.update([x["site_code"], *_host_words(x["host"])])
+        for dn in data.get("dynamic_objects", []):
+            words.update(_dn_values(dn))
+        words.update(c["name"] for c in data.get("ca_certificates", []))
+        for x in data.get("gpo_scripts", []):
+            for path in (x["config"], x["path"], x["target"]):
+                words.update(_path_words(path))
+            if x["host"]:
+                words.update(_host_words(x["host"]))
+        for x in data.get("sysvol_acls", []):
+            words.update(_path_words(x["path"]))
+        for x in data.get("probes", {}).get("tier0_smb", []):
+            words.add(x["name"])
+        for x in data.get("probes", {}).get("patch_levels", []):
+            words.update(_host_words(x["name"]))
+        for x in data.get("display_specifiers", []):
+            words.update(v for v in _dn_values(x["dn"]) if not _numeric(v))
         for o in data.get("objects", []):
             words.add(o["name"])
             words.update(_dn_values(o["dn"]))
@@ -292,9 +321,7 @@ class Redactor:
             *data.get("script_secrets", []),
             *data.get("gpo_local_groups", []),
         ]:
-            words.update(
-                p for p in re.split(r"[\\/]", item["path"]) if p and not GUID_LIKE.match(p)
-            )
+            words.update(_path_words(item["path"]))
         words.update(data.get("ca_hosts", []))
         odd = []
         for w in words:
@@ -373,6 +400,20 @@ def _dn_values(dn: str) -> list[str]:
             value = part.split("=", 1)[1].strip()
             out += [value, DN_ESCAPE.sub(r"\1", value)]
     return out
+
+
+def _numeric(word: str) -> bool:
+    """Digits and dots: a name made of them would rewrite SIDs, OIDs and version numbers."""
+    return not word.strip("0123456789.")
+
+
+def _host_words(host: str) -> list[str]:
+    """A host name and its labels. An address has none: `text` replaces it whole."""
+    return [p for p in [host, *host.split(".")] if p and not _numeric(p)]
+
+
+def _path_words(path: str) -> list[str]:
+    return [p for p in re.split(r"[\\/]", path) if p and not GUID_LIKE.match(p) and not _numeric(p)]
 
 
 def _url_words(url: str) -> list[str]:
@@ -491,6 +532,10 @@ def redact(data: dict[str, Any], key: bytes) -> dict[str, Any]:
     # an address block names the network; 0.0.0.0/24 would make every subnet the same one
     for before, after in zip(data.get("subnets", []), out.get("subnets", []), strict=True):
         after["name"] = r.token(before["name"])
+    for before, after in zip(
+        data.get("display_specifiers", []), out.get("display_specifiers", []), strict=True
+    ):
+        after["command"] = r.token(before["command"])  # free text: a path, a URL, a host
     out["redacted"] = True
     # read from the input: redacting an old redacted file again cannot relate its tokens
     out["host_names_comparable"] = model.host_names_comparable(data)

@@ -1,0 +1,53 @@
+id = "AD-ACL-013"
+aliases = ["ou-extended-rights"]
+summary = "A broad group holds a password reset, all extended rights or full control over accounts through an OU or container, or a delegate holds all extended rights."
+severities = ["low", "high"]
+severity_logic = """
+**High** for a broad group (Domain Users, Authenticated Users, Everyone and similar). **Low** for a
+named delegate with all extended rights.
+"""
+mitre = ["T1098"]
+data_sources = ["ldap"]
+attributes = ["nTSecurityDescriptor"]
+related = ["AD-ACL-003", "AD-ACL-004"]
+since = "0.2.5"
+
+risk = """
+An ACE on an OU that child accounts inherit applies to every account below it. For a broad group,
+password reset or all extended rights there is a direct way to take over those accounts.
+"""
+
+detection = """
+From the LDAP snapshot, the inheritable, non-inherited ACEs on OUs, top-level containers and the
+domain head that apply to users, inetOrgPerson objects, computers or every class.
+
+The baseline is Microsoft's `defaultSecurityDescriptor` of the `organizationalUnit` class, which
+gives no extended right to anyone but SYSTEM and Domain Admins.
+
+Reported:
+
+- for a broad group: full control, write or WriteDacl, all extended rights, or Reset Password,
+- for anyone else outside tier 0: all extended rights, unless the ACE also grants takeover.
+
+**A named delegate with Reset Password or Full Control over an OU is not reported**: that is how
+delegation normally looks, and whether a given grant is right is not visible from here. Other
+specific extended rights are not looked at. Tier-0 principals and the operator groups do not
+count. Older snapshots did not keep which ACEs are inherited, so this check does not run on them.
+"""
+
+false_positives = """
+- **A named delegate with all extended rights** may be on purpose, even if it is wider than needed.
+- **Deny ACEs are not read.**
+"""
+
+remediation = """
+1. Remove the grant from broad groups.
+2. Replace all extended rights with the specific right the delegate needs.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-013"
+
+[[references]]
+title = "[MS-ADSC]: Class organizationalUnit"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adsc/deb49741-d386-443a-b242-2f914e8f0405"
+kind = "spec"

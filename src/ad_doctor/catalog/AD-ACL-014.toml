@@ -1,0 +1,58 @@
+id = "AD-ACL-014"
+aliases = ["sccm-control"]
+summary = "A principal outside tier 0 controls the System Management container or a Configuration Manager site server's computer object."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when the control is over a site server's computer object, or when a broad group holds
+it on the container. **Medium** for any other non-tier-0 principal with write or create rights
+on the container.
+"""
+mitre = ["T1072", "T1222.001"]
+data_sources = ["ldap"]
+attributes = ["nTSecurityDescriptor"]
+related = ["AD-INF-022", "AD-ACL-004"]
+since = "0.2.5"
+
+risk = """
+Whoever controls a site server's computer object can take over that computer (resource-based
+delegation, shadow credentials, an owner rewriting the DACL) and, through it, the clients of the
+site. Write access to the container lets someone publish objects there, including a management
+point that clients may be directed to.
+"""
+
+detection = """
+From the LDAP snapshot, on the `System Management` container and on the computer objects of the
+site servers ([AD-INF-022](AD-INF-022.md) says how they are found):
+
+- on the container, an owner or an ACE granting takeover rights or the right to create children,
+- on a site server, an owner or the rights [AD-ACL-004](AD-ACL-004.md) looks for on a computer.
+
+Tier-0 principals, the operator groups, and the site servers themselves do not count. A group
+holding Full Control on the container is treated as a group of site servers only if every member
+that can be read is a computer. If the container's DACL could not be read, the check is not
+judged and the report says so.
+"""
+
+false_positives = """
+- **The account that joined a site server** often stays its owner. That is a real control path,
+  but not an attack.
+- **Deny ACEs are not read**, so a grant that a deny cancels is still reported.
+"""
+
+remediation = """
+1. Leave Full Control on the container to the site servers' computer accounts.
+2. Set the owner of the site servers' computer objects to a tier-0 group, and remove the rights
+   that are listed.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-014"
+
+[[references]]
+title = "Publishing and the Active Directory schema"
+url = "https://learn.microsoft.com/en-us/intune/configmgr/core/plan-design/network/extend-the-active-directory-schema"
+kind = "vendor"
+
+[[references]]
+title = "Misconfiguration Manager: RECON-1, enumerate SCCM over LDAP"
+url = "https://docs.specterops.io/misconfiguration-manager-docs/attack-techniques/RECON/RECON-1/recon-1_description"
+kind = "research"

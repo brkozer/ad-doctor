@@ -1,0 +1,54 @@
+id = "AD-ADCS-022"
+aliases = ["certighost"]
+summary = "A CA's build is below Microsoft's fix for CVE-2026-54121 (Certighost), which lets a domain user get a certificate as a domain controller. A version match, not a test."
+severities = ["low", "medium"]
+severity_logic = """
+**Medium** when the CA's build is below the fix and `EDITF_ENABLECHASECLIENTDC` is set in its
+EditFlags. **Low** when the build is below the fix and the flag is off. Neither is high: the build
+number is compared and the flaw is not tested.
+"""
+mitre = ["T1649"]
+data_sources = ["probe-winreg"]
+attributes = ["CurrentBuildNumber and UBR of the CA host", "EditFlags of the CA's policy module"]
+related = ["AD-INF-029", "AD-ADCS-012"]
+since = "0.2.5"
+
+risk = """
+Microsoft's advisory says an authenticated attacker can obtain a certificate that authenticates as a
+machine through PKINIT, and that a domain controller's account can be targeted. Researchers place the
+flaw in the CA's chase of a domain controller named by the requester. A domain controller's identity
+gives full control of the domain.
+"""
+
+detection = """
+Each CA host's `CurrentBuildNumber` and `UBR` are read over the `winreg` pipe and compared with the
+fixed build Microsoft published for the release. The `EditFlags` value comes from the CA
+configuration that the ESC6 and ESC11 checks already read. The value is reported only when both are
+known: a build the table does not cover, or EditFlags that cannot be read, leave a note and no
+finding. `--no-patch-level` and `--no-probes` turn it off.
+"""
+
+false_positives = """
+- **A fix installed another way, or a mitigation.** The check cannot see these; it compares numbers.
+- **Flag off.** Microsoft's advisory does not name the flag. Clearing it is described by researchers as
+  a temporary mitigation, so the row stays, as low.
+"""
+
+remediation = """
+Install the July 2026 or later cumulative update on the CA host. If that must wait,
+`certutil -setreg policy\\EditFlags -EDITF_ENABLECHASECLIENTDC` and a restart of the CA service is the
+temporary measure researchers describe; test it first, as it can break requests that rely on the
+chase.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-022"
+
+[[references]]
+title = "CVE-2026-54121: Active Directory Certificate Services Elevation of Privilege"
+url = "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-54121"
+kind = "vendor"
+
+[[references]]
+title = "Certighost: research write-up"
+url = "https://kudelskisecurity.com/research/certighost"
+kind = "research"

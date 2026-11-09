@@ -1,0 +1,48 @@
+id = "AD-INF-025"
+aliases = ["tier0-member-smb-signing"]
+summary = "A tier-0 member server does not require SMB signing, so relayed NTLM authentication can be used against it."
+severities = ["high"]
+severity_logic = """
+**High** for every tier-0 member server whose SMB negotiate says signing is not required.
+"""
+mitre = ["T1557.001"]
+data_sources = ["probe-smb"]
+attributes = ["dNSHostName of tier-0 computers", "SMB2 NEGOTIATE SecurityMode"]
+related = ["AD-INF-008"]
+since = "0.2.5"
+
+risk = """
+A CA, an Entra Connect server, an Exchange server or a Configuration Manager site server can be
+taken over by relaying an administrator's NTLM authentication to it over SMB when it does not
+require signing. Being an administrator on one of them is control of the domain.
+"""
+
+detection = """
+The tier-0 computers that are not DCs are worked out from the snapshot (the same list as the rest of
+ad-doctor uses). Each one that has a `dNSHostName` gets one SMB2 negotiate on port 445 and no logon:
+no credentials reach it. It runs with the other probes, so `--no-probes` turns it off.
+
+A host with no name in the directory or no SMB connection stays unknown, and a note says so.
+"""
+
+false_positives = """
+- **A computer that is tier 0 only on paper.** The list comes from the directory. Accept the row with
+  an [accepted-risk file](../ci.md#accepted-risks) if the role is gone.
+"""
+
+remediation = """
+Enable *Microsoft network server: Digitally sign communications (always)* through a GPO that
+reaches these servers.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-025"
+
+[[references]]
+title = "Overview of Server Message Block signing"
+url = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/overview-server-message-block-signing"
+kind = "vendor"
+
+[[references]]
+title = "[MS-SMB2]: Server Message Block Protocol Versions 2 and 3"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/"
+kind = "spec"

@@ -13,7 +13,12 @@ SYSVOL, which has `--no-sysvol`.
 | Web enrollment (ESC8) | each enterprise CA, port 80 | one `GET /certsrv/` to read the authentication headers |
 | HTTPS enrollment | each enterprise CA, port 443, and each URL in `msPKI-Enrollment-Servers` | one `GET` over TLS to read the authentication headers; no credentials are sent, the server certificate is not checked, and EPA is not determined (`--https-port 0` skips it). A URL that uses plain HTTP gets the same `GET` over HTTP |
 | CA registry (ESC6/7/11/16, audit filter) | each enterprise CA, port 445 | reads the CA's configuration over `\pipe\winreg` (MS-RRP), `KEY_READ` only; `--no-ca-registry` skips it |
-| SYSVOL | the scanned DC | reads GPO files and scripts (`--no-sysvol` skips it) |
+| Patch level (AD-INF-029, AD-ADCS-022) | each DC and each enterprise CA, port 445 | reads `CurrentBuildNumber` and `UBR` under `SOFTWARE\Microsoft\Windows NT\CurrentVersion` over `\pipe\winreg`, `KEY_READ` only; `--no-patch-level` skips it |
+| SYSVOL | the scanned DC | reads GPO files and scripts, and the owner and DACL of the files GPOs run with `READ_CONTROL` only (`--no-sysvol` skips it) |
+| SMB signing of tier-0 member servers | every tier-0 computer that is not a DC, port 445 | SMB negotiate only; no credentials reach those servers |
+| WebClient (`--dc-probes`) | each DC | opens the `DAV RPC SERVICE` named pipe for reading and closes it |
+| SMBv1 (`--dc-probes`) | each DC, port 445 | one SMB1 negotiate that offers only the `NT LM 0.12` dialect, no session |
+| LDAPS TLS versions (`--dc-probes`) | each DC, port 636 | one handshake per TLS version, nothing sent after it |
 
 The DC being scanned is reached through the address and ports on the command line; the
 other DCs by their DNS names on the standard ports. `--single-dc` limits the DC probes to
@@ -21,9 +26,22 @@ the DC being scanned. A URL from `msPKI-Enrollment-Servers` is reached on the po
 only a URL with no port follows `--http-port` or `--https-port`. When one of these probes
 does not run, or such a URL gives no answer to judge, a note says so.
 
+The three DC probes marked `--dc-probes` are off by default and have their own switch, since
+an SMB1 negotiate and old TLS handshakes can show up in logs and on network sensors as unusual.
+`--no-probes` wins over `--dc-probes`. Without the switch, the checks that need them
+do not run and a note says so.
+
+## The patch level comparison
+
+The build and UBR go into the snapshot, and the comparison is done against `patches.toml`, one
+dated data file holding the lowest fixed build Microsoft's Security Update Guide lists for each
+CVE. A build number says nothing about a mitigation or about the flaw itself, so these findings
+are never high and say that they are a version match. A note reports a table more than 45 days
+older than the scan, a build it does not cover, and any host it could not read.
+
 ## Intrusiveness of the CA registry probe
 
-Opening `\pipe\winreg` on a CA host is a read, but it is not invisible. On a host where the
+Opening `\pipe\winreg` on a CA or DC host is a read, but it is not invisible. On a host where the
 `RemoteRegistry` service is set to start on demand, opening the pipe **trigger-starts the
 service**: a visible change of service state (System event 7036), plus an SMB logon
 (4624 type 3), and reads under `CertSvc` may be audited if object-access auditing is on for

@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 from typing import Any
 
-from .sd import Ace
+from .sd import FULL_CONTROL, GENERIC_ALL, Ace
 
 
 class UAC(IntEnum):
@@ -158,6 +158,8 @@ class Account:
     krbtgt_link: str | None = None
     # the dMSA that replaces this account, from the link on the account's own side
     superseded_by: str | None = None
+    # the mail attribute is set (the address itself is not kept)
+    has_mail: bool = False
 
     def has(self, flag: UAC) -> bool:
         return bool(self.uac & flag)
@@ -271,6 +273,42 @@ class Gpo:
     machine_extensions: list[str] | None = None
     # name (or GUID, when unreadable) of the WMI filter
     wmi_filter: str | None = None
+    # high 16 bits of versionNumber and gPCUserExtensionNames; None when not collected
+    user_version: int | None = None
+    user_extensions: list[str] | None = None
+
+
+@dataclass
+class GpoScript:
+    """One file a GPO runs: a script of scripts.ini or psscripts.ini, or the program of a
+    Preferences scheduled task. Arguments are never kept; they can hold a password."""
+
+    gpo: str  # GUID, upper case
+    side: str  # computer or user
+    source: str  # scripts.ini, psscripts.ini or scheduledtasks.xml
+    phase: str  # startup, shutdown, logon, logoff or task
+    config: str  # SYSVOL-relative path of the file that lists it
+    path: str  # the file as written
+    # sysvol (target is set), host (host is set), unresolved (a variable in the path), missing
+    # (a SYSVOL path with no file there), moved (a what-if took it off its host) or unclear (a
+    # network path on a command line that does not say what it runs)
+    location: str = ""
+    target: str = ""  # SYSVOL-relative path, when in SYSVOL or NETLOGON
+    host: str = ""  # lower case, when on another host
+    run_as: str = ""  # system, user (the one logging on) or other
+    filtered: bool = False  # a Preferences item with item-level targeting
+
+
+@dataclass
+class SysvolAcl:
+    """The rights that matter on one file or folder of SYSVOL (fileacl.py)."""
+
+    path: str  # relative to SYSVOL\\<domain>
+    directory: bool
+    owner: str | None = None
+    aces: list[Ace] = field(default_factory=list)
+    judged: bool = True  # False: a deny or conditional ACE decides, per user
+    error: str = ""  # why the descriptor could not be read
 
 
 @dataclass
@@ -548,6 +586,35 @@ class DcProbe:
     ldaps_channel_binding_required: bool | None = None
     # why the DC could not be probed (unreachable, no credentials, ...)
     error: str | None = None
+    # the DC probe pack (--dc-probes): None when off or inconclusive
+    webclient: bool | None = None
+    smb1: bool | None = None
+    # whether a TLS handshake of exactly this version was accepted on the LDAPS port
+    tls10: bool | None = None
+    tls11: bool | None = None
+    tls12: bool | None = None
+    tls13: bool | None = None
+
+
+@dataclass
+class HostSmb:
+    """SMB negotiate result of a member server; None means it could not be probed."""
+
+    name: str
+    signing_required: bool | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostPatch:
+    """Build and update revision of a DC or CA host, read from its registry over MS-RRP."""
+
+    name: str
+    roles: list[str] = field(default_factory=list)  # "dc", "ca"
+    build: int | None = None
+    ubr: int | None = None
+    # why the build or the UBR could not be read
+    error: str | None = None
 
 
 DEFAULT_POLICY_MODULE = "CertificateAuthority_MicrosoftDefault.Policy"
@@ -588,6 +655,42 @@ class CaConfig:
 
 
 @dataclass
+class SccmObject:
+    """A Configuration Manager site or management point published in the directory."""
+
+    dn: str
+    kind: str  # "site" or "management point"
+    site_code: str = ""
+    # dNSHostName of a management point
+    host: str = ""
+
+
+@dataclass
+class CaCertificate:
+    """A CA certificate published in the Configuration partition, as far as the checks read it."""
+
+    name: str  # the subject's common name, or the directory object's name
+    # where it is published: enrollment, root, aia, ntauth
+    stores: list[str] = field(default_factory=list)
+    # False: the certificate could not be parsed, so the fields below say nothing
+    parsed: bool = False
+    key_type: str = ""
+    key_bits: int | None = None
+    signature_hash: str = ""
+    self_signed: bool = False
+    not_after: datetime | None = None
+
+
+@dataclass
+class DisplaySpecifierCommand:
+    """A context menu entry of a display specifier that runs something on another host."""
+
+    dn: str
+    attribute: str  # adminContextMenu or shellContextMenu
+    command: str  # a UNC path or a URL
+
+
+@dataclass
 class UnreadableMember:
     """A DN in the member attribute of a tier-0 group that the scan could not read."""
 
@@ -611,6 +714,14 @@ class Probes:
     dcs: list[DcProbe] = field(default_factory=list)
     # configuration of each enterprise CA (empty when not read, and in older snapshots)
     ca_configs: list[CaConfig] = field(default_factory=list)
+    # tier-0 member servers probed for SMB signing; False in older snapshots and with no probes
+    tier0_smb: list[HostSmb] = field(default_factory=list)
+    tier0_smb_checked: bool = False
+    # whether --dc-probes ran: False in older snapshots and when it was not asked for
+    dc_pack_ran: bool = False
+    # build and UBR of DCs and CAs; False in older snapshots and with --no-patch-level
+    patch_levels: list[HostPatch] = field(default_factory=list)
+    patch_checked: bool = False
 
     def per_dc(self, attr: str, fallback: bool | None, scanned: str) -> dict[str, bool | None]:
         """DC name -> result of one probe; older snapshots only hold the scanned DC."""
@@ -681,6 +792,8 @@ class Snapshot:
     gpo_autologon: list[GpoAutologon] = field(default_factory=list)
     # False in older snapshots and when SYSVOL was not read: those files are unknown
     policy_files_collected: bool = False
+    # False in older snapshots: the loopback value of Registry.pol was not kept then
+    loopback_collected: bool = False
     script_secrets: list[ScriptSecret] = field(default_factory=list)
     gmsas: list[Gmsa] = field(default_factory=list)
     rodcs: list[Rodc] = field(default_factory=list)
@@ -780,6 +893,40 @@ class Snapshot:
     # False in older snapshots: Ace.inherited was not kept, so an inherited copy looks
     # like an explicit ACE
     ace_inheritance_checked: bool = False
+    # CN=System Management,CN=System and the Configuration Manager objects under it
+    sccm_container: DirObject | None = None
+    sccm_objects: list[SccmObject] = field(default_factory=list)
+    # False in older snapshots and when the container or its DACL could not be read
+    sccm_checked: bool = False
+    # AD FS DKM containers whose DACL came back; a plain user normally sees none
+    dkm_containers: list[DirObject] = field(default_factory=list)
+    # False in older snapshots and when no DKM container's DACL could be read
+    dkm_checked: bool = False
+    # label (CONFIG_ACL_LABELS) -> DACL; a label that is absent could not be read
+    config_acls: dict[str, list[Ace]] = field(default_factory=dict)
+    # False in older snapshots and when none of them could be read
+    config_acls_checked: bool = False
+    # False in older snapshots and when no account returned a mail attribute
+    mail_checked: bool = False
+    ca_certificates: list[CaCertificate] = field(default_factory=list)
+    # False in older snapshots and when a certificate store could not be read
+    ca_certificates_checked: bool = False
+    # context menu entries that start a UNC path or a URL
+    display_specifiers: list[DisplaySpecifierCommand] = field(default_factory=list)
+    # False in older snapshots and when the display specifiers could not be read
+    display_specifiers_checked: bool = False
+    # DNs of objects with the dynamicObject class in the domain and Configuration partitions
+    dynamic_objects: list[str] = field(default_factory=list)
+    # msDS-Other-Settings of the Directory Service object; None when absent or not readable
+    dynamic_ttl_default: int | None = None
+    dynamic_ttl_min: int | None = None
+    # False in older snapshots and when a partition could not be searched
+    dynamic_objects_checked: bool = False
+    # files GPOs run, and the permissions on them and on the folders above them
+    gpo_scripts: list[GpoScript] = field(default_factory=list)
+    sysvol_acls: list[SysvolAcl] = field(default_factory=list)
+    # False in older snapshots and when SYSVOL was not read
+    gpo_scripts_checked: bool = False
 
     @property
     def has_2025(self) -> bool:
@@ -828,6 +975,21 @@ class Snapshot:
             sids |= {f"{self.root_sid}-{rid}" for rid in FOREST_ROOT_RIDS}
         return sids
 
+    def sccm_site_servers(self) -> list[Account]:
+        """Computers behind the Full Control grants on the System Management container, which
+        is what Microsoft has a site server's computer account hold there. Groups count
+        through their members; tier-0 and broad principals say nothing about a site server."""
+        if self.sccm_container is None:
+            return []
+        holders = {
+            a.sid
+            for a in self.sccm_container.aces
+            if a.mask & GENERIC_ALL or (a.mask & FULL_CONTROL) == FULL_CONTROL
+        }
+        return computers_behind(
+            holders - self.tier0_sids() - self.broad_sids(), self.accounts, self.objects
+        )
+
     def to_json(self) -> dict[str, Any]:
         return _encode(self)  # type: ignore[no-any-return]
 
@@ -838,6 +1000,7 @@ class Snapshot:
         # most DACLs repeat the same ACEs, and most member values repeat an account's DN
         seen_aces: dict[Ace, Ace] = {}
         dns = {a["dn"]: a["dn"] for a in data["accounts"]}
+        sccm_container = data.get("sccm_container")
         return cls(
             domain=data["domain"],
             domain_dn=data["domain_dn"],
@@ -889,17 +1052,7 @@ class Snapshot:
             enrollment_urls=data.get("enrollment_urls", []),
             root_sid=data.get("root_sid", ""),
             probes=_probes(data.get("probes", {}), seen_aces),
-            objects=[
-                DirObject(
-                    **{
-                        **o,
-                        "aces": _aces(o["aces"], seen_aces),
-                        "inheritable": _aces(o.get("inheritable", []), seen_aces),
-                        "members": [dns.get(m, m) for m in o.get("members", [])],
-                    }
-                )
-                for o in data.get("objects", [])
-            ],
+            objects=[_dir_object(o, seen_aces, dns) for o in data.get("objects", [])],
             gpo_settings={k: GpoSettings(**v) for k, v in data.get("gpo_settings", {}).items()},
             gpo_registry={
                 k: [RegistryEntry(**e) for e in v] for k, v in data.get("gpo_registry", {}).items()
@@ -914,6 +1067,7 @@ class Snapshot:
             },
             gpo_autologon=[GpoAutologon(**x) for x in data.get("gpo_autologon", [])],
             policy_files_collected=data.get("policy_files_collected", False),
+            loopback_collected=data.get("loopback_collected", False),
             script_secrets=[ScriptSecret(**x) for x in data.get("script_secrets", [])],
             gmsas=[Gmsa(**x) for x in data.get("gmsas", [])],
             rodcs=[Rodc(**x) for x in data.get("rodcs", [])],
@@ -993,6 +1147,35 @@ class Snapshot:
             ldap_signing_required=data.get("ldap_signing_required"),
             notes=[*data.get("notes", []), *_older_snapshot_notes(data)],
             ace_inheritance_checked=data.get("ace_inheritance_checked", False),
+            sccm_container=(
+                _dir_object(sccm_container, seen_aces, dns) if sccm_container else None
+            ),
+            sccm_objects=[SccmObject(**x) for x in data.get("sccm_objects", [])],
+            sccm_checked=data.get("sccm_checked", False),
+            gpo_scripts=[GpoScript(**x) for x in data.get("gpo_scripts", [])],
+            sysvol_acls=[
+                SysvolAcl(**{**x, "aces": _aces(x.get("aces", []), seen_aces)})
+                for x in data.get("sysvol_acls", [])
+            ],
+            gpo_scripts_checked=data.get("gpo_scripts_checked", False),
+            dkm_containers=[_dir_object(o, seen_aces, dns) for o in data.get("dkm_containers", [])],
+            dkm_checked=data.get("dkm_checked", False),
+            config_acls={k: _aces(v, seen_aces) for k, v in data.get("config_acls", {}).items()},
+            config_acls_checked=data.get("config_acls_checked", False),
+            mail_checked=data.get("mail_checked", False),
+            ca_certificates=[
+                CaCertificate(**{**c, "not_after": _dt(c.get("not_after"))})
+                for c in data.get("ca_certificates", [])
+            ],
+            ca_certificates_checked=data.get("ca_certificates_checked", False),
+            display_specifiers=[
+                DisplaySpecifierCommand(**x) for x in data.get("display_specifiers", [])
+            ],
+            display_specifiers_checked=data.get("display_specifiers_checked", False),
+            dynamic_objects=data.get("dynamic_objects", []),
+            dynamic_ttl_default=data.get("dynamic_ttl_default"),
+            dynamic_ttl_min=data.get("dynamic_ttl_min"),
+            dynamic_objects_checked=data.get("dynamic_objects_checked", False),
         )
 
 
@@ -1072,6 +1255,42 @@ TIER0_RIDS = {"498", "500", "512", "516", "518", "519", "521"}
 FOREST_ROOT_RIDS = {"498", "500", "512", "518", "519"}
 
 
+# the objects AD-ACL-012 reads the DACL of
+CONFIG_ACL_LABELS = (
+    "Schema",
+    "Configuration",
+    "Partitions",
+    "Sites",
+    "Display Specifiers",
+    "Extended Rights",
+    "Directory Service",
+)
+
+
+def computers_behind(
+    sids: set[str], accounts: list[Account], objects: list[DirObject]
+) -> list[Account]:
+    """Computer accounts among these SIDs, and among the members of the groups these SIDs
+    name, nesting included; only groups the snapshot holds can be followed."""
+    if not sids:
+        return []
+    computers = {a.sid: a for a in accounts if a.is_computer and a.sid}
+    by_dn = {a.dn.lower(): a for a in accounts if a.is_computer}
+    groups = {o.dn.lower(): o for o in objects if o.kind == "group"}
+    found = {computers[s].dn.lower(): computers[s] for s in sids if s in computers}
+    todo = [o for o in groups.values() if o.sid in sids]
+    seen = {o.dn.lower() for o in todo}
+    while todo:
+        for member in todo.pop().members:
+            key = member.lower()
+            if key in by_dn:
+                found[key] = by_dn[key]
+            elif key in groups and key not in seen:
+                seen.add(key)
+                todo.append(groups[key])
+    return sorted(found.values(), key=lambda a: a.sam)
+
+
 def exchange_members(objects: list[DirObject]) -> set[str]:
     """Lower-cased DNs of every transitive member of the Exchange groups."""
     groups = {o.dn.lower(): o for o in objects if o.kind == "group"}
@@ -1128,6 +1347,18 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
             ("krbtgt_links_checked", "AD-KRB-007 (Entra Kerberos objects)"),
             ("dns_zones_checked", "AD-DNS-001 to AD-DNS-003 (DNS zones)"),
             ("dns_nodes_checked", "AD-DNS-004 to AD-DNS-007 (DNS records)"),
+            ("sccm_checked", "AD-INF-022 and AD-ACL-014 (Configuration Manager)"),
+            ("dkm_checked", "AD-ACL-011 (AD FS DKM container)"),
+            ("config_acls_checked", "AD-ACL-012 (Schema and Configuration permissions)"),
+            ("ace_inheritance_checked", "AD-ACL-013 (extended rights on OUs)"),
+            ("mail_checked", "AD-PRIV-017 (mail on tier-0 accounts)"),
+            ("ca_certificates_checked", "AD-ADCS-021 (weak CA certificates)"),
+            ("display_specifiers_checked", "AD-INF-023 (display specifiers)"),
+            ("dynamic_objects_checked", "AD-INF-024 (dynamic objects and TTL settings)"),
+            (
+                "gpo_scripts_checked",
+                "AD-GPO-017, AD-GPO-018 (scripts and tasks that GPOs run) and their graph edges",
+            ),
         )
         if key not in data
     ]
@@ -1140,6 +1371,12 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
         missing.append("AD-ADCS-018 (CA audit filter)")
     if "enrollment_https" not in data.get("probes", {}):
         missing.append("AD-ADCS-019 (HTTPS enrollment endpoints)")
+    if "tier0_smb_checked" not in data.get("probes", {}):
+        missing.append("AD-INF-025 (SMB signing on tier-0 member servers)")
+    if "dc_pack_ran" not in data.get("probes", {}):
+        missing.append("AD-INF-026, AD-INF-027 and AD-INF-028 (the DC probe pack)")
+    if "patch_checked" not in data.get("probes", {}):
+        missing.append("AD-INF-029 and AD-ADCS-022 (patch level)")
     if any(a.get("rbcd") and "rbcd_principals" not in a for a in data["accounts"]):
         missing.append("the resource-based delegation edges of the control graph")
     notes = [f"snapshot from an older version: {text} not evaluated" for text in missing]
@@ -1155,6 +1392,17 @@ def _key_credential(data: dict[str, Any]) -> KeyCredential:
     return KeyCredential(**{**data, "created": _dt(data["created"]), "added": _dt(data["added"])})
 
 
+def _dir_object(data: dict[str, Any], seen: dict[Ace, Ace], dns: dict[str, str]) -> DirObject:
+    return DirObject(
+        **{
+            **data,
+            "aces": _aces(data["aces"], seen),
+            "inheritable": _aces(data.get("inheritable", []), seen),
+            "members": [dns.get(m, m) for m in data.get("members", [])],
+        }
+    )
+
+
 def _aces(items: list[dict[str, Any]], seen: dict[Ace, Ace]) -> list[Ace]:
     out = []
     for item in items:
@@ -1168,6 +1416,8 @@ def _probes(data: dict[str, Any], seen_aces: dict[Ace, Ace]) -> Probes:
         **{
             **data,
             "dcs": [DcProbe(**d) for d in data.get("dcs", [])],
+            "tier0_smb": [HostSmb(**h) for h in data.get("tier0_smb", [])],
+            "patch_levels": [HostPatch(**h) for h in data.get("patch_levels", [])],
             "ca_configs": [
                 CaConfig(**{**c, "aces": _aces(c.get("aces", []), seen_aces)})
                 for c in data.get("ca_configs", [])

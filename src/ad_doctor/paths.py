@@ -16,6 +16,11 @@ are exported, but logon is not control, so the path search does not follow them.
 Whoever can write a GPO controls what it applies to. That reach runs through scope nodes
 (gpo_scope.Reach), not through OU nodes: an OU's contains edges stand for ACL inheritance.
 Scope nodes are plumbing, so they count as neither controlled objects nor tier 0.
+
+Whoever can change a file a GPO runs runs code where the GPO applies, as SYSTEM on its
+computers or as its users. That reach goes through a script node of the GPO and side, which
+goes to the same scope nodes. It leaves out a Preferences item with item-level targeting
+and a task that runs as anyone else, since the snapshot cannot tell whether they apply.
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
-from . import gpo_scope, sd
+from . import fileacl, gpo_scope, sd
 from .checks import (
     CA_RIGHTS,
     CREATOR_OWNER,
@@ -58,6 +63,9 @@ Edge = tuple[str, str]  # (target node, label)
 GPO_APPLIES = "GPO applies to"  # GPO to the scope of a link
 GPO_INHERITED = "GPO inherited by"  # scope to the scope of a child OU
 GPO_REACHES = "GPO reaches"  # scope to an account
+SCRIPT_WRITE = "can change a file GPO runs"
+SCRIPT_HOST = "hosts a file GPO runs"
+SCRIPT_RUNS = "GPO runs file on"
 UNESCAPED_COMMA = gpo_scope.RDN_SEPARATOR
 CONSTRAINED = "constrained delegation (protocol transition)"
 RESOURCE_BASED = "resource-based delegation"
@@ -132,6 +140,7 @@ NODE_PREFIX_KINDS = (
     ("tier0:ca:", "ca"),
     ("tier0:dc-ou", "ou"),
     ("gpo-scope:", "scope"),
+    ("gpo-script:", "scope"),
 )
 # Everyone, Anonymous Logon, Authenticated Users, Enterprise Domain Controllers
 WELL_KNOWN_GROUPS = {"S-1-1-0", "S-1-5-7", "S-1-5-11", "S-1-5-9"}
@@ -379,6 +388,7 @@ def build(snap: Snapshot, provenance: bool = False) -> Graph:
         add(scope, below_it, GPO_INHERITED, rec and FIXED["gpo-scope"])
     for scope, account in reach.holds:
         add(scope, _sid_node(account.sid), GPO_REACHES, rec and FIXED["gpo-scope"])
+    _script_edges(snap, reach, add, principal, rec, names, kinds, edge_props)
 
     # local groups set by Group Policy: an admin-equivalent group makes the member SYSTEM on
     # the computer, so it becomes the computer account; a domain group rewritten through
@@ -498,6 +508,70 @@ def build(snap: Snapshot, provenance: bool = False) -> Graph:
     names[domain_node] = snap.domain
     kinds[domain_node] = "domain"
     return Graph(edges, names, tier0, logon_edges, edge_props, kinds, rec)
+
+
+def _script_edges(
+    snap: Snapshot,
+    reach: gpo_scope.Reach,
+    add: Callable[[str, str, str, Any], None],
+    principal: Callable[[str], str],
+    rec: Provenance | None,
+    names: dict[str, str],
+    kinds: dict[str, str],
+    edge_props: dict[tuple[str, str, str], dict[str, Any]],
+) -> None:
+    """Writers of the files a GPO runs, and hosts that serve them, to where the GPO applies.
+    A machine script or a task as SYSTEM becomes the computer; a logon script or a task as
+    the logged-on user becomes the user. The folders and links go through `script_can_run`
+    and the scope: a writer of the file cannot turn the side on or add a link."""
+    if not snap.gpo_scripts:
+        return
+    gpos = {g.guid.upper(): g for g in snap.gpos}
+    acls = {x.path.lower(): x for x in snap.sysvol_acls}
+    hosts = gpo_scope.host_index(snap)
+    applies: dict[tuple[str, str], list[tuple[str, tuple[str, ...]]]] = {}
+    for applied, scope, caveats in reach.applies:
+        applies.setdefault((applied.guid.upper(), gpo_scope.scope_side(scope)), []).append(
+            (scope, caveats)
+        )
+    built: set[str] = set()
+    seen: set[tuple[str, str, str]] = set()
+    for x in snap.gpo_scripts:
+        guid = x.gpo.upper()
+        g = gpos.get(guid)
+        wanted = "system" if x.side == "computer" else "user"
+        if g is None or x.filtered or x.run_as != wanted or not gpo_scope.script_can_run(g, x):
+            continue
+        node = sys.intern(f"gpo-script:{guid}:{x.side}")
+        if node not in built:
+            built.add(node)
+            names[node] = f"files GPO {g.name} runs ({x.side} side)"
+            kinds[node] = "scope"
+            for scope, caveats in applies.get((guid, x.side), ()):
+                add(
+                    node,
+                    scope,
+                    SCRIPT_RUNS,
+                    rec and rec.applies(guid, scope, SCRIPT_RUNS, reach.entered_by),
+                )
+                if caveats:
+                    edge_props[(node, scope, SCRIPT_RUNS)] = {
+                        "gpo": g.name,
+                        "caveats": list(caveats),
+                    }
+        for target in (x.config, x.target if x.location == "sysvol" else ""):
+            if not target:
+                continue
+            for sid, where in fileacl.writers(acls, target).found:
+                if (sid, where.lower(), node) not in seen:
+                    seen.add((sid, where.lower(), node))
+                    add(principal(sid), node, SCRIPT_WRITE, rec and rec.script_ace(where, sid))
+        host = hosts.get(x.host) if x.location == "host" else None
+        if host is not None and host.sid:
+            source = _sid_node(host.sid)
+            if (source, x.path.lower(), node) not in seen:
+                seen.add((source, x.path.lower(), node))
+                add(source, node, SCRIPT_HOST, rec and rec.script_host(guid, x.path))
 
 
 def _delegation_edges(
@@ -701,6 +775,7 @@ def tier0_nodes(
     tier0_dns: Iterable[str],
 ) -> set[str]:
     """Tier-0 groups and accounts, the domain head, the DC OU, AdminSDHolder, CA servers,
+    Configuration Manager site servers,
     CA nodes that an ESC7 edge reaches, and the tier0: nodes among `names` (templates,
     PKI objects). What-if calls it again after a change to group membership."""
     tier0 = {_sid_node(s) for s in _tier0_group_sids(snap)}
@@ -715,6 +790,8 @@ def tier0_nodes(
         for a in snap.accounts:
             if a.sam.upper() == ca.upper() and a.sid:
                 tier0.add(_sid_node(a.sid))
+    # a Configuration Manager site server runs code on every client it manages
+    tier0 |= {_sid_node(a.sid) for a in snap.sccm_site_servers() if a.sid}
     return tier0
 
 

@@ -1,0 +1,42 @@
+id = "AD-ACC-019"
+aliases = ["smartcard-hash"]
+summary = "A smart-card-required account's password hash has not changed for over a year, so a stolen hash keeps working."
+severities = ["low", "medium"]
+severity_logic = """
+**Medium** when at least one of the accounts is privileged, **low** otherwise.
+"""
+mitre = ["T1550.002"]
+data_sources = ["ldap"]
+attributes = ["userAccountControl", "pwdLastSet"]
+related = ["AD-ACC-011"]
+since = "0.2.5"
+
+risk = """
+An account that must use a smart card still has an NT hash, generated when the flag was set. The
+user never types it, so it never changes by itself unless the domain rolls it, and anyone who
+stole it can use it for as long as it stays the same.
+"""
+
+detection = """
+From the LDAP snapshot: enabled users with `SMARTCARD_REQUIRED` whose password was last set more
+than **365 days** ago. That is this check's own line; DISA's STIG asks for 60 days. Whether the
+domain has rolling turned on (`msDS-ExpirePasswordsOnSmartCardOnlyAccounts`) is not read: an
+account whose hash really did roll has a recent `pwdLastSet` and is not reported.
+"""
+
+false_positives = """
+- **A privileged account** also appears in [AD-ACC-011](AD-ACC-011.md); the fix there is a
+  password change, here a rotation of a hash nobody types.
+"""
+
+remediation = """
+1. At domain functional level 2016 or later, turn on *Enable rolling of expiring NTLM secrets*.
+2. Otherwise, clear and set the smart card flag on a schedule, which gives the account a new hash.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-019"
+
+[[references]]
+title = "DISA STIG V-243476: smart card accounts must have their NT hash rotated"
+url = "https://www.stigviewer.com/stigs/active_directory_domain_v3/2024-09-13/finding/V-243476"
+kind = "spec"

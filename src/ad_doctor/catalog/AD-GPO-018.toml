@@ -1,0 +1,60 @@
+id = "AD-GPO-018"
+aliases = ["gpo-script-remote-host"]
+summary = "A GPO runs a script or task from a host outside tier 0, so whoever controls that host runs code where the GPO applies."
+severities = ["info", "medium", "high"]
+severity_logic = """
+**High** when the host is outside tier 0 and the GPO reaches a tier-0 account or computer. **Medium**
+when it is outside tier 0 and the GPO reaches none. **Info** when the host cannot be judged: it is
+no computer in the snapshot (a DFS namespace, a NAS, an IP address), the path has a variable in
+it, the command line does not say that the path is what runs, or the reach depends on loopback that
+could not be read. An item with item-level targeting or in a GPO with a WMI filter tops out at
+medium.
+"""
+mitre = ["T1037.003", "T1484.001"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "Machine and User Scripts\\scripts.ini and psscripts.ini",
+    "Machine and User Preferences\\ScheduledTasks\\ScheduledTasks.xml",
+    "sAMAccountName and dNSHostName of computers",
+    "gPLink, gPOptions and the GPO's status, version, extensions and DACL",
+]
+related = ["AD-GPO-017"]
+since = "0.2.5"
+
+risk = """
+A file on another server is only as safe as that server. Any administrator of it, or anything
+that gets SYSTEM there, can replace the file and run code as SYSTEM on the computers the GPO
+applies to, or as each user who logs on there. When a workstation-level file server serves a script
+to tier 0, a compromise of that server reaches tier 0.
+"""
+
+detection = """
+The files are found as in AD-GPO-017. A UNC path whose host is not the domain or a DC, or whose
+share is not SYSVOL or NETLOGON, is matched against the computers in the snapshot by short and full
+name. A host that matches a tier-0 computer (a DC, CA server, Entra Connect or Exchange server, a
+member of a tier-0 group, or a Configuration Manager site server) stays quiet.
+
+The host is never contacted: its share and file permissions are not known, so this check says who
+controls the machine, not who can write the share.
+"""
+
+false_positives = """
+- **A WMI filter** on the GPO is assumed to match and is not evaluated: such a row says so and stays
+  at medium or below.
+- **A file server that is managed as tier 0** but that the directory does not show as tier 0. Accept
+  the row with an [accepted-risk file](../ci.md#accepted-risks).
+- **A script that only runs on computers at the same tier as the host.** The check still reports it,
+  as medium: control of the host is control of what the script reaches.
+"""
+
+remediation = """
+1. Serve scripts used by tier 0 from SYSVOL or from a tier-0 host.
+2. For a wide scope, treat the host at the level of what it reaches, or move the script.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-018"
+
+[[references]]
+title = "[MS-GPSCR]: Group Policy: Scripts Extension Encoding"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpscr/"
+kind = "spec"

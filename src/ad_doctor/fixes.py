@@ -415,6 +415,8 @@ def change_lines(change: Facts, snap: Snapshot) -> list[str]:
             f"Set-ADObject -Identity {_q(change.dn)} "
             f"-Remove @{{'sIDHistory' = {_q(change.prim[2])}}} -WhatIf"
         )
+    elif kind in ("script-ace", "script-host"):
+        out.append(f"# {change.label} (the file's Security tab or the GPO; no dry run)")
     return [one_line(line) for line in out]
 
 
@@ -563,6 +565,99 @@ def render_change_script(
 def snippet(f: Finding, snap: Snapshot) -> list[str]:
     """The script lines for one finding (guarded like the whole script)."""
     return [one_line(line) for line in FIXES.get(f.check_id, _manual)(f, snap)]
+
+
+# check ID -> userAccountControl bit, and whether it must be set for the fix to still apply
+# (0 means the check looks at msDS-AllowedToActOnBehalfOfOtherIdentity instead)
+PREFLIGHT: dict[str, tuple[int, bool]] = {
+    "AD-KRB-002": (0x400000, True),
+    "AD-KRB-004": (0x200000, True),
+    "AD-DEL-001": (0x80000, True),
+    "AD-DEL-002": (0x1000000, True),
+    "AD-DEL-003": (0, True),
+    "AD-ACC-001": (0x20, True),
+    "AD-ACC-002": (0x80, True),
+    "AD-ACC-003": (0x10000, True),
+    "AD-ACC-004": (0x2, False),
+    "AD-ACC-005": (0x2, False),
+}
+
+_PREFLIGHT_FUNCTION = """\
+function Test-AdDoctorPreflight {
+    param([string]$Check, [string]$Name, [string]$Filter, [int]$Flag, [bool]$MustBeSet)
+    $props = 'userAccountControl', 'primaryGroupID', 'pwdLastSet', 'lastLogonTimestamp', 'servicePrincipalName', 'msDS-AllowedToDelegateTo', 'msDS-AllowedToActOnBehalfOfOtherIdentity'
+    $found = @(Get-ADObject -LDAPFilter $Filter -Properties $props -ErrorAction Stop)
+    if ($found.Count -ne 1) {
+        Write-Output "STOP  $Check $Name : $($found.Count) objects match"
+        $script:AdDoctorStops++
+        return
+    }
+    $o = $found[0]
+    $logon = $null
+    if ($o.lastLogonTimestamp) { $logon = [DateTime]::FromFileTimeUtc([long]$o.lastLogonTimestamp) }
+    if ($Flag -eq 0) {
+        $applies = $null -ne $o.'msDS-AllowedToActOnBehalfOfOtherIdentity'
+    } else {
+        $applies = (($o.userAccountControl -band $Flag) -ne 0) -eq $MustBeSet
+    }
+    $stop = $null
+    if (-not $applies) { $stop = 'the setting is no longer as the snapshot had it' }
+    elseif ($Check -eq 'AD-DEL-001' -and $o.primaryGroupID -in 516, 521) { $stop = 'this is a domain controller' }
+    elseif ($Check -eq 'AD-ACC-005' -and $logon -and $logon -gt $AdDoctorSnapshot) { $stop = "logged on since the snapshot ($logon UTC)" }
+    if ($stop) {
+        Write-Output "STOP  $Check $Name : $stop"
+        $script:AdDoctorStops++
+        return
+    }
+    $warn = @()
+    if ($Check -eq 'AD-DEL-002' -and @($o.'msDS-AllowedToDelegateTo').Count -gt 0) { $warn += 'these services lose protocol transition: ' + ($o.'msDS-AllowedToDelegateTo' -join ', ') }
+    if ($Check -eq 'AD-ACC-001' -and [long]$o.pwdLastSet -eq 0) { $warn += 'no password has been set: set one first' }
+    if ($Check -eq 'AD-ACC-003' -and @($o.servicePrincipalName).Count -gt 0) { $warn += 'it has an SPN: an expiring password may stop a service' }
+    if ($logon -and $logon -gt [DateTime]::UtcNow.AddDays(-30)) { $warn += "in use: last logon $logon UTC" }
+    foreach ($w in $warn) { Write-Output "WARN  $Check $Name : $w" }
+    if ($warn.Count -eq 0) { Write-Output "OK    $Check $Name" }
+}"""  # noqa: E501
+
+
+def render_preflight(findings: list[Finding], snap: Snapshot) -> str:
+    """A read-only script to run before the fix script: it looks each object up again and
+    says whether the fix still applies. It changes nothing, so it has no -WhatIf to remove."""
+    taken = snap.collected_at.isoformat()
+    out = [
+        f"# ad-doctor preflight for {snap.domain}",
+        f"# generated {snap.collected_at:%Y-%m-%d %H:%M} UTC; covers {len(PREFLIGHT)} fixes",
+        "# Read-only: its only directory command is Get-ADObject. Nothing here changes AD.",
+        "# Run it before the --fixes script. STOP: the object no longer matches the snapshot.",
+        "# WARN: the fix is still valid, but read the reason before removing -WhatIf.",
+        "#Requires -Modules ActiveDirectory",
+        "$script:AdDoctorStops = 0",
+        f"$AdDoctorSnapshot = [DateTime]::Parse({_q(taken)}).ToUniversalTime()",
+        _PREFLIGHT_FUNCTION,
+        "",
+    ]
+    covered = [f for f in findings if f.check_id in PREFLIGHT]
+    for f in covered:
+        flag, must = PREFLIGHT[f.check_id]
+        out.append(f"# --- {f.check_id}")
+        for obj in f.objects:
+            name = _name(obj)
+            query = _q(f"(sAMAccountName={_ldap(name)})")
+            out.append(
+                f"Test-AdDoctorPreflight {_q(f.check_id)} {_q(name)} {query} "
+                f"0x{flag:x} ${str(must).lower()}"
+            )
+        out.append("")
+    others = sorted({f.check_id for f in findings if f.check_id not in PREFLIGHT})
+    if others:
+        out.append("# No preflight for these checks: " + ", ".join(others))
+    out += [
+        "if ($script:AdDoctorStops) {",
+        '    Write-Output "$script:AdDoctorStops object(s) stopped"',
+        "    exit 1",
+        "}",
+        "",
+    ]
+    return "\n".join(one_line(line) if not line.startswith("function ") else line for line in out)
 
 
 def render_fixes(findings: list[Finding], snap: Snapshot) -> str:

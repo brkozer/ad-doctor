@@ -1,9 +1,10 @@
 """SYSVOL over SMB: Group Policy Preferences passwords (MS14-025), GPO security templates
 (GptTmpl.inf), registry policy (Machine\\Registry.pol), local group membership set by Group
-Policy (Restricted Groups and GPP Local Groups) and credentials written into logon scripts.
+Policy (Restricted Groups and GPP Local Groups), credentials written into logon scripts,
+and which files GPOs run with who can change those files.
 
 Only file names, line numbers, account names and setting values are kept; secrets never
-leave this module.
+leave this module, and neither do the arguments of a script or a task.
 """
 
 from __future__ import annotations
@@ -11,19 +12,24 @@ from __future__ import annotations
 import errno
 import re
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable
 from dataclasses import dataclass, field
+from pathlib import PureWindowsPath
 
 import smbclient
 from smbprotocol.exceptions import SMBException
+from smbprotocol.open import FilePipePrinterAccessMask, SMB2QueryInfoRequest, SMB2QueryInfoResponse
 
-from . import auditpol, regpol
+from . import auditpol, fileacl, regpol
 from .model import (
     GpoAutologon,
     GpoLocalGroup,
+    GpoScript,
     GpoSettings,
     GppPassword,
     RegistryEntry,
     ScriptSecret,
+    SysvolAcl,
     well_known_sid,
 )
 
@@ -82,7 +88,54 @@ MACHINE_REGISTRY_XML = re.compile(
     rf"^Policies\\({_GUID})\\Machine\\Preferences\\Registry\\Registry\.xml$", re.I
 )
 USER_GROUPS = re.compile(rf"^Policies\\({_GUID})\\User\\Preferences\\Groups\\Groups\.xml$", re.I)
+RUN_CONFIG = re.compile(
+    rf"^Policies\\({_GUID})\\(Machine|User)\\"
+    r"(?:Scripts\\(scripts|psscripts)\.ini|Preferences\\ScheduledTasks\\ScheduledTasks\.xml)$",
+    re.I,
+)
 XML_DECLARATION = re.compile(r"^\s*<\?xml[^>]*\?>")
+# files that run on their own, looked at in NETLOGON even when no GPO names them
+RUNNABLE = (".bat", ".cmd", ".ps1", ".psm1", ".vbs", ".kix", ".js", ".wsf", ".exe", ".msi")
+# programs whose argument is what really runs
+INTERPRETERS = {
+    "cmd", "powershell", "pwsh", "wscript", "cscript", "mshta", "msiexec", "regsvr32", "rundll32",
+}  # fmt: skip
+POWERSHELL = {"powershell", "pwsh"}
+# powershell.exe switches that take a value, by their full names and their own short ones
+PS_VALUE_SWITCHES = (
+    "executionpolicy", "windowstyle", "version", "inputformat", "outputformat", "psconsolefile",
+    "configurationname", "configurationfile", "custompipename", "settingsfile", "workingdirectory",
+)  # fmt: skip
+PS_VALUE_SHORT = {"ep", "ex", "wd"}
+# where a file name that has spaces and no quotes ends
+RUN_SUFFIXES = (*RUNNABLE, ".com", ".vbe", ".jse", ".hta", ".dll", ".ocx", ".cpl", ".scr", ".msp")
+UNCLEAR = "unclear"  # GpoScript.location: a network path that may not be what runs
+SECTIONS = {
+    "computer": {"startup": "Startup", "shutdown": "Shutdown"},
+    "user": {"logon": "Logon", "logoff": "Logoff"},
+}
+TASK_TAGS = {"Task", "TaskV2", "ImmediateTask", "ImmediateTaskV2"}
+MISSING = "not found"
+MAX_DESCRIPTOR = 65536
+SECURITY_INFO = 3  # SMB2_0_INFO_SECURITY
+OWNER_AND_DACL_INFO = 0x1 | 0x4  # OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+LOGON_SERVER = "%logonserver%"
+USER_DOMAIN = "%userdnsdomain%"
+SYSTEM_NAMES = {"nt authority\\system", "system", "s-1-5-18"}
+LOGGED_ON = {"%logondomain%\\%logonuser%", "%logonuser%"}
+WORD = re.compile(r"""(?:"[^"]*"|'[^']*'|\S)+""")
+SWITCH = re.compile(r"[-/][A-Za-z?]")
+MSI_FILE = re.compile(
+    r"""[-/](?:package|uninstall|update|i|a|x|p|f[a-z]*|j[um]?)(?=$|["'\\{%]|[a-z]:)""", re.I
+)
+CMD_STATEMENT = re.compile(r"""(?:"[^"]*"|'[^']*'|[^&|])+""")
+PS_STATEMENT = re.compile(r"""(?:"[^"]*"|'[^']*'|[^&|;])+""")
+STATEMENT_LEAD = re.compile(r"^\s*(?:@|call\s+|\.\s+)*", re.I)
+REDIRECT = re.compile(r"""\d?>>?\s*(?:"[^"]*"|\S+)""")
+LOCAL_FILE = re.compile(r"[a-z]:|\.{0,2}\\", re.I)
+MAX_PATH = 512
+MAX_NESTED = 4  # cmd /c powershell -Command cmd /c ...: a hostile file can go on for ever
+MAX_STATEMENTS = 16
 
 
 class SysvolError(Exception):
@@ -108,6 +161,8 @@ class SysvolResult:
     autologon: list[GpoAutologon] = field(default_factory=list)
     # SYSVOL-relative audit.csv and Registry.xml files that could not be read
     policy_unread: list[str] = field(default_factory=list)
+    scripts: list[GpoScript] = field(default_factory=list)
+    acls: list[SysvolAcl] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     # False when SYSVOL was not read, so "no local group settings" means "not collected"
     scanned: bool = False
@@ -398,6 +453,427 @@ def _decode(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def _stem(program: str) -> str:
+    return PureWindowsPath(program).stem.lower()
+
+
+def _network(path: str) -> bool:
+    return path.startswith("\\\\") or path.lower().startswith(LOGON_SERVER)
+
+
+def _file_end(text: str, spaces: bool = True) -> tuple[str, str]:
+    """(file, what follows it) of an unquoted command line. Where a file name can hold spaces,
+    it runs to the first word with a known extension; a switch or no such word ends it at the
+    first space. What follows can hold a password, so it must never count as the file."""
+    words = list(re.finditer(r"\S+", text))
+    if not words:
+        return "", ""
+    first = words[0]
+    if spaces and _stem(first.group()) not in INTERPRETERS:
+        for index, word in enumerate(words):
+            if index and SWITCH.match(word.group()):
+                break
+            if word.group().lower().endswith(RUN_SUFFIXES):
+                return text[: word.end()], text[word.end() :]
+    return first.group(), text[first.end() :]
+
+
+def _program(line: str, spaces: bool = True) -> tuple[str, str]:
+    """(the file at the start of a command line, what follows it). `spaces`: the line is a
+    GPO's command field, not text a shell splits at spaces, so a file name can hold them."""
+    text = line.strip()
+    quote = text[:1]
+    if quote not in ('"', "'"):
+        return _file_end(text, spaces)
+    inner, closed, rest = text[1:].partition(quote)
+    if not closed:
+        return _file_end(text[1:])
+    file, beyond = _file_end(inner)
+    return file, f"{beyond} {rest}".strip()
+
+
+def _unclear(text: str) -> list[tuple[str, str]]:
+    """The first network path of a command line that does not say what it runs."""
+    for word in WORD.finditer(REDIRECT.sub("", text)):
+        path = _program(word.group().lstrip("&("))[0]
+        if _network(path):
+            return [(path[:MAX_PATH], UNCLEAR)]
+    return []
+
+
+def _unwrap(line: str) -> str:
+    """A command line without the quotes around all of it: "a b c", and ""a b" c" as cmd
+    takes it. In "a b" "c" the quotes belong to the words, and they stay."""
+    text = line.strip()
+    if len(text) > 1 and text[0] in "\"'" and text[-1] == text[0]:
+        close = text.find(text[0], 1)
+        if close == len(text) - 1 or not text[close + 1].isspace():
+            return text[1:-1]
+    return text
+
+
+def _cmd_line(text: str) -> str | None:
+    """What follows cmd's /c, /k or /r, which can touch it, as in /c"x y"."""
+    for word in WORD.finditer(text):
+        raw = word.group()
+        if not raw.startswith("/"):
+            return None
+        if raw[1:2].lower() in ("c", "k", "r"):
+            return text[word.start() + 2 :]
+    return None
+
+
+def _powershell_run(text: str) -> tuple[str | None, str | None]:
+    """(the value of -File, or the command text) of a powershell or pwsh command line. Both
+    programs take any unique start of a switch's name, and a value after a colon."""
+    words = list(WORD.finditer(text))
+    index = 0
+    while index < len(words):
+        word = words[index]
+        raw = word.group()
+        if raw[0] not in "-/":
+            return None, text[word.start() :]
+        name, colon, value = raw[1:].partition(":")
+        name = name.lower()
+        if name and "file".startswith(name):
+            if colon:
+                return value, None
+            return (words[index + 1].group() if index + 1 < len(words) else ""), None
+        if name and "command".startswith(name):
+            return None, text[word.start() + len(name) + 2 if colon else word.end() :]
+        if name in ("e", "ec") or (len(name) > 1 and "encodedcommand".startswith(name)):
+            return "", None  # encoded: no path to follow, as before
+        takes_value = name in PS_VALUE_SHORT or (
+            name and any(s.startswith(name) for s in PS_VALUE_SWITCHES)
+        )
+        index += 2 if takes_value and not colon else 1
+    return None, None
+
+
+def _file_operand(name: str, text: str) -> str | None:
+    """The file msiexec, regsvr32, rundll32, wscript, cscript or mshta is told to run."""
+    words = [word.group() for word in WORD.finditer(text)]
+    if name == "regsvr32":
+        for word in words:
+            if word.lower().startswith("/i:") and _network(_program(word[3:])[0]):
+                return word[3:]
+    for index, word in enumerate(words):
+        if name == "msiexec":
+            match = MSI_FILE.match(word)
+            if match:
+                following = words[index + 1] if index + 1 < len(words) else ""
+                return word[match.end() :] or following
+        elif word[0] not in "-/":
+            return word.split(",", 1)[0] if name == "rundll32" else word
+    return None
+
+
+def _run_targets(command: str, arguments: str, depth: int = 0) -> list[tuple[str, str]]:
+    """(path, location) of what a command line runs: the command, or for an interpreter only
+    the argument it executes, when that is on the network. A log file or a data file named in
+    the arguments is not run. Where the line does not say what runs, its first network path
+    comes back as `UNCLEAR`. Arguments never come back: they can hold a password."""
+    program, rest = _program(command, depth == 0)
+    if not program:
+        return []
+    name = _stem(program)
+    if name not in INTERPRETERS:
+        return [(program[:MAX_PATH], "")]
+    text = f"{rest} {arguments}".strip()
+    if depth >= MAX_NESTED:
+        return _unclear(text)
+    file, line = None, None
+    if name == "cmd":
+        line = _cmd_line(text)
+    elif name in POWERSHELL:
+        file, line = _powershell_run(text)
+    else:
+        file = _file_operand(name, text)
+    if file is not None:
+        path = _program(file)[0]
+        return [(path[:MAX_PATH], "")] if _network(path) else []
+    if line is None:
+        return _unclear(text)
+    out: list[tuple[str, str]] = []
+    if name in POWERSHELL:
+        statements = PS_STATEMENT.findall(_unwrap(line.replace('\\"', '"')))
+    else:
+        statements = CMD_STATEMENT.findall(_unwrap(line))
+    for found in statements[:MAX_STATEMENTS]:
+        statement = STATEMENT_LEAD.sub("", found, count=1)
+        head = _program(statement, False)[0]
+        if _network(head) or _stem(head) in INTERPRETERS:
+            out += _run_targets(statement, "", depth + 1)
+        elif head and not (LOCAL_FILE.match(head) or head.lower().endswith(RUN_SUFFIXES)):
+            out += _unclear(statement)
+    return out
+
+
+def parse_scripts_ini(text: str, guid: str, side: str, config: str, source: str) -> list[GpoScript]:
+    """The scripts of one scripts.ini or psscripts.ini ([MS-GPSCR]): `<n>CmdLine` and
+    `<n>Parameters` under [Startup], [Shutdown], [Logon] or [Logoff]. A relative path is in
+    the GPO's own Scripts\\<phase> folder."""
+    entries: dict[tuple[str, str], dict[str, str]] = {}
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        match = re.match(r"(\d+)(CmdLine|Parameters)\s*=(.*)", line, re.I)
+        if match and section in SECTIONS[side]:
+            field_name = match.group(2).lower()
+            entries.setdefault((section, match.group(1)), {})[field_name] = match.group(3).strip()
+    out = []
+    folder = config.rsplit("\\", 1)[0]
+    for (phase, _), item in entries.items():
+        for path, location in _run_targets(item.get("cmdline", ""), item.get("parameters", "")):
+            script = GpoScript(
+                guid, side, source, phase, config, path, location,
+                run_as="system" if side == "computer" else "user",
+            )  # fmt: skip
+            if not re.match(r"\\\\|[a-z]:|%", path, re.I) and ".." not in path.split("\\"):
+                script.location = "sysvol"
+                script.target = rf"{folder}\{SECTIONS[side][phase]}\{path}"
+            out.append(script)
+    return out
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _child(node: ET.Element, name: str) -> ET.Element | None:
+    return next((c for c in node if _local(c.tag) == name), None)
+
+
+def _text(node: ET.Element | None, path: tuple[str, ...]) -> str:
+    for name in path:
+        node = None if node is None else _child(node, name)
+    return (node.text or "").strip() if node is not None else ""
+
+
+def _task_run_as(side: str, name: str) -> str:
+    who = name.strip().lower()
+    if side == "user":
+        return "user" if not who or who in LOGGED_ON else "other"
+    return "system" if who in SYSTEM_NAMES else "other"
+
+
+def _task_item(
+    item: ET.Element, guid: str, side: str, config: str, filtered: bool
+) -> list[GpoScript]:
+    props = _child(item, "Properties")
+    if props is None or (props.get("action") or "U").upper() == "D":
+        return []
+    runs: list[tuple[str, str]] = []
+    task = _child(props, "Task")
+    if task is not None:
+        if _text(task, ("Settings", "Enabled")).lower() == "false":
+            return []
+        actions = _child(task, "Actions")
+        for action in () if actions is None else actions:
+            if _local(action.tag) == "Exec":
+                runs.append((_text(action, ("Command",)), _text(action, ("Arguments",))))
+        name = props.get("runAs") or _text(task, ("Principals", "Principal", "UserId"))
+    else:
+        if props.get("enabled") == "0":
+            return []
+        runs.append((props.get("appName") or "", props.get("args") or ""))
+        name = props.get("runAs") or ""
+    run_as = _task_run_as(side, name)
+    return [
+        GpoScript(
+            guid,
+            side,
+            "scheduledtasks.xml",
+            "task",
+            config,
+            path,
+            location,
+            run_as=run_as,
+            filtered=filtered,
+        )
+        for command, arguments in runs
+        for path, location in _run_targets(command, arguments)
+    ]
+
+
+def parse_scheduled_tasks(data: bytes, guid: str, side: str, config: str) -> list[GpoScript]:
+    """The programs of a Preferences ScheduledTasks.xml. Disabled items and items that
+    delete a task do not run; item-level targeting is kept as a flag."""
+    text = XML_DECLARATION.sub("", _decode(data), count=1)
+    if "<!doctype" in text.casefold():
+        raise MalformedXml("a document type declaration")
+    try:
+        root = ET.fromstring(text)
+    except (ET.ParseError, ValueError, RecursionError) as exc:
+        raise MalformedXml(str(exc)) from exc
+    out: list[GpoScript] = []
+    stack = [(iter(root), False, False)]
+    while stack:
+        child = next(stack[-1][0], None)
+        if child is None:
+            stack.pop()
+            continue
+        _, disabled, filtered = stack[-1]
+        off = disabled or child.get("disabled") == "1"
+        targeted = filtered or _has_filters(child)
+        if child.tag == "Collection":
+            if len(stack) >= MAX_XML_DEPTH:
+                raise MalformedXml("Collections nested too deeply")
+            stack.append((iter(child), off, targeted))
+        elif child.tag in TASK_TAGS and not off:
+            out += _task_item(child, guid, side, config, targeted)
+    return out
+
+
+def place(script: GpoScript, domain: str, hosts: set[str]) -> bool:
+    """Fill in where the file is. False when it is on the computer that runs it (a local
+    path, a program on the PATH), which says nothing about who can reach it. `hosts` holds
+    the lower-cased names SYSVOL and NETLOGON are served under."""
+    if script.location:
+        return True
+    path = script.path.replace("/", "\\")
+    if path.lower().startswith(LOGON_SERVER):
+        path = rf"\\{domain}{path[len(LOGON_SERVER) :]}"
+    if not path.startswith("\\\\"):
+        return False
+    path = re.sub(re.escape(USER_DOMAIN), lambda _: domain, path, flags=re.I)
+    if "%" in path or ".." in path.split("\\"):
+        script.location = "unresolved"
+        return True
+    host, _, rest = path[2:].partition("\\")
+    share, _, inner = rest.partition("\\")
+    if not inner:
+        return False
+    if host.lower() in hosts and share.lower() in ("netlogon", "sysvol"):
+        if share.lower() == "netlogon":
+            script.location, script.target = "sysvol", rf"scripts\{inner}"
+            return True
+        top, _, below = inner.partition("\\")
+        if top.lower() == domain.lower() and below:
+            script.location, script.target = "sysvol", below
+            return True
+        script.location = "unresolved"
+        return True
+    script.location, script.host = "host", host.lower()
+    return True
+
+
+def _descriptor(path: str, port: int, directory: bool) -> bytes:
+    """Owner and DACL of a file or folder: READ_CONTROL and one QUERY_INFO, nothing else."""
+    with smbclient.open_file(
+        path,
+        mode="rb",
+        buffering=0,
+        file_type="dir" if directory else "file",
+        desired_access=FilePipePrinterAccessMask.READ_CONTROL,
+        share_access="rwd",
+        port=port,
+    ) as handle:
+        opened = handle.fd
+        request = SMB2QueryInfoRequest()
+        request["info_type"] = SECURITY_INFO
+        request["output_buffer_length"] = MAX_DESCRIPTOR
+        request["additional_information"] = OWNER_AND_DACL_INFO
+        request["file_id"] = opened.file_id
+        session = opened.tree_connect.session.session_id
+        sent = opened.connection.send(request, session, opened.tree_connect.tree_connect_id)
+        response = SMB2QueryInfoResponse()
+        response.unpack(opened.connection.receive(sent)["data"].get_value())
+        raw: bytes = response["buffer"].get_value()
+    return raw
+
+
+def _read_acl(base: str, rel: str, port: int, directory: bool) -> SysvolAcl:
+    try:
+        raw = _descriptor(rf"{base}\{rel}", port, directory)
+    except (SMBException, OSError, ValueError) as exc:
+        if getattr(exc, "errno", None) == errno.ENOENT:
+            return SysvolAcl(rel, directory, error=MISSING)
+        return SysvolAcl(rel, directory, error=type(exc).__name__)
+    return fileacl.parse(raw, rel, directory)
+
+
+def _read_run_files(
+    result: SysvolResult,
+    base: str,
+    port: int,
+    found: list[GpoScript],
+    netlogon: list[str],
+    domain: str,
+    hosts: set[str],
+) -> None:
+    """Where each file a GPO runs is, and the permissions on it and the folders above."""
+    acls: dict[str, SysvolAcl] = {}
+
+    def read(rel: str, directory: bool) -> SysvolAcl:
+        key = rel.lower()
+        if key not in acls:
+            acls[key] = _read_acl(base, rel, port, directory)
+        return acls[key]
+
+    def read_chain(rel: str) -> bool:
+        first, *folders = fileacl.chain(rel)
+        if read(first, False).error == MISSING:
+            return False
+        for folder in folders:
+            read(folder, True)
+        return True
+
+    for script in found:
+        relative = bool(script.location)
+        if not place(script, domain, hosts):
+            continue
+        if script.location == "sysvol" and not read_chain(script.target):
+            if relative:
+                continue  # not in the GPO's folder: a program on the PATH
+            script.location = "missing"
+        read_chain(script.config)
+        result.scripts.append(script)
+    for rel in netlogon:
+        read_chain(rel)
+    result.acls = [acl for acl in acls.values() if acl.error != MISSING]
+    unknown = [
+        f"{acl.path} ({acl.error or 'deny or conditional ACE'})"
+        for acl in result.acls
+        if acl.error or not acl.judged
+    ]
+    if unknown:
+        result.notes.append(
+            f"permissions of {len(unknown)} paths that scripts run from could not be judged, so "
+            f"AD-GPO-017 did not evaluate them: {', '.join(unknown[:5])}"
+        )
+    missing = [s.path for s in result.scripts if s.location == "missing"]
+    if missing:
+        result.notes.append(
+            f"{len(missing)} files that GPOs run were not found in SYSVOL or NETLOGON: "
+            + ", ".join(missing[:5])
+        )
+
+
+def _run_entries(result: SysvolResult, rel: str, data: bytes, known: set[str]) -> list[GpoScript]:
+    match = RUN_CONFIG.match(rel)
+    if not match or match.group(1).upper() not in known:
+        return []
+    guid = match.group(1).upper()
+    side = "computer" if match.group(2).lower() == "machine" else "user"
+    if match.group(3):
+        return parse_scripts_ini(_decode(data), guid, side, rel, f"{match.group(3).lower()}.ini")
+    try:
+        return parse_scheduled_tasks(data, guid, side, rel)
+    except MalformedXml:
+        result.notes.append(f"{rel}: malformed XML, AD-GPO-017 and AD-GPO-018 did not evaluate it")
+        return []
+
+
+def _lists_runs(rel: str, known: set[str]) -> bool:
+    """Whether this SYSVOL path is a scripts.ini, psscripts.ini or ScheduledTasks.xml of a GPO."""
+    match = RUN_CONFIG.match(rel)
+    return match is not None and match.group(1).upper() in known
+
+
 def scan(
     host: str,
     domain: str,
@@ -406,12 +882,17 @@ def scan(
     gpo_guids: list[str],
     port: int = 445,
     kerberos: bool = False,
+    dc_hosts: Iterable[str] = (),
+    netbios: str = "",
 ) -> SysvolResult:
     base = rf"\\{host}\SYSVOL\{domain}"
     result = SysvolResult()
     known = {g.upper() for g in gpo_guids}
     user_side: list[str] = []
     gpp_registry: list[str] = []
+    run_entries: list[GpoScript] = []
+    netlogon: list[str] = []
+    run_unread: list[str] = []
     try:
         smbclient.register_session(
             host,
@@ -424,7 +905,11 @@ def scan(
             root = rf"{base}\{top}"
             try:
                 walker = list(smbclient.walk(root, port=port))
-            except (SMBException, OSError):
+            except (SMBException, OSError) as exc:
+                result.notes.append(
+                    rf"SYSVOL\{top} could not be listed ({type(exc).__name__}): what is in it, "
+                    "AD-GPO-017 and AD-GPO-018 included, was not evaluated"
+                )
                 continue
             for dirpath, _dirs, files in walker:
                 for name in files:
@@ -434,6 +919,8 @@ def scan(
                     script = lower.endswith(SCRIPT_EXTENSIONS) and lower != "gpt.ini"
                     if (m := MACHINE_REGISTRY_XML.match(rel)) and m.group(1).upper() in known:
                         gpp_registry.append(rel)
+                    if top == "scripts" and lower.endswith(RUNNABLE):
+                        netlogon.append(rel)
                     if not wanted and not script:
                         continue
                     try:
@@ -441,7 +928,10 @@ def scan(
                     except (SMBException, OSError) as exc:
                         # admin-only scripts and files being replicated are normal
                         result.unreadable.append(f"{rel} ({type(exc).__name__})")
+                        if _lists_runs(rel, known):
+                            run_unread.append(rel)
                         continue
+                    run_entries += _run_entries(result, rel, data, known)
                     if wanted:
                         result.gpp_passwords += [GppPassword(rel, u) for u in scan_xml(data)]
                         guid = machine_groups_gpo(rel, known)
@@ -471,6 +961,9 @@ def scan(
                 continue
             result.gpo_settings[guid] = parse_gpttmpl(text)
             result.local_groups += parse_group_membership(text, guid.upper(), rel)
+        short = netbios or domain.split(".")[0]  # the first label only when the name is unknown
+        names = {domain.lower(), short.lower(), *(h.lower() for h in dc_hosts)}
+        _read_run_files(result, base, port, run_entries, netlogon, domain, names)
         for guid in gpo_guids:
             _read_registry(result, base, guid, port)
             _read_audit(result, base, guid, port)
@@ -480,6 +973,11 @@ def scan(
                 f"{len(gpp_registry)} GPOs set registry values through Preferences "
                 "(Machine\\Preferences\\Registry): AD-GPO-009 to -012 do not evaluate them, and "
                 f"they can change what Registry.pol sets: {', '.join(gpp_registry[:5])}"
+            )
+        if run_unread:
+            result.notes.append(
+                f"{len(run_unread)} files that list what GPOs run could not be read, so "
+                f"AD-GPO-017 and AD-GPO-018 did not evaluate them: {', '.join(run_unread[:5])}"
             )
         if user_side:
             result.notes.append(

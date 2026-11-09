@@ -1,0 +1,52 @@
+id = "AD-INF-024"
+aliases = ["dynamic-objects"]
+summary = "Objects with the dynamicObject class exist, which delete themselves without a tombstone, or the TTL settings are below their defaults."
+severities = ["low", "high"]
+severity_logic = """
+**High** when a dynamic object is a tier-0 account, group or computer. **Low** for any other, and
+for a TTL setting below its default.
+"""
+mitre = ["T1070", "T1098"]
+data_sources = ["ldap"]
+attributes = ["objectClass", "msDS-Other-Settings"]
+related = ["AD-INF-021"]
+since = "0.2.5"
+
+risk = """
+A dynamic object disappears when its time to live runs out and leaves no tombstone, so a short-lived
+account or group is gone before anyone reviews it. Lowering the minimum TTL shortens how long one
+has to exist.
+"""
+
+detection = """
+From the LDAP snapshot:
+
+- objects with the `dynamicObject` auxiliary class in the domain and Configuration partitions,
+- `DynamicObjectMinTTL` below **900** seconds and `DynamicObjectDefaultTTL` below **86400** seconds in
+  `msDS-Other-Settings`, the defaults in [MS-ADTS].
+
+Only objects this account can see are found. If a partition could not be searched, the check is
+not judged; if the TTL settings could not be read, a note says that part was not judged.
+"""
+
+false_positives = """
+- **Software that uses short-lived directory entries on purpose.** Review the list and accept it
+  with an [accepted-risk file](../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. Review each object and delete those you cannot explain.
+2. Restore `DynamicObjectMinTTL=900` and `DynamicObjectDefaultTTL=86400` in `msDS-Other-Settings`.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-024"
+
+[[references]]
+title = "[MS-ADTS]: LDAP Configurable Settings"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/41cbdb2c-eab1-45b0-8236-ae777b1c5406"
+kind = "spec"
+
+[[references]]
+title = "Dynamic Objects Misconfiguration and Usage"
+url = "https://www.tenable.com/indicators/ioe/ad/C-DYNAMIC-OBJECTS"
+kind = "vendor"

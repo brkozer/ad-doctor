@@ -1,0 +1,86 @@
+# Microsoft's fixed build for the CVEs ad-doctor compares hosts against.
+#
+# Every number comes from the MSRC CVRF document of the CVE's month
+# (https://api.msrc.microsoft.com/cvrf/v3.0/cvrf/<YYYY-Mon>), field FixedBuild. A number is the
+# lowest fixed build Microsoft lists for that Windows Server release, hotpatch included, so a
+# hotpatched host is not reported by mistake. Only Windows Server on NT 10.0 is here: for 2012 and
+# 2012 R2 the published number is a rollup's file version, not one UBR is known to match.
+#
+# Monthly upkeep: add new CVEs from MSRC, then change `updated`. ad-doctor adds a note when this
+# date is older than `stale_after_days` at the time of the scan.
+
+updated = "2026-11-09"
+stale_after_days = 45
+
+[[cve]]
+id = "CVE-2025-33073"
+title = "Windows SMB client elevation of privilege"
+released = "2025-06-10"
+roles = ["dc"]
+url = "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-33073"
+[cve.fixed]
+14393 = 8148
+17763 = 7434
+20348 = 3745
+25398 = 1665
+26100 = 4270
+
+[[cve]]
+id = "CVE-2025-53779"
+title = "Windows Kerberos elevation of privilege (dMSA, BadSuccessor)"
+released = "2025-08-12"
+roles = ["dc"]
+url = "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-53779"
+[cve.fixed]
+26100 = 4851
+
+[[cve]]
+id = "CVE-2025-54918"
+title = "Windows NTLM elevation of privilege"
+released = "2025-09-09"
+roles = ["dc"]
+url = "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-54918"
+[cve.fixed]
+14393 = 8422
+17763 = 7792
+20348 = 4106
+25398 = 1849
+26100 = 6508
+
+[[cve]]
+id = "CVE-2025-58726"
+title = "Windows SMB server elevation of privilege"
+released = "2025-10-14"
+roles = ["dc"]
+url = "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-58726"
+[cve.fixed]
+14393 = 8519
+17763 = 7919
+20348 = 4294
+25398 = 1913
+26100 = 6899
+
+[[cve]]
+id = "CVE-2026-27912"
+title = "Windows Kerberos elevation of privilege"
+released = "2026-04-14"
+roles = ["dc"]
+url = "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-27912"
+[cve.fixed]
+14393 = 9060
+17763 = 8644
+20348 = 5020
+25398 = 2274
+26100 = 32690
+
+[[cve]]
+id = "CVE-2026-54121"
+title = "AD CS elevation of privilege (Certighost)"
+released = "2026-07-14"
+roles = ["ca"]
+url = "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-54121"
+[cve.fixed]
+14393 = 9339
+17763 = 9020
+20348 = 5386
+26100 = 33158

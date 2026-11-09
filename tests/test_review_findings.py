@@ -628,6 +628,8 @@ def target_of(**kw: Any) -> Target:
     fields: dict[str, Any] = {
         "host": "h", "port": None, "ldaps": False, "no_sysvol": False, "smb_port": 445,
         "signing_probe_port": 389, "http_port": 80, "https_port": 443, "no_probes": False,
+        "dc_probes": False,
+        "no_patch_level": False,
         "kerberos": False, "single_dc": False, "no_ca_registry": False, "user": None,
     }  # fmt: skip
     return cli._target(argparse.Namespace(**{**fields, **kw}))

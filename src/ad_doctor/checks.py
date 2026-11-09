@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 
-from . import auditpol, catalog, dnsprop, gpo_scope, regpol, sd
+from . import auditpol, catalog, dnsprop, fileacl, gpo_scope, patches, regpol, sd
 from .gpo_scope import LOCAL_GROUPS, Grant
 from .model import (
     EXCHANGE_GROUPS,
@@ -21,12 +21,16 @@ from .model import (
     Account,
     AuthPolicy,
     AuthSilo,
+    CaCertificate,
     CaConfig,
     CertTemplate,
+    DirObject,
     Dmsa,
     DnsNode,
     DnsZone,
     Finding,
+    GpoScript,
+    HostPatch,
     KeyCredential,
     Pso,
     Severity,
@@ -4864,6 +4868,785 @@ def recent_sid_history(snap: Snapshot) -> Finding | None:
         "the account.",
         sorted(f"{a.sam}: sIDHistory changed {c.changed:%Y-%m-%d}" for a, c in hits),
     )
+
+
+# --- Configuration Manager, AD FS, Entra Cloud Sync --------------------------------------
+
+
+def _site_holders(snap: Snapshot) -> set[str]:
+    """Full Control holders on the System Management container that are site servers, or
+    groups holding only computers (the way a hierarchy's site servers are often granted it)."""
+    container = snap.sccm_container
+    if container is None:
+        return set()
+    computers = {a.dn.lower(): a for a in snap.accounts if a.is_computer}
+    computer_sids = {a.sid for a in computers.values() if a.sid}
+    groups = {o.dn.lower(): o for o in snap.objects if o.kind == "group"}
+    holders = {
+        a.sid
+        for a in container.aces
+        if a.mask & sd.GENERIC_ALL or (a.mask & sd.FULL_CONTROL) == sd.FULL_CONTROL
+    } - snap.broad_sids()
+
+    def only_computers(group: DirObject) -> bool:
+        seen = {group.dn.lower()}
+        todo = [group]
+        found = False
+        while todo:
+            for member in todo.pop().members:
+                key = member.lower()
+                if key in computers:
+                    found = True
+                elif key in groups:
+                    if key not in seen:
+                        seen.add(key)
+                        todo.append(groups[key])
+                else:
+                    return False
+        return found
+
+    by_sid = {o.sid: o for o in groups.values() if o.sid}
+    return {s for s in holders if s in computer_sids or (s in by_sid and only_computers(by_sid[s]))}
+
+
+def _full_or_write(ace: sd.Ace) -> str:
+    full = ace.mask & sd.GENERIC_ALL or (ace.mask & sd.FULL_CONTROL) == sd.FULL_CONTROL
+    return "full control" if full else "write/WriteDacl/WriteOwner"
+
+
+def _create_or_takeover(ace: sd.Ace) -> list[str]:
+    if ace.takeover:
+        return [_full_or_write(ace)]
+    return ["create child objects"] if ace.mask & sd.CREATE_CHILD else []
+
+
+@check("AD-INF-022", "Configuration Manager site systems to treat as tier 0")
+def sccm_footprint(snap: Snapshot) -> Finding | None:
+    rows = [f"site server {a.sam}" for a in snap.sccm_site_servers()]
+    for x in snap.sccm_objects:
+        if x.kind == "site":
+            rows.append(f"site {x.site_code or x.dn}")
+        else:
+            rows.append(f"management point {x.host or x.dn} (site {x.site_code or 'unknown'})")
+    if snap.sccm_container is not None and not rows:
+        rows.append("System Management container, no site server identified")
+    if not rows:
+        return None
+    return _finding(
+        "AD-INF-022",
+        Severity.INFO,
+        "Configuration Manager is or was published in this domain. A site server can run code "
+        "on every client it manages, so whoever controls one controls those clients; ad-doctor "
+        "counts site servers as tier 0 in its attack paths. Which computers are clients is not "
+        "visible in the directory.",
+        "Treat site servers, the site database and SMS Providers as tier 0 if the site manages "
+        "tier-0 systems, and remove the container if Configuration Manager is gone.",
+        sorted(rows),
+    )
+
+
+@check("AD-ACL-014", "Non-tier-0 control over Configuration Manager in the directory")
+def sccm_control(snap: Snapshot) -> Finding | None:
+    container = snap.sccm_container
+    if not snap.sccm_checked or container is None:
+        return None
+    tier0 = _tier0_group_sids(snap)
+    broad = snap.broad_sids()
+    expected = _site_holders(snap) | tier0 | {PRINCIPAL_SELF, CREATOR_OWNER}
+    hits = set()
+    high = False
+    if container.owner and container.owner not in expected:
+        hits.add(f"System Management: owned by {snap.name_of(container.owner)}")
+    for ace in container.aces:
+        rights = _create_or_takeover(ace) if ace.sid not in expected else []
+        if rights:
+            hits.add(f"System Management: {snap.name_of(ace.sid)} ({', '.join(rights)})")
+            high = high or ace.sid in broad
+    objects = snap.object_by_dn()
+    for a in snap.sccm_site_servers():
+        o = objects.get(a.dn.lower())
+        if o is None:
+            continue
+        if o.owner and o.owner not in expected:
+            hits.add(f"{a.sam}: owned by {snap.name_of(o.owner)}")
+            high = True
+        for ace in o.aces:
+            rights = _control_rights(snap, ace, "computer") if ace.sid not in expected else []
+            if rights:
+                hits.add(f"{a.sam}: {snap.name_of(ace.sid)} ({', '.join(rights)})")
+                high = True
+    if not hits:
+        return None
+    return _finding(
+        "AD-ACL-014",
+        Severity.HIGH if high else Severity.MEDIUM,
+        "Control over a site server's account gives control over the server and its clients; "
+        "write access to the System Management container lets someone publish a management "
+        "point that clients may be pointed to.",
+        "Leave Full Control on the container to the site servers only, and manage the site "
+        "servers' computer objects from tier 0.",
+        sorted(hits),
+    )
+
+
+@check("AD-PRIV-016", "gMSA with DCSync (Entra Cloud Sync) readable outside tier 0")
+def dcsync_gmsa_readers(snap: Snapshot) -> Finding | None:
+    dcsync = _dcsync_sids(snap)
+    by_dn = snap.by_dn()
+    by_sid = {a.sid: a for a in snap.accounts if a.sid}
+    tier0 = _tier0_group_sids(snap)
+    tier0_dns = snap.tier0_dns()
+    hits = []
+    for g in snap.gmsas:
+        account = by_dn.get(g.dn.lower())
+        if account is None or account.sid not in dcsync:
+            continue
+        for sid in g.readers:
+            reader = by_sid.get(sid)
+            if sid in tier0 or (reader is not None and reader.dn.lower() in tier0_dns):
+                continue
+            notes = []
+            if reader is not None and reader.has(UAC.TRUSTED_FOR_DELEGATION):
+                notes.append("unconstrained delegation")
+            if reader is not None and reader.is_computer and not reader.laps:
+                notes.append("no LAPS")
+            extra = f" ({', '.join(notes)})" if notes else ""
+            hits.append(f"{g.name} readable by {snap.name_of(sid)}{extra}")
+    if not hits:
+        return None
+    return _finding(
+        "AD-PRIV-016",
+        Severity.MEDIUM,
+        "This gMSA can replicate every password hash in the domain, and these principals can "
+        "retrieve its password; Entra Cloud Sync sets one up this way for its agent. "
+        "Controlling one of them means controlling the domain.",
+        "Treat the agent servers as tier 0, keep the reader list to them, and drop the "
+        "replication rights if password hash sync is not used.",
+        sorted(hits),
+    )
+
+
+@check("AD-ACC-020", "Entra Connect connector accounts with old passwords")
+def connector_password_age(snap: Snapshot) -> Finding | None:
+    cutoff = snap.collected_at - OLD_PRIVILEGED_PASSWORD
+    dcsync = _dcsync_sids(snap)
+    old = [
+        a
+        for a in _sync_accounts(snap)
+        if (changed := a.password_changed) is not None and changed < cutoff
+    ]
+    if not old:
+        return None
+    return _finding(
+        "AD-ACC-020",
+        Severity.MEDIUM if any(a.sid in dcsync for a in old) else Severity.LOW,
+        "The password of a sync connector has not changed in over a year. A copy taken from "
+        "the sync server or a backup keeps working for as long as it stays the same.",
+        "Change the connector password in Active Directory and in the sync service together, "
+        "and treat the sync server as tier 0.",
+        _names(old),
+    )
+
+
+def _reads_dkm(ace: sd.Ace) -> bool:
+    if ace.takeover or ace.mask & sd.GENERIC_READ:
+        return True
+    return bool(ace.mask & sd.READ_PROPERTY) and ace.object_type in (None, sd.THUMBNAIL_PHOTO)
+
+
+@check("AD-ACL-011", "AD FS DKM container readable outside tier 0")
+def dkm_acl(snap: Snapshot) -> Finding | None:
+    if not snap.dkm_checked:
+        return None
+    skip = snap.tier0_sids() | {PRINCIPAL_SELF, CREATOR_OWNER}
+    broad = snap.broad_sids()
+    people = {a.sid for a in snap.accounts if a.sid and not a.is_computer}
+    hits = set()
+    high = False
+    for c in snap.dkm_containers:
+        holders = {a.sid for a in c.aces if a.sid not in skip and _reads_dkm(a)}
+        # one user or managed account alone is taken to be the farm's service account
+        if len(holders) == 1 and holders <= people and not holders & broad:
+            continue
+        high = high or bool(holders & broad)
+        hits |= {f"{c.name}: {snap.name_of(s)}" for s in holders}
+    if not hits:
+        return None
+    return _finding(
+        "AD-ACL-011",
+        Severity.HIGH if high else Severity.MEDIUM,
+        "These principals can read the key that protects the AD FS token-signing private key, "
+        "which lets them forge sign-ins (Golden SAML). One user or managed account is expected "
+        "here, the farm's service account; the rest should not be.",
+        "Install the AD FS update for CVE-2026-56155 and let it remediate the DACL, or keep "
+        "only Domain Admins, Enterprise Admins, SYSTEM and the service account.",
+        sorted(hits),
+    )
+
+
+@check("AD-ACL-012", "Non-tier-0 control over the Schema or Configuration partition")
+def config_partition_control(snap: Snapshot) -> Finding | None:
+    tier0 = snap.tier0_sids() | {PRINCIPAL_SELF, CREATOR_OWNER}
+    hits = set()
+    for label, aces in snap.config_acls.items():
+        for ace in aces:
+            if ace.sid in tier0:
+                continue
+            rights = _create_or_takeover(ace)
+            if ace.mask & sd.CONTROL_ACCESS and ace.object_type is None and not ace.takeover:
+                rights.append("all extended rights")
+            if rights:
+                hits.add(f"{label}: {snap.name_of(ace.sid)} ({', '.join(rights)})")
+    if not hits:
+        return None
+    return _finding(
+        "AD-ACL-012",
+        Severity.HIGH,
+        "These objects act on the whole forest: the schema, its sites and GPO links, display "
+        "specifiers and domain settings. Write access here reaches every domain in it.",
+        "Remove the rights; only the forest's administrators should hold them.",
+        sorted(hits),
+    )
+
+
+OU_RIGHTS_CLASSES = (None, sd.USER_CLASS, sd.INET_ORG_PERSON_CLASS, sd.COMPUTER_CLASS)
+OU_RIGHTS_PLACES = ("ou", "container", "domain")
+
+
+def _ou_right(ace: sd.Ace) -> str | None:
+    if ace.inherited_object_type not in OU_RIGHTS_CLASSES:
+        return None
+    if ace.takeover:
+        return _full_or_write(ace)
+    if not ace.mask & sd.CONTROL_ACCESS:
+        return None
+    if ace.object_type is None:
+        return "all extended rights"
+    return "reset password" if ace.object_type == sd.RESET_PASSWORD else None
+
+
+@check("AD-ACL-013", "Extended rights over accounts granted on OUs")
+def ou_extended_rights(snap: Snapshot) -> Finding | None:
+    if not snap.ace_inheritance_checked:
+        return None
+    tier0 = _tier0_group_sids(snap) | {PRINCIPAL_SELF, CREATOR_OWNER}
+    broad = snap.broad_sids()
+    hits = set()
+    high = False
+    for o in snap.objects:
+        if o.kind not in OU_RIGHTS_PLACES:
+            continue
+        for ace in o.inheritable:
+            if ace.inherited or ace.sid in tier0:
+                continue
+            right = _ou_right(ace)
+            # a named delegate with a specific right, or Full Control over its OU, is the
+            # usual shape of delegation; only all extended rights for one stands out
+            if right is None or (ace.sid not in broad and right != "all extended rights"):
+                continue
+            high = high or ace.sid in broad
+            hits.add(f"{o.name}: {snap.name_of(ace.sid)} ({right})")
+    if not hits:
+        return None
+    return _finding(
+        "AD-ACL-013",
+        Severity.HIGH if high else Severity.LOW,
+        "These grants pass to the accounts below: a broad group can reset passwords or use "
+        "every extended right there, and all extended rights is more than a delegate needs.",
+        "Remove the grants from broad groups and replace all extended rights with the specific "
+        "right the delegate needs.",
+        sorted(hits),
+    )
+
+
+# --- Privileged leftovers ----------------------------------------------------------------
+
+
+BUILTIN_ADMIN_RECENT = timedelta(days=30)
+
+
+@check("AD-ACC-018", "Built-in Administrator account used recently")
+def builtin_admin_logon(snap: Snapshot) -> Finding | None:
+    cutoff = snap.collected_at - BUILTIN_ADMIN_RECENT
+    hits = [
+        a
+        for a in _enabled_users(snap)
+        if a.rid == 500 and a.last_logon is not None and a.last_logon >= cutoff
+    ]
+    if not hits:
+        return None
+    day = max(a.last_logon for a in hits if a.last_logon).strftime("%Y-%m-%d")
+    return _finding(
+        "AD-ACC-018",
+        Severity.LOW,
+        f"The RID 500 account last signed in around {day}. Microsoft reserves it for the "
+        "initial build and disaster recovery, and asks for an alert on every use.",
+        "Use named tier-0 accounts, keep this one for recovery with an alert on its use, and "
+        "do not disable it: forest recovery needs it.",
+        _names(hits),
+    )
+
+
+@check("AD-ACC-019", "Smart-card-required accounts whose hash is not rotated")
+def smartcard_hash_rotation(snap: Snapshot) -> Finding | None:
+    cutoff = snap.collected_at - OLD_PRIVILEGED_PASSWORD
+    privileged = snap.privileged_dns()
+    hits = [
+        a
+        for a in _enabled_users(snap)
+        if a.has(UAC.SMARTCARD_REQUIRED)
+        and (changed := a.password_changed) is not None
+        and changed < cutoff
+    ]
+    if not hits:
+        return None
+    return _finding(
+        "AD-ACC-019",
+        Severity.MEDIUM if any(a.dn.lower() in privileged for a in hits) else Severity.LOW,
+        "A smart-card-required account still has an NT hash, set once when the flag was "
+        "turned on. It has not changed in over a year, so a stolen hash keeps working.",
+        "At domain functional level 2016 or later, turn on rolling of expiring NTLM secrets "
+        "and let these passwords expire; otherwise toggle the smart card flag on a schedule.",
+        _names(hits),
+    )
+
+
+@check("AD-PRIV-017", "Tier-0 accounts with a mail address")
+def tier0_mail(snap: Snapshot) -> Finding | None:
+    if not snap.mail_checked:
+        return None
+    privileged = snap.privileged_dns()
+    hits = [a for a in _enabled_users(snap) if a.has_mail and a.dn.lower() in privileged]
+    if not hits:
+        return None
+    return _finding(
+        "AD-PRIV-017",
+        Severity.LOW,
+        "A mail address usually means a mailbox, and a tier-0 account that reads mail can be "
+        "phished directly. The attribute alone does not prove a mailbox exists.",
+        "Give administrators a separate account for mail and clear the attribute here.",
+        _names(hits),
+    )
+
+
+def _group_cycles(groups: dict[str, DirObject]) -> list[list[DirObject]]:
+    """Strongly connected sets of groups along member links (Tarjan's algorithm, without
+    recursion: nesting has no depth limit)."""
+    links = {dn: [m.lower() for m in o.members if m.lower() in groups] for dn, o in groups.items()}
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    out: list[list[DirObject]] = []
+    for start in links:
+        if start in index:
+            continue
+        work: list[tuple[str, int]] = [(start, 0)]
+        while work:
+            dn, pos = work.pop()
+            if pos == 0:
+                index[dn] = low[dn] = len(index)
+                stack.append(dn)
+                on_stack.add(dn)
+            descended = False
+            for i in range(pos, len(links[dn])):
+                nxt = links[dn][i]
+                if nxt not in index:
+                    work += [(dn, i + 1), (nxt, 0)]
+                    descended = True
+                    break
+                if nxt in on_stack:
+                    low[dn] = min(low[dn], index[nxt])
+            if descended:
+                continue
+            if low[dn] == index[dn]:
+                members = []
+                while True:
+                    item = stack.pop()
+                    on_stack.discard(item)
+                    members.append(item)
+                    if item == dn:
+                        break
+                if len(members) > 1 or dn in links[dn]:
+                    out.append([groups[m] for m in members])
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[dn])
+    return out
+
+
+@check("AD-PRIV-018", "Circular group nesting")
+def group_loops(snap: Snapshot) -> Finding | None:
+    groups = {o.dn.lower(): o for o in snap.objects if o.kind == "group"}
+    cycles = _group_cycles(groups)
+    if not cycles:
+        return None
+    tier0 = _tier0_group_sids(snap)
+    return _finding(
+        "AD-PRIV-018",
+        Severity.LOW if any(g.sid in tier0 for c in cycles for g in c) else Severity.INFO,
+        "These groups are members of each other, so removing a member from one does not "
+        "remove it from the others, and membership reviews and tools can go wrong.",
+        "Break each loop by removing one nesting, starting with any tier-0 group.",
+        sorted(" <-> ".join(sorted(g.name for g in c)) for c in cycles),
+    )
+
+
+# --- CA certificates, display specifiers, dynamic objects --------------------------------
+
+
+WEAK_HASHES = {"md2": Severity.HIGH, "md4": Severity.HIGH, "md5": Severity.HIGH,
+               "sha1": Severity.MEDIUM}  # fmt: skip
+SHORT_KEY = 2048
+BROKEN_KEY = 1024
+
+
+def _weak_certificate(c: CaCertificate) -> tuple[Severity, list[str]] | None:
+    issues: list[str] = []
+    severity = Severity.INFO
+    if c.key_type in ("rsa", "dsa") and c.key_bits is not None and c.key_bits < SHORT_KEY:
+        issues.append(f"{c.key_type.upper()} key of {c.key_bits} bits")
+        severity = Severity.HIGH if c.key_bits < BROKEN_KEY else Severity.MEDIUM
+    # a self-signed root is trusted by being installed, so its own signature is not checked
+    if not c.self_signed and c.signature_hash in WEAK_HASHES:
+        issues.append(f"signed with {c.signature_hash.upper()}")
+        severity = max(severity, WEAK_HASHES[c.signature_hash])
+    return (severity, issues) if issues else None
+
+
+@check("AD-ADCS-021", "Weak CA certificates published in the forest")
+def weak_ca_certificates(snap: Snapshot) -> Finding | None:
+    hits = []
+    severity = Severity.INFO
+    for c in snap.ca_certificates:
+        weak = _weak_certificate(c) if c.parsed else None
+        if weak is None or (c.not_after is not None and c.not_after < snap.collected_at):
+            continue
+        severity = max(severity, weak[0])
+        hits.append(f"{c.name} ({', '.join(c.stores)}): {', '.join(weak[1])}")
+    if not hits:
+        return None
+    return _finding(
+        "AD-ADCS-021",
+        severity,
+        "A short CA key or a weak signature on a CA certificate gives an attacker a better "
+        "chance of producing a certificate this CA's clients accept, which NTAuth makes good "
+        "for domain logon.",
+        "Reissue the CA certificate with an RSA key of at least 2048 bits and SHA-256, and "
+        "retire the old one.",
+        sorted(hits),
+    )
+
+
+@check("AD-INF-023", "Display specifiers that run something from another host")
+def display_specifier_commands(snap: Snapshot) -> Finding | None:
+    if not snap.display_specifiers:
+        return None
+    rows = {f"{x.dn.split(',')[0].removeprefix('CN=')} ({x.attribute}): {x.command}"
+            for x in snap.display_specifiers}  # fmt: skip
+    return _finding(
+        "AD-INF-023",
+        Severity.MEDIUM,
+        "These context menu entries start a file or address on another host when an "
+        "administrator uses them in an Active Directory console. Whoever can change that "
+        "target runs code as that administrator.",
+        "Remove the entries you do not recognise, and keep tools an administrator starts on "
+        "a host only tier 0 can write to.",
+        sorted(rows),
+    )
+
+
+DYNAMIC_MIN_TTL = 900
+DYNAMIC_DEFAULT_TTL = 86400
+
+
+@check("AD-INF-024", "Dynamic objects or lowered TTL settings")
+def dynamic_objects(snap: Snapshot) -> Finding | None:
+    if not snap.dynamic_objects_checked:
+        return None
+    tier0 = snap.tier0_dns()
+    rows = list(snap.dynamic_objects)
+    high = any(dn.lower() in tier0 for dn in rows)
+    if snap.dynamic_ttl_min is not None and snap.dynamic_ttl_min < DYNAMIC_MIN_TTL:
+        rows.append(f"DynamicObjectMinTTL is {snap.dynamic_ttl_min} seconds (default 900)")
+    if snap.dynamic_ttl_default is not None and snap.dynamic_ttl_default < DYNAMIC_DEFAULT_TTL:
+        rows.append(
+            f"DynamicObjectDefaultTTL is {snap.dynamic_ttl_default} seconds (default 86400)"
+        )
+    if not rows:
+        return None
+    return _finding(
+        "AD-INF-024",
+        Severity.HIGH if high else Severity.LOW,
+        "Dynamic objects delete themselves when their TTL runs out and leave no tombstone, "
+        "which suits a short-lived backdoor. A lowered TTL shortens how long one lasts.",
+        "Review each object, delete those you cannot explain, and restore the TTL settings "
+        "in msDS-Other-Settings to 900 and 86400 seconds.",
+        sorted(rows),
+    )
+
+
+# --- Scripts that Group Policy runs, and the probes of tier-0 hosts ----------------------
+
+
+def _script_tier0(snap: Snapshot) -> set[str]:
+    """SIDs that may change a script without crossing out of tier 0."""
+    dns = snap.tier0_dns()
+    sids = _tier0_group_sids(snap) | {CREATOR_OWNER}
+    sids |= {a.sid for a in snap.accounts if a.sid and a.dn.lower() in dns}
+    return sids | {o.sid for o in snap.objects if o.sid and o.dn.lower() in dns}
+
+
+def _running_scripts(snap: Snapshot) -> list[tuple[GpoScript, str, gpo_scope.ScriptReach]]:
+    """(file, GPO name, reach) of the files that some enabled account can run."""
+    if not snap.gpo_scripts:
+        return []
+    gpos = {g.guid.upper(): g for g in snap.gpos}
+    reach = gpo_scope.script_reach(snap, snap.tier0_dns() | set(tier0_hosts(snap)))
+    out = []
+    for x in snap.gpo_scripts:
+        g = gpos.get(x.gpo.upper())
+        where = reach.get((x.gpo.upper(), x.side))
+        if g is not None and where and where.accounts and gpo_scope.script_can_run(g, x):
+            out.append((x, g.name, where))
+    return out
+
+
+def _reach_label(where: gpo_scope.ScriptReach) -> str:
+    """What a row's reach rests on, written where item-level targeting is."""
+    wmi = "WMI filter not evaluated, " if where.wmi else ""
+    loopback = {"on": "through loopback, ", "unknown": "loopback not evaluated, "}
+    return wmi + loopback.get(where.loopback, "")
+
+
+@check("AD-GPO-017", "Scripts Group Policy runs that can be changed outside tier 0")
+def gpo_script_writable(snap: Snapshot) -> Finding | None:
+    if not snap.gpo_scripts_checked or not (snap.gpo_scripts or snap.sysvol_acls):
+        return None
+    acls = {a.path.lower(): a for a in snap.sysvol_acls}
+    tier0 = _script_tier0(snap)
+    broad = snap.broad_sids()
+    rows: dict[str, Severity] = {}
+    named: set[str] = set()
+
+    def add(label: str, path: str, top: Severity, low: Severity) -> None:
+        for (sid, where), right in fileacl.writers(acls, path).found.items():
+            if sid in tier0:
+                continue
+            at = "" if where.lower() == path.lower() else f", through {where}"
+            row = f"{label}: {path}: {snap.name_of(sid)} ({right}{at})"
+            grade = top if sid in broad else low
+            rows[row] = max(grade, rows.get(row, Severity.LOW))
+
+    for x, name, where in _running_scripts(snap):
+        paths = [p for p in (x.config, x.target if x.location == "sysvol" else "") if p]
+        named |= {p.lower() for p in paths}
+        side = "item-level targeting not evaluated, " if x.filtered else ""
+        label = f"GPO {name} ({side}{_reach_label(where)}{x.side} {x.phase})"
+        capped = x.filtered or where.wmi
+        top = Severity.MEDIUM if capped else Severity.HIGH
+        grade = Severity.HIGH if where.tier0 and not capped else Severity.MEDIUM
+        if where.loopback == "unknown":
+            top, grade = Severity.MEDIUM, Severity.LOW
+        for path in paths:
+            add(label, path, top, grade)
+    for acl in snap.sysvol_acls:
+        low = acl.path.lower()
+        if not acl.directory and low.startswith("scripts\\") and low not in named:
+            add("NETLOGON", acl.path, Severity.MEDIUM, Severity.LOW)
+    if not rows:
+        return None
+    return _finding(
+        "AD-GPO-017",
+        max(rows.values()),
+        "A file a GPO runs, the file that lists it, or a folder above them can be changed by "
+        "someone outside tier 0. Whoever changes it runs code as SYSTEM on the computers the GPO "
+        "applies to, or as each user who logs on there.",
+        "Take the write rights off the file and the folders above it, and give tier-0 groups "
+        "ownership. Move a script used by tier 0 into a folder only tier 0 can write.",
+        sorted(rows),
+    )
+
+
+@check("AD-GPO-018", "Scripts Group Policy runs from hosts outside tier 0")
+def gpo_script_host(snap: Snapshot) -> Finding | None:
+    if not snap.gpo_scripts_checked or not snap.gpo_scripts:
+        return None
+    hosts = gpo_scope.host_index(snap)
+    roles = tier0_hosts(snap)
+    sccm = {a.dn.lower() for a in snap.sccm_site_servers()}
+    rows: dict[str, Severity] = {}
+    for x, name, where in _running_scripts(snap):
+        label = f"GPO {name} ({_reach_label(where)}{x.side} {x.phase}): {x.path}"
+        if x.location == "unresolved":
+            rows[f"{label}: a variable in the path, host not judged"] = Severity.INFO
+        elif x.location == "unclear":
+            rows[f"{label}: the command line does not say that this runs, not judged"] = (
+                Severity.INFO
+            )
+        elif x.location == "host":
+            account = hosts.get(x.host)
+            if account is None:
+                rows[f"{label}: host {x.host} is not a computer in the snapshot, not judged"] = (
+                    Severity.INFO
+                )
+            elif account.dn.lower() not in roles and account.dn.lower() not in sccm:
+                capped = x.filtered or where.wmi
+                grade = Severity.HIGH if where.tier0 and not capped else Severity.MEDIUM
+                if where.loopback == "unknown":
+                    rows[f"{label}: host {account.sam} is outside tier 0, not judged"] = (
+                        Severity.INFO
+                    )
+                else:
+                    rows[f"{label}: host {account.sam} is outside tier 0"] = grade
+    if not rows:
+        return None
+    return _finding(
+        "AD-GPO-018",
+        max(rows.values()),
+        "A GPO runs a file from a host outside tier 0. Whoever controls that host can replace "
+        "the file and run code on the computers the GPO applies to, or as each user who logs "
+        "on there. The permissions on the host are not read.",
+        "Serve scripts used by tier 0 from SYSVOL or a tier-0 host, and treat a host that serves "
+        "scripts to a wide scope as being at the level of what it reaches.",
+        sorted(rows),
+    )
+
+
+@check("AD-INF-025", "SMB signing not required on tier-0 member servers")
+def tier0_member_smb_signing(snap: Snapshot) -> Finding | None:
+    weak = sorted(h.name for h in snap.probes.tier0_smb if h.signing_required is False)
+    if not weak:
+        return None
+    return _finding(
+        "AD-INF-025",
+        Severity.HIGH,
+        "Relayed NTLM authentication can be used against these tier-0 servers over SMB: an "
+        "administrator relayed to one of them is an administrator there.",
+        "Enable 'Microsoft network server: Digitally sign communications (always)' on them.",
+        weak,
+    )
+
+
+def _pack_rows(snap: Snapshot, attr: str) -> list[str]:
+    if not snap.probes.dc_pack_ran:
+        return []
+    return sorted(d.name for d in snap.probes.dcs if getattr(d, attr) is True)
+
+
+@check("AD-INF-026", "WebClient running on domain controllers")
+def webclient_on_dc(snap: Snapshot) -> Finding | None:
+    running = _pack_rows(snap, "webclient")
+    if not running:
+        return None
+    return _finding(
+        "AD-INF-026",
+        Severity.MEDIUM,
+        "With WebClient running, a coerced DC can authenticate over HTTP, which SMB and LDAP "
+        "signing do not protect, so the authentication can be relayed.",
+        "Stop and disable the WebClient service on domain controllers.",
+        running,
+    )
+
+
+@check("AD-INF-027", "SMBv1 enabled on domain controllers")
+def smb1_on_dc(snap: Snapshot) -> Finding | None:
+    enabled = _pack_rows(snap, "smb1")
+    if not enabled:
+        return None
+    return _finding(
+        "AD-INF-027",
+        Severity.HIGH,
+        "These DCs answered an SMB1 negotiate. SMB1 has no integrity by default and carries the "
+        "flaws behind EternalBlue.",
+        "Remove the SMB 1.0 feature, or set SMB1 to disabled on the server.",
+        enabled,
+    )
+
+
+@check("AD-INF-028", "LDAPS accepts TLS 1.0 or 1.1 on domain controllers")
+def legacy_ldaps_tls(snap: Snapshot) -> Finding | None:
+    rows = [f"{d} (TLS 1.0)" for d in _pack_rows(snap, "tls10")]
+    rows += [f"{d} (TLS 1.1)" for d in _pack_rows(snap, "tls11")]
+    if not rows:
+        return None
+    return _finding(
+        "AD-INF-028",
+        Severity.MEDIUM,
+        "These DCs completed a TLS handshake of a version that is deprecated (RFC 8996) on the "
+        "LDAPS port.",
+        "Disable TLS 1.0 and 1.1 in SCHANNEL on the DCs once no client needs them.",
+        sorted(rows),
+    )
+
+
+VERSION_ONLY = (
+    "This compares a build number with Microsoft's fixed build and does not test the flaw; "
+    "a configuration finding is stronger evidence."
+)
+
+
+def _fixes_text(host: HostPatch, cves: list[patches.Cve]) -> str:
+    assert host.build is not None and host.ubr is not None
+    below = "; ".join(
+        f"{c.id} from {patches.version(host.build, c.fixed[host.build])}" for c in cves
+    )
+    return f"{host.name} (at {patches.version(host.build, host.ubr)}, needs {below})"
+
+
+@check("AD-INF-029", "Domain controllers below Microsoft's fixed build for an AD flaw")
+def dc_patch_level(snap: Snapshot) -> Finding | None:
+    rows: dict[str, str] = {}
+    for host in sorted(snap.probes.patch_levels, key=lambda h: h.name.lower()):
+        if "dc" in host.roles and (cves := patches.missing_fixes(host, "dc")):
+            rows[_fixes_text(host, cves)] = host.name
+    if not rows:
+        return None
+    finding = _finding(
+        "AD-INF-029",
+        Severity.MEDIUM,
+        "These domain controllers run a build below the one Microsoft published as fixing the "
+        f"named flaws. {VERSION_ONLY}",
+        "Install the current cumulative update on these domain controllers.",
+        sorted(rows),
+    )
+    finding.keys = {text: name for text, name in rows.items()}
+    finding.data = {"confidence": "version only", "table": str(patches.table().updated)}
+    return finding
+
+
+@check("AD-ADCS-022", "CA below the fix for CVE-2026-54121 (Certighost)")
+def certighost(snap: Snapshot) -> Finding | None:
+    table = patches.table()
+    cve = table.get(patches.CERTIGHOST)
+    configs = {c.host.lower(): c for c in snap.probes.ca_configs}
+    rows: dict[str, str] = {}
+    flag_set = False
+    for host in sorted(snap.probes.patch_levels, key=lambda h: h.name.lower()):
+        cfg = configs.get(host.name.lower())
+        if "ca" not in host.roles or cfg is None or cfg.edit_flags is None:
+            continue
+        if not patches.below(host, cve):
+            continue
+        chase = bool(cfg.edit_flags & sd.EDITF_ENABLECHASECLIENTDC)
+        flag_set = flag_set or chase
+        state = "EDITF_ENABLECHASECLIENTDC set" if chase else "EDITF_ENABLECHASECLIENTDC off"
+        rows[f"{_fixes_text(host, [cve])}, {cfg.name}: {state}"] = host.name
+    if not rows:
+        return None
+    finding = _finding(
+        "AD-ADCS-022",
+        Severity.MEDIUM if flag_set else Severity.LOW,
+        "These CAs run a build below Microsoft's fix for CVE-2026-54121, through which a domain "
+        "user can get a certificate that authenticates as a domain controller. With "
+        f"EDITF_ENABLECHASECLIENTDC set the path researchers describe is open. {VERSION_ONLY}",
+        "Install the July 2026 or later cumulative update on the CA host. Clearing "
+        "EDITF_ENABLECHASECLIENTDC is a temporary measure only.",
+        sorted(rows),
+    )
+    finding.keys = {text: name for text, name in rows.items()}
+    finding.data = {"confidence": "version only", "table": str(table.updated)}
+    return finding
 
 
 # AD-PATH-001 lives in paths.py; importing it here registers it with every run.

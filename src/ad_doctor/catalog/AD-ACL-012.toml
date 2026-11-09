@@ -1,0 +1,53 @@
+id = "AD-ACL-012"
+aliases = ["config-acl"]
+summary = "A principal outside tier 0 can write to, or create objects in, the schema or a forest-wide object of the Configuration partition."
+severities = ["high"]
+severity_logic = """
+Always **high**: these objects act on every domain in the forest.
+"""
+mitre = ["T1222.001", "T1484"]
+data_sources = ["ldap"]
+attributes = ["nTSecurityDescriptor"]
+related = ["AD-ACL-003", "AD-INF-023"]
+since = "0.2.5"
+
+risk = """
+The schema, the Configuration partition, and containers such as `CN=Sites` and `CN=Partitions` are
+shared by the whole forest. Write access to them can change how every domain behaves, link GPOs
+to sites, or change the settings other checks read.
+"""
+
+detection = """
+From the LDAP snapshot, the DACLs of seven objects: the Schema partition head, the Configuration
+partition head, `CN=Partitions`, `CN=Sites`, `CN=DisplaySpecifiers`, `CN=Extended-Rights` and
+`CN=Directory Service`. A row is any ACE, outside tier 0, that grants takeover rights, the right
+to create children, or all extended rights.
+
+**There is no ACE-by-ACE baseline.** The rule is that only tier 0 may write here. Microsoft's
+`defaultSecurityDescriptor` of the schema head's class gives others read access only, and the lab
+DC (Windows Server 2025) holds nothing more for these seven: outside tier 0, only Authenticated
+Users with read rights.
+
+Left out, because a default could not be sourced: the DACLs of other Configuration objects, and
+changes to the `defaultSecurityDescriptor` of schema classes. A label that could not be read is
+named in a note and not judged.
+"""
+
+false_positives = """
+- **Products that extend the forest**, such as Exchange, may add principals here. Exchange groups
+  on these objects are reported like any others.
+- **Deny ACEs are not read.**
+"""
+
+remediation = """
+1. Remove the ACE, unless a product you run documents it.
+2. Find out who added it: replication metadata and the Security log of a domain controller
+   show when the DACL changed.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-012"
+
+[[references]]
+title = "[MS-ADSC]: Class dMD"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adsc/e487c826-1d82-4986-bb5d-73846d076753"
+kind = "spec"

@@ -1,0 +1,67 @@
+id = "AD-INF-022"
+aliases = ["sccm-footprint"]
+summary = "Configuration Manager (SCCM) is published in this domain. Its site servers can run code on the clients they manage, so they are counted as tier 0."
+severities = ["info"]
+severity_logic = """
+Always **info**: the finding names what is there. Whether it is a risk depends on what the site
+manages, which the directory does not show.
+"""
+mitre = ["T1072"]
+data_sources = ["ldap"]
+attributes = ["nTSecurityDescriptor", "mSSMSSiteCode", "dNSHostName"]
+related = ["AD-ACL-014", "AD-PATH-001"]
+since = "0.2.5"
+
+risk = """
+A Configuration Manager site can install software and run scripts on every client it manages. If
+domain controllers or other tier-0 servers are clients, whoever controls a site server controls
+them too.
+"""
+
+detection = """
+From the LDAP snapshot:
+
+- the container `CN=System Management,CN=System,<domain>`,
+- `mSSMSSite` and `mSSMSManagementPoint` objects inside it,
+- the computers that hold Full Control on the container, directly or through a group. Microsoft
+  has site servers granted exactly that, so this is how they are found. Broad and tier-0
+  principals are left out of this list.
+
+These computers count as **tier 0 in the attack graph**, like CA servers: AD-PATH-001 and
+`blast-radius` treat a path to one as a path to tier 0.
+
+A domain with no such container reports nothing. The container inherits its permissions from
+`CN=System`, so ordinary users normally see it. If the search is refused, the report says the
+check was not judged.
+"""
+
+false_positives = """
+- **A site that manages no tier-0 system** is still listed. Nothing in the directory shows which
+  computers are clients, so the graph counts every site server as tier 0. Accept it with an
+  [accepted-risk file](../ci.md#accepted-risks) if that is deliberate.
+- **Leftovers.** The container can outlive a site that was removed.
+"""
+
+remediation = """
+1. Confirm which servers run Configuration Manager and whether domain controllers are clients.
+2. If the site manages tier-0 systems, manage the site servers, the site database and the SMS
+   Providers from tier 0.
+3. If Configuration Manager is gone, remove the `System Management` container.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-022"
+
+[[references]]
+title = "Publishing and the Active Directory schema"
+url = "https://learn.microsoft.com/en-us/intune/configmgr/core/plan-design/network/extend-the-active-directory-schema"
+kind = "vendor"
+
+[[references]]
+title = "Misconfiguration Manager: RECON-1, enumerate SCCM over LDAP"
+url = "https://docs.specterops.io/misconfiguration-manager-docs/attack-techniques/RECON/RECON-1/recon-1_description"
+kind = "research"
+
+[[references]]
+title = "ConfigManBearPig 2.0"
+url = "https://specterops.io/blog/2026/08/03/configmanbearpig-2-0/"
+kind = "research"

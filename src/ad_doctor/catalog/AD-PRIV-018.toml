@@ -1,0 +1,39 @@
+id = "AD-PRIV-018"
+aliases = ["group-loops"]
+summary = "Groups are members of each other, directly or through nesting."
+severities = ["info", "low"]
+severity_logic = """
+**Low** when a loop includes a tier-0 group, **info** otherwise.
+"""
+mitre = []
+data_sources = ["ldap"]
+attributes = ["member"]
+related = ["AD-PRIV-001"]
+since = "0.2.5"
+
+risk = """
+A loop gives no one extra rights by itself. It does make a membership hard to follow: taking a
+member out of one group can leave it in through another, and review scripts can loop or
+miscount.
+"""
+
+detection = """
+From the LDAP snapshot: strongly connected sets along `member` links between the groups of this
+domain. Groups of other domains are not visible. Very large groups may be read only in part, in
+which case a loop through the part not read is missed.
+"""
+
+false_positives = """
+- **Deliberate nesting between peer groups** is rare, but it is reported.
+"""
+
+remediation = """
+1. Remove one nesting from each loop, beginning with any tier-0 group.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-018"
+
+[[references]]
+title = "Search Filter Syntax: LDAP_MATCHING_RULE_IN_CHAIN"
+url = "https://learn.microsoft.com/en-us/windows/win32/adsi/search-filter-syntax"
+kind = "vendor"

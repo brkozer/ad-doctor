@@ -1,0 +1,44 @@
+id = "AD-ACC-018"
+aliases = ["rid500-logon"]
+summary = "The built-in Administrator account (RID 500) was used in the last 30 days."
+severities = ["low"]
+severity_logic = """
+Always **low**: this is a matter of practice, and the account may have been used for a good reason.
+"""
+mitre = ["T1078.002"]
+data_sources = ["ldap"]
+attributes = ["lastLogonTimestamp", "objectSid"]
+related = ["AD-ACC-011"]
+since = "0.2.5"
+
+risk = """
+Microsoft reserves the domain's Administrator account for the initial build and disaster recovery,
+and asks for an alert every time it is used. Everyday use leaves its credentials on more systems,
+and the logs do not tie the actions to one person.
+"""
+
+detection = """
+From the LDAP snapshot: the enabled account whose RID is 500, found by SID so a rename does not
+hide it, whose `lastLogonTimestamp` is within the last **30 days**. That is this check's own line.
+
+`lastLogonTimestamp` is updated only about every 14 days, so a recent sign-in can be missed. A
+disabled account is not reported. If the account does not come back at all, a note says the check
+was not judged.
+"""
+
+false_positives = """
+- **Building or recovering a domain** right before the scan.
+"""
+
+remediation = """
+1. Use named tier-0 accounts for administration.
+2. Keep this account for recovery, with an alert on its use. Do not disable it: Microsoft notes
+   that forest recovery makes use of it.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-018"
+
+[[references]]
+title = "Appendix D: Securing Built-In Administrator Accounts in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-d--securing-built-in-administrator-accounts-in-active-directory"
+kind = "vendor"

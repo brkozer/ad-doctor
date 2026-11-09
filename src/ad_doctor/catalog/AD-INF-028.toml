@@ -1,0 +1,43 @@
+id = "AD-INF-028"
+aliases = ["ldaps-legacy-tls"]
+summary = "A domain controller completes a TLS 1.0 or 1.1 handshake on the LDAPS port. Only with --dc-probes."
+severities = ["medium"]
+severity_logic = """
+**Medium** for each DC that completes a handshake of TLS 1.0 or TLS 1.1.
+"""
+mitre = ["T1557"]
+data_sources = ["probe-ldaps"]
+attributes = ["TLS handshake on the LDAPS port, one per version"]
+related = ["AD-INF-010"]
+since = "0.2.5"
+
+risk = """
+TLS 1.0 and 1.1 are deprecated (RFC 8996): they lack the stronger cipher suites, and a client that
+can be downgraded to them gets weaker protection for the LDAP bind and the data behind it.
+"""
+
+detection = """
+With `--dc-probes`, the scan attempts one handshake of each version, TLS 1.0 to 1.3, on the LDAPS
+port (and sends nothing after it). The verdict comes from a handshake that completed. A version
+is only called refused when another one was accepted on the same port, so a port that does not
+answer TLS is unknown, and so is a version this machine's TLS library cannot offer. A note says so
+when TLS 1.0 or 1.1 stay unknown. Without the switch the check does not run and a note says so.
+"""
+
+false_positives = """
+- **A client that still needs it**: review who connects with old TLS before disabling the version.
+"""
+
+remediation = "Disable TLS 1.0 and 1.1 for SCHANNEL on the DCs once no client needs them."
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --dc-probes --only AD-INF-028"
+
+[[references]]
+title = "RFC 8996: Deprecating TLS 1.0 and TLS 1.1"
+url = "https://www.rfc-editor.org/rfc/rfc8996"
+kind = "spec"
+
+[[references]]
+title = "Transport Layer Security (TLS) registry settings"
+url = "https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings"
+kind = "vendor"

@@ -17,6 +17,7 @@ the resolution is printed:
     gmsa:<gMSA>:<reader>                    delegation:<account>:unconstrained
     rbcd:<computer>:<principal>             sid-history:<account>[:<SID>]
     oid-link:<OID>                          ca-flag:<CA>:san-from-request|no-sid-extension
+    script-ace:"<SYSVOL path>":<trustee>    script-host:"<GPO>":"<path as the GPO writes it>"
     all-rights-of:helpdesk[:tier0]          every change of that trustee
 
 Names are a sAMAccountName, a name, a DN or a SID. More than one match is an error that
@@ -395,6 +396,17 @@ class Resolver:
             if a is None:
                 return False
             return key[2] in ((a.rbcd_principals or []) if kind[0] == "r" else a.sid_history)
+        if kind == "script-ace":
+            return any(
+                x.path.lower() == key[1]
+                and (x.owner == key[2] or any(a.sid == key[2] for a in x.aces))
+                for x in snap.sysvol_acls
+            )
+        if kind == "script-host":
+            return any(
+                x.gpo.upper() == key[1] and x.path.lower() == key[2] and x.location == "host"
+                for x in snap.gpo_scripts
+            )
         if kind == "oid-link":
             return snap.oid_group_links.get(key[1], "").lower() == key[2]
         if kind == "ca-flag":
@@ -513,6 +525,10 @@ class Resolver:
             return any(x.dn.lower() == key[1] for x in snap.gmsas)
         if kind in ("delegation", "rbcd-principal", "sid-history"):
             return key[1] in self.where.dn
+        if kind == "script-ace":
+            return any(x.path.lower() == key[1] for x in snap.sysvol_acls)
+        if kind == "script-host":
+            return any(x.gpo.upper() == key[1] for x in snap.gpo_scripts)
         if kind == "oid-link":
             return key[1] in snap.oid_group_links
         if kind == "ca-flag":
@@ -687,6 +703,15 @@ class Resolver:
                     return [("sid-history", dn, principal(args[1]))], []
                 held = next((a for a in self.snap.accounts if a.dn.lower() == dn), None)
                 return [("sid-history", dn, s) for s in (held.sid_history if held else [])], []
+            if kind == "script-ace":
+                need(2, 'script-ace:"<SYSVOL path>":<trustee>')
+                return [("script-ace", args[0].lower(), principal(args[1]))], []
+            if kind == "script-host":
+                need(2, 'script-host:"<GPO>":"<path>"')
+                guid = self.gpo(args[0])
+                if guid is None:
+                    raise _Absent(f"no GPO {args[0]!r} in this snapshot")
+                return [("script-host", guid, args[1].lower())], []
             if kind == "oid-link":
                 need(1, "oid-link:<OID>")
                 linked = self.snap.oid_group_links.get(args[0])
@@ -1133,6 +1158,10 @@ def canonical(snap: Snapshot, prim: Prim, where: changes.Where) -> str:
         return f"oid-link:{quote(f['oid'])}"
     if kind == "ca-flag":
         return f"ca-flag:{quote(f['ca'])}:{f['flag']}"
+    if kind == "script-ace":
+        return f"script-ace:{quote(f['path'])}:{who('trustee')}"
+    if kind == "script-host":
+        return f"script-host:{quote(f['gpo'])}:{quote(f['path'])}"
     return f"delegation:{dn('account')}:{f['what']}"
 
 

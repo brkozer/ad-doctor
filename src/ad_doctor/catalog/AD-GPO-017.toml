@@ -1,0 +1,90 @@
+id = "AD-GPO-017"
+aliases = ["writable-gpo-scripts", "netlogon-script-acl"]
+summary = "A script or scheduled task a GPO runs, the file that lists it, or a NETLOGON script can be changed by someone outside tier 0."
+severities = ["low", "medium", "high"]
+severity_logic = """
+**High** when the GPO reaches a tier-0 account or computer, or a broad group (Authenticated Users,
+Domain Users and the like) can change a file a GPO runs. **Medium** for any other writer of such a
+file, a broad group on a NETLOGON script no GPO names, and any writer of an item with item-level
+targeting or in a GPO with a WMI filter. **Low** for a named writer of a NETLOGON script no GPO
+names, and for a named writer of a logon script whose reach depends on loopback that could not be
+read; a broad group on such a script is medium.
+"""
+mitre = ["T1037.003", "T1484.001", "T1053.005"]
+data_sources = ["sysvol", "ldap"]
+attributes = [
+    "Machine and User Scripts\\scripts.ini and psscripts.ini",
+    "Machine and User Preferences\\ScheduledTasks\\ScheduledTasks.xml",
+    "owner and DACL of each file and of the folders above it, up to the GPO's folder or NETLOGON",
+    "gPLink, gPOptions and the GPO's status, version, extensions and DACL",
+]
+related = ["AD-GPO-018", "AD-GPO-001", "AD-GPP-002"]
+since = "0.2.5"
+
+risk = """
+A startup script or a task running as SYSTEM runs on every computer the GPO applies to, and a logon
+script runs as every user who logs on there. Whoever can change the file, or the folder that holds
+it, gets that code execution without touching the GPO, and the change looks like an edit of a file.
+"""
+
+detection = """
+Each GPO's `scripts.ini`, `psscripts.ini` and `ScheduledTasks.xml` is read over SMB as an ordinary
+user. A script or task counts only when Windows would process it: its side is on and has been
+written, and the Scripts or Scheduled Tasks extension is listed on the GPO. A GPO that reaches
+no enabled account is left out, unless it runs a logon script where only computers sit: there
+the loopback setting (`UserPolicyMode` in `Registry.pol`) of those computers decides. Where it is
+on, the row says so; where it cannot be read, the row says it was not evaluated. Who logs on there
+is not known. Preferences items that are disabled or delete a task are left out.
+
+A command line is followed to what runs: the script itself, or the file an interpreter is told to
+run, when it is on the network. That is the value of `-File` or the first word of `-Command` for
+`powershell` and `pwsh`, what follows `/c` or `/k` for `cmd`, the first operand for `wscript`,
+`cscript`, `mshta`, `rundll32` and `regsvr32`, and `/i` and its like for `msiexec`. A network path
+that is only an argument, such as a log file, is not followed. Local paths and programs on the
+`PATH` are not in the scope of this check. A network path on a command line that does not say what
+it runs is reported by AD-GPO-018 as not judged. The arguments themselves are never kept.
+
+For every path in SYSVOL or NETLOGON the owner and DACL are read with `READ_CONTROL` only, on the
+file, on the file that lists it, and on each folder above them up to the GPO's folder or the top of
+NETLOGON. Executable files in NETLOGON are read the same way when no GPO names them, as a lower
+grade. A principal can change the path when it holds on the file a write, append, `WRITE_DAC` or
+`WRITE_OWNER` right; on a folder `WRITE_DAC` or `WRITE_OWNER`, or both the right to delete children
+and to create them; or when it owns any of them.
+
+A descriptor that has a deny or conditional ACE for one of those rights depends on each
+user's groups: it is not judged, and a note says so. So is one that cannot be read.
+"""
+
+false_positives = """
+- **A delegated GPO editor.** Group Policy Management copies an edit delegation on to the GPO's
+  folder in SYSVOL, so a delegate shows up here as well as in AD-GPO-004. The right is real.
+- **Item-level targeting** on a Preferences task is not evaluated: such a row is said to be.
+- **A WMI filter** on the GPO is assumed to match and is not evaluated: such a row says so and stays
+  at medium or below.
+- **The folders above a GPO's own** (`Policies`, the domain folder) are not read.
+"""
+
+remediation = """
+1. Remove write access for everyone outside tier 0 from the file and the folders above it, and make
+   a tier-0 group the owner.
+2. Keep scripts that tier-0 systems run in a folder only tier 0 can write.
+3. Check the file's content: a writer may already have changed it.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-GPO-017"
+
+[[references]]
+title = "[MS-GPSCR]: Group Policy: Scripts Extension Encoding"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpscr/"
+kind = "spec"
+
+[[references]]
+title = "[MS-GPPREF]: Group Policy: Preferences Extension Data Structure"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gppref/"
+kind = "spec"
+
+
+[[references]]
+title = "ScriptSentry"
+url = "https://github.com/techspence/ScriptSentry"
+kind = "tool"

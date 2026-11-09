@@ -274,6 +274,9 @@ const CORE = (function () {
     for (const [p, group, member] of raw.tier0.pairs) pairs.set(p, [group, member]);
     const baseTier0 = G.tier0.slice();
     for (const [node] of raw.assume) baseTier0[node] = 1;
+    const declared = {};
+    for (const [node] of raw.assume) if (!G.tier0[node]) declared[node] = 1;
+    G.declared = declared;
     const names = new Map();
     for (const [num, id, values, label, cost, warning, rebuild] of raw.changes) {
       names.set(num, { num: num, id: id, kind: raw.kinds[raw.prim_kind[num]], values: values,
@@ -545,8 +548,11 @@ const CORE = (function () {
       out += " -[" + M.labels[S.nxtHow[node]] + "]-> " + M.names[S.nxt[node]];
       node = S.nxt[node];
     }
-    return out;
+    return out && declaredNodes(M)[node] ? out + DECLARED_MARK : out;
   }
+
+  // the assumed tier-0 nodes outside built-in tier 0: a path ending at one says so
+  function declaredNodes(M) { return M.declared || {}; }
 
   // Path.render of a found path, or of a holder's (node, [dst, how])
   function foundText(M, S, node) {
@@ -554,7 +560,9 @@ const CORE = (function () {
   }
 
   function holderText(M, S, node, h) {
-    return M.names[node] + " -[" + M.labels[h[1]] + "]-> " + M.names[h[0]] + stepsText(M, S, h[0]);
+    const rest = stepsText(M, S, h[0]);
+    return M.names[node] + " -[" + M.labels[h[1]] + "]-> " + M.names[h[0]] +
+      (rest || (declaredNodes(M)[h[0]] ? DECLARED_MARK : ""));
   }
 
   // The network as arrays, built on first use: arc 2i is the i-th forward arc, 2i + 1 its

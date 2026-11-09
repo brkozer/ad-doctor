@@ -1,0 +1,47 @@
+id = "AD-PRIV-017"
+aliases = ["admin-mail"]
+summary = "An enabled tier-0 account has a mail address, which usually means it can receive mail and be phished."
+severities = ["low"]
+severity_logic = """
+Always **low**: the attribute alone does not prove a mailbox exists.
+"""
+mitre = ["T1566"]
+data_sources = ["ldap"]
+attributes = ["mail"]
+related = ["AD-PRIV-010"]
+since = "0.2.5"
+
+risk = """
+An administrator who reads mail with an administrative account can be phished with that account's
+rights. Microsoft asks for separate accounts for administration and for everyday use such as
+mail.
+"""
+
+detection = """
+From the LDAP snapshot: enabled users in a tier-0 group whose `mail` attribute is set. The address
+itself is never kept in the snapshot.
+
+If no account in the domain returned `mail`, that may mean none is set or that this account cannot
+read it, so a note says the check was not judged.
+"""
+
+false_positives = """
+- **A mail address for notifications only**, with no mailbox behind it, is reported too.
+"""
+
+remediation = """
+1. Give administrators a separate account for mail and browsing.
+2. Clear `mail` on the tier-0 account, and remove any mailbox behind it.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-017"
+
+[[references]]
+title = "Rapidly modernize your security infrastructure"
+url = "https://learn.microsoft.com/en-us/security/privileged-access-workstations/security-rapid-modernization-plan"
+kind = "vendor"
+
+[[references]]
+title = "Legacy privileged access guidance"
+url = "https://learn.microsoft.com/en-us/security/privileged-access-workstations/legacy-privileged-access-devices"
+kind = "vendor"

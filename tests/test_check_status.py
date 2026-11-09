@@ -188,7 +188,7 @@ def test_an_unattributed_failed_search_makes_the_score_a_minimum() -> None:
 
 def test_no_sysvol_leaves_a_note_naming_what_it_skipped() -> None:
     c = Collector(None, Target("h", sysvol=False))  # type: ignore[arg-type]
-    c._sysvol("lab.test", [])
+    c._sysvol("lab.test", [], [], "", "")
     assert any("by choice" in n and "AD-GPP-001" in n for n in c.notes)
 
 

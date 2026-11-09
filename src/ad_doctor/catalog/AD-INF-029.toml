@@ -1,0 +1,52 @@
+id = "AD-INF-029"
+aliases = ["dc-patch-level"]
+summary = "A domain controller's build is below the build Microsoft published as fixing a flaw that matters to Active Directory. A version match, not a test."
+severities = ["medium"]
+severity_logic = """
+**Medium**, always. The number is compared and the flaw is not tested, so it never ranks with a
+configuration finding that reads the setting itself.
+"""
+mitre = ["T1068"]
+data_sources = ["probe-winreg"]
+attributes = ["CurrentBuildNumber and UBR of HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"]
+related = ["AD-ADCS-022"]
+since = "0.2.5"
+
+risk = """
+Each CVE in the table lets an authenticated attacker gain more rights on or through a domain
+controller. A domain controller below the fixed build is exposed to it until the update is installed,
+unless something else mitigates it, which this check cannot see.
+"""
+
+detection = """
+Over the `winreg` pipe (read only), each domain controller's `CurrentBuildNumber` and `UBR` are
+read and compared with the table in `patches.toml`, which holds the lowest fixed build Microsoft
+published for each CVE, hotpatch builds included. It covers Windows Server 2016, 2019, 2022, 23H2
+and 2025; other builds are not judged. `--no-patch-level` turns it off, and so does `--no-probes`.
+
+A host whose build or UBR cannot be read, or a build that is not in the table, stays unknown and a
+note says so. An old table is also reported in a note.
+"""
+
+false_positives = """
+- **A fix installed another way.** A host on a hotpatch baseline can show a lower number than a host
+  on the monthly update; the table uses the lowest number for that reason, which means a monthly
+  host between the two builds is not reported.
+- **Mitigation by configuration.** SMB signing, for example, limits some of these flaws.
+"""
+
+remediation = """
+Install the current cumulative update on the domain controller.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-029"
+
+[[references]]
+title = "Microsoft Security Update Guide"
+url = "https://msrc.microsoft.com/update-guide/"
+kind = "vendor"
+
+[[references]]
+title = "[MS-RRP]: Windows Remote Registry Protocol"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rrp/"
+kind = "spec"

@@ -55,11 +55,14 @@ ad-doctor scan dc01.corp.example --ldaps -k
 | `--accept FILE` | [accepted risks](ci.md#accepted-risks) |
 | `--invariants FILE` | [declared state](invariants.md) to enforce |
 | `--fixes FILE` | write the PowerShell remediation script |
+| `--preflight FILE` | write a read-only PowerShell script to run before the fixes (first 10 fixes only) |
 | `--only ID ...` | run a subset of checks |
 | `-k`, `--kerberos` | bind with Kerberos instead of a password |
 | `--no-sysvol`, `--no-probes` | skip the SYSVOL read, or every other [probe](probes.md) |
 | `--no-ca-registry` | skip reading CA settings (ESC6/7/11/16, audit filter) over `\pipe\winreg` |
 | `--single-dc` | probe only the DC being scanned |
+| `--dc-probes` | also probe each DC for WebClient, SMBv1 and the TLS versions of LDAPS (off by default) |
+| `--no-patch-level` | do not read each DC's and CA's build and UBR over `\pipe\winreg` |
 
 Parts that cannot run (no AD CS, SYSVOL unreachable) become notes in the report rather than
 failing the scan, and the report lists every check as judged, not applicable or not

@@ -32,8 +32,8 @@ def test_every_check_has_mitre_or_is_hygiene() -> None:
     from ad_doctor.checks import MITRE
 
     unmapped = {c.id for c in REGISTRY} - MITRE.keys()
-    # functional level and directory health: hygiene, no technique
-    assert unmapped == {"AD-INF-003", "AD-INF-019", "AD-INF-020", "AD-INF-021"}
+    # functional level, directory health and group loops: hygiene, no technique
+    assert unmapped == {"AD-INF-003", "AD-INF-019", "AD-INF-020", "AD-INF-021", "AD-PRIV-018"}
 
 
 @pytest.mark.parametrize(

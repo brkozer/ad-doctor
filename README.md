@@ -8,7 +8,7 @@
 Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
-(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 130
+(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 152
 checks for what attackers look for first: roastable accounts, risky delegation,
 exploitable certificate templates and CA settings (ESC1–9, 11, 13–17), DCSync and other takeover rights,
 shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync accounts,
@@ -122,6 +122,9 @@ against a live DC.
 | | AD-ACC-015 | gMSA passwords with a long rotation interval | low |
 | | AD-ACC-016 | Identity collisions to review: UPN, SPN and host name | low |
 | | AD-ACC-017 | sIDHistory written in the last 30 days (replication metadata) | low/medium |
+| | AD-ACC-020 | Entra Connect connector accounts with passwords older than a year | low/medium |
+| | AD-ACC-018 | Built-in Administrator (RID 500) used in the last 30 days | low |
+| | AD-ACC-019 | Smart-card-required accounts whose hash has not changed in a year | low/medium |
 | Privileged access | AD-PRIV-001 | Tier-0 groups with more than 5 members | low |
 | | AD-PRIV-002 | Privileged accounts that can be delegated | medium |
 | | AD-PRIV-003 | Schema Admins or Enterprise Admins not empty | low |
@@ -137,6 +140,9 @@ against a live DC.
 | | AD-PRIV-013 | Tier-0 accounts not denied logon on lower-tier computers, per OU with Group Policy precedence | info/low/medium |
 | | AD-PRIV-014 | Tier-0 accounts outside an enforced authentication policy silo | low |
 | | AD-PRIV-015 | Members added to tier-0 groups in the last 30 days (replication metadata) | low |
+| | AD-PRIV-016 | gMSA holding DCSync (Entra Cloud Sync) readable outside tier 0 | medium |
+| | AD-PRIV-017 | Tier-0 accounts with a mail address | low |
+| | AD-PRIV-018 | Circular group nesting | info/low |
 | Policy | AD-POL-001 | Weak default password policy | medium |
 | | AD-POL-002 | `ms-DS-MachineAccountQuota` above 0 | medium |
 | | AD-POL-003 | Weak fine-grained password policies | low/medium |
@@ -163,6 +169,14 @@ against a live DC.
 | | AD-INF-019 | SYSVOL still replicated by FRS | low/medium |
 | | AD-INF-020 | Sites and subnets that need review | low |
 | | AD-INF-021 | Replication conflict objects and duplicate accounts | low/medium |
+| | AD-INF-022 | Configuration Manager site systems, counted as tier 0 in attack paths | info |
+| | AD-INF-023 | Display specifiers that run something from another host | medium |
+| | AD-INF-024 | Dynamic objects, and TTL settings below their defaults | low/high |
+| | AD-INF-025 | SMB signing not required on tier-0 member servers (probe) | high |
+| | AD-INF-026 | WebClient running on domain controllers (`--dc-probes`) | medium |
+| | AD-INF-027 | SMBv1 enabled on domain controllers (`--dc-probes`) | high |
+| | AD-INF-028 | LDAPS accepts TLS 1.0 or 1.1 on domain controllers (`--dc-probes`) | medium |
+| | AD-INF-029 | Domain controllers below Microsoft's fixed build for an AD flaw (version match, `--no-patch-level` turns it off) | medium |
 | DNS | AD-DNS-001 | Zones that accept nonsecure dynamic updates | medium/high |
 | | AD-DNS-002 | Zones writable outside tier 0 | medium/high |
 | | AD-DNS-003 | Authenticated users can add records to zones (default) | info |
@@ -190,6 +204,8 @@ against a live DC.
 | | AD-ADCS-018 | CA audit filter not fully on (registry probe) | low/medium |
 | | AD-ADCS-019 | HTTPS enrollment endpoints where EPA is not verified (probe) | low |
 | | AD-ADCS-020 | ESC10: weak certificate mapping set by Group Policy on domain controllers | info/medium |
+| | AD-ADCS-021 | Weak CA certificates published in the forest | medium/high |
+| | AD-ADCS-022 | CA below the fix for CVE-2026-54121, Certighost (version match, `--no-patch-level` turns it off) | low/medium |
 | Permissions | AD-ACL-001 | Non-default principals with DCSync rights | high |
 | | AD-ACL-002 | Non-default control over AdminSDHolder | high |
 | | AD-ACL-003 | Non-default control over the domain object | high |
@@ -200,6 +216,10 @@ against a live DC.
 | | AD-ACL-008 | Entra Connect sync account or server controllable outside tier 0 | high |
 | | AD-ACL-009 | Control over dMSAs that replace another account | low/medium |
 | | AD-ACL-010 | AdminSDHolder's ACL changed in the last 30 days (replication metadata) | medium |
+| | AD-ACL-014 | Control outside tier 0 over the System Management container or SCCM site servers | medium/high |
+| | AD-ACL-011 | AD FS DKM container readable outside tier 0 (normally not judged: a plain user cannot read it) | medium/high |
+| | AD-ACL-012 | Control outside tier 0 over the Schema or Configuration partition | high |
+| | AD-ACL-013 | Extended rights over accounts granted on OUs and containers | low/high |
 | Group Policy | AD-GPO-001 | GPOs linked to the domain or DC OU editable outside tier 0 | high |
 | | AD-GPO-002 | Non-tier-0 principals can link GPOs to the domain or DCs | high |
 | | AD-GPO-003 | NTLMv1/LM, LM hashes, reversible encryption or dangerous privileges in those GPOs | medium/high |
@@ -216,6 +236,8 @@ against a live DC.
 | | AD-GPO-014 | Group Policy sets automatic logon or stores its password (values never reproduced) | info/high |
 | | AD-GPO-015 | Group Policy keeps NTLMv1-derived single sign-on in audit mode | info/low |
 | | AD-GPO-016 | Group Policy allows weak Kerberos types as the domain default | info/low/medium |
+| | AD-GPO-017 | Scripts and tasks GPOs run that can be changed outside tier 0, and NETLOGON scripts | low/medium/high |
+| | AD-GPO-018 | Scripts and tasks GPOs run from hosts outside tier 0 | info/medium/high |
 | | AD-GPP-001 | Passwords in Group Policy Preferences (MS14-025) | high |
 | | AD-GPP-002 | Credentials in SYSVOL or NETLOGON scripts (values never reproduced) | high |
 | Attack paths | AD-PATH-001 | Control paths from non-tier-0 principals to tier 0 | high |
@@ -289,6 +311,7 @@ ad-doctor export-graph 2026-11.json -o graph.json --paths-only
 | `--accept FILE` | accepted risks (see [`examples/accept.toml`](examples/accept.toml)) |
 | `--invariants FILE` | declared state to enforce (see [`examples/invariants.toml`](examples/invariants.toml)) |
 | `--fixes FILE` | write the PowerShell remediation script |
+| `--preflight FILE` | write a read-only PowerShell script to run before the fixes (first 10 fixes only) |
 | `--only ID ...` | run a subset of checks (`ad-doctor checks` lists them) |
 | `view FILE`, `--open` | write the offline HTML viewer from a snapshot or a JSON report (`--baseline`, `--accept`, `--invariants`, `--fixes` as above; `--history DIR` for the trend, `--graph auto\|full\|paths\|none` for blast radius, `--encrypt`/`--no-encrypt`) |
 | `paths FILE --chokepoints` | list the control paths to tier 0, or rank the steps they share (`-f text\|json\|mermaid`) |
@@ -298,6 +321,11 @@ ad-doctor export-graph 2026-11.json -o graph.json --paths-only
 | `--no-probes`, `--http-port`, `--https-port` | skip every probe (LDAP signing, SMB, channel binding, enrollment, CA registry; SYSVOL has its own `--no-sysvol`), or move the web enrollment ports (0 skips one) |
 | `--no-ca-registry` | skip reading CA settings (ESC6/7/11/16, audit filter) over `\pipe\winreg` |
 | `--single-dc` | probe only the DC being scanned instead of every DC in the domain |
+| `--dc-probes` | also probe each DC for WebClient, SMBv1 and the TLS versions of LDAPS; off by default |
+| `--no-patch-level` | do not read each DC's and CA's build and UBR over `\pipe\winreg` |
+| `rollup REPORT ...` | one view over the JSON reports of several domains (`-f text\|json\|markdown`) |
+| `service-accounts FILE` | the service accounts of a snapshot (`-f text\|json`) |
+| `tier-scorecard FILE` | counts about tier 0 from a snapshot, with no score (`-f text\|json`) |
 | `--signing-probe-port PORT` | plain LDAP port for the signing probe; `0` skips it |
 
 Parts that cannot run (no AD CS, SYSVOL unreachable, Kerberos without an NTLM account for
@@ -490,6 +518,32 @@ ports. A CES URL is reached on the port it names; only a URL with no port follow
 - An ordinary user cannot see dMSAs, so AD-ACL-009 normally reports only a link on the
   replaced account's side, and says who controls the dMSA is unknown. The exact conditions
   of the Ouroboros technique could not be confirmed, so the check tops out at medium.
+- Configuration Manager is seen only as it publishes itself: AD-INF-022 and AD-ACL-014 read the
+  `System Management` container, and every computer with Full Control on it is taken for a site
+  server. The graph counts them as tier 0 whether or not the site manages tier-0 systems, which the
+  directory does not show. The site database, SMS Providers and client settings are not visible.
+- AD-ACL-011 normally reports "not judged": a plain user cannot read the DKM container, and a domain
+  without AD FS looks the same. `thumbnailPhoto` is never requested. One non-tier-0 user or
+  managed account with access is taken to be the farm's service account.
+- AD-ACL-012 reads seven objects. Other Configuration objects, and the `defaultSecurityDescriptor`
+  of schema classes, are not compared with a default, since none could be sourced. AD-ACL-013
+  does not report a named delegate with Reset Password or Full Control over an OU, the normal
+  shape of delegation.
+- AD-ADCS-021 does not check elliptic curve keys, ROCA or revocation, and ignores the signature on
+  a self-signed root. AD-INF-023 reports only UNC and URL commands: local commands exist by
+  default. AD-INF-024 finds only the dynamic objects the scan account can see.
+- AD-GPO-017 and AD-GPO-018 read the files a GPO names; a script that calls another script is not
+  followed, a local path is out of scope, and the permissions of another host are not read. A Preferences
+  item with item-level targeting, or a task that runs as another account, gets no graph edge, since
+  the snapshot cannot tell whether it applies or whose rights it would give. A descriptor with a deny
+  or conditional ACE is not judged.
+- AD-INF-026 to AD-INF-028 need `--dc-probes`. The 1783 RPC port test of the same family is not
+  implemented.
+- AD-INF-029 and AD-ADCS-022 compare a build number with the table in `patches.toml`; they do not
+  test the flaw, so they stay at medium or below. The table covers Windows Server 2016 to 2025 and
+  uses the lowest fixed build Microsoft published, hotpatch included, so a monthly-update host
+  between the hotpatch build and the update build is not reported. A note says when the table is
+  old or a build is not in it.
 - AD-KRB-007 takes `pwdLastSet` of the key account as the age of the key; the key version
   held by Microsoft Entra is not visible from the directory. AD-ACC-016 treats a host name
   whose first label starts with a 15-character computer name as matching.
@@ -507,6 +561,15 @@ ports. A CES URL is reached on the port it names; only a URL with no port follow
   below level 2016 (AD-INF-003: a 2025 DC needs that level), a DC or CA the probes cannot
   read (AD-INF-013, AD-ADCS-016), large tier-0 groups (AD-PRIV-001, not seeded),
   krbtgt, Seamless SSO and admin password age, the password and DC parts of AD-KRB-005,
+  Configuration Manager (AD-INF-022, AD-ACL-014: no site in the lab), AD FS (AD-ACL-011: no
+  AD FS, and `adreader` could not read it anyway), a Cloud Sync gMSA (AD-PRIV-016), an old
+  connector password (AD-ACC-020), writers on the Configuration partition (AD-ACL-012),
+  broad extended rights on an OU (AD-ACL-013), an old smart-card hash (AD-ACC-019), mail on
+  admins (AD-PRIV-017: no account in the lab has one), group loops (AD-PRIV-018), weak CA
+  certificates (AD-ADCS-021), remote display specifiers (AD-INF-023), dynamic objects
+  (AD-INF-024), a GPO that runs a script or a task (AD-GPO-017, AD-GPO-018: none in the lab, whose
+  NETLOGON script has default permissions), a tier-0 member server with a name in the directory
+  (AD-INF-025), WebClient and SMBv1 on a DC (AD-INF-026, AD-INF-027),
   SID history (AD-ACC-017 needs a real one), an AdminSDHolder change after the domain's first
   day (AD-ACL-010: the lab's ACL was changed on the first day), silos that exist (AD-PRIV-014:
   the lab has none) and a deny logon GPO (AD-PRIV-013: none in the lab), trust SID filtering, the age of a trust (AD-INF-016 needs 40 days to pass;
@@ -527,7 +590,7 @@ flowchart LR
     P --> S
     S -- "collect -o / redact" --> F[(snapshot.json)]
     F --> A
-    S --> A[checks.py + paths.py<br/>130 pure functions]
+    S --> A[checks.py + paths.py<br/>152 pure functions]
     A --> I[invariants.py<br/>accept.py]
     I --> R[report.py<br/>text, JSON, Markdown,<br/>SARIF, JUnit]
     I --> W[viewer.py<br/>offline HTML viewer]

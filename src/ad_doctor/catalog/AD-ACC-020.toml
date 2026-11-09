@@ -1,0 +1,43 @@
+id = "AD-ACC-020"
+aliases = ["connector-password-age"]
+summary = "An Entra Connect connector account's password has not changed for over a year."
+severities = ["low", "medium"]
+severity_logic = """
+**Medium** when at least one of the accounts holds DCSync rights on the domain, **low** otherwise.
+"""
+mitre = ["T1078.002"]
+data_sources = ["ldap"]
+attributes = ["pwdLastSet", "sAMAccountName", "description"]
+related = ["AD-PRIV-011", "AD-ACC-011"]
+since = "0.2.5"
+
+risk = """
+A connector password is long and random, so age does not make it guessable. A copy taken from the
+sync server or from a backup, however, stays valid until the password changes.
+"""
+
+detection = """
+From the LDAP snapshot: enabled accounts recognised as Entra Connect sync accounts by their fixed
+name pattern (`MSOL_` and `Sync_`) whose password is older than **365 days**. That is this check's
+own line, the same as [AD-ACC-011](AD-ACC-011.md); Microsoft publishes no rotation interval. A
+Cloud Sync gMSA is left out, because the domain rotates it ([AD-ACC-015](AD-ACC-015.md) looks at
+the interval).
+"""
+
+false_positives = """
+- **A deliberate decision** not to rotate, because a change has to be made on the sync server at
+  the same time. Accept it with an [accepted-risk file](../ci.md#accepted-risks).
+"""
+
+remediation = """
+1. Change the AD DS connector account's password in Active Directory.
+2. Update it in the Synchronization Service at the same time, as Microsoft describes, or sync
+   stops.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-020"
+
+[[references]]
+title = "Microsoft Entra Connect Sync: Changing the AD DS account password"
+url = "https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/how-to-connect-sync-change-addsacct-pass"
+kind = "vendor"

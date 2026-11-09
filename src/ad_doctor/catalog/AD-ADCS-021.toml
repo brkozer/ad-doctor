@@ -1,0 +1,51 @@
+id = "AD-ADCS-021"
+aliases = ["weak-ca-cert"]
+summary = "A CA certificate published in the forest has an RSA or DSA key under 2048 bits, or a CA below the root was signed with MD2, MD4, MD5 or SHA-1."
+severities = ["medium", "high"]
+severity_logic = """
+**High** for a key under 1024 bits or an MD2, MD4 or MD5 signature. **Medium** for a key under
+2048 bits or a SHA-1 signature.
+"""
+mitre = ["T1649"]
+data_sources = ["ldap"]
+attributes = ["cACertificate"]
+related = ["AD-ADCS-011"]
+since = "0.2.5"
+
+risk = """
+A CA whose key can be attacked, or whose certificate rests on a broken hash, weakens every
+certificate below it. A CA in NTAuth can issue certificates that are good for domain logon.
+"""
+
+detection = """
+From the LDAP snapshot: `cACertificate` in `Enrollment Services`, `Certification Authorities`, `AIA`
+and `NTAuthCertificates`, parsed by a small built-in reader; the certificates themselves are not
+kept. Each certificate is one row, with the stores it is in.
+
+- RSA and DSA keys under **2048 bits** ([NIST SP 800-131A](https://csrc.nist.gov/pubs/sp/800/131/a/r2/final)
+  disallows them). Elliptic curve keys are not judged.
+- MD2, MD4, MD5 or SHA-1 signatures, **except on a self-signed certificate**: a root is trusted
+  because it is installed, so the signature on itself is never checked.
+
+Expired certificates are not reported, nor are revocation, the ROCA key flaw and templates
+([AD-ADCS-011](AD-ADCS-011.md) looks at those). A store that could not be read, a certificate that
+could not be parsed, or a CA below the root whose signature algorithm is not a known one is counted
+in a note and not judged.
+"""
+
+false_positives = """
+- **An old CA kept only to check old signatures** may be left in place on purpose. Take it out of
+  NTAuth if it no longer issues.
+"""
+
+remediation = """
+1. Renew the CA certificate with a new RSA key of at least 2048 bits and SHA-256.
+2. Publish the new certificate and retire the old one from NTAuth when nothing depends on it.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ADCS-021"
+
+[[references]]
+title = "NIST SP 800-131A Rev. 2: Transitioning the Use of Cryptographic Algorithms and Key Lengths"
+url = "https://csrc.nist.gov/pubs/sp/800/131/a/r2/final"
+kind = "spec"

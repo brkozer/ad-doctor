@@ -1,0 +1,37 @@
+id = "AD-INF-026"
+aliases = ["webclient-on-dc"]
+summary = "The WebClient service is running on a domain controller, which lets a coerced DC authenticate over HTTP. Only with --dc-probes."
+severities = ["medium"]
+severity_logic = """
+**Medium** for each DC where the WebClient pipe answers.
+"""
+mitre = ["T1187", "T1557"]
+data_sources = ["probe-smb"]
+attributes = ["named pipe DAV RPC SERVICE on IPC$"]
+related = ["AD-INF-009", "AD-INF-027", "AD-INF-028"]
+since = "0.2.5"
+
+risk = """
+With WebClient running, a coerced DC can authenticate over HTTP. HTTP is not protected by SMB or
+LDAP signing, so that authentication can be relayed to LDAP or to a CA's web enrollment.
+"""
+
+detection = """
+With `--dc-probes`, the scan opens the `DAV RPC SERVICE` named pipe on `IPC$` for reading and closes
+it again; a DC whose answer is "no such pipe" does not run the service. Any other answer stays
+unknown and a note says so. It is not a default probe: without the switch the check does not run
+and a note says so.
+"""
+
+false_positives = """
+- **Server Core and most DCs** do not have the service installed; those stay quiet.
+"""
+
+remediation = "Stop and disable the WebClient service on domain controllers."
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --dc-probes --only AD-INF-026"
+
+[[references]]
+title = "[MS-WDV]: Web Distributed Authoring and Versioning (WebDAV) Protocol: Client Extensions"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wdv/"
+kind = "spec"

@@ -43,6 +43,8 @@ FIELDS = {
     "sid-history": ("account", "sid"),
     "oid-link": ("oid", "group"),
     "ca-flag": ("ca", "flag"),
+    "script-ace": ("path", "trustee"),
+    "script-host": ("gpo", "path"),
 }
 # fields that hold a DN (lower-cased in IDs) and a SID (upper-cased)
 DN_FIELDS = {"object", "group", "container", "gmsa", "account", "computer"}
@@ -64,6 +66,8 @@ COST = {
     "ca-right": 3,
     "oid-link": 3,
     "ca-flag": 3,
+    "script-ace": 1,
+    "script-host": 3,
 }
 TIER0_MEMBER_COST = 5  # taking a member out of a tier-0 group
 WARN_COST = 10
@@ -86,6 +90,8 @@ KIND_ORDER = (
     "delegation",
     "rbcd-principal",
     "sid-history",
+    "script-ace",
+    "script-host",
 )
 DELEGATIONS = ("unconstrained", "protocol-transition", "rbcd")  # and "constrained:<SPN>"
 CA_FLAG_TEXT = {
@@ -238,6 +244,10 @@ def describe(snap: Snapshot, prim: Prim, where: Where | None = None) -> str:
         return f"unlink issuance policy {f['oid']} from {obj('group')}"
     if kind == "ca-flag":
         return f"CA {f['ca']}: {CA_FLAG_TEXT.get(f['flag'], f['flag'])}"
+    if kind == "script-ace":
+        return f"remove the write rights of {who('trustee')} on SYSVOL path {f['path']}"
+    if kind == "script-host":
+        return f"stop GPO {gpo} running {f['path']} from its host"
     return f"remove {f['what']} delegation of {obj('account')}"
 
 
@@ -368,6 +378,8 @@ def trustee_of(prim: Prim) -> str:
     kind = prim[0]
     if kind in ("ace", "inherited-ace", "pki-ace", "template-ace", "adminsdholder-ace"):
         return prim[-1]
+    if kind == "script-ace":
+        return prim[2]
     if kind in ("gmsa-reader", "rbcd-principal"):
         return prim[2]
     if kind == "ca-right":
@@ -635,6 +647,16 @@ def apply(snap: Snapshot, prov: Provenance, removed: Iterable[int]) -> dict[int,
                 kept = [s for s in account.rbcd_principals if stays("rbcd-principal", s)]
                 account.rbcd_principals = kept
                 account.rbcd = bool(kept)  # an empty list clears the attribute
+    if by_kind.get("script-ace"):
+        for acl in snap.sysvol_acls:
+            at = acl.path.lower()
+            acl.aces = [a for a in acl.aces if not hit(("script-ace", at, a.sid))]
+            if acl.owner and hit(("script-ace", at, acl.owner)):
+                acl.owner = None  # back to a tier-0 owner; which one is the operator's choice
+    if by_kind.get("script-host"):
+        for x in snap.gpo_scripts:
+            if x.location == "host" and hit(("script-host", x.gpo.upper(), x.path.lower())):
+                x.location = "moved"  # the GPO still runs a script, from somewhere else
     return gone
 
 

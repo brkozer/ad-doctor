@@ -46,6 +46,31 @@ keeping only paths, line numbers, account names and setting values &mdash; never
 `Registry.pol` it keeps only the values its checks read; a value named like a password is
 reported by location alone.
 
+## Forest-wide objects and AD FS
+
+The scan also reads, with an ordinary account: the DACLs of the Schema and Configuration
+partition heads and five containers under them, `cACertificate` of the published CA certificates,
+`adminContextMenu` and `shellContextMenu` of the display specifiers, `msDS-Other-Settings`,
+objects with the `dynamicObject` class, and the `System Management` container with the
+Configuration Manager objects in it. Of the AD FS DKM containers it asks for the DACL only: it
+never requests `thumbnailPhoto`, the attribute that holds the key. A plain user normally cannot
+read them, so that check is reported as not judged.
+
+## Scripts that GPOs run
+
+From SYSVOL it also reads `scripts.ini`, `psscripts.ini` and Preferences `ScheduledTasks.xml`,
+keeping the file each one runs and never its arguments. For the files in SYSVOL and NETLOGON it reads
+the owner and DACL with `READ_CONTROL` only: an ordinary user can do that by default. A file it
+cannot read, or a descriptor with a deny ACE, is reported in a note as not judged, not as passing.
+Other hosts named in those files are not contacted.
+
+## Patch level
+
+Over `\pipe\winreg` it reads `CurrentBuildNumber` and `UBR` under
+`SOFTWARE\Microsoft\Windows NT\CurrentVersion` on each DC and CA. An ordinary domain user could
+read it on the lab; a host with a hardened `winreg` may refuse. A host where it cannot be read is
+reported in a note as not judged, not as passing. `--no-patch-level` turns it off.
+
 ## Authentication
 
 - **NTLM** with the account you give it, including channel binding where the DC enforces it.

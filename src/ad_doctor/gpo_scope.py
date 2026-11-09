@@ -49,6 +49,7 @@ from .model import (
     GpLink,
     Gpo,
     GpoLocalGroup,
+    GpoScript,
     RegistryEntry,
     Snapshot,
     well_known_sid,
@@ -66,6 +67,8 @@ CSE_OF_SOURCE = {
     "audit": CSE_AUDIT,
     "gpp_registry": CSE_GPP_REGISTRY,
 }
+CSE_SCRIPTS = "{42B5FAAE-6536-11D2-AE5A-0000F87571E3}"  # [MS-GPSCR]
+CSE_SCHEDULED_TASKS = "{AADCED64-746C-4633-A97C-D61349046527}"  # Preferences Scheduled Tasks
 GPO_USER_DISABLED = 0x1
 GPO_COMPUTER_DISABLED = 0x2
 SIDES = (("computer", GPO_COMPUTER_DISABLED), ("user", GPO_USER_DISABLED))
@@ -1272,3 +1275,122 @@ def filter_note(snap: Snapshot) -> list[str]:
 
 def grants(snap: Snapshot) -> list[Grant]:
     return resolve(snap).grants
+
+
+def script_can_run(g: Gpo, script: GpoScript) -> bool:
+    """False when Windows would not process this kind of file in the GPO: its side is off or
+    never written, or the client-side extension is not listed. A writer of the file cannot
+    change any of that, unlike a writer of the GPO. Older snapshots do not hold it."""
+    cse = CSE_SCHEDULED_TASKS if script.source == "scheduledtasks.xml" else CSE_SCRIPTS
+    if script.side == "computer":
+        off, version, extensions = (
+            g.flags & GPO_COMPUTER_DISABLED, g.machine_version, g.machine_extensions,
+        )  # fmt: skip
+    else:
+        off, version, extensions = g.flags & GPO_USER_DISABLED, g.user_version, g.user_extensions
+    return not off and version != 0 and (extensions is None or cse in extensions)
+
+
+def scope_side(scope: str) -> str:
+    """The side of a scope node: computer or user. A site scope holds domain controllers."""
+    side = scope.split(":", 2)[1]
+    return "computer" if side == "site" else side
+
+
+LOOPBACK_MODES = (1, 2)  # merge, replace
+
+
+@dataclass(frozen=True)
+class ScriptReach:
+    accounts: int
+    tier0: bool
+    wmi: bool = False  # the GPO has a WMI filter, which is assumed to match
+    # A user-side script of a GPO that reaches no user, where computers sit. "on": loopback is
+    # set on one of them, and `accounts` counts those computers. "unknown": it cannot be told.
+    loopback: str = ""
+
+
+def _loopback_state(view: RegistryView | None, computer: Account) -> str:
+    """ "on", "off" or "unknown": what Group Policy leaves in UserPolicyMode on a computer."""
+    if view is None:
+        return "unknown"
+    outcomes = view.merged(computer, regpol.LOOPBACK_KEY, regpol.LOOPBACK_VALUE).outcomes
+    set_on = [o.present and o.data in LOOPBACK_MODES for o in outcomes]
+    if any(o.unknown for o in outcomes) or (any(set_on) and not all(set_on)):
+        return "unknown"
+    return "on" if all(set_on) else "off"
+
+
+def script_reach(snap: Snapshot, tier0: set[str]) -> dict[tuple[str, str], ScriptReach]:
+    """(GUID, side) -> how many accounts the GPO reaches on that side and whether one of
+    them is in `tier0` (lower-cased DNs), for the GPOs that run a file.
+
+    A user-side script of a GPO that reaches no user can still run through loopback, on the
+    computers the GPO is linked above: see `ScriptReach.loopback`. Who logs on there is not
+    in the directory. Loopback is not added to a GPO that reaches users some other way."""
+    wanted = {(x.gpo.upper(), x.side) for x in snap.gpo_scripts}
+    if not wanted:
+        return {}
+    found = reach(snap)
+    filtered = {g.guid.upper() for g, _, _ in found.applies if g.wmi_filter}
+    below: dict[str, list[str]] = {}
+    for scope, child in found.inherits:
+        below.setdefault(scope, []).append(child)
+    held: dict[str, list[Account]] = {}
+    for scope, account in found.holds:
+        held.setdefault(scope, []).append(account)
+    starts: dict[tuple[str, str], list[str]] = {}
+    for g, scope, _ in found.applies:
+        guid, side = g.guid.upper(), scope_side(scope)
+        if (guid, side) in wanted or (guid, "user") in wanted:
+            starts.setdefault((guid, side), []).append(scope)
+
+    def under(scopes: list[str]) -> dict[str, Account]:
+        seen, todo = set(scopes), list(scopes)
+        accounts: dict[str, Account] = {}
+        while todo:
+            scope = todo.pop()
+            accounts.update((a.dn.lower(), a) for a in held.get(scope, ()))
+            fresh = [c for c in below.get(scope, ()) if c not in seen]
+            seen.update(fresh)
+            todo += fresh
+        return accounts
+
+    out = {}
+    for key, scopes in starts.items():
+        accounts = under(scopes)
+        out[key] = ScriptReach(len(accounts), bool(accounts.keys() & tier0), key[0] in filtered)
+    view = RegistryView(snap) if snap.loopback_collected else None
+    for key in wanted:
+        if key[1] != "user" or (key in out and out[key].accounts):
+            continue
+        # a filter on the GPO is read against the user under loopback, so links alone count
+        scopes = starts.get((key[0], "computer"), []) + [
+            s for s, _ in found.widened.get(key[0], ()) if scope_side(s) == "computer"
+        ]
+        states = {dn: _loopback_state(view, a) for dn, a in under(scopes).items()}
+        mode = (
+            "on" if "on" in states.values() else "unknown" if "unknown" in states.values() else ""
+        )
+        if mode:
+            hit = {dn for dn, state in states.items() if state == mode}
+            out[key] = ScriptReach(len(hit), bool(hit & tier0), key[0] in filtered, mode)
+    return out
+
+
+def host_index(snap: Snapshot) -> dict[str, Account]:
+    """Lower-cased host name (short and full) -> the one computer account it can mean."""
+    out: dict[str, Account | None] = {}
+
+    def put(name: str, a: Account) -> None:
+        key = name.lower().rstrip(".")
+        out[key] = a if key not in out or out[key] is a else None
+
+    for a in snap.accounts:
+        if a.is_computer and not a.managed:
+            short = a.sam.removesuffix("$")
+            put(short, a)
+            put(f"{short}.{snap.domain}", a)
+            if a.dns_host:
+                put(a.dns_host, a)
+    return {name: a for name, a in out.items() if a is not None}

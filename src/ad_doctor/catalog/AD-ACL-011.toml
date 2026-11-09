@@ -1,0 +1,54 @@
+id = "AD-ACL-011"
+aliases = ["dkm-acl"]
+summary = "The AD FS DKM container can be read by more than the principals Microsoft lists. An ordinary user normally cannot read it, and then this is not judged."
+severities = ["medium", "high"]
+severity_logic = """
+**High** when a broad group holds the right. **Medium** for other principals outside tier 0.
+"""
+mitre = ["T1552.004", "T1606.002"]
+data_sources = ["ldap"]
+attributes = ["nTSecurityDescriptor"]
+related = ["AD-ACL-001"]
+since = "0.2.5"
+
+risk = """
+AD FS protects its token-signing and token-encryption private keys with a key stored in the
+Distributed Key Manager (DKM) container. Anyone who can read that key can decrypt the private
+keys and forge sign-ins to everything that trusts the farm. Microsoft's CVE-2026-56155 is about
+this container's permissions.
+"""
+
+detection = """
+From the LDAP snapshot: the containers under `CN=ADFS,CN=Microsoft,CN=Program Data,<domain>`, DACL
+only. **The objects holding the key are never read, and `thumbnailPhoto` is never asked for.**
+
+Microsoft's expected state is Domain Admins, Enterprise Admins and SYSTEM with full control, plus
+the AD FS service account. A principal counts here if it holds read access or takeover rights and
+is outside tier 0 (the built-in Administrators group counts as tier 0).
+
+**Normal result: not judged.** With the expected DACL an ordinary user cannot read the container
+at all, and a domain without AD FS looks the same, so the report says "not judged". Nothing is
+concluded from that. Run the scan with an account that can read the container to get a verdict.
+
+Exactly one user or managed account alongside tier 0 is taken to be the farm's service account
+and reported as nothing: the directory does not say which account that is.
+"""
+
+false_positives = """
+- **A second, deliberate service account** is reported, since Microsoft expects only one.
+- **Deny ACEs are not read**, so a grant that a deny cancels is still reported.
+"""
+
+remediation = """
+1. Install the AD FS update for CVE-2026-56155. From the 13 October 2026 update, AD FS remediates
+   insecure DKM container DACLs by default.
+2. Otherwise leave only Domain Admins, Enterprise Admins, SYSTEM and the AD FS service account on
+   the container, with inheritance disabled.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-011"
+
+[[references]]
+title = "CVE-2026-56155: AD FS Distributed Key Manager container ACL hardening"
+url = "https://support.microsoft.com/en-us/help/5121391"
+kind = "vendor"

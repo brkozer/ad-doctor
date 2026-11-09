@@ -1,0 +1,46 @@
+id = "AD-INF-027"
+aliases = ["smb1-on-dc"]
+summary = "A domain controller answers an SMB1 negotiate. Only with --dc-probes."
+severities = ["high"]
+severity_logic = """
+**High** for each DC that accepts the SMB1 dialect.
+"""
+mitre = ["T1210", "T1557"]
+data_sources = ["probe-smb"]
+attributes = ["SMB1 negotiate response"]
+related = ["AD-INF-008", "AD-INF-026"]
+since = "0.2.5"
+
+risk = """
+SMB1 is the protocol behind EternalBlue and has no integrity protection by default. Microsoft has
+deprecated it and removes it by default on current Windows.
+"""
+
+detection = """
+With `--dc-probes`, the scan sends one SMB1 negotiate offering only the `NT LM 0.12` dialect, as
+[MS-CIFS] defines it, and reads the answer. The server picking that dialect means SMB1 is on. A
+refusal, another protocol's answer or a closed connection means off; no connection or no answer
+stays unknown and a note says so. No session is started. Without the switch the check does not run
+and a note says so.
+"""
+
+false_positives = """
+- **A device in front of the DC** that answers SMB itself is reported as the DC.
+"""
+
+remediation = """
+On a DC: `Set-SmbServerConfiguration -EnableSMB1Protocol $false`, or remove the SMB 1.0/CIFS
+feature.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --dc-probes --only AD-INF-027"
+
+[[references]]
+title = "How to detect, enable and disable SMBv1, SMBv2, and SMBv3 in Windows"
+url = "https://learn.microsoft.com/en-us/windows-server/storage/file-server/troubleshoot/detect-enable-and-disable-smbv1-v2-v3"
+kind = "vendor"
+
+[[references]]
+title = "[MS-CIFS]: Common Internet File System Protocol"
+url = "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cifs/"
+kind = "spec"

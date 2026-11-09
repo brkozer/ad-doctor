@@ -1,0 +1,50 @@
+id = "AD-INF-023"
+aliases = ["display-specifiers"]
+summary = "A context menu entry of a display specifier starts a file or address on another host when an administrator uses it."
+severities = ["medium"]
+severity_logic = """
+Always **medium**: it needs an administrator to click the entry, and a vendor tool on a share looks
+the same.
+"""
+mitre = ["T1546"]
+data_sources = ["ldap"]
+attributes = ["adminContextMenu", "shellContextMenu"]
+related = ["AD-ACL-012"]
+since = "0.2.5"
+
+risk = """
+Display specifiers set what Active Directory consoles show. An `adminContextMenu` entry can name a
+program or address, which the console runs with the administrator's rights. Someone who controls
+that remote file runs code as whoever clicks the entry.
+"""
+
+detection = """
+From the LDAP snapshot: values of `adminContextMenu` and `shellContextMenu` under
+`CN=DisplaySpecifiers` in Microsoft's `order,text,command` form whose command is a UNC path or a
+URL. The `order,{clsid}` form names a COM class, and is not reported.
+
+Only remote commands are reported. Windows ships local ones (`RsAdmin.msc` appears in every locale
+on the lab DC), and which local commands are default could not be sourced for every version. The
+property page attributes name COM classes and are not read.
+"""
+
+false_positives = """
+- **A vendor's tool on a file share** is reported. The share's permissions then decide the risk.
+"""
+
+remediation = """
+1. Remove the entries you do not recognise.
+2. For a tool you do want, keep it on a host only tier 0 can write to.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-INF-023"
+
+[[references]]
+title = "Registering a Static Context Menu Item"
+url = "https://learn.microsoft.com/en-us/windows/win32/ad/registering-a-static-context-menu-item"
+kind = "vendor"
+
+[[references]]
+title = "Active Directory Security: Abusing Display Specifiers"
+url = "https://semperis.com/blog/active-directory-security-abusing-display-specifiers"
+kind = "research"

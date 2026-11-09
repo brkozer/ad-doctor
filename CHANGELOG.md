@@ -9,6 +9,50 @@ logic or severity between versions, but an ID is never reused for something else
 
 ### Added
 
+- **Patch level** (AD-INF-029, AD-ADCS-022): each DC's and CA's build and UBR are read over the
+  `winreg` pipe and compared with a dated table of Microsoft's fixed builds (`patches.toml`), including
+  CVE-2026-54121 (Certighost). A version match never goes above medium, and `--no-patch-level` turns
+  it off. A note says when the table is old or a build is not in it.
+- **`--preflight FILE`**: a read-only PowerShell script for the first 10 fixes, run before the
+  `--fixes` script, that looks each object up again and prints OK, WARN or STOP.
+- **`ad-doctor rollup`**: one view over the JSON reports of several domains, without averaging
+  scores and with not-judged checks listed as such.
+- **`ad-doctor service-accounts` and `ad-doctor tier-scorecard`**: two views of a snapshot from
+  data it already holds. The scorecard covers tier 0 only, since the directory does not record
+  tier 1 or 2, and shows how many tier-0 members could not be read.
+- **Configuration Manager.** AD-INF-022 reports the published site systems, and the computers
+  with Full Control on the `System Management` container count as tier 0 in attack paths.
+  AD-ACL-014 reports control over that container or those computers from outside tier 0.
+- **Entra Cloud Sync and connector accounts.** AD-PRIV-016 reports a gMSA holding DCSync whose
+  password can be read outside tier 0; the gMSA is found by its rights, not by name. AD-ACC-020
+  reports connector passwords older than a year.
+- **AD FS DKM.** AD-ACL-011 reads only the DACL of the DKM containers, never `thumbnailPhoto`. A
+  plain user normally cannot read them, and the report then says the check was not judged.
+- **Forest and OU permissions.** AD-ACL-012 reports writers outside tier 0 on the Schema and
+  Configuration partitions and five containers under them. AD-ACL-013 reports extended rights
+  over accounts for broad groups on OUs and containers, and all extended rights for a delegate.
+- **Privileged leftovers.** AD-ACC-018 (RID 500 used recently), AD-ACC-019 (smart-card accounts
+  with an unrotated hash), AD-PRIV-017 (mail on tier-0 accounts) and AD-PRIV-018 (group loops).
+- **AD-GPO-017 and AD-GPO-018 follow only what an interpreter runs**: a log file or data path in
+  the arguments is no longer reported, and a command line that does not say what runs is not judged.
+  A password in a quoted argument or a `CmdLine` no longer reaches the snapshot or the report.
+  A GPO with a WMI filter tops out at medium, a logon script that only loopback brings to users is
+  judged from `UserPolicyMode`, and `\\NETBIOS\NETLOGON` counts as NETLOGON through the domain's
+  real NetBIOS name. An unreadable `scripts.ini` or `ScheduledTasks.xml` now marks both as not
+  judged, as a probe pack answer it could not get does for AD-INF-026 to AD-INF-028.
+- **AD-ADCS-021** (weak published CA certificates), **AD-INF-023** (display specifiers that run
+  something from another host) and **AD-INF-024** (dynamic objects and lowered TTL settings).
+  Snapshots from earlier versions load and report the checks that need new data as not evaluated.
+- **Scripts Group Policy runs.** `scripts.ini`, `psscripts.ini` and Preferences `ScheduledTasks.xml`
+  are read, keeping the file each one runs and never its arguments. AD-GPO-017 reports a file in
+  SYSVOL or NETLOGON, the file that lists it or a folder above them that can be changed outside
+  tier 0; AD-GPO-018 reports a file served from a host outside tier 0. A descriptor that cannot be
+  read or has a deny ACE is a note, not a pass. Writers and hosts get graph edges to where the GPO
+  applies, except for item-level targeting and a task run as another account, and what-if takes
+  them out with `script-ace` and `script-host`.
+- **SMB signing on tier-0 member servers** (AD-INF-025): one negotiate per server, no credentials.
+- **DC probe pack, `--dc-probes`, off by default**: AD-INF-026 (WebClient), AD-INF-027 (SMBv1) and
+  AD-INF-028 (TLS 1.0 and 1.1 on LDAPS), each a read-only request.
 - **Tier-0 logon restrictions, silos and change history.** **AD-PRIV-013** reports the
   computers, per OU, where Group Policy does not deny tier-0 accounts local logon, RDP,
   batch or service logon, using each computer's own processing order. **AD-PRIV-014** reports

@@ -685,7 +685,9 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     if plan is not None and args.check:
         problems_gate += expect_problems(plan.expect, res, closes_all)
     gap = coverage.path_gaps(ctx.snap.notes, bool(res.before.holders))
-    if gap and (args.fail_if_exposed is not None or (plan is not None and args.check)):
+    if gap and (
+        args.fail_if_exposed is not None or (plan is not None and args.check and plan.expect)
+    ):
         problems_gate.append(
             "the control graph is incomplete, so a limit on who is exposed cannot be met: "
             + gap["notes"][0]
@@ -952,7 +954,8 @@ def run_plan(args: argparse.Namespace) -> tuple[dict[str, Any], int, planfile.Pl
         changes=[planfile.entry_for(prov.prims[c], recs[c]["label"]) for c in p.changes],
         keeps=list(given.keeps) if given else [],
     )
-    if args.max_changes is None:
+    # an incomplete graph cannot prove a limit: the file would fail its own check
+    if args.max_changes is None and not gap:
         users = max(res.after.users, 1)
         out.expect = {
             "max_exposed_percent": math.ceil(100 * res.after.exposed / users),

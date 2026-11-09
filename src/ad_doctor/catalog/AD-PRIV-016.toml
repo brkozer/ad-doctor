@@ -1,0 +1,50 @@
+id = "AD-PRIV-016"
+aliases = ["cloud-sync-gmsa"]
+summary = "A gMSA holds DCSync rights, as the Entra Cloud Sync agent's does, and principals outside tier 0 can retrieve its password."
+severities = ["medium"]
+severity_logic = """
+Always **medium**, like [AD-PRIV-011](AD-PRIV-011.md): the reader's control is a step away from
+DCSync, and the agent server may be well protected in ways the directory does not show.
+"""
+mitre = ["T1003.006", "T1078.002"]
+data_sources = ["ldap"]
+attributes = ["msDS-GroupMSAMembership", "nTSecurityDescriptor"]
+related = ["AD-ACL-001", "AD-ACL-006", "AD-PRIV-011"]
+since = "0.2.5"
+
+risk = """
+Entra Cloud Sync runs under a gMSA that gets both replication rights on the domain for password
+hash sync. The computers allowed to retrieve its password can act as it, so a local administrator
+on one of them can replicate every password hash in the domain.
+"""
+
+detection = """
+From the LDAP snapshot: every gMSA that holds both replication rights on the domain head, and
+each principal in its `msDS-GroupMSAMembership` that is outside tier 0. A row shows when the
+reader has unconstrained delegation or no LAPS.
+
+Nothing is matched by name. Microsoft's installer calls the account `provAgentgMSA`, but a custom
+gMSA can be used, and any gMSA holding DCSync has the same problem. The DCSync itself is
+[AD-ACL-001](AD-ACL-001.md).
+
+When the domain's DACL, or the reader list of such a gMSA, could not be read, the check is not
+judged for it and the report says so. `AD-ACL-006` covers the broad-group case of any gMSA.
+"""
+
+false_positives = """
+- **Agent servers managed as tier 0** without being in a tier-0 group still appear. Add them to
+  an [accepted-risk file](../ci.md#accepted-risks) once they are.
+"""
+
+remediation = """
+1. Manage the agent servers as you would a domain controller.
+2. Keep `PrincipalsAllowedToRetrieveManagedPassword` to those servers.
+3. If password hash sync is not used, remove the replication rights.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-PRIV-016"
+
+[[references]]
+title = "Use a group managed service account with Microsoft Entra Cloud Sync"
+url = "https://learn.microsoft.com/en-us/entra/identity/hybrid/cloud-sync/gmsa-cloud-sync"
+kind = "vendor"

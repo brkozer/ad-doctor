@@ -63,6 +63,8 @@ BLOCK_NTLMV1_SSO = "BlockNtlmv1SSO"
 WINLOGON_KEY = r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
 AUTO_LOGON = "AutoAdminLogon"
 DEFAULT_PASSWORD = "DefaultPassword"
+LOOPBACK_KEY = r"Software\Policies\Microsoft\Windows\System"
+LOOPBACK_VALUE = "UserPolicyMode"  # 1 merge, 2 replace
 
 # a hardened path for one of the two shares Group Policy itself is read from
 _HARDENED_SHARE = re.compile(r"^\\\\[^\\]+\\(?:sysvol|netlogon)\\?$", re.IGNORECASE)
@@ -88,6 +90,7 @@ _VALUES = {
     norm(SCHANNEL_KEY): {CERT_MAPPING.casefold()},
     norm(KDC_KEY): {STRONG_MAPPING.casefold(), DEFAULT_ENCTYPES.casefold()},
     norm(MSV1_0_KEY): {BLOCK_NTLMV1_SSO.casefold()},
+    norm(LOOPBACK_KEY): {LOOPBACK_VALUE.casefold()},
 }
 _MODULE_NAMES = norm(MODULE_NAMES_KEY)
 _HARDENED = norm(HARDENED_KEY)

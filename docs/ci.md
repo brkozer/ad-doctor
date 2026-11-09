@@ -82,3 +82,26 @@ expires = 2027-03-31
 Expired acceptances turn back into findings, acceptances that no longer match anything are
 reported as stale, and the ones expiring within 30 days are listed. Every check page links
 here, because accepting a risk is the documented alternative to fixing it.
+
+## Several domains
+
+`ad-doctor rollup` takes the JSON reports of several domains (`scan -f json` or
+`analyze -f json`) and prints one row per domain and one per check that fired anywhere, with the
+domains it fired in:
+
+```bash
+ad-doctor rollup reports/corp.json reports/child.json -f markdown -o rollup.md
+```
+
+Scores stay per domain and are never averaged. A check that did not run in a domain, or that a
+note says could not judge everything, is listed as not judged there, not as clean. Older reports
+of the same domain are ignored, with a note, and so a directory of monthly reports can be passed
+as it is. A note says when reports come from different versions or ran different checks.
+
+## Before you apply a fix
+
+`--preflight FILE` on `scan` and `analyze` writes a PowerShell script for the first ten fixes
+(AD-KRB-002, AD-KRB-004, AD-DEL-001 to 003, AD-ACC-001 to 005) that only reads: `Get-ADObject` for
+each object, then `OK`, `WARN` or `STOP`. `STOP` means the object has changed since the snapshot,
+or that the fix would touch a domain controller. Run it, read the warnings, then decide what to do
+with the `--fixes` script, which still runs everything with `-WhatIf`.

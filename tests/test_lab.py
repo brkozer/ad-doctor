@@ -13,7 +13,7 @@ from typing import Any
 import ldap3
 import pytest
 
-from ad_doctor import dnsprop, gpo_scope, opengraph, paths
+from ad_doctor import dnsprop, gpo_scope, opengraph, paths, probes
 from ad_doctor.checks import run_all, tier0_hosts
 from ad_doctor.collect import Collector, DnsNodeScan, Target, collect, connect
 from ad_doctor.model import DnsNode, Severity, Snapshot
@@ -35,6 +35,11 @@ pytestmark = pytest.mark.lab
 # AD-ACL-010 and AD-ACC-017 (need a change after the domain's first day, or SID history,
 # and the lab has neither), AD-PRIV-015 (read in the test below; its seeded additions age
 # out of the 30-day window). AD-PRIV-013 and -014 fire here, see the test below.
+# Not in the lab or not readable by adreader: AD-INF-022, AD-ACL-014, AD-ACL-011, AD-ACL-012,
+# AD-ACL-013, AD-PRIV-016, AD-PRIV-017, AD-PRIV-018, AD-ACC-020, AD-ACC-019, AD-ADCS-021,
+# AD-INF-023 and AD-INF-024, read in the test below. Unit tests only: AD-GPO-017 and AD-GPO-018 (no
+# GPO in the lab runs a script), AD-INF-025 (no tier-0 member server with a name in the directory),
+# AD-INF-026 to AD-INF-028 (need --dc-probes; the scan runner covers them).
 EXPECTED = {
     "AD-ADCS-020": {
         "Domain Controllers: DC01: no GPO sets CertificateMappingMethods or "
@@ -44,6 +49,7 @@ EXPECTED = {
         "_msdcs.adlab.test (ForestDnsZones): Authenticated Users",
         "adlab.test (DomainDnsZones): Authenticated Users",
     },
+    "AD-ACC-018": {"Administrator"},
     "AD-KRB-002": {"legacy_app"},
     "AD-KRB-003": {"svc_sql", "svc_web"},
     "AD-KRB-004": {"des_user"},
@@ -203,7 +209,15 @@ def snap() -> Snapshot:
     snap = collect(lab_target())
     assert snap.domain == "adlab.test"
     # an ordinary user cannot see fine-grained password policies or dMSAs; nothing else may fail
-    ok = ("fine-grained", "dMSA", "by choice", "userPrincipalName")
+    ok = (
+        "fine-grained",
+        "dMSA",
+        "by choice",
+        "userPrincipalName",
+        "AD FS DKM",
+        "mail attribute",
+        "dNSHostName",
+    )
     assert [n for n in snap.notes if not any(word in n for word in ok)] == []
     return snap
 
@@ -495,7 +509,7 @@ def test_seeded_misconfiguration_found(findings: dict[str, set[str]], check_id: 
 def test_clean_and_default_objects_not_flagged(findings: dict[str, set[str]]) -> None:
     for check_id, objects in findings.items():
         assert "alice" not in objects
-        if check_id.startswith("AD-ADCS"):
+        if check_id.startswith("AD-ADCS") and check_id != "AD-ADCS-022":
             # only the seeded objects: the built-in templates, the CA object and its host
             # account are not exploitable by default
             assert objects == EXPECTED[check_id]
@@ -598,3 +612,51 @@ def test_lab_policy_files_are_read_and_unset_is_unknown(snap: Snapshot) -> None:
     assert findings["AD-ADCS-020"].severity is Severity.INFO
     assert "unknown" in findings["AD-ADCS-020"].objects[0]
     assert not {"AD-GPO-014", "AD-GPO-015", "AD-GPO-016"} & set(findings)
+
+
+def test_forest_objects_are_read_and_the_lab_stays_quiet(
+    snap: Snapshot, findings: dict[str, set[str]]
+) -> None:
+    assert snap.sccm_checked and snap.sccm_container is None and not snap.sccm_objects
+    assert not snap.dkm_checked and any("AD-ACL-011 not judged" in n for n in snap.notes)
+    assert len(snap.config_acls) == 7
+    assert not snap.mail_checked and any("AD-PRIV-017 not judged" in n for n in snap.notes)
+    cas = {c.name: c for c in snap.ca_certificates}
+    assert cas["adlab-CA"].parsed and cas["adlab-CA"].key_bits == 2048
+    assert set(cas["adlab-CA"].stores) == {"enrollment", "root", "aia", "ntauth"}
+    assert snap.ca_certificates_checked and snap.display_specifiers_checked
+    assert snap.dynamic_objects_checked and not snap.dynamic_objects
+    assert (snap.dynamic_ttl_default, snap.dynamic_ttl_min) == (86400, 900)
+    quiet = {
+        "AD-INF-022", "AD-ACL-014", "AD-ACL-011", "AD-ACL-012", "AD-ACL-013", "AD-PRIV-016",
+        "AD-PRIV-017", "AD-PRIV-018", "AD-ACC-020", "AD-ACC-019", "AD-ADCS-021", "AD-INF-023",
+        "AD-INF-024",
+    }  # fmt: skip
+    assert not quiet & findings.keys()
+
+
+def test_patch_level_is_read_as_an_ordinary_user(
+    snap: Snapshot, findings: dict[str, set[str]]
+) -> None:
+    assert snap.probes.patch_checked
+    level = next(p for p in snap.probes.patch_levels if p.name == "DC01.adlab.test")
+    assert sorted(level.roles) == ["ca", "dc"] and level.build == 26100 and not level.error
+    assert isinstance(level.ubr, int) and level.ubr > 0
+    # the lab's Server 2025 is unpatched on purpose and its CA has the default EditFlags
+    assert {"AD-INF-029", "AD-ADCS-022"} <= findings.keys()
+    assert any("EDITF_ENABLECHASECLIENTDC set" in o for o in findings["AD-ADCS-022"])
+
+
+def test_script_permissions_are_read_as_an_ordinary_user(snap: Snapshot) -> None:
+    assert snap.gpo_scripts_checked and snap.gpo_scripts == []
+    logon_script = next(a for a in snap.sysvol_acls if a.path.lower() == r"scripts\map.bat")
+    assert logon_script.owner and logon_script.judged and not logon_script.error
+    assert snap.probes.tier0_smb_checked and not snap.probes.dc_pack_ran
+
+
+def test_probe_pack_answers_on_the_wire() -> None:
+    host = os.environ["AD_DOCTOR_LAB_HOST"]
+    assert probes.smb1_enabled(host, int(os.environ.get("AD_DOCTOR_LAB_SMB_PORT", "445"))) is False
+    if os.environ.get("AD_DOCTOR_LAB_SSL", "1") == "1":
+        versions = probes.ldaps_tls_versions(host, int(os.environ.get("AD_DOCTOR_LAB_PORT", "636")))
+        assert versions["tls12"] is True

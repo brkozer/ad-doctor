@@ -53,6 +53,8 @@ GP_LINK = "f30e3bbe-9ff0-11d1-b603-0000f80367c1"
 GROUP_MSA_MEMBERSHIP = "888eedd6-ce04-df40-b462-b8a50e41ba38"
 MANAGED_ACCOUNT_PRECEDED_BY = "a0945b2b-57a2-43bd-b327-4d112a4e8bd1"
 APPLY_GROUP_POLICY = "edacfd8f-ffb3-11d1-b41d-00a0c968f939"
+# where AD FS keeps the DKM key; ad-doctor only looks at who may read it
+THUMBNAIL_PHOTO = "8d3bca50-1d7e-11d0-a081-00aa006c33ed"
 # Classes
 DMSA_CLASS = "0feb936f-47b3-49f2-9386-1dedc2c23765"  # msDS-DelegatedManagedServiceAccount
 DNS_NODE_CLASS = "e0fa1e8c-9b45-11d0-afdd-00c04fd930c9"
@@ -67,6 +69,7 @@ CA_MANAGE = 0x1  # ManageCA (CA administrator)
 CA_OFFICER = 0x2  # ManageCertificates (certificate manager)
 # CA registry settings
 EDITF_ATTRIBUTESUBJECTALTNAME2 = 0x40000  # policy\EditFlags: SAN from request attributes
+EDITF_ENABLECHASECLIENTDC = 0x00100000
 IF_ENFORCEENCRYPTICERTREQUEST = 0x200  # CA\InterfaceFlags: ICPR requires packet privacy
 REQDISP_PENDING = 0x100  # policy\RequestDisposition: every request waits for a manager
 SZOID_NTDS_CA_SECURITY_EXT = "1.3.6.1.4.1.311.25.2"  # the SID extension (KB5014754)
@@ -91,6 +94,7 @@ PROPERTY_SET = {
 USER_CLASS = "bf967aba-0de6-11d0-a285-00aa003049e2"
 COMPUTER_CLASS = "bf967a86-0de6-11d0-a285-00aa003049e2"
 GROUP_CLASS = "bf967a9c-0de6-11d0-a285-00aa003049e2"
+INET_ORG_PERSON_CLASS = "4828cc14-1437-45bc-9b07-ad6f015e5f28"
 OU_CLASS = "bf967aa5-0de6-11d0-a285-00aa003049e2"
 
 

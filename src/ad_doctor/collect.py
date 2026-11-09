@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import html
 import re
 import struct
@@ -22,20 +23,23 @@ from ldap3.core.exceptions import (
 )
 from ldap3.protocol.microsoft import security_descriptor_control
 
-from . import dnsprop, gpo_scope, keycred, probes, sd, sysvol
-from .checks import dns_lookup_hosts, foreign_zone_trustee, san_note
+from . import dnsprop, gpo_scope, keycred, probes, sd, sysvol, x509
+from .checks import dns_lookup_hosts, foreign_zone_trustee, san_note, tier0_hosts
 from .model import (
+    CONFIG_ACL_LABELS,
     SILO_LEVEL,
     TIER0_RIDS,
     UAC,
     Account,
     AuthPolicy,
     AuthSilo,
+    CaCertificate,
     CaConfig,
     CertTemplate,
     ConflictObject,
     DcProbe,
     DirObject,
+    DisplaySpecifierCommand,
     Dmsa,
     DnsNode,
     DnsZone,
@@ -45,16 +49,19 @@ from .model import (
     Gpo,
     GpoLocalGroup,
     GpoSettings,
+    HostSmb,
     MemberChange,
     Probes,
     Pso,
     Rodc,
+    SccmObject,
     SidHistoryChange,
     Site,
     Snapshot,
     Subnet,
     Trust,
     UnreadableMember,
+    computers_behind,
     exchange_members,
     filetime_to_datetime,
     well_known_sid,
@@ -131,6 +138,17 @@ PASSWORD_ATTRIBUTES = ("userPassword", "unixUserPassword", "msSFU30Password", "o
 LAPS_PASSWORD_ATTRIBUTES = ("ms-Mcs-AdmPwd", "msLAPS-Password", "msLAPS-EncryptedPassword")
 DMSA_CLASS = "msds-delegatedmanagedserviceaccount"
 # Microsoft Entra Kerberos writes this fixed object: a logical RODC with its own krbtgt
+# "order,{clsid}", optionally followed by data, is the COM form of a context menu value
+COM_MENU_VALUE = re.compile(r"^\s*\d+\s*,\s*\{[0-9A-Fa-f-]{36}\}")
+REMOTE_COMMAND = re.compile(r"^\s*\"?(?:[\\/]{2}|[A-Za-z][A-Za-z0-9+.-]+:[\\/]{2})")
+MAX_COMMAND = 512
+# store, RDN under Public Key Services, filter, search scope
+CA_STORES = (
+    ("enrollment", "CN=Enrollment Services", "(objectClass=pKIEnrollmentService)", ldap3.LEVEL),
+    ("root", "CN=Certification Authorities", "(objectClass=certificationAuthority)", ldap3.LEVEL),
+    ("aia", "CN=AIA", "(objectClass=certificationAuthority)", ldap3.LEVEL),
+    ("ntauth", "CN=NTAuthCertificates", "(objectClass=*)", ldap3.BASE),
+)
 ENTRA_KERBEROS_DN = re.compile(r"^cn=azureadkerberos,ou=domain controllers,", re.IGNORECASE)
 MANAGED_CLASSES = {
     "msds-groupmanagedserviceaccount",
@@ -170,6 +188,7 @@ ACCOUNT_ATTRS = [
     "msDS-SupersededManagedAccountLink",
     "msDS-KrbTgtLink",
     "userPrincipalName",
+    "mail",
     "msDS-RevealOnDemandGroup",
     "msDS-NeverRevealGroup",
     *PASSWORD_ATTRIBUTES,
@@ -232,6 +251,19 @@ class Target:
     ca_registry: bool = True
     # names declared as tier 0: an account among them gets its owner and DACL read too
     declared_tier0: list[str] = dataclasses.field(default_factory=list)
+    # the DC probe pack: WebClient, SMBv1 and the TLS versions of LDAPS (--dc-probes)
+    dc_probes: bool = False
+    # read the build and UBR of each DC and CA over the winreg pipe (part of the probes)
+    patch_level: bool = True
+
+
+PATCH_CHECKS = {"dc": "AD-INF-029", "ca": "AD-ADCS-022"}
+PACK_CHECKS = {
+    "WebClient": "AD-INF-026",
+    "SMBv1": "AD-INF-027",
+    "TLS 1.0": "AD-INF-028",
+    "TLS 1.1": "AD-INF-028",
+}
 
 
 def _ces_urls(values: list[str]) -> list[str]:
@@ -500,6 +532,17 @@ class Collector:
         trustees |= {a.sid for o in objects for a in o.aces} | {o.owner for o in objects if o.owner}
         gmsas = self._gmsas(domain_dn)
         trustees |= {s for g in gmsas for s in g.readers}
+        sccm_container, sccm_objects, sccm_checked = self._sccm(domain_dn)
+        dkm_containers, dkm_checked = self._dkm(domain_dn)
+        config_acls = self._config_acls(root.other, config_dn)
+        for extra in self._host_objects(accounts, objects, gmsas, sccm_container, get & get_all):
+            objects.append(extra)
+            trustees |= {a.sid for a in extra.aces} | ({extra.owner} if extra.owner else set())
+        for held in (sccm_container, *dkm_containers):
+            if held is not None:
+                trustees |= {a.sid for a in held.aces}
+                trustees |= {held.owner} if held.owner else set()
+        trustees |= {a.sid for aces in config_acls.values() for a in aces}
         dmsas, dmsas_checked = self._dmsas(domain_dn)
         trustees |= {s for d in dmsas for s in d.readers}
         trustees |= {a.sid for d in dmsas for a in d.aces} | {d.owner for d in dmsas if d.owner}
@@ -510,7 +553,9 @@ class Collector:
         trustees |= {s for a in accounts for s in a.sid_history if s.startswith("S-1-5-21-")}
         trustees |= {c.owner for c in ca_configs if c.owner}
 
-        sysvol_result = self._sysvol(domain, [g.guid for g in gpos])
+        sysvol_result = self._sysvol(domain, [g.guid for g in gpos], accounts, domain_dn, config_dn)
+        trustees |= {a.sid for x in sysvol_result.acls for a in x.aces}
+        trustees |= {x.owner for x in sysvol_result.acls if x.owner}
         local_groups, gpo_settings = self._resolve_local_groups(
             sysvol_result.local_groups, sysvol_result.gpo_settings, domain_dn, config_dn, domain
         )
@@ -520,6 +565,21 @@ class Collector:
         # one value per attribute; dSASignature changes on every backup
         metadata = "".join(_str(h.get("msds-replattributemetadata", [])))
         psos, psos_unreadable, psos_visible = self._psos(domain_dn)
+        ca_certificates, ca_certificates_checked = self._ca_certificates(pks)
+        display_specifiers, display_specifiers_checked = self._display_specifiers(config_dn)
+        dynamic_objects, dynamic_checked = self._dynamic_objects(domain_dn, config_dn)
+        ttl_default, ttl_min = self._dynamic_ttl(config_dn)
+        mail_checked = any(a.has_mail for a in accounts)
+        if not mail_checked:
+            self.notes.append(
+                "no mail attribute came back (none set, or this account cannot read them): "
+                "AD-PRIV-017 not judged"
+            )
+        if not any(a.rid == 500 and not a.is_computer for a in accounts):
+            self.notes.append(
+                "built-in Administrator (RID 500) not returned: AD-ACC-018 not judged"
+            )
+        self.notes += _dcsync_gmsa_notes(acls["domain"], gmsas, accounts)
         upn_checked = any(a.upn for a in accounts)
         if not upn_checked:
             self.notes.append(
@@ -568,6 +628,7 @@ class Collector:
             gpo_preferences=sysvol_result.preferences,
             gpo_autologon=sysvol_result.autologon,
             policy_files_collected=sysvol_result.scanned,
+            loopback_collected=sysvol_result.scanned,
             script_secrets=sysvol_result.script_secrets,
             gmsas=gmsas,
             rodcs=[Rodc(a.sam, a_reveal, a_never) for a, a_reveal, a_never in self.rodc_policies],
@@ -623,9 +684,29 @@ class Collector:
             sid_history_checked=sid_checked,
             notes=self.notes,
             ace_inheritance_checked=True,
+            sccm_container=sccm_container,
+            sccm_objects=sccm_objects,
+            sccm_checked=sccm_checked,
+            dkm_containers=dkm_containers,
+            dkm_checked=dkm_checked,
+            config_acls=config_acls,
+            config_acls_checked=bool(config_acls),
+            mail_checked=mail_checked,
+            ca_certificates=ca_certificates,
+            ca_certificates_checked=ca_certificates_checked,
+            display_specifiers=display_specifiers,
+            display_specifiers_checked=display_specifiers_checked,
+            dynamic_objects=dynamic_objects,
+            dynamic_ttl_default=ttl_default,
+            dynamic_ttl_min=ttl_min,
+            dynamic_objects_checked=dynamic_checked,
+            gpo_scripts=sysvol_result.scripts,
+            sysvol_acls=sysvol_result.acls,
+            gpo_scripts_checked=sysvol_result.scanned,
         )
         snap.ldap_signing_required = self.scanned_ldap_signing
         snap.probes.ca_configs = ca_configs
+        self._probe_tier0_members(snap)
         snap.notes += gpo_scope.resolve(snap).notes
         snap.notes += gpo_scope.site_note(snap)
         snap.notes += gpo_scope.filter_note(snap)
@@ -958,6 +1039,7 @@ class Collector:
                 "flags",
                 "versionNumber",
                 "gPCMachineExtensionNames",
+                "gPCUserExtensionNames",
                 "gPCWQLFilter",
             ],
             scope=ldap3.LEVEL,
@@ -988,6 +1070,10 @@ class Collector:
                     machine_extensions(_first(e, "gPCMachineExtensionNames")) if readable else None
                 ),
                 wmi_filter=self._wmi_filter(domain_dn, _first(e, "gPCWQLFilter")),
+                user_version=_int(e, "versionNumber") >> 16 & 0xFFFF if readable else None,
+                user_extensions=(
+                    machine_extensions(_first(e, "gPCUserExtensionNames")) if readable else None
+                ),
             )
             gpos.append(gpo)
             objects.append(DirObject(dn, gpo.name, "gpo", owner=desc.owner, aces=desc.aces))
@@ -1469,12 +1555,7 @@ class Collector:
             for x in entries
         ) and not any(named(h) for s in settings.values() for h in s.privileges.get(right, [])):
             return entries, settings
-        crossref = self.optional(
-            f"CN=Partitions,{config_dn}",
-            f"(&(objectClass=crossRef)(nCName={ldap3.utils.conv.escape_filter_chars(domain_dn)}))",
-            ["nETBIOSName"],
-        )
-        netbios = (_first(crossref[0], "nETBIOSName") if crossref else "") or domain.split(".")[0]
+        netbios = self._netbios_name(domain_dn, config_dn, domain)
         cache: dict[str, str] = {}
         unresolved: list[str] = []
 
@@ -1766,6 +1847,217 @@ class Collector:
                 "for them"
             )
         return out
+
+    # --- Configuration Manager, AD FS, Configuration partition ------------------------
+
+    def _sccm(self, domain_dn: str) -> tuple[DirObject | None, list[SccmObject], bool]:
+        """The System Management container and what Configuration Manager published in it."""
+        base = f"CN=System Management,CN=System,{domain_dn}"
+        attrs = ["name", "sAMAccountName", "objectSid", "member", "nTSecurityDescriptor"]
+        entries = self.attempt(
+            base, "(objectClass=*)", attrs, scope=ldap3.BASE, controls=OWNER_AND_DACL
+        )
+        children = self.attempt(
+            base,
+            "(|(objectClass=mSSMSSite)(objectClass=mSSMSManagementPoint))",
+            ["objectClass", "mSSMSSiteCode", "dNSHostName", "mSSMSMPName"],
+        )
+        if entries is None or children is None:
+            self.notes.append(
+                "System Management container could not be searched: AD-INF-022 and AD-ACL-014 "
+                "not judged"
+            )
+            return None, [], False
+        found = []
+        for e in children:
+            classes = {c.lower() for c in _str(e.get("objectclass", []))}
+            found.append(
+                SccmObject(
+                    dn=e["distinguishedname"][0],
+                    kind="site" if "mssmssite" in classes else "management point",
+                    site_code=_first(e, "mSSMSSiteCode"),
+                    host=_first(e, "dNSHostName") or _first(e, "mSSMSMPName"),
+                )
+            )
+        if not entries:
+            return None, found, True
+        container = self._object(entries[0], "container")
+        if not container.aces:
+            self.notes.append(
+                "DACL of the System Management container not readable: AD-ACL-014 not judged "
+                "and site servers not identified"
+            )
+            return container, found, False
+        return container, found, True
+
+    def _host_objects(
+        self,
+        accounts: list[Account],
+        objects: list[DirObject],
+        gmsas: list[Gmsa],
+        sccm_container: DirObject | None,
+        dcsync: set[str],
+    ) -> list[DirObject]:
+        """Owner and DACL of Configuration Manager site servers and of the computers that
+        may read the password of a gMSA holding DCSync (Entra Cloud Sync agents)."""
+        by_dn = {a.dn.lower(): a for a in accounts}
+        sids = {
+            s
+            for g in gmsas
+            if (a := by_dn.get(g.dn.lower())) is not None and a.sid in dcsync
+            for s in g.readers
+        }
+        if sccm_container is not None:
+            sids |= {
+                a.sid
+                for a in sccm_container.aces
+                if a.mask & sd.GENERIC_ALL or (a.mask & sd.FULL_CONTROL) == sd.FULL_CONTROL
+            }
+        known = {o.dn.lower() for o in objects}
+        out = []
+        attrs = ["sAMAccountName", "name", "objectSid", "member", "nTSecurityDescriptor"]
+        for a in computers_behind(sids, accounts, objects):
+            if a.dn.lower() not in known:
+                out += [self._object(e, "computer") for e in self._base(a.dn, attrs)]
+        return out
+
+    def _dkm(self, domain_dn: str) -> tuple[list[DirObject], bool]:
+        """DACLs of the AD FS DKM containers. Only the DACL is asked for: the key sits in
+        thumbnailPhoto on the objects below them, and this never reads it."""
+        unknown = (
+            "no readable AD FS DKM container (AD FS is not used here, or this account cannot "
+            "read it, which is the expected state): AD-ACL-011 not judged"
+        )
+        entries = self.attempt(
+            f"CN=ADFS,CN=Microsoft,CN=Program Data,{domain_dn}",
+            "(objectClass=container)",
+            ["name", "nTSecurityDescriptor"],
+            scope=ldap3.LEVEL,
+            controls=DACL_ONLY,
+        )
+        if not entries:
+            self.notes.append(unknown)
+            return [], False
+        containers = [self._object(e, "container") for e in entries]
+        readable = [c for c in containers if c.aces]
+        if not readable:
+            self.notes.append(unknown)
+            return [], False
+        if len(readable) < len(containers):
+            self.notes.append(
+                f"{len(containers) - len(readable)} AD FS DKM container(s) came back without "
+                "a DACL: AD-ACL-011 not judged for them"
+            )
+        return readable, True
+
+    def _config_acls(self, root: dict[str, Any], config_dn: str) -> dict[str, list[sd.Ace]]:
+        schema_dn = (root.get("schemaNamingContext") or [f"CN=Schema,{config_dn}"])[0]
+        targets = (
+            schema_dn,
+            config_dn,
+            f"CN=Partitions,{config_dn}",
+            f"CN=Sites,{config_dn}",
+            f"CN=DisplaySpecifiers,{config_dn}",
+            f"CN=Extended-Rights,{config_dn}",
+            f"CN=Directory Service,CN=Windows NT,CN=Services,{config_dn}",
+        )
+        out = {}
+        unread = []
+        for label, dn in zip(CONFIG_ACL_LABELS, targets, strict=True):
+            aces = self._dacl(dn)
+            if aces:
+                out[label] = aces
+            else:
+                unread.append(label)
+        if unread:
+            self.notes.append(
+                f"DACL not readable: {', '.join(unread)}: AD-ACL-012 not judged there"
+            )
+        return out
+
+    def _display_specifiers(self, config_dn: str) -> tuple[list[DisplaySpecifierCommand], bool]:
+        entries = self.attempt(
+            f"CN=DisplaySpecifiers,{config_dn}",
+            "(|(adminContextMenu=*)(shellContextMenu=*))",
+            ["adminContextMenu", "shellContextMenu"],
+            must_exist=True,
+        )
+        if entries is None:
+            self.notes.append("display specifiers not readable: AD-INF-023 not judged")
+            return [], False
+        out = []
+        for e in entries:
+            for attribute in ("adminContextMenu", "shellContextMenu"):
+                for value in _str(e.get(attribute.lower(), [])):
+                    command = display_command(value)
+                    if command is not None and REMOTE_COMMAND.match(command):
+                        dn = e["distinguishedname"][0]
+                        out.append(DisplaySpecifierCommand(dn, attribute, command))
+        return out, True
+
+    def _dynamic_objects(self, domain_dn: str, config_dn: str) -> tuple[list[str], bool]:
+        found: list[str] = []
+        checked = True
+        for base in (domain_dn, config_dn):
+            entries = self.attempt(base, "(objectClass=dynamicObject)", ["objectClass"])
+            if entries is None:
+                checked = False
+                self.notes.append(f"dynamic objects under {base} not read: AD-INF-024 not judged")
+            else:
+                found += [e["distinguishedname"][0] for e in entries]
+        return sorted(found), checked
+
+    def _dynamic_ttl(self, config_dn: str) -> tuple[int | None, int | None]:
+        entry = self.optional(
+            f"CN=Directory Service,CN=Windows NT,CN=Services,{config_dn}",
+            "(objectClass=*)",
+            ["msDS-Other-Settings"],
+            scope=ldap3.BASE,
+        )
+        settings = dict(
+            s.split("=", 1) for s in _str(entry[0].get("msds-other-settings", [])) if "=" in s
+        ) if entry else {}  # fmt: skip
+
+        def number(name: str) -> int | None:
+            value = settings.get(name, "")
+            return int(value) if value.isdigit() else None
+
+        default, minimum = number("DynamicObjectDefaultTTL"), number("DynamicObjectMinTTL")
+        if default is None or minimum is None:
+            self.notes.append(
+                "dynamic object TTL settings not readable or not set: the TTL part of "
+                "AD-INF-024 not judged"
+            )
+        return default, minimum
+
+    def _ca_certificates(self, pks: str) -> tuple[list[CaCertificate], bool]:
+        """The CA certificates the forest publishes, one entry per certificate."""
+        found: dict[bytes, CaCertificate] = {}
+        checked = True
+        for store, rdn, flt, scope in CA_STORES:
+            entries = self.attempt(f"{rdn},{pks}", flt, ["name", "cACertificate"], scope=scope)
+            if entries is None:
+                checked = False
+                continue
+            for e in entries:
+                for der in e.get("cacertificate", []):
+                    digest = hashlib.sha256(der).digest()
+                    if digest not in found:
+                        found[digest] = _ca_certificate(der, _first(e, "name"))
+                    if store not in found[digest].stores:
+                        found[digest].stores.append(store)
+        if not checked:
+            self.notes.append("a CA certificate store could not be read: AD-ADCS-021 not judged")
+        # a signature it cannot name cannot be called strong; on a root it is never checked
+        unparsed = sum(
+            not c.parsed or (c.signature_hash == "unknown" and not c.self_signed)
+            for c in found.values()
+        )
+        if unparsed:
+            self.notes.append(
+                f"{unparsed} CA certificate(s) not understood: AD-ADCS-021 did not judge them"
+            )
+        return sorted(found.values(), key=lambda c: c.name.lower()), checked
 
     # --- AD CS -----------------------------------------------------------------------
 
@@ -2076,7 +2368,23 @@ class Collector:
 
     # --- SMB, probes -----------------------------------------------------------------
 
-    def _sysvol(self, domain: str, gpo_guids: list[str]) -> sysvol.SysvolResult:
+    def _netbios_name(self, domain_dn: str, config_dn: str, domain: str) -> str:
+        """nETBIOSName of the domain's crossRef; its first DNS label when that is not readable."""
+        crossref = self.optional(
+            f"CN=Partitions,{config_dn}",
+            f"(&(objectClass=crossRef)(nCName={ldap3.utils.conv.escape_filter_chars(domain_dn)}))",
+            ["nETBIOSName"],
+        )
+        return (_first(crossref[0], "nETBIOSName") if crossref else "") or domain.split(".")[0]
+
+    def _sysvol(
+        self,
+        domain: str,
+        gpo_guids: list[str],
+        accounts: list[Account],
+        domain_dn: str,
+        config_dn: str,
+    ) -> sysvol.SysvolResult:
         t = self.target
         if t is None:
             return sysvol.SysvolResult()
@@ -2090,9 +2398,17 @@ class Collector:
             self.notes.append("SYSVOL not checked: needs credentials")
             return sysvol.SysvolResult()
         try:
+            dc_hosts = [
+                name
+                for a in accounts
+                if a.is_registered_dc
+                for name in (a.dns_host, a.sam.removesuffix("$"))
+                if name
+            ]
             result = sysvol.scan(
-                t.host, domain, t.user, t.password, gpo_guids, t.smb_port, t.kerberos
-            )
+                t.host, domain, t.user, t.password, gpo_guids, t.smb_port, t.kerberos, dc_hosts,
+                self._netbios_name(domain_dn, config_dn, domain),
+            )  # fmt: skip
             if result.unreadable:
                 shown = ", ".join(result.unreadable[:5])
                 more = len(result.unreadable) - 5
@@ -2171,7 +2487,37 @@ class Collector:
             result.ldaps_channel_binding_required = probes.ldaps_channel_binding_required(
                 host, t.port if scanned else 636, t.user or "", t.password or ""
             )
+        if t.dc_probes:
+            self._probe_dc_pack(result, host, scanned)
         return result
+
+    def _probe_dc_pack(self, result: DcProbe, host: str, scanned: bool) -> None:
+        """WebClient, SMBv1 and the TLS versions of LDAPS on one DC (--dc-probes)."""
+        t = self.target
+        assert t is not None
+        smb_port = t.smb_port if scanned else 445
+        if t.kerberos or (t.user and t.password is not None):
+            result.webclient = probes.webclient(host, smb_port, t.user, t.password, t.kerberos)
+        result.smb1 = probes.smb1_enabled(host, smb_port)
+        versions = probes.ldaps_tls_versions(host, t.port if scanned and t.use_ssl else 636)
+        result.tls10, result.tls11 = versions["tls10"], versions["tls11"]
+        result.tls12, result.tls13 = versions["tls12"], versions["tls13"]
+        unknown = [
+            label
+            for label, value in (
+                ("WebClient", result.webclient),
+                ("SMBv1", result.smb1),
+                ("TLS 1.0", result.tls10),
+                ("TLS 1.1", result.tls11),
+            )
+            if value is None
+        ]
+        if unknown:
+            checks = " and ".join(dict.fromkeys(PACK_CHECKS[label] for label in unknown))
+            self.notes.append(
+                f"{result.name}: probe pack could not tell: {', '.join(unknown)}, so {checks} "
+                "did not judge it"
+            )
 
     def _probes(self, dc_dns_host: str, accounts: list[Account]) -> Probes:
         t = self.target
@@ -2198,6 +2544,17 @@ class Collector:
             self.notes.append(
                 "web enrollment not probed by choice: AD-ADCS-010 and AD-CHAIN-003 did not judge it"
             )
+        if not (t.probes and t.dc_probes):
+            self.notes.append(
+                "WebClient, SMBv1 and LDAPS TLS versions not probed by choice (--dc-probes): "
+                "AD-INF-026, AD-INF-027 and AD-INF-028 did not judge them"
+            )
+        if not (t.probes and t.patch_level):
+            why = "--no-probes" if not t.probes else "--no-patch-level"
+            self.notes.append(
+                f"patch level not read by choice ({why}): AD-INF-029 and AD-ADCS-022 did not "
+                "judge it"
+            )
         if not t.probes and not t.plain_port:
             return result
         for name, scanned in self._dc_targets(dc_dns_host, accounts):
@@ -2216,7 +2573,80 @@ class Collector:
                 self.notes.append(f"{name}: not probed ({dc.error})")
         if t.probes:
             self._probe_enrollment(dc_dns_host, result)
+            result.dc_pack_ran = t.dc_probes
+            if t.patch_level:
+                self._read_patch_levels(dc_dns_host, accounts, result)
         return result
+
+    def _read_patch_levels(self, dc_dns_host: str, accounts: list[Account], result: Probes) -> None:
+        """Build and UBR of every DC and CA host, each read once."""
+        t = self.target
+        assert t is not None
+        if not (t.kerberos or (t.user and t.password is not None)):
+            self.notes.append(
+                "patch level not read: it needs credentials, so AD-INF-029 and AD-ADCS-022 "
+                "did not judge it"
+            )
+            return
+        result.patch_checked = True
+        hosts: dict[str, tuple[str, list[str], bool]] = {}
+        for name, scanned in self._dc_targets(dc_dns_host, accounts):
+            hosts[name.lower()] = (name, ["dc"], scanned)
+        for name in self.ca_dns_hosts:
+            if name.lower() in hosts:
+                hosts[name.lower()][1].append("ca")
+            else:
+                hosts[name.lower()] = (name, ["ca"], False)
+        for name, roles, scanned in hosts.values():
+            # the DC being scanned is reached through the address given for it
+            level = probes.patch_level(
+                t.host if scanned else name,
+                t.smb_port if scanned else 445,
+                name,
+                roles,
+                t.user,
+                t.password,
+                t.kerberos,
+            )
+            result.patch_levels.append(level)
+            if level.error:
+                checks = " and ".join(
+                    check for role, check in PATCH_CHECKS.items() if role in level.roles
+                )
+                self.notes.append(
+                    f"{name}: patch level not read, {checks} not judged: {level.error}"
+                )
+
+    def _probe_tier0_members(self, snap: Snapshot) -> None:
+        """SMB signing of the tier-0 computers that are not DCs: a negotiate, no logon."""
+        t = self.target
+        if t is None:
+            return
+        if not t.probes:
+            self.notes.append(
+                "SMB signing of tier-0 member servers not probed by choice: AD-INF-025 did not "
+                "judge it"
+            )
+            return
+        snap.probes.tier0_smb_checked = True
+        roles = dict(tier0_hosts(snap))
+        for a in snap.sccm_site_servers():
+            roles.setdefault(a.dn.lower(), "Configuration Manager site server")
+        for a in sorted(snap.accounts, key=lambda x: x.sam.lower()):
+            if not a.is_computer or a.is_dc or a.dn.lower() not in roles or not a.enabled:
+                continue
+            if not a.dns_host:
+                self.notes.append(
+                    f"{a.sam}: no dNSHostName, SMB signing not probed, AD-INF-025 not judged for it"
+                )
+                continue
+            required, error = probes.smb_signing(a.dns_host, 445)
+            snap.probes.tier0_smb.append(HostSmb(a.sam, required, error))
+            if required is None:
+                self.notes.append(
+                    f"{a.sam}: SMB signing not known, no SMB connection, AD-INF-025 not judged "
+                    f"for it: {error}"
+                )
 
     def _enrollment_targets(self) -> list[tuple[str, str, str, str, int, bool]]:
         """(scheme, host, Host header, path, port, published): each CA's web enrollment, which
@@ -2358,6 +2788,7 @@ class Collector:
                 e["distinguishedname"][0], uac, _first(e, "msDS-KrbTgtLink")
             ),
             upn=_first(e, "userPrincipalName") or None,
+            has_mail=bool(e.get("mail")),
             krbtgt_link=_first(e, "msDS-KrbTgtLink") or None,
             superseded_by=(
                 _first(e, "msDS-SupersededManagedAccountLink")
@@ -2374,6 +2805,54 @@ class Collector:
                 )
             )
         return account
+
+
+def display_command(value: str) -> str | None:
+    """The program or address of a context menu value; None for the "order,{clsid}" form.
+    A value with neither form is returned as a whole: nothing else can be said about it."""
+    if COM_MENU_VALUE.match(value):
+        return None
+    parts = value.split(",", 2)
+    return (parts[2].strip() if len(parts) == 3 else value.strip())[:MAX_COMMAND]
+
+
+def _ca_certificate(der: bytes, name: str) -> CaCertificate:
+    try:
+        cert = x509.parse(der)
+    except (ValueError, IndexError, UnicodeDecodeError):
+        return CaCertificate(name)
+    return CaCertificate(
+        name=cert.common_name or name,
+        parsed=True,
+        key_type=cert.key_type,
+        key_bits=cert.key_bits,
+        signature_hash=cert.signature_hash,
+        self_signed=cert.self_signed,
+        not_after=cert.not_after,
+    )
+
+
+def _dcsync_gmsa_notes(
+    domain_aces: list[sd.Ace], gmsas: list[Gmsa], accounts: list[Account]
+) -> list[str]:
+    if not gmsas:
+        return []
+    if not domain_aces:
+        return ["DACL of the domain not readable: AD-PRIV-016 not judged"]
+    get = {a.sid for a in domain_aces if a.extended_right(sd.DS_REPL_GET_CHANGES)}
+    get_all = {a.sid for a in domain_aces if a.extended_right(sd.DS_REPL_GET_CHANGES_ALL)}
+    by_dn = {a.dn.lower(): a for a in accounts}
+    unread = sorted(
+        g.name
+        for g in gmsas
+        if not g.readers and (a := by_dn.get(g.dn.lower())) is not None and a.sid in get & get_all
+    )
+    if not unread:
+        return []
+    return [
+        f"who may read the password of {', '.join(unread)} is not readable: "
+        "AD-PRIV-016 not judged for them"
+    ]
 
 
 def is_entra_kerberos(dn: str, uac: int, krbtgt_link: str) -> bool:
