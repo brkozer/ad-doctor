@@ -458,6 +458,69 @@ def test_collector_says_what_it_could_not_read() -> None:
     assert any("failed" in n for n in c.notes) and any("not visible" in n for n in c.notes)
 
 
+ROOT_HINTS_ONLY = [zone_entry(f"CN=System,{HEAD}", "RootDNSServers")]
+SYSTEM = container(f"CN=System,{HEAD}")
+READ_ZONE = zone_entry(DOMAIN_ZONES, "lab.test", TYPE_PRIMARY, UPDATE_SECURE)
+
+
+@pytest.mark.parametrize(
+    "refusal", [LDAPInsufficientAccessRightsResult(), LDAPNoSuchObjectResult()]
+)
+def test_root_hints_alone_do_not_count_as_a_location_read(refusal: Exception) -> None:
+    c = collector(
+        {
+            container(DOMAIN_ZONES): refusal,
+            container(FOREST_ZONES): refusal,
+            SYSTEM: ROOT_HINTS_ONLY,
+        },
+        (DOMAIN_ZONES, FOREST_ZONES),
+    )
+    zones, _, checked = c._dns_zones(HEAD, HEAD, SID, SID)
+    assert not checked and [z.name for z in zones] == ["RootDNSServers"]
+    assert "no DNS zone location could be read: AD-DNS-001 to AD-DNS-003 not judged" in c.notes
+
+
+def test_a_real_zone_in_the_domain_partition_counts_as_read() -> None:
+    legacy = zone_entry(f"CN=System,{HEAD}", "old.test", TYPE_PRIMARY, UPDATE_SECURE)
+    refused = LDAPInsufficientAccessRightsResult()
+    c = collector(
+        {container(DOMAIN_ZONES): refused, container(FOREST_ZONES): refused, SYSTEM: [legacy]},
+        (DOMAIN_ZONES, FOREST_ZONES),
+    )
+    _, _, checked = c._dns_zones(HEAD, HEAD, SID, SID)
+    assert checked and not any("no DNS zone location" in n for n in c.notes)
+
+
+@pytest.mark.parametrize(
+    "refusal", [LDAPInsufficientAccessRightsResult(), LDAPNoSuchObjectResult()]
+)
+def test_unread_partition_says_which_checks_did_not_judge_it(refusal: Exception) -> None:
+    c = collector(
+        {container(DOMAIN_ZONES): [READ_ZONE], container(FOREST_ZONES): refusal},
+        (DOMAIN_ZONES, FOREST_ZONES),
+    )
+    _, _, checked = c._dns_zones(HEAD, HEAD, SID, SID)
+    assert checked
+    assert (
+        "ForestDnsZones could not be read: DNS zones stored there not judged "
+        "(AD-DNS-001 to AD-DNS-003)" in c.notes
+    )
+
+
+def test_refused_domain_partition_location_says_so() -> None:
+    c = collector(
+        {
+            container(DOMAIN_ZONES): [READ_ZONE],
+            container(FOREST_ZONES): [],
+            SYSTEM: LDAPInsufficientAccessRightsResult(),
+        },
+        (DOMAIN_ZONES, FOREST_ZONES),
+    )
+    _, _, checked = c._dns_zones(HEAD, HEAD, SID, SID)
+    assert checked
+    assert any(n.startswith("domain partition could not be read") for n in c.notes)
+
+
 def test_collector_keeps_one_partition_when_the_other_is_missing() -> None:
     c = collector(
         {

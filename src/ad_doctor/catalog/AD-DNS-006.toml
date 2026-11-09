@@ -4,7 +4,8 @@ summary = "An ordinary account owns the DNS record of a name clients look up by 
 severities = ["low", "high"]
 severity_logic = """
 **High** when the record holds an address or an alias, so clients are sent to its target. **Low**
-when it holds no address record, none can be read, or its owner is in another domain.
+when it holds no address record, none can be read, its owner is in another domain, or its owner is
+a computer whose name matches the record.
 """
 mitre = ["T1557"]
 data_sources = ["ldap"]
@@ -23,8 +24,11 @@ assume it is on. It says nothing about `autodiscover`.
 detection = """
 A name counts when its first label is `wpad`, `isatap` or `autodiscover`, in any forward zone. It is
 reported when the owner read from its security descriptor is not tier 0, DnsAdmins, an operator or
-a domain controller. Tombstoned records are left out, and so is a computer that registered its own
-name, as a host really called `wpad` does.
+a domain controller. Tombstoned records are left out.
+
+A computer that owns its own name is listed at Low for review. It may be a host really called `wpad`,
+or one an ordinary user created under `ms-DS-MachineAccountQuota`. The snapshot does not record who
+created a computer, so the two cannot be told apart.
 
 A name whose owner cannot be read is not judged, and a note gives the number.
 """
@@ -32,6 +36,8 @@ A name whose owner cannot be read is not judged, and a note gives the number.
 false_positives = """
 - **A proxy or mail administrator** outside DnsAdmins who created the record by hand. Confirm it, and
   have the record owned by an administrator so that the owner cannot redirect it.
+- **A host really called `wpad`** that registered its own name. Confirm who created the computer
+  account.
 """
 
 remediation = """

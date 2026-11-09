@@ -71,9 +71,12 @@ def record_type(raw: bytes) -> int | None:
 
 
 def record_types(values: Sequence[bytes]) -> list[int] | None:
-    """The types of the readable values, or None when none is readable. A malformed value
-    beside a valid one cannot hide the valid one."""
-    found = {record_type(raw) for raw in values[:MAX_RECORD_VALUES]}
+    """The types of the readable values, or None when none is readable or there are more
+    values than are read. A malformed value beside a valid one cannot hide the valid one, and
+    neither can a long run of values ahead of it."""
+    if len(values) > MAX_RECORD_VALUES:
+        return None
+    found = {record_type(raw) for raw in values}
     found.discard(None)
     return sorted(t for t in found if t is not None) or None
 

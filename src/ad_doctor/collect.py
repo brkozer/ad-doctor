@@ -1044,6 +1044,13 @@ class Collector:
         ]
         zones: list[DnsZone] = []
         partition_read = False
+
+        def unread_location(source: str) -> str:
+            return (
+                f"{source} could not be read: DNS zones stored there not judged "
+                "(AD-DNS-001 to AD-DNS-003)"
+            )
+
         for source, partition in partitions:
             if partition.lower() not in held:
                 self.notes.append(
@@ -1053,14 +1060,18 @@ class Collector:
                 continue
             found = self._zones_under(f"CN=MicrosoftDNS,{partition}", source, must_exist=True)
             if found is None:
+                self.notes.append(unread_location(source))
                 continue
             partition_read = True
             zones += found
         legacy = self._zones_under(
             f"CN=MicrosoftDNS,CN=System,{domain_dn}", DNS_LEGACY_ZONES, must_exist=False
         )
+        if legacy is None:
+            self.notes.append(unread_location(DNS_LEGACY_ZONES))
         zones += legacy or []
-        checked = partition_read or bool(legacy)
+        # every domain partition can hold a copy of the root hints: that alone answers nothing
+        checked = partition_read or any(z.name.lower() != DNS_ROOT_HINTS for z in legacy or [])
         if not checked:
             self.notes.append(
                 "no DNS zone location could be read: AD-DNS-001 to AD-DNS-003 not judged"
@@ -1104,6 +1115,7 @@ class Collector:
         return scan, checked
 
     def _scan_zone(self, zone: DnsZone, scan: DnsNodeScan) -> bool:
+        before = scan.names_seen
         try:
             for e in self.stream(
                 zone.dn,
@@ -1117,7 +1129,8 @@ class Collector:
         except LDAPOperationResult as exc:
             self.notes.append(f"records of {zone.label} not fully read: {exc.description}")
             return False
-        return True
+        # every zone holds at least its "@" name, so no name at all means the listing was hidden
+        return scan.names_seen > before
 
     def _scan_node(self, e: dict[str, Any], zone: DnsZone, scan: DnsNodeScan) -> None:
         dn = e["distinguishedname"][0]

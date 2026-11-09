@@ -9,6 +9,7 @@ import tracemalloc
 from collections.abc import Iterator
 from datetime import timedelta
 from typing import Any
+from xml.etree import ElementTree
 
 import pytest
 from ldap3.core.exceptions import LDAPInsufficientAccessRightsResult
@@ -17,6 +18,7 @@ from ad_doctor import dnsprop, redact, sd
 from ad_doctor.checks import dns_lookup_hosts, run_all
 from ad_doctor.collect import MAX_KEPT_DNS_NODES, Collector
 from ad_doctor.model import DnsNode, DnsZone, Severity, Snapshot
+from ad_doctor.report import Report, not_judged, render_junit, render_sarif
 from ad_doctor.sd import Ace
 from tests.test_acl_adcs import ace_bytes, descriptor, sid_bytes
 from tests.test_checks import NOW, computer, ids, only, snapshot, user
@@ -96,9 +98,26 @@ def test_record_types_keeps_the_valid_values() -> None:
     assert dnsprop.record_types([]) is None
 
 
-def test_record_types_is_bounded() -> None:
-    values = [record(dnsprop.TYPE_NS, b"x")] * (dnsprop.MAX_RECORD_VALUES + 5)
-    assert dnsprop.record_types([*values, record()]) == [dnsprop.TYPE_NS]
+def test_record_types_past_the_limit_are_unknown() -> None:
+    dead = [record(dnsprop.TYPE_TOMBSTONE, b"\x00" * 8)] * (dnsprop.MAX_RECORD_VALUES - 1)
+    assert dnsprop.record_types([*dead, record()]) == [dnsprop.TYPE_TOMBSTONE, dnsprop.TYPE_A]
+    assert dnsprop.record_types([*dead, dead[0], record()]) is None
+    assert dnsprop.record_types([*dead, dead[0], dead[0], record()]) is None
+
+
+def test_values_past_the_limit_do_not_read_as_tombstoned() -> None:
+    dead = [record(dnsprop.TYPE_TOMBSTONE, b"\x00" * 8)] * dnsprop.MAX_RECORD_VALUES
+    c = scanning(
+        {
+            FORWARD: [node_entry("wpad", *dead, record()), node_entry("@", record())],
+            f"DC=wpad,{FORWARD}": [owner_entry("wpad", HELPDESK)],
+        }
+    )
+    scan, _, _ = walk(c)
+    found = scan.kept[0][1]
+    assert found.record_types is None and not found.is_tombstoned
+    finding = only(records_snapshot(found), "AD-DNS-006")
+    assert finding.severity is Severity.LOW and "records not readable" in finding.objects[0]
 
 
 def test_parser_never_raises_on_random_bytes() -> None:
@@ -250,10 +269,14 @@ def test_wpad_tombstoned_is_quiet() -> None:
     assert "AD-DNS-006" not in fired(records_snapshot(wpad(tombstoned=True)))
 
 
-def test_host_really_called_wpad_is_quiet() -> None:
+def test_computer_of_the_same_name_is_listed_at_low() -> None:
+    # a host really called wpad, or one an ordinary user created under the quota
     host = computer("WPAD", sid=f"{SID}-2000")
-    snap = records_snapshot(wpad(owner=f"{SID}-2000"), people=(host,))
-    assert "AD-DNS-006" not in fired(snap)
+    finding = only(records_snapshot(wpad(owner=f"{SID}-2000"), people=(host,)), "AD-DNS-006")
+    assert finding.severity is Severity.LOW
+    assert finding.objects == [
+        "wpad in lab.test (DomainDnsZones): owned by a computer of the same name, review"
+    ]
 
 
 def test_another_computer_owning_wpad_is_reported() -> None:
@@ -388,16 +411,54 @@ def test_longest_zone_decides() -> None:
     assert "AD-DNS-007" not in fired(snap)
 
 
-def test_wildcard_covers_the_name() -> None:
-    gone = ghost_snapshot(live_computer("HOST/old.lab.test"))
-    gone.dns_nodes = [node(owner=DOMAIN_ADMINS)]
-    assert "AD-DNS-007" not in fired(gone)
+WILDCARD_MENTION = "a wildcard may answer it today"
+TYPE_TXT = 16
 
 
-def test_tombstoned_wildcard_covers_nothing() -> None:
+def test_wildcard_that_answers_still_leaves_the_name_claimable() -> None:
     snap = ghost_snapshot(live_computer("HOST/old.lab.test"))
-    snap.dns_nodes = [node(owner=DOMAIN_ADMINS, tombstoned=True)]
-    assert "AD-DNS-007" in fired(snap)
+    snap.dns_nodes = [node(owner=DOMAIN_ADMINS)]
+    finding = only(snap, "AD-DNS-007")
+    assert WILDCARD_MENTION in finding.objects[0]
+    assert "takes precedence over a wildcard" in finding.detail
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"tombstoned": True},
+        {"record_types": [TYPE_TXT]},  # the reservation AD-DNS-005 recommends
+        {"record_types": None},
+        {"zone": "other.test"},
+    ],
+)
+def test_wildcard_that_does_not_answer_is_not_mentioned(fields: dict[str, Any]) -> None:
+    snap = ghost_snapshot(live_computer("HOST/old.lab.test"))
+    snap.dns_nodes = [node(owner=DOMAIN_ADMINS, **fields)]
+    finding = only(snap, "AD-DNS-007")
+    assert WILDCARD_MENTION not in finding.objects[0] and "wildcard" not in finding.detail
+
+
+def test_parent_zone_wildcard_says_nothing_about_a_child_zone() -> None:
+    child = zone("child.lab.test", dn=f"DC=child.lab.test,{FORWARD}", nodes_read=True)
+    zones = (zone(nodes_read=True), child)
+    snap = ghost_snapshot(live_computer("HOST/x.child.lab.test"), zones=zones)
+    snap.dns_nodes = [node(owner=DOMAIN_ADMINS)]
+    finding = only(snap, "AD-DNS-007")
+    assert "zone child.lab.test" in finding.objects[0]
+    assert WILDCARD_MENTION not in finding.objects[0]
+    snap.dns_nodes = [node(owner=DOMAIN_ADMINS, zone="child.lab.test")]
+    assert WILDCARD_MENTION in only(snap, "AD-DNS-007").objects[0]
+
+
+def test_wildcard_below_the_zone_apex_answers_only_under_itself() -> None:
+    snap = ghost_snapshot(
+        live_computer("HOST/x.sub.lab.test", "HOST/y.other.lab.test"),
+    )
+    snap.dns_nodes = [node("*.sub", owner=DOMAIN_ADMINS)]
+    objects = only(snap, "AD-DNS-007").objects
+    assert [WILDCARD_MENTION in o for o in objects] == ["sub.lab" in o for o in objects]
+    assert sum(WILDCARD_MENTION in o for o in objects) == 1
 
 
 def test_delegated_subtree_is_quiet() -> None:
@@ -432,6 +493,87 @@ def test_older_snapshot_says_not_evaluated() -> None:
     assert not snap.dns_nodes_checked and snap.dns_nodes == []
     assert any("AD-DNS-004 to AD-DNS-007" in n for n in snap.notes)
     assert not {"AD-DNS-004", "AD-DNS-005", "AD-DNS-006", "AD-DNS-007"} & set(fired(snap))
+
+
+DNS_CHECKS = {f"AD-DNS-00{i}" for i in range(1, 8)}
+ZONE_CHECKS = {"AD-DNS-001", "AD-DNS-002", "AD-DNS-003"}
+RECORD_CHECKS = DNS_CHECKS - ZONE_CHECKS
+
+
+def skipped_in_junit(snap: Snapshot) -> set[str]:
+    root = ElementTree.fromstring(render_junit(Report(snap, run_all(snap)), sorted(DNS_CHECKS)))
+    return {c.attrib["name"].split()[0] for c in root if c.find("skipped") is not None}
+
+
+def test_older_snapshot_skips_every_dns_check_in_junit() -> None:
+    data = snapshot().to_json()
+    for key in (
+        "dns_zones",
+        "dns_zones_checked",
+        "dns_nodes",
+        "dns_nodes_checked",
+        "dns_spn_hosts",
+        "dns_delegations",
+    ):
+        del data[key]
+    assert skipped_in_junit(Snapshot.from_json(data)) == DNS_CHECKS
+
+
+@pytest.mark.parametrize(
+    ("note", "named"),
+    [
+        (
+            "this DC holds no copy of DomainDnsZones: DNS zones stored there not judged "
+            "(AD-DNS-001 to AD-DNS-003)",
+            ZONE_CHECKS,
+        ),
+        (
+            "ForestDnsZones could not be read: DNS zones stored there not judged "
+            "(AD-DNS-001 to AD-DNS-003)",
+            ZONE_CHECKS,
+        ),
+        ("no DNS zone location could be read: AD-DNS-001 to AD-DNS-003 not judged", ZONE_CHECKS),
+        (
+            "records of 1 DNS zone(s) could not be listed, AD-DNS-004 to AD-DNS-007 did not "
+            "judge them: lab.test (DomainDnsZones)",
+            RECORD_CHECKS,
+        ),
+        ("no forward DNS zone was listed: AD-DNS-004 to AD-DNS-007 not judged", RECORD_CHECKS),
+        (
+            "5 more DNS names of kind 'wildcard' not read, past the limit of 200: AD-DNS-004 to "
+            "AD-DNS-006 list the first ones only",
+            RECORD_CHECKS - {"AD-DNS-007"},
+        ),
+    ],
+)
+def test_collector_notes_skip_every_check_they_name(note: str, named: set[str]) -> None:
+    snap = snapshot(notes=[note])
+    assert skipped_in_junit(snap) == named
+    assert set(not_judged(Report(snap, []))) == named
+    item = json.loads(render_sarif(Report(snap, [])))["runs"][0]["invocations"][0][
+        "toolConfigurationNotifications"
+    ][0]
+    assert item["level"] == "warning" and set(item["properties"]["notJudged"]) == named
+
+
+def test_notes_from_a_real_walk_skip_every_check() -> None:
+    c = collector({}, ())
+    zones, _, _ = c._dns_zones(HEAD, HEAD, SID, SID)
+    c._dns_nodes(zones, [], "lab.test")
+    assert skipped_in_junit(snapshot(notes=c.notes)) == DNS_CHECKS
+
+
+@pytest.mark.parametrize(
+    ("note", "expected"),
+    [
+        ("AD-DNS-003 to AD-DNS-001 not judged", {"AD-DNS-001", "AD-DNS-003"}),
+        ("AD-DNS-001 to AD-DNS-999999 not judged", {"AD-DNS-001", "AD-DNS-999999"}),
+        ("AD-DNS-001 to AD-KRB-003 not judged", {"AD-DNS-001", "AD-KRB-003"}),
+        ("AD-DNS-001 to AD-DNS-003 judges the zones", {"AD-DNS-001"}),
+    ],
+)
+def test_ranges_in_notes_are_bounded_and_well_formed(note: str, expected: set[str]) -> None:
+    assert set(not_judged(Report(snapshot(notes=[note]), []))) == expected
 
 
 def test_quiet_when_records_were_not_read() -> None:
@@ -624,8 +766,38 @@ def test_walk_survives_an_owner_that_does_not_parse() -> None:
     assert checked and scan.kept[0][1].owner is None
 
 
-def test_walk_notes_zones_whose_permissions_are_unread() -> None:
+def test_walk_of_a_zone_with_no_names_is_not_a_read() -> None:
+    # every zone has an "@", so a successful empty result means the children are hidden
     c = scanning({FORWARD: []})
+    host = live_computer("HOST/app.lab.test")
+    _, checked, zones = walk(c, None, host)
+    assert not checked and not zones[0].nodes_read
+    assert any("could not be listed" in n and "AD-DNS-007" in n for n in c.notes)
+
+
+def test_walk_of_a_zone_holding_only_conflict_names_is_not_a_read() -> None:
+    c = scanning({FORWARD: [node_entry("old\nCNF:guid", record())]})
+    _, checked, zones = walk(c)
+    assert not checked and not zones[0].nodes_read
+
+
+def test_empty_zone_beside_a_read_zone_is_not_judged() -> None:
+    other = "DC=other.test,CN=MicrosoftDNS,DC=DomainDnsZones,DC=lab,DC=test"
+    c = scanning({FORWARD: [], other: [node_entry("@", record(), zone_dn=other)]})
+    empty, read = zone(acl_read=True), zone("other.test", dn=other, acl_read=True)
+    host = live_computer("HOST/app.lab.test", "HOST/app.other.test")
+    _, checked, _ = walk(c, [empty, read], host)
+    assert checked and not empty.nodes_read and read.nodes_read
+    note = next(n for n in c.notes if "could not be listed" in n)
+    assert "lab.test (DomainDnsZones)" in note
+    finding = only(ghost_snapshot(host, zones=(empty, read), notes=c.notes), "AD-DNS-007")
+    assert finding.objects == [
+        f"{host.sam}: HOST/app.other.test (zone other.test (DomainDnsZones))"
+    ]
+
+
+def test_walk_notes_zones_whose_permissions_are_unread() -> None:
+    c = scanning({FORWARD: [node_entry("@", record())]})
     walk(c, [zone(acl_read=False, aces=[])])
     assert any("AD-DNS-007 did not judge" in n for n in c.notes)
 

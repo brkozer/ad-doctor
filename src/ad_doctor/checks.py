@@ -3070,8 +3070,10 @@ def dns_shadowed_names(snap: Snapshot) -> Finding | None:
             continue  # an unread owner is a note from the collector
         computer = by_sid.get(node.owner or "")
         if computer and computer.sam.rstrip("$").lower() == node.name.split(".", 1)[0].lower():
-            continue  # a host that really has this name registered itself
-        if kind == "foreign":
+            # a host really called this, or a computer an ordinary user created under the
+            # quota: the snapshot does not record who created it
+            hits.append(f"{_node_label(node)}: owned by a computer of the same name, review")
+        elif kind == "foreign":
             hits.append(f"{_node_label(node)}: owner in another domain: {owner}, review")
         elif _answers_clients(node):
             severity = Severity.HIGH
@@ -3146,8 +3148,13 @@ def _under(name: str, parent: str) -> bool:
     return name == parent or name.endswith(f".{parent}")
 
 
-def _covered_by_wildcard(name: str, wildcards: list[str]) -> bool:
-    return any(name.endswith(suffix) for suffix in wildcards)
+def _wildcard_answers(name: str, zone: DnsZone, wildcards: list[DnsNode]) -> bool:
+    """A wildcard holding an address or alias, in the zone that holds this name. A parent zone's
+    wildcard does not answer inside a child zone hosted separately."""
+    return any(
+        w.zone.lower() == zone.name.lower() and name.endswith(f"{w.name[1:]}.{w.zone}".lower())
+        for w in wildcards
+    )
 
 
 def _zone_claimable(zone: DnsZone, broad: set[str]) -> bool:
@@ -3174,11 +3181,12 @@ def dns_ghost_spns(snap: Snapshot) -> Finding | None:
     seen = {h.lower() for h in snap.dns_spn_hosts}
     broad = snap.broad_sids()
     wildcards = [
-        f"{n.name[1:]}.{n.zone}".lower()
+        n
         for n in _dns_nodes(snap, dnsprop.KIND_WILDCARD)
-        if not n.is_tombstoned
+        if not n.is_tombstoned and _answers_clients(n)
     ]
     severity = Severity.LOW
+    answered = False
     hits = set()
     for account in snap.accounts:
         if not account.spns or not _may_hold_ghost(account):
@@ -3197,7 +3205,6 @@ def dns_ghost_spns(snap: Snapshot) -> Finding | None:
                 not copies
                 or not any(z.nodes_read for z in copies)
                 or not any(_zone_claimable(z, broad) for z in copies)
-                or _covered_by_wildcard(name, wildcards)
                 # a child zone stored here is delegated to itself: it is not somewhere else
                 or any(
                     _under(name, d.lower()) and d.lower() != copies[0].name.lower()
@@ -3207,7 +3214,11 @@ def dns_ghost_spns(snap: Snapshot) -> Finding | None:
                 continue
             if account.is_computer and _spn_parts(spn)[0] in GHOST_REFLECTION_CLASSES:
                 severity = Severity.MEDIUM
-            hits.add(f"{account.sam}: {spn} (zone {copies[0].label})")
+            # an explicit record takes precedence over a wildcard: the name can still be claimed
+            wildcard = _wildcard_answers(name, copies[0], wildcards)
+            answered = answered or wildcard
+            mention = ", a wildcard may answer it today" if wildcard else ""
+            hits.add(f"{account.sam}: {spn} (zone {copies[0].label}{mention})")
     if not hits:
         return None
     return _finding(
@@ -3216,7 +3227,13 @@ def dns_ghost_spns(snap: Snapshot) -> Finding | None:
         "No DNS record exists for these service names, and any domain user can add one. The "
         "attacker points the name at a host of their own and coerces a client to it. The "
         "Kerberos ticket that arrives is for the account holding the SPN, and it can be relayed "
-        "to that account's services. Without SMB signing on a computer, that means SYSTEM.",
+        "to that account's services. Without SMB signing on a computer, that means SYSTEM."
+        + (
+            " A record of its own takes precedence over a wildcard, so a name a wildcard "
+            "answers can still be claimed."
+            if answered
+            else ""
+        ),
         "Remove the SPNs nothing uses with 'setspn -D', or create the DNS record the service "
         "needs. Enforce SMB signing, and install the October 2025 or later Windows updates "
         "(CVE-2025-58726).",

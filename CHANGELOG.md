@@ -25,11 +25,14 @@ logic or severity between versions, but an ID is never reused for something else
   marshaled target information (high, medium when all are tombstoned). AD-DNS-005 reports
   wildcards (high when an ordinary account owns one that answers address queries, low when
   unclear, information when an administrator owns it). AD-DNS-006 reports `wpad`, `isatap`
-  and `autodiscover` owned by ordinary accounts (high, or low without an address). AD-DNS-007
+  and `autodiscover` owned by ordinary accounts (high, or low without an address or when a
+  computer of the same name owns it, since an ordinary user may have created it). AD-DNS-007
   reports SPN hosts of accounts in use that have no DNS record, in zones where any domain
-  user can add one; it is about held SPNs and does not repeat AD-DEL-005. Unreadable zones,
-  records and owners are notes and are not reported as passing, and snapshots from older
-  versions say these checks were not evaluated. On the lab none of the four fires: the
+  user can add one; a wildcard does not hide such a name, because an explicit record takes
+  precedence. It is about held SPNs and does not repeat AD-DEL-005. Unreadable zones, records
+  and owners are notes and are not reported as passing, and snapshots from older versions say
+  these checks were not evaluated. JUnit and SARIF treat a range of IDs in a note as naming
+  every check in it. On the lab none of the four fires: the
   SPN hosts without a record belong to accounts that have never logged on.
 
 ## [0.2.2] - 2026-11-09

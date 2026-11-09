@@ -50,7 +50,12 @@ An SPN is reported when all of these hold:
    takes nonsecure updates.
 4. No `dnsNode` exists for the name. A tombstoned record still counts as existing, and so does one
    whose data cannot be read.
-5. No wildcard covers it, and no NS record delegates it elsewhere.
+5. No NS record delegates it elsewhere.
+
+A wildcard does not stop a name being reported. It answers only names without a record of their own,
+so an explicit record still takes precedence and the name can still be claimed. When a wildcard holding
+an address or an alias lies in the zone that holds the name, the finding says it may answer the name
+today. A TXT wildcard and a wildcard in a parent zone answer nothing for it.
 
 The whole zone is not stored: the collector keeps only the names that SPNs ask about. A zone that
 could not be listed, or whose permissions could not be read, is named in a note and not judged.

@@ -214,6 +214,21 @@ _XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]
 # A note that names a check says the check could not judge all it covers. Two forms only
 # state what a check is for: "AD-POL-001 judges the default ..." and a closing "(AD-GPO-008)".
 CHECK_IN_NOTE = re.compile(r"(?<!\()\bAD-[A-Z]+-\d+\b(?! judges )")
+# "AD-DNS-001 to AD-DNS-003" names every check in it, in parentheses or not: this form is only
+# ever used to say what was not judged.
+CHECK_RANGE_IN_NOTE = re.compile(r"\b(AD-[A-Z]+-)(\d{1,6}) to \1(\d{1,6})\b(?! judges )")
+# a note can quote directory text, which must not ask for a million test cases
+MAX_CHECKS_IN_RANGE = 99
+
+
+def checks_in_note(note: str) -> list[str]:
+    """The IDs of the checks a note says could not judge everything they cover."""
+    found = CHECK_IN_NOTE.findall(note)
+    for match in CHECK_RANGE_IN_NOTE.finditer(note):
+        first, last = int(match[2]), int(match[3])
+        if 0 <= last - first < MAX_CHECKS_IN_RANGE:
+            found += [f"{match[1]}{n:0{len(match[2])}d}" for n in range(first, last + 1)]
+    return list(dict.fromkeys(found))
 
 
 def not_judged(r: Report) -> dict[str, list[str]]:
@@ -221,7 +236,7 @@ def not_judged(r: Report) -> dict[str, list[str]]:
     the notes are the only record that exists in snapshots from every version."""
     out: dict[str, list[str]] = {}
     for note in r.snap.notes:
-        for check_id in dict.fromkeys(CHECK_IN_NOTE.findall(note)):
+        for check_id in checks_in_note(note):
             out.setdefault(check_id, []).append(note)
     return out
 
@@ -366,7 +381,7 @@ def _sarif_notifications(r: Report) -> list[dict[str, Any]]:
     """The collection notes; one that names checks says which were not fully judged."""
     out: list[dict[str, Any]] = []
     for note in r.snap.notes:
-        checks = sorted(set(CHECK_IN_NOTE.findall(note)))
+        checks = sorted(checks_in_note(note))
         item: dict[str, Any] = {
             "level": "warning" if checks else "note",
             "message": {"text": note},
