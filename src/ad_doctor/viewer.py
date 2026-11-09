@@ -141,7 +141,8 @@ def _graph(vm: dict[str, Any], snap: Snapshot, opts: Options, path_ids: list[str
         doc = opts.whatif or {}
         plan_ids = [c["id"] for c in (vm["whatif"] or {}).get("changes", []) if c.get("id")]
         assume = [str(a["node"]) for a in doc.get("assumptions") or [] if a.get("node")]
-        goal = (doc.get("recommendation") or {}).get("goal")
+        # a plan document says it in its recommendation, a what-if document at the top
+        goal = (doc.get("recommendation") or {}).get("goal") or doc.get("goal")
         steps: list[tuple[str, str]] = []
         for p in (vm["paths"] or {}).get("list", []):
             ids = [p["start"], *(s["node"] for s in p["steps"])]
@@ -157,6 +158,10 @@ def _graph(vm: dict[str, Any], snap: Snapshot, opts: Options, path_ids: list[str
         )
         where = {n: i for i, n in enumerate(viewer_graph.nodes_of(g))}
         model["path_nodes"] = [where.get(n, -1) for n in path_ids]
+        from . import whatif_cmd  # imported here as in cli.py: only the full graph needs it
+
+        model["limits"] = whatif_cmd.limits("ad-doctor whatif NEW.json --plan plan.toml --check")
+        model["redacted_note"] = whatif_cmd.REDACTED_NOTE if opts.redacted else None
         vm["whatif_model"] = model
     else:
         analysis = paths.analyze(snap)
@@ -214,7 +219,8 @@ _NUMBERS = {"exposed": "int", "users": "int", "holders": "int", "routes": "int?"
 _WHATIF_TOP = {
     "changes": "rows", "before": "obj", "after": "obj", "paths": "obj", "findings": "obj",
     "check": "obj", "steps": "rows?", "recommendation": "obj?", "plan_status": "rows?",
-    "accounts": "rows?", "assumptions": "rows?", "notes": "strs?", "caveats": "strs?",
+    "goal": "str?", "accounts": "rows?", "assumptions": "rows?", "notes": "strs?",
+    "caveats": "strs?",
 }  # fmt: skip
 _WHATIF_ROWS: dict[str, dict[str, str]] = {
     "changes": {

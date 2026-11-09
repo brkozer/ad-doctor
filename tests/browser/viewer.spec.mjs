@@ -628,6 +628,118 @@ test("what-if: changes come from the path screen's edges and chokepoints", async
   expect(seen.errors).toEqual([]);
 });
 
+// Adds the first step of every path on the screen that is not in the selection yet.
+async function addEveryStep(page, each) {
+  for (const item of await page.locator(".pitem").all()) {
+    await item.click();
+    for (const step of await page.locator(".wl-edges .wl-add[aria-pressed=false]").all()) {
+      await step.click();
+      if (await each(step)) return step;
+    }
+  }
+  return null;
+}
+
+test("what-if: a step and a chokepoint of the same change show the same state", async ({ page }) => {
+  await page.goto(url("live") + "#whatif");
+  await page.getByRole("button", { name: "Start from nothing" }).click();
+  await page.evaluate(() => { location.hash = "#paths"; });
+  const pressed = page.locator(".wl-choke .wl-add[aria-pressed=true]");
+  await expect(pressed).toHaveCount(0);
+  const step = await addEveryStep(page, async () => (await pressed.count()) > 0);
+  expect(step).not.toBeNull(); // no chokepoint button was clicked: the step's add moved it
+  await expect(pressed.first()).toHaveText("In what-if: remove");
+  const count = page.locator(".nav a[data-route=whatif] .count");
+  const before = Number(await count.textContent());
+  await pressed.first().click();
+  await expect(step).toHaveText("Add to what-if");
+  await expect(step).toHaveAttribute("aria-pressed", "false");
+  await expect(count).toHaveText(String(before - 1));
+});
+
+test("what-if: the keyboard stays in the list after Remove and Clear", async ({ page }) => {
+  await page.goto(url("live") + "#whatif");
+  await page.getByRole("button", { name: "Start from nothing" }).click();
+  await page.evaluate(() => { location.hash = "#paths"; });
+  await addEveryStep(page, async () => false);
+  await page.evaluate(() => { location.hash = "#whatif"; });
+  const remove = page.getByRole("button", { name: /^Remove from the selection/ });
+  await expect(remove).toHaveCount(2);
+  await remove.first().focus();
+  await page.keyboard.press("Enter"); // the row after it moves up
+  await expect(remove).toHaveCount(1);
+  await expect(remove.first()).toBeFocused();
+  await page.keyboard.press("Enter"); // the last row: the one before it, a row of the plan
+  await expect(remove).toHaveCount(0);
+  await expect(page.locator(".wl-list .wl-row input:not(:disabled)").last()).toBeFocused();
+  for (const name of ["Back to the plan", "Start from nothing"]) {
+    await page.getByRole("button", { name }).focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator(".wl-list")).toBeFocused();
+  }
+  await page.goto(url("noplan") + "#paths");
+  await page.locator(".wl-edges .wl-add").first().click();
+  await page.evaluate(() => { location.hash = "#whatif"; });
+  await remove.first().focus();
+  await page.keyboard.press("Enter"); // nothing left: the list
+  await expect(page.locator("main")).toContainText("Nothing selected yet");
+  await expect(page.locator(".wl-list")).toBeFocused();
+  await page.evaluate(() => { location.hash = "#paths"; });
+  await page.locator(".wl-edges .wl-add").first().click();
+  await page.evaluate(() => { location.hash = "#whatif"; });
+  await page.getByRole("button", { name: "Clear" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".wl-list")).toBeFocused();
+});
+
+for (const name of ["noplan", "live", "xss", "redacted"]) {
+  test(`what-if: ${name} lists the limits next to the numbers`, async ({ page }) => {
+    await page.goto(url(name) + "#whatif");
+    const limits = page.locator(".wl-results .wl-limits");
+    await expect(limits).toContainText("Edges ad-doctor does not see stay: sessions");
+    await expect(limits).toContainText("What an attacker already planted is not undone");
+    await expect(limits).toContainText("Collect again after the changes and run: ad-doctor whatif NEW.json --plan plan.toml --check");
+  });
+}
+
+test("what-if: a plan from a redacted snapshot says it does not resolve against the real one", async ({ page }) => {
+  const text = "does not resolve against the real one";
+  await page.goto(url("noplan") + "#whatif");
+  await expect(page.locator(".wl-redacted")).toHaveCount(0);
+  await page.goto(url("redacted") + "#whatif");
+  await expect(page.locator(".wl-redacted")).toContainText(text);
+  await page.evaluate(() => { location.hash = "#paths"; });
+  await page.locator(".wl-edges .wl-add").first().click();
+  await page.evaluate(() => { location.hash = "#whatif"; });
+  const file = await downloadPlan(page, "redacted");
+  const lines = readFileSync(file, "utf-8").split("\n");
+  expect(lines[0]).toContain("changes to make in AD");
+  expect(lines[1]).toMatch(/^# Note: redacted snapshot: .*does not resolve against the real one$/);
+  expect(runPlan("redacted", file).kind).toBe("whatif"); // a comment: the file still loads
+});
+
+test("what-if: an empty selection can be neither downloaded nor copied", async ({ page }) => {
+  await page.goto(url("noplan") + "#whatif");
+  const dl = page.getByRole("button", { name: "Download plan.toml" });
+  const copy = page.getByRole("button", { name: "Copy TOML" });
+  await expect(dl).toBeDisabled();
+  await expect(copy).toBeDisabled();
+  await page.evaluate(() => { location.hash = "#paths"; });
+  await page.locator(".wl-edges .wl-add").first().click();
+  await page.evaluate(() => { location.hash = "#whatif"; });
+  await expect(copy).toBeEnabled();
+  await page.locator(".wl-row input").first().uncheck();
+  await expect(copy).toBeDisabled();
+});
+
+test("what-if: a page from a whatif document keeps the goal of an all-paths plan", async ({ page }) => {
+  await page.goto(url("allpaths") + "#whatif");
+  const file = await downloadPlan(page, "allpaths");
+  expect(readFileSync(file, "utf-8")).toContain('goal = "all-paths"');
+  await expect(page.locator(".wl-results")).not.toContainText("not comparable");
+  expect(runPlan("allpaths", file).goal).toBe("all-paths");
+});
+
 test("what-if: an edge no change can take out says why", async ({ page }) => {
   await page.goto(url("live") + "#paths");
   let why = await page.locator(".wl-why").count();

@@ -178,10 +178,20 @@ def history(work: Path, old: Snapshot) -> Path:
 def build(out: Path) -> dict[str, Path]:
     """Write the pages (and the old report) into `out`; return their paths."""
     out.mkdir(parents=True, exist_ok=True)
-    pages = {
-        name: out / f"{name}.html"
-        for name in ("xss", "full", "sealed", "paths", "clean", "bench", "whatif", "noplan", "live")
-    }
+    names = [
+        "xss",
+        "full",
+        "sealed",
+        "paths",
+        "clean",
+        "bench",
+        "whatif",
+        "noplan",
+        "live",
+        "redacted",
+        "allpaths",
+    ]
+    pages = {name: out / f"{name}.html" for name in names}
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         xss = work / "xss.json"
@@ -248,6 +258,23 @@ def build(out: Path) -> dict[str, Path]:
         shutil.copy(xss, out / "xss-snapshot.json")
         shutil.copy(work / "new.json", out / "noplan-snapshot.json")
         write_live_page(work, pages["live"], out / "live-snapshot.json")
+        # a redacted snapshot and no plan: the download does not resolve against the real one
+        red = out / "redacted-snapshot.json"
+        os.environ["AD_DOCTOR_REDACT_KEY"] = "fixture-only redaction key"
+        try:
+            assert main(["redact", str(work / "new.json"), "-o", str(red)]) == 0
+        finally:
+            os.environ.pop("AD_DOCTOR_REDACT_KEY", None)
+        args = ["view", str(red), "--no-encrypt", "-o", str(pages["redacted"])]
+        assert main(args) == 0
+        # the result of an all-paths plan: the goal has to reach the page without a recommendation
+        src, toml, result = str(work / "new.json"), work / "all.toml", work / "all-whatif.json"
+        args = ["plan", src, "--goal", "all-paths", "-f", "toml", "-o", str(toml)]
+        assert main(args) == 0
+        assert main(["whatif", src, "--plan", str(toml), "-f", "json", "-o", str(result)]) == 0
+        shutil.copy(work / "new.json", out / "allpaths-snapshot.json")
+        args = ["view", str(work / "new.json"), "--whatif", str(result), "--no-encrypt"]
+        assert main([*args, "-o", str(pages["allpaths"])]) == 0
         # a clean domain, as `analyze -f html` writes it (no graph, no findings)
         clean = work / "clean.json"
         clean.write_text(

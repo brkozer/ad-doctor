@@ -28,6 +28,11 @@ from .resolve import ORPHAN_NOTE, Resolved, Resolver, SpecError, canonical
 
 SCHEMA = 1
 
+REDACTED_NOTE = (
+    "redacted snapshot: change IDs differ from the real snapshot's, so a plan made "
+    "from it does not resolve against the real one"
+)
+
 
 @dataclass
 class Context:
@@ -102,10 +107,7 @@ def load(args: argparse.Namespace) -> Context:
             "of its own, so a plan can list a copy and its source (too large, never too small)"
         )
     if redacted:
-        ctx.notes.append(
-            "redacted snapshot: change IDs differ from the real snapshot's, so a plan made "
-            "from it does not resolve against the real one"
-        )
+        ctx.notes.append(REDACTED_NOTE)
     return ctx
 
 
@@ -131,6 +133,18 @@ def assumptions(ctx: Context, groups: list[tuple[str, list[str]]]) -> list[dict[
     return list(rows.values())
 
 
+def limits(check_hint: str) -> list[str]:
+    """What no number of a simulation covers; the viewer's live screen shows these too."""
+    return [
+        "Edges ad-doctor does not see stay: sessions, local admin outside Group Policy, "
+        "unconstrained delegation, constrained delegation without protocol transition, "
+        "delegation to a service account, certificate paths that need DC or CA patch levels "
+        "(ESC9, ESC15, ESC6 without ESC16), trusts, Deny ACEs.",
+        "What an attacker already planted is not undone.",
+        f"Collect again after the changes and run: {check_hint}",
+    ]
+
+
 def caveats(snap: Snapshot, check_hint: str) -> list[str]:
     return [
         f"Simulated on the snapshot of {snap.collected_at:%Y-%m-%d %H:%M} UTC; AD is unchanged "
@@ -145,12 +159,7 @@ def caveats(snap: Snapshot, check_hint: str) -> list[str]:
         "Kerberos tickets keep their group memberships until they expire (10 hours by default).",
         "Certificates already issued stay valid until they expire or are revoked.",
         "Other domain controllers see a change after replication.",
-        "Edges ad-doctor does not see stay: sessions, local admin outside Group Policy, "
-        "unconstrained delegation, constrained delegation without protocol transition, "
-        "delegation to a service account, certificate paths that need DC or CA patch levels "
-        "(ESC9, ESC15, ESC6 without ESC16), trusts, Deny ACEs.",
-        "What an attacker already planted is not undone.",
-        f"Collect again after the changes and run: {check_hint}",
+        *limits(check_hint),
     ]
 
 
@@ -548,6 +557,8 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             tier0_names += plan.tier0
             plan_tier0 = list(plan.tier0)
         goal, sources_from, allow = plan.goal, plan.sources, plan.allow
+    if goal == "from" and not sources_from:
+        goal = "exposure"
     extra = tier0_nodes(ctx, tier0_names)
     removed: set[int] = {p for r in resolved for p in r.prims}
     removed |= {s.p for s in statuses if s.p is not None}
@@ -569,7 +580,7 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     srcs = cut.sources_for(
         ctx.snap,
         view,
-        "exposure" if goal == "from" and not sources_from else goal,
+        goal,
         sources_from,
         cut.accepted_holders(ctx.g, accepted_holders),
     )
@@ -598,7 +609,7 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             cut.sources_for(
                 ctx.snap,
                 res.after.graph,
-                "exposure" if goal == "from" and not sources_from else goal,
+                goal,
                 sources_from,
                 cut.accepted_holders(res.after.graph, accepted_holders),
             )
@@ -609,6 +620,7 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         )
     counts = _edge_counts(ctx.g, res.before, removed)
     doc = document(ctx, "whatif")
+    doc["goal"] = goal
     closed_by = _closed_by(ctx, res, removed)
     recs: list[tuple[int | None, dict[str, Any]]] = []
     seen: set[int] = set()

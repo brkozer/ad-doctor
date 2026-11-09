@@ -17,6 +17,8 @@ logic or severity between versions, but an ID is never reused for something else
   is shown; changes that need a rebuild are unavailable with the reason and get no number.
   *Download plan.toml* writes a file `whatif --plan` accepts. Findings are not rechecked
   in the browser, and there is no interactive what-if above the full-graph limit.
+- `whatif -f json` carries `goal`, the goal of the plan it ran, so a page built from it
+  keeps `all-paths`.
 
 ## [0.2.2] - 2026-11-09
 

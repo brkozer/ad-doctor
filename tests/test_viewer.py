@@ -343,6 +343,25 @@ def test_whatif_screen_data(pages: dict[str, Path]) -> None:
     assert plain["whatif"] is None
 
 
+def test_whatif_document_keeps_the_goal_of_its_plan(pages: dict[str, Path]) -> None:
+    vm = json.loads(decode_payload(pages["allpaths"].read_text(encoding="utf-8")))
+    assert vm["whatif"]["kind"] == "whatif" and vm["whatif"]["recommendation"] is None
+    assert vm["whatif_model"]["goal"] == "all-paths"
+    noplan = json.loads(decode_payload(pages["noplan"].read_text(encoding="utf-8")))
+    assert noplan["whatif_model"]["goal"] == "exposure"
+
+
+def test_whatif_model_carries_the_limits_and_the_redaction_note(pages: dict[str, Path]) -> None:
+    noplan = json.loads(decode_payload(pages["noplan"].read_text(encoding="utf-8")))
+    model = noplan["whatif_model"]
+    assert model["redacted_note"] is None
+    joined = " ".join(model["limits"])
+    for text in ("does not see", "sessions", "already planted", "Collect again"):
+        assert text in joined
+    red = json.loads(decode_payload(pages["redacted"].read_text(encoding="utf-8")))
+    assert "does not resolve against the real one" in red["whatif_model"]["redacted_note"]
+
+
 def test_whatif_needs_a_plan_of_this_snapshot(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -359,6 +378,7 @@ def test_whatif_needs_a_plan_of_this_snapshot(
     assert "is for" in str(viewer.whatif_problem(doc, "other.test", digest))
     assert "not ad-doctor" in str(viewer.whatif_problem({"tool": "x"}, domain, None))
     assert "plan -f json" in str(viewer.whatif_problem({**doc, "kind": "analyze"}, domain, None))
+    assert "goal" in str(viewer.whatif_problem({**doc, "goal": 5}, domain, None))
     other = tmp_path / "other.json"
     other.write_text(snap.read_text() + " ")
     capsys.readouterr()

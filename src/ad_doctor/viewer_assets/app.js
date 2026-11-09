@@ -1635,10 +1635,12 @@
       btn.textContent = has() ? "In what-if: remove" : addLabel || "Add to what-if";
       btn.setAttribute("aria-pressed", String(has()));
     };
+    WI_PAINT.set(btn, paint);
     btn.addEventListener("click", (ev) => {
       ev.stopPropagation();
       if (has()) wiDrop(got.nums); else wiAdd(got.nums);
-      paint();
+      // a step and a chokepoint can be the same change: every button on the screen follows
+      for (const other of document.querySelectorAll(".wl-add")) WI_PAINT.get(other)();
       refreshNav();
       const n = wiState().on.size;
       announce(plural(n, "change") + " in the what-if selection");
@@ -1646,6 +1648,22 @@
     btn.addEventListener("keydown", (ev) => ev.stopPropagation());
     paint();
     return btn;
+  }
+
+  // Where the keyboard goes when a row of the list is gone: the row now at that place, one
+  // before it at the end of the list, the list itself when no row has a control.
+  function wiFocusRow(list, at) {
+    const rows = Array.from(list.querySelectorAll(".wl-row"));
+    for (const row of rows.slice(at).concat(rows.slice(0, at).reverse())) {
+      const control = row.querySelector("button") || row.querySelector("input:not(:disabled)");
+      if (control) { control.focus(); return; }
+    }
+    list.focus();
+  }
+
+  function wiFocusList() {
+    const list = document.querySelector(".wl-list");
+    if (list) list.focus();
   }
 
   function wiPct(x, n) {
@@ -1682,7 +1700,7 @@
     return CORE.whatifPlanToml(entries, {
       domain: VM.meta.domain, domain_sid: VM.graph.domain_sid, made_against: VM.meta.collected_at,
       made_by: "ad-doctor " + VM.meta.version + " viewer", goal: M.goal,
-      assume: M.assume.map((a) => a[1]), skipped: skipped,
+      assume: M.assume.map((a) => a[1]), skipped: skipped, note: VM.whatif_model.redacted_note,
     });
   }
 
@@ -1706,18 +1724,20 @@
     if (!row.inPlan) {
       drop = h("button", { type: "button", class: "btn ghost", "aria-label": "Remove from the selection: " + info.label }, "Remove");
       drop.addEventListener("click", () => {
+        const at = Array.from(item.parentNode.children).indexOf(item);
         wiDrop([info.num]);
-        drawList();
+        drawList(at);
         draw();
       });
     }
-    return h("li", { class: "wl-row" + (info.rebuild ? " off" : ""), "data-change": info.id },
+    const item = h("li", { class: "wl-row" + (info.rebuild ? " off" : ""), "data-change": info.id },
       box,
       h("div", { class: "wl-text" },
         h("div", null, h("code", null, info.id), " " + info.label,
           h("span", { class: "small muted" }, "  " + (row.inPlan ? "in the plan" : "added") + ", cost " + info.cost)),
         notes),
       drop);
+    return item;
   }
 
   function wiDiff(wi, r) {
@@ -1760,7 +1780,9 @@
     planDiffers ? h("p", { class: "small warn-text" },
       "The plan counted routes from other sources or with other kept changes than this page, so its route numbers are not comparable with these.") : null,
     wiDiff(state.wi, r),
-    h("p", { class: "small muted" }, r.note, " Numbers change as you tick; AD is unchanged and nothing is applied."));
+    h("p", { class: "small muted" }, r.note, " Numbers change as you tick; AD is unchanged and nothing is applied."),
+    h("ul", { class: "small muted wl-limits", "aria-label": "Limits of these numbers" },
+      VM.whatif_model.limits.map((x) => h("li", null, x))));
   }
 
   function wiPathLists(r) {
@@ -1776,7 +1798,7 @@
     if (!M) return null;
     const wi = wiState();
     const G = graphOf();
-    const list = h("ul", { class: "wl-list", "aria-label": "Changes in the selection" });
+    const list = h("ul", { class: "wl-list", tabindex: "-1", "aria-label": "Changes in the selection" });
     const results = h("div");
     const pathLists = h("div");
     const missing = h("div");
@@ -1789,12 +1811,13 @@
       pathLists.replaceChildren(...wiPathLists(now).filter(Boolean));
       count.textContent = plural(on.length, "change") + " selected";
       dl.disabled = on.length === 0;
+      copy.disabled = on.length === 0;
       refreshNav();
       const r = results.querySelector(".wl-results");
       announce("Exposed " + r.getAttribute("data-exposed") + " of " + r.getAttribute("data-users") +
         ", principals with a path " + r.getAttribute("data-holders") + ", routes " + (r.getAttribute("data-routes") || "unknown"));
     };
-    const drawList = () => {
+    const drawList = (focusAt) => {
       const rows = Array.from(wi.rows.values()).map((row) => wiChangeRow(row, draw, drawList));
       list.replaceChildren(...rows);
       if (!rows.length && !wi.missing.length) {
@@ -1807,6 +1830,7 @@
           h("div", null, h("code", null, c.id), " " + c.label),
           h("div", { class: "small warn-text wl-unavailable" },
             "Unavailable here: no edge in this graph comes from it, so it is not in the download. Run ad-doctor whatif on the snapshot.")))));
+      if (focusAt !== undefined) wiFocusRow(list, focusAt);
     };
     dl.addEventListener("click", () => download("plan.toml", wiToml(), "application/toml"));
     const copy = copyButton(() => wiToml(), "Copy TOML", "plan file");
@@ -1815,14 +1839,18 @@
     reset.addEventListener("click", () => {
       if (VM.whatif) wiResetToPlan(); else wiClear();
       route();
+      wiFocusList();
     });
     const clear = VM.whatif ? h("button", { type: "button", class: "btn" }, "Start from nothing") : null;
-    if (clear) clear.addEventListener("click", () => { wiClear(); route(); });
+    if (clear) clear.addEventListener("click", () => { wiClear(); route(); wiFocusList(); });
     drawList();
     draw();
     return h("div", { class: "stack wl" },
       sectionTitle("Try changes", count),
       h("div", { class: "actions wl-actions no-print" }, dl, copy, reset, clear),
+      VM.whatif_model.redacted_note
+        ? h("p", { class: "small warn-text wl-redacted no-print" }, "Note: " + VM.whatif_model.redacted_note + ".")
+        : null,
       results,
       h("div", null, sectionTitle("The selection"), list, missing),
       pathLists);
@@ -2251,6 +2279,7 @@
 
   let GRAPH = null; // CORE.graph(VM.graph), built on first use
   let WI_MODEL = null; // CORE.whatifModel over it, built on first use
+  const WI_PAINT = new WeakMap(); // an Add to what-if button -> what redraws its label
 
   function graphOf() {
     if (!GRAPH && VM.graph) GRAPH = CORE.graph(VM.graph);

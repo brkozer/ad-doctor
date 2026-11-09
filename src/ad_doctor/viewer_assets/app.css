@@ -683,6 +683,8 @@ table.heat .tick { color: var(--muted); margin-left: 2px; }
 .wl-diff h3 { margin: 0 0 6px; font-size: 14px; }
 .wl-diff p { margin: 0 0 6px; }
 .wl-results .stats { margin-bottom: 14px; }
+.wl-limits { margin: 0 0 16px; padding-left: 18px; overflow-wrap: anywhere; }
+.wl-redacted { margin: 0; }
 .wl-edges { list-style: none; margin: 10px 0 0; padding: 0; }
 .wl-edges li { padding: 5px 0; border-top: 1px solid var(--rule); overflow-wrap: anywhere; min-width: 0; }
 .wl-add { white-space: nowrap; }

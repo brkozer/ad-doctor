@@ -394,9 +394,15 @@ interactive. It starts from the plan the file carries, or from nothing:
   lists its ID as a comment. So does a change with no edge in this graph.
 - *Download plan.toml* writes the selection in the format above; `whatif --plan` accepts it.
   It has no `[expect]` and no `[[keep]]`: those are decisions the page does not know. The goal
-  is `exposure`, or `all-paths` when the plan was made for it; `from` plans are written as
-  `exposure`. `[assume] tier0` is kept.
+  is `exposure`, or `all-paths` when the plan was made for it, whether the page was given
+  `plan -f json` or `whatif --plan ... -f json` (a `whatif` document from before it carried
+  `goal` is read as `exposure`); `from` plans are written as `exposure`. `[assume] tier0` is
+  kept. From a redacted snapshot the page says that the file does not resolve against the real
+  snapshot, and the file says so in a comment. *Copy TOML* and the download need at least one
+  change.
 
+Next to the numbers, with or without a plan, the page lists the edges ad-doctor does not see,
+that what an attacker already planted is not undone, and to collect again to verify.
 Findings are not rechecked in the browser, and the page says so: run `whatif` on the snapshot
 for the findings that would clear. Routes are the same maximum flow as the command line
 with its default kept changes, so a plan made with `--keep` or a `[[keep]]` can count

@@ -786,9 +786,10 @@ const CORE = (function () {
   // IDs left out, written as comments: those IDs are hex, so no directory text gets there).
   function whatifPlanToml(entries, info) {
     const lines = ["# ad-doctor plan for " + (commentText(info.domain) || "a domain") +
-      ": changes to make in AD, checked with `ad-doctor whatif SNAPSHOT --plan FILE --check`",
-    "schema = 1", "", "[plan]",
-    "domain = " + tomlString(info.domain), "domain_sid = " + tomlString(info.domain_sid)];
+      ": changes to make in AD, checked with `ad-doctor whatif SNAPSHOT --plan FILE --check`"];
+    if (info.note) lines.push("# Note: " + commentText(info.note));
+    lines.push("schema = 1", "", "[plan]",
+      "domain = " + tomlString(info.domain), "domain_sid = " + tomlString(info.domain_sid));
     const made = tomlDateTime(info.made_against);
     if (made) lines.push("made_against = " + made);
     lines.push("made_by = " + tomlString(info.made_by), "goal = " + tomlString(info.goal));
