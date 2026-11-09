@@ -4,11 +4,11 @@ summary = "Group Policy does not require mutual authentication and integrity for
 severities = ["info", "medium"]
 severity_logic = """
 **Medium** when the effective policy sets the path without both protections, on any Windows
-version, or when no GPO sets it on a Windows older than Windows 10 and Server 2016, which have
-no default.
-**Info** when no GPO sets it on a newer or unrecorded Windows (which applies the hardening by
-default), when only named servers are hardened, or when the result cannot be decided (see
-Detection).
+version, or when no GPO sets it on a Windows whose name is not recognised as Windows 10, Server
+2016 or later: only those are known to have the default.
+**Info** when no GPO sets it on a recognised newer Windows (which applies the hardening by
+default) or where the version is not recorded (unknown), when only named servers are hardened,
+or when the result cannot be decided (see Detection).
 """
 mitre = ["T1557"]
 data_sources = ["sysvol", "ldap"]
@@ -38,8 +38,8 @@ markers are honoured.
 
 Where a WMI filter, an assumed site, a filter group the snapshot does not hold or an unreadable
 file could change the result, the computer gets an **info** row that says why instead of a
-verdict. Computers without a Windows `operatingSystem` value (pre-staged objects, cluster names,
-appliances) are skipped; domain controllers always count.
+verdict. Hyper-V Server counts as Windows. Computers without a Windows `operatingSystem` value
+(pre-staged objects, cluster names, appliances) are skipped; domain controllers always count.
 
 
 The value names read are the two wildcard paths for SYSVOL and NETLOGON. Host-specific entries

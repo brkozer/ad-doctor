@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 
 from . import auditpol, catalog, gpo_scope, regpol, sd
@@ -2399,9 +2399,12 @@ def powershell_logging(snap: Snapshot) -> Finding | None:
 
 
 HARDENED_SHARES = ("SYSVOL", "NETLOGON")
-# Windows 10 and Server 2016 require both protections on these shares without any policy
-PRE_HARDENING_OS = re.compile(
-    r"windows (?:server )?(?:2003|2008|2012|xp|vista|7|8(?:\.1)?)\b", re.I
+# Windows 10 and Server 2016 require both protections on these shares without any policy. Only
+# a name known to be that new gets credit for it: older editions have too many names to list.
+# The year-less "Windows Server Standard" and "Datacenter" are the semi-annual channel, 2016 on.
+HARDENED_DEFAULT_OS = re.compile(
+    r"\bwindows 1\d\b|\bserver 20(?:1[6-9]|[2-9]\d)\b|\bwindows server (?:standard|datacenter)\b",
+    re.I,
 )
 
 
@@ -2444,9 +2447,15 @@ def _share_state(
     hosts = _named_hosts(view, a, share)
     if hosts:
         return Severity.INFO, f"hardened only for named servers ({', '.join(hosts)})"
-    if PRE_HARDENING_OS.search(re.sub("[\u00ae\u2122]", "", a.os or "")):
-        return Severity.MEDIUM, "no GPO hardens it and this Windows version has no default"
-    return Severity.INFO, "no GPO sets it (Windows 10 and Server 2016 harden it by default)"
+    if not a.os:
+        return Severity.INFO, "no GPO sets it and this computer's Windows version is not recorded"
+    if HARDENED_DEFAULT_OS.search(re.sub("[\u00ae\u2122]", "", a.os)):
+        return Severity.INFO, "no GPO sets it (Windows 10 and Server 2016 harden it by default)"
+    return (
+        Severity.MEDIUM,
+        "no GPO hardens it and this Windows is older than Windows 10 and Server 2016 or not "
+        "recognised, so no default can be assumed",
+    )
 
 
 @check("AD-GPO-012", "UNC hardened paths for SYSVOL and NETLOGON missing or weak")
@@ -2495,6 +2504,7 @@ def _audit_row(view: gpo_scope.RegistryView, a: Account) -> _PolicyRow | None:
     partial: list[str] = []
     zero: list[str] = []
     basic: list[str] = []
+    basic_off: list[str] = []
     absent: list[str] = []
     open_points: list[str] = []
     categories = view.basic_audit(a)
@@ -2503,7 +2513,8 @@ def _audit_row(view: gpo_scope.RegistryView, a: Account) -> _PolicyRow | None:
         if not e.decided:
             open_points.append(f"{sub.name} ({_undecided(e)})")
         elif not e.present:
-            (basic if sub.legacy in categories else absent).append(sub.name)
+            audits = categories.get(sub.legacy)
+            (basic if audits else basic_off if audits is False else absent).append(sub.name)
         elif e.value == auditpol.NONE:
             off.append(f"{sub.name}{_gpo_note(e)}")
         elif e.value == auditpol.NOT_CHANGED:
@@ -2526,6 +2537,8 @@ def _audit_row(view: gpo_scope.RegistryView, a: Account) -> _PolicyRow | None:
             "only basic audit policy covers these, and whether it applies depends on the "
             f"computer's SCENoApplyLegacyAuditPolicy: {', '.join(basic)}"
         )
+    if basic_off:
+        parts.append(f"basic audit policy sets no auditing for these: {', '.join(basic_off)}")
     if len(absent) == len(auditpol.RECOMMENDED):
         parts.append(f"no GPO sets any of the {len(absent)} recommended subcategories")
     elif absent:
@@ -3741,17 +3754,39 @@ def _esc10_row(view: gpo_scope.RegistryView, a: Account) -> _PolicyRow | None:
     return _PolicyRow(a, severity, "; ".join([*problems, *notes]))
 
 
+# NTAuth is not in the snapshot, so a third-party CA trusted through it cannot be seen
+_NO_CA = "no enterprise CA or certificate template is in the snapshot"
+
+
+def _certificates_seen(snap: Snapshot) -> bool:
+    return bool(snap.templates or snap.ca_hosts or snap.enrollment_urls or snap.probes.ca_configs)
+
+
 @check("AD-ADCS-020", "ESC10: weak certificate mapping set by Group Policy on domain controllers")
 def esc10(snap: Snapshot) -> Finding | None:
     view = gpo_scope.policy_view(snap)
     if view is None:
         return None
     rows = [row for a in _dcs_of(view) if (row := _esc10_row(view, a))]
+    lead = ""
+    if not _certificates_seen(snap):
+        # what no GPO sets is only worth checking where a certificate can be had; a weak value
+        # a GPO does set is a fact, and it matters the day a CA is added
+        rows = [
+            replace(row, severity=Severity.INFO, text=f"{row.text}; {_NO_CA}")
+            for row in rows
+            if row.severity is Severity.MEDIUM
+        ]
+        lead = (
+            f"Nothing here issues the certificates this needs: {_NO_CA}. A third-party CA trusted "
+            "through NTAuth is not read and would. "
+        )
     return _policy_finding(
         snap,
         "AD-ADCS-020",
-        "Whoever can change a victim's userPrincipalName can get a certificate that maps to the "
-        f"victim where these domain controllers accept weak mappings: {STRONG_MAPPING} at 0 or 1 "
+        f"{lead}Whoever can change a victim's userPrincipalName can get a certificate that "
+        "maps to the victim where these domain controllers accept weak mappings: "
+        f"{STRONG_MAPPING} at 0 or 1 "
         "(Kerberos, DCs without the September 2025 updates, which no longer read it) or a "
         f"{regpol.CERT_MAPPING} with the UPN bit (Schannel). This shows only what Group Policy "
         "sets: both values are commonly set locally on each DC, so a DC listed as unknown may "

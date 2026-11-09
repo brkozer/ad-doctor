@@ -485,7 +485,9 @@ def policy(
     made = [gpo("Hardening", pol_entries, [(where, 0, False, True)], **audited())]
     guid = made[0][0].guid
     accounts = [dc()] if where == DC_OU else [member()]
-    return snapped(made, audit={guid: []}, prefs={guid: xml_entries}, accounts=accounts)
+    return snapped(
+        made, audit={guid: []}, prefs={guid: xml_entries}, accounts=accounts, ca_hosts=["CA01"]
+    )
 
 
 def entry(key: str, name: str, value: Any, action: str = "set", **kw: Any) -> RegistryEntry:
@@ -566,7 +568,8 @@ def test_esc10_ignores_member_servers() -> None:
 def test_esc10_unreadable_xml_is_undecided() -> None:
     made = [gpo("Broken", [], [(DC_OU, 0, False, True)], **audited())]
     guid = made[0][0].guid
-    found = run(snapped(made, audit={guid: []}, prefs={}, accounts=[dc()]), ESC10)
+    snap = snapped(made, audit={guid: []}, prefs={}, accounts=[dc()], ca_hosts=["CA01"])
+    found = run(snap, ESC10)
     assert found is not None and found.severity is Severity.INFO
     assert "Registry.xml of Broken not readable" in found.objects[0]
 

@@ -277,7 +277,7 @@ class Gpo:
 class RegistryEntry:
     """One instruction of a GPO's Machine\\Registry.pol that a check reads, in file order."""
 
-    key: str  # registry path under HKLM, as written
+    key: str  # registry path under HKLM, as written (delete_key from Registry.pol: lower case)
     name: str  # value name without its marker; "" for delete_all and delete_key
     action: str  # "set", "soft", "delete", "delete_all" or "delete_key" (key is the one deleted)
     reg_type: int = 0  # REG_* of a set or soft
@@ -351,8 +351,10 @@ class GpoSettings:
     vulnerable_channel_allow: str | None = None
     # privilege constant -> SIDs (or names) granted
     privileges: dict[str, list[str]] = field(default_factory=dict)
-    # [Event Audit] categories this GPO configures (basic audit policy)
+    # [Event Audit] categories this GPO audits something for (basic audit policy)
     audit_categories: list[str] = field(default_factory=list)
+    # [Event Audit] categories this GPO sets to 0, no auditing
+    audit_off: list[str] = field(default_factory=list)
 
 
 @dataclass

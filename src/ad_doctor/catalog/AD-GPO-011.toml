@@ -36,8 +36,8 @@ markers are honoured.
 
 Where a WMI filter, an assumed site, a filter group the snapshot does not hold or an unreadable
 file could change the result, the computer gets an **info** row that says why instead of a
-verdict. Computers without a Windows `operatingSystem` value (pre-staged objects, cluster names,
-appliances) are skipped; domain controllers always count.
+verdict. Hyper-V Server counts as Windows. Computers without a Windows `operatingSystem` value
+(pre-staged objects, cluster names, appliances) are skipped; domain controllers always count.
 
 
 Windows PowerShell's policy keys only. PowerShell 7 has its own under `PowerShellCore`, which can

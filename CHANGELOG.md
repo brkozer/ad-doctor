@@ -12,7 +12,10 @@ logic or severity between versions, but an ID is never reused for something else
 - **Registry policy from SYSVOL.** Each GPO's computer-side `Machine\Registry.pol` is read
   ([MS-GPREG] format, delete and soft markers included) and only the values the checks need are
   kept. A file that does not parse or cannot be read is a note and stays unknown. A value named
-  like a password is reported by its location; its data is never read into the snapshot.
+  like a password is reported by its location; its data is never read into the snapshot, and
+  redaction replaces the location unless it is Winlogon's own `DefaultPassword`. Registry paths
+  and value names over 1024 characters make the file malformed. An instruction with a missing or
+  empty value, type or data only creates the key, as the format says.
 - **Group Policy precedence for registry settings.** `gpo_scope` works out the effective value
   of a registry setting per computer from link order, Enforced, Block Inheritance and security
   filtering. A WMI filter, an assumed site, a filter group the snapshot does not hold or an
@@ -20,7 +23,9 @@ logic or severity between versions, but an ID is never reused for something else
 - **AD-GPO-009** (LLMNR not turned off by Group Policy), **AD-GPO-010** (WSUS over HTTP),
   **AD-GPO-011** (PowerShell script block or module logging not set) and **AD-GPO-012** (UNC
   hardened paths for SYSVOL and NETLOGON missing or weak), for domain controllers and other
-  Windows computers. "No GPO sets it" never claims what the computer's own registry holds.
+  Windows computers, Hyper-V Server included. "No GPO sets it" never claims what the computer's
+  own registry holds, and AD-GPO-012 credits the Windows default only to names it recognises as
+  Windows 10, Server 2016 or later.
   Snapshots from earlier versions load and report these four as not evaluated.
 - **Advanced audit policy and Preferences registry items from SYSVOL.** `audit.csv` ([MS-GPAC])
   and `Machine\Preferences\Registry\Registry.xml` are read with the same precedence; a file
@@ -30,7 +35,9 @@ logic or severity between versions, but an ID is never reused for something else
   (automatic logon or a stored DefaultPassword in a GPO), **AD-GPO-015** (BlockNtlmv1SSO kept
   in audit mode), **AD-GPO-016** (DES or RC4 in DefaultDomainSupportedEncTypes) and
   **AD-ADCS-020** (ESC10: weak certificate mapping set by Group Policy on domain controllers).
-  A value no GPO sets stays unknown and is reported as such where the check needs it. Snapshots
+  A value no GPO sets stays unknown and is reported as such where the check needs it. With no
+  enterprise CA or template in the snapshot, AD-ADCS-020 reports only a weak value a GPO sets, as
+  info. An `[Event Audit]` category set to 0 does not count as coverage in AD-GPO-013. Snapshots
   from earlier versions load and report these five as not evaluated.
 
 ## [0.2.2] - 2026-11-09

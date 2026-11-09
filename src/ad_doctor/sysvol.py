@@ -170,7 +170,10 @@ def parse_gpttmpl(text: str) -> GpoSettings:
             holders = [v.strip().lstrip("*") for v in value.split(",")]
             settings.privileges[key] = [h for h in holders if h]
         elif section == "event audit" and key.lower() in auditpol.LEGACY_CATEGORIES:
-            settings.audit_categories.append(auditpol.LEGACY_CATEGORIES[key.lower()])
+            audited = _int(value)
+            if audited is not None:
+                category = auditpol.LEGACY_CATEGORIES[key.lower()]
+                (settings.audit_categories if audited else settings.audit_off).append(category)
     return settings
 
 
@@ -318,7 +321,7 @@ def _registry_item(out: regpol.Parsed, item: ET.Element, disabled: bool, filtere
     props = item.find("Properties")
     if props is None:
         return
-    key, name = props.get("key") or "", props.get("name") or ""
+    key, name = regpol.bound(props.get("key") or ""), regpol.bound(props.get("name") or "")
     kind = REG_TYPES.get((props.get("type") or "").upper(), 0)
     value = props.get("value") or ""
     action = (props.get("action") or "U").upper()
@@ -342,7 +345,8 @@ def _registry_item(out: regpol.Parsed, item: ET.Element, disabled: bool, filtere
             regpol.keep(out, RegistryEntry(key, name, "delete", filtered=filtered))
     elif regpol.watched(key, name):
         how = "soft" if action == "C" else "set"  # C writes only where no value exists
-        regpol.keep(out, RegistryEntry(key, name, how, kind, data, filtered))
+        kept = regpol.kept_data(key, name, data)
+        regpol.keep(out, RegistryEntry(key, name, how, kind, kept, filtered))
 
 
 def parse_registry_xml(data: bytes) -> regpol.Parsed:
@@ -519,7 +523,7 @@ def _keep_facts(
 ) -> None:
     """The fact and the location only: the data never leaves the parser."""
     for key, name in parsed.secrets[:20]:
-        result.notes.append(f"{rel}: holds a value named like a password: {key}\\{name}")
+        result.notes.append(f"{rel}{regpol.SECRET_NOTE}{key}\\{name}")
     found = parsed.autologon
     if found.auto_on or found.password:
         result.autologon.append(

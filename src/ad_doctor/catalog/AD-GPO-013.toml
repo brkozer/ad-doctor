@@ -36,7 +36,8 @@ Policy recommendations*. Kerberos subcategories appear only in its Stronger colu
 checked.
 
 A setting value of 0 is not judged: GPMC writes it for "No Auditing" while [MS-GPAC] defines it
-as "unchanged". Where only `[Event Audit]` covers a subcategory, the row says so: whether basic
+as "unchanged". An `[Event Audit]` category set to 0 is no auditing and covers nothing, and categories are played
+in the order Windows applies GPOs. Where only `[Event Audit]` covers a subcategory, the row says so: whether basic
 audit policy applies depends on `SCENoApplyLegacyAuditPolicy` on the computer.
 """
 

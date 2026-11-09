@@ -121,7 +121,7 @@ def test_delete_values_lists_only_the_names_read() -> None:
 def test_delete_keys_keeps_a_key_at_or_above_a_watched_one() -> None:
     parent = r"Software\Policies\Microsoft\Windows NT"
     entries = regpol.parse(pol(sz(parent, "**DeleteKeys ", "DNSClient;Unrelated"))).entries
-    assert [(e.key, e.action) for e in entries] == [(KEY, "delete_key")]
+    assert [(e.key, e.action) for e in entries] == [(regpol.norm(KEY), "delete_key")]
 
 
 def test_key_and_marker_compare_without_case() -> None:

@@ -9,6 +9,9 @@ The bytes come from SYSVOL and anybody who can edit a GPO can write them, so eve
 bounded and a file that does not parse raises `MalformedPol` as a whole: half a file says
 nothing about what the other half sets. Only the values the checks read are kept. A value
 named like a password leaves here as its location alone; its data is never returned.
+
+An instruction may stop after its key, value, type or size. Such an instruction, or one whose
+value, type or data is empty, only creates the key: it sets no value.
 """
 
 from __future__ import annotations
@@ -24,6 +27,9 @@ VERSION = 1
 MAX_KEPT = 4096  # entries kept from one file
 MAX_TEXT = 1024  # characters kept of one string
 MAX_STRINGS = 64  # strings kept of one REG_MULTI_SZ
+# characters of a registry path or value name, far past any real one: an instruction can list
+# thousands of names, so a padded name must not reach the checks
+MAX_NAME = 1024
 _HEADER = 8
 
 REG_SZ = 1
@@ -63,7 +69,9 @@ _HARDENED_SHARE = re.compile(r"^\\\\[^\\]+\\(?:sysvol|netlogon)\\?$", re.IGNOREC
 _SECRET_NAME = re.compile(r"password|passwd|pwd", re.IGNORECASE)
 SECRET_NAME = _SECRET_NAME
 _VARIABLE = re.compile(r"\s*%[^%]+%\s*")  # not a password: expanded on the client
-_URL_USER = re.compile(r"^([a-z][a-z0-9+.-]*://)[^/@]*@", re.IGNORECASE)
+_URL_SCHEME = re.compile(r"[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+# what the notes say about such a value, and where redaction finds its location
+SECRET_NOTE = ": holds a value named like a password: "
 
 
 def norm(key: str) -> str:
@@ -128,6 +136,12 @@ def watched(key: str, name: str) -> bool:
     return name.casefold() in _VALUES.get(k, ())
 
 
+def is_default_password(location: str) -> bool:
+    """Whether 'key\\name' is Winlogon's own DefaultPassword, the same words in every domain."""
+    key, _, name = location.rpartition("\\")
+    return norm(key) == _WINLOGON and name.casefold() == DEFAULT_PASSWORD.casefold()
+
+
 def _watched_key(key: str) -> bool:
     k = norm(key)
     return k in _VALUES or k in (_MODULE_NAMES, _HARDENED)
@@ -137,6 +151,36 @@ def deletes_watched(key: str) -> bool:
     """Whether deleting this key also deletes a key the checks read."""
     k = norm(key)
     return any(w == k or w.startswith(k + "\\") for w in _WATCHED_KEYS)
+
+
+def bound(name: str) -> str:
+    """A registry path or value name, which the bytes of a GPO can make any length."""
+    if len(name) > MAX_NAME:
+        raise MalformedPol(f"a registry name of {len(name)} characters")
+    return name
+
+
+def scrub_url(value: str) -> str:
+    """A server URL without credentials: everything before the last @ goes, since a password
+    can hold '/' or '@' itself, and losing part of a server name costs less than a password."""
+    text = value.strip()
+    scheme = _URL_SCHEME.match(text)
+    head = scheme.group(0) if scheme else ""
+    return head + text[len(head) :].rpartition("@")[2]
+
+
+def kept_data(
+    key: str, name: str, data: int | str | list[str] | None
+) -> int | str | list[str] | None:
+    """What the data of a watched value may leave the parser as, from either file format."""
+    if norm(key) == _MODULE_NAMES:
+        return ""  # the value name is the module; the data repeats it
+    if name.casefold() == WSUS_SERVER.casefold():
+        if isinstance(data, str):
+            return scrub_url(data)
+        if isinstance(data, list):
+            return [scrub_url(item) for item in data]
+    return data
 
 
 def _string(data: bytes, pos: int) -> tuple[str, int]:
@@ -184,17 +228,20 @@ def keep(out: Parsed, entry: RegistryEntry) -> None:
 
 
 def _set_value(out: Parsed, key: str, name: str, action: str, kind: int, payload: bytes) -> None:
+    if not (name and kind and payload):
+        return  # only the key is created: a value an earlier GPO set stays as it is
     note_winlogon(out.autologon, key, name, _value_data(kind, payload), True)
     if not watched(key, name):
         if kind in _TEXT_TYPES and _SECRET_NAME.search(name) and _text(payload).strip():
             out.secrets.append((key[:256], name[:128]))
         return
-    data = _value_data(kind, payload)
-    if norm(key) == _MODULE_NAMES:
-        data = ""  # the value name is the module; the data repeats it
-    elif isinstance(data, str) and name.casefold() == WSUS_SERVER.casefold():
-        data = _URL_USER.sub(r"\1", data)
+    data = kept_data(key, name, _value_data(kind, payload))
     keep(out, RegistryEntry(key, name, action, kind, data))
+
+
+def _targets(payload: bytes) -> list[str]:
+    """The names a **DeleteValues or **DeleteKeys instruction lists."""
+    return [bound(t) for t in (t.strip() for t in _text(payload).split(";")) if t]
 
 
 def _instruction(out: Parsed, key: str, name: str, kind: int, payload: bytes) -> None:
@@ -211,15 +258,53 @@ def _instruction(out: Parsed, key: str, name: str, kind: int, payload: bytes) ->
         if _watched_key(key):
             keep(out, RegistryEntry(key, "", "delete_all"))
     elif marker == "**deletevalues":
-        for target in (t.strip() for t in _text(payload).split(";")):
-            if target and watched(key, target):
+        for target in _targets(payload):
+            if watched(key, target):
                 keep(out, RegistryEntry(key, target, "delete"))
     elif marker == "**deletekeys":
-        for target in (t.strip() for t in _text(payload).split(";")):
-            full = f"{key.rstrip(chr(92))}\\{target}"
-            if target and deletes_watched(full):
+        # compared form, once each: a kept path is then no longer than the watched key it
+        # is above, however the file spells it and however often it lists it
+        base = key.rstrip("\\")
+        for full in dict.fromkeys(norm(f"{base}\\{t}") for t in _targets(payload)):
+            if deletes_watched(full):
                 keep(out, RegistryEntry(full, "", "delete_key"))
     # **SecureKey changes a key's ACL and sets no value; other markers set nothing either
+
+
+def _closes(data: bytes, pos: int) -> bool:
+    return data[pos : pos + 2] == b"]\0"
+
+
+def _number(data: bytes, pos: int, what: str) -> tuple[int, int]:
+    if pos + 4 > len(data):
+        raise MalformedPol(f"truncated {what}")
+    return int(struct.unpack("<I", data[pos : pos + 4])[0]), pos + 4
+
+
+def _record(data: bytes, pos: int) -> tuple[tuple[str, str, int, bytes] | None, int]:
+    """The fields of the instruction after an opening bracket, and the offset after it. None
+    for an instruction that stops before its data."""
+    key, pos = _string(data, pos)
+    bound(key)
+    if _closes(data, pos):
+        return None, pos + 2
+    pos = _expect(data, pos, b";\0")
+    name, pos = _string(data, pos)
+    bound(name)
+    if _closes(data, pos):
+        return None, pos + 2
+    pos = _expect(data, pos, b";\0")
+    kind, pos = _number(data, pos, "type")
+    if _closes(data, pos):
+        return None, pos + 2
+    pos = _expect(data, pos, b";\0")
+    size, pos = _number(data, pos, "size")
+    if _closes(data, pos):
+        return None, pos + 2
+    pos = _expect(data, pos, b";\0")
+    if pos + size > len(data):
+        raise MalformedPol("size runs past the end of the file")
+    return (key, name, kind, data[pos : pos + size]), _expect(data, pos + size, b"]\0")
 
 
 def parse(data: bytes) -> Parsed:
@@ -231,22 +316,7 @@ def parse(data: bytes) -> Parsed:
     out = Parsed()
     pos = _HEADER
     while pos < len(data):
-        pos = _expect(data, pos, b"[\0")
-        key, pos = _string(data, pos)
-        pos = _expect(data, pos, b";\0")
-        name, pos = _string(data, pos)
-        pos = _expect(data, pos, b";\0")
-        if pos + 4 > len(data):
-            raise MalformedPol("truncated type")
-        kind = int(struct.unpack("<I", data[pos : pos + 4])[0])
-        pos = _expect(data, pos + 4, b";\0")
-        if pos + 4 > len(data):
-            raise MalformedPol("truncated size")
-        size = int(struct.unpack("<I", data[pos : pos + 4])[0])
-        pos = _expect(data, pos + 4, b";\0")
-        if pos + size > len(data):
-            raise MalformedPol("size runs past the end of the file")
-        payload = data[pos : pos + size]
-        pos = _expect(data, pos + size, b"]\0")
-        _instruction(out, key, name, kind, payload)
+        fields, pos = _record(data, _expect(data, pos, b"[\0"))
+        if fields is not None:
+            _instruction(out, *fields)
     return out

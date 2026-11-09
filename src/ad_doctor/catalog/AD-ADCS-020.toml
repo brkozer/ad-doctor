@@ -6,7 +6,9 @@ severity_logic = """
 **Medium** when the effective Group Policy value of `CertificateMappingMethods` has a weak bit
 (UPN 0x4, subject/issuer 0x1 or issuer 0x2) or `StrongCertificateBindingEnforcement` is 0 or 1.
 **Info** when no GPO sets one of them, so its value on the DC is unknown, when a value is not
-recognised or when the result cannot be decided.
+recognised or when the result cannot be decided; and for a weak value when the snapshot shows no
+enterprise CA, certificate template or enrollment endpoint, since nothing seen issues the
+certificates this needs. In that domain the other rows are left out.
 """
 mitre = ["T1649"]
 data_sources = ["sysvol", "ldap"]
@@ -37,6 +39,9 @@ false_positives = """
   a value of 0 or 1 in a GPO is then stale. The patch level is not read here.
 - **A value set locally** is not visible, and overrides nothing here.
 - **`GptTmpl.inf`.** A value written through custom security template entries is not read.
+- **A third-party CA trusted through NTAuth.** The NTAuth store is not read, so a domain whose
+  only certificates come from such a CA looks like one with no CA: no row unless a GPO sets a weak
+  value, and then only info. No finding here does not say certificate mapping is strong.
 """
 
 remediation = """

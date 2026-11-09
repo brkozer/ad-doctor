@@ -548,13 +548,22 @@ class _Layer:
     file: str = "Registry.pol"
 
 
+_HARDENED = regpol.norm(regpol.HARDENED_KEY)
+
+
+def _value_name(key: str, name: str) -> str:
+    """A value name for comparing, under a compared key. A hardened path is one value with or
+    without its trailing backslash, as `regpol.watched` accepts it."""
+    return (name.strip().rstrip("\\") if key == _HARDENED else name).casefold()
+
+
 def _concerns(entry: RegistryEntry, key: str, name: str) -> bool:
     k = regpol.norm(entry.key)
     if entry.action == "delete_key":
         return key == k or key.startswith(k + "\\")
     if k != key:
         return False
-    return entry.action == "delete_all" or entry.name.casefold() == name
+    return entry.action == "delete_all" or _value_name(key, entry.name) == name
 
 
 def _after(start: Outcome, entries: list[RegistryEntry], layer: _Layer) -> Outcome:
@@ -583,7 +592,7 @@ def effective_value(layers: tuple[_Layer, ...], key: str, name: str) -> Effectiv
     result to what is possible and takes nothing away; one that surely applies replaces it."""
     state: tuple[Outcome, ...] = (NOT_SET,)
     wanted = regpol.norm(key)
-    wanted_name = name.casefold()
+    wanted_name = _value_name(wanted, name)
     for layer in layers:
         if layer.entries is None:
             unread = (f"{layer.file} of {layer.gpo.name} not readable",)
@@ -608,10 +617,12 @@ class RegistryView:
 
     def targets(self) -> list[Account]:
         """Computers that process Windows Group Policy. A computer object with no operating
-        system recorded is pre-staged or a cluster name, not a host; DCs count regardless."""
+        system recorded is pre-staged or a cluster name, not a host; DCs count regardless. A
+        Hyper-V Server records no 'Windows' in its name and processes Group Policy all the same."""
 
         def windows(a: Account) -> bool:
-            return bool(a.os and "windows" in a.os.lower()) or (a.is_registered_dc and not a.os)
+            name = (a.os or "").lower()
+            return "windows" in name or "hyper-v" in name or (a.is_registered_dc and not a.os)
 
         return [
             a
@@ -676,13 +687,24 @@ class RegistryView:
         layers = self._source_layers(a, "audit", self.snap.gpo_audit, "audit.csv")
         return self._played("audit", layers, auditpol.KEY, subcategory)
 
-    def basic_audit(self, a: Account) -> set[str]:
-        """[Event Audit] categories that a GPO which may reach this computer configures."""
-        found: set[str] = set()
-        for g, _ in self.r.applied(a, "restricted"):
+    def basic_audit(self, a: Account) -> dict[str, bool]:
+        """[Event Audit] categories GPOs set on this computer, played in processing order: True
+        when one audits something, False when the value left is 0, no auditing. A GPO that may
+        not apply can add a category to what is possible and takes nothing away."""
+        found: dict[str, bool] = {}
+        for g, caveats in self.r.processing_order(a):
             settings = self.snap.gpo_settings.get(g.guid)
-            if settings:
-                found.update(settings.audit_categories)
+            if settings is None or not computer_side_applies(g, "restricted"):
+                continue
+            passes, assumed = self.r.filtered(g, a)
+            if not passes:
+                continue
+            found.update(dict.fromkeys(settings.audit_categories, True))
+            for category in settings.audit_off:
+                if not (caveats or assumed or _gpo_caveats(g)):
+                    found[category] = False
+                else:
+                    found.setdefault(category, False)
         return found
 
     def _played(self, kind: str, layers: tuple[_Layer, ...], key: str, name: str) -> Effective:

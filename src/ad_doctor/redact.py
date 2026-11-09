@@ -37,7 +37,8 @@ KEEP = {
     "public key services", "certificate templates", "enrollment services", "ntauthcertificates",
     "oid", "default domain policy", "default domain controllers policy",
     "machine", "user", "preferences", "groups", "scripts", "logon", "logoff", "startup",
-    "windows",  # in operatingSystem values, which AD-GPO-009 to -012 read
+    # in operatingSystem values, which AD-GPO-009 to -012 read
+    "windows", "server", "hyper-v",
     "registry", "registry.xml", "registry.pol", "audit", "audit.csv",
     # the [Event Audit] categories AD-GPO-013 compares
     "auditaccountlogon", "auditaccountmanage", "auditdsaccess", "auditlogonevents",
@@ -365,17 +366,33 @@ def _url_words(url: str) -> list[str]:
     return [p for p in found if len(p) > 1 and not p.isdigit()]
 
 
+def _server_words(server: str) -> list[str]:
+    """A WSUS server as a GPO writes it, with or without a scheme."""
+    text = server.strip()
+    return _url_words(text if "://" in text else f"//{text}")
+
+
 def _registry_words(entry: dict[str, Any]) -> list[str]:
     """Names in a registry entry: a WSUS server, the host of a hardened path, a module."""
     key = regpol.norm(entry["key"])
-    if key == regpol.norm(regpol.WSUS_KEY) and isinstance(entry.get("data"), str):
-        return _url_words(entry["data"])
+    if key == regpol.norm(regpol.WSUS_KEY):
+        data = entry.get("data")
+        servers = data if isinstance(data, list) else [data] if isinstance(data, str) else []
+        return [word for server in servers for word in _server_words(server)]
     if key == regpol.norm(regpol.HARDENED_KEY):
         host = entry["name"].lstrip("\\").split("\\")[0]
-        return [] if "*" in host or not host else [host, *host.split(".")]
+        if host == "*" or not host:
+            return []
+        labels = [label for label in host.split(".") if label != "*"]
+        return labels if "*" in host else [host, *labels]  # the wildcard stays readable
     if key == regpol.norm(regpol.MODULE_NAMES_KEY) and entry["name"] != "*":
         return [entry["name"]]
     return []
+
+
+def _redact_server(r: Redactor, server: str) -> str:
+    scheme, sep, rest = server.partition("://")
+    return f"{scheme}{sep}{r.text(rest)}" if sep else r.text(server)
 
 
 def _redact_registry(r: Redactor, before: dict[str, Any], after: dict[str, Any]) -> None:
@@ -385,8 +402,11 @@ def _redact_registry(r: Redactor, before: dict[str, Any], after: dict[str, Any])
     key = regpol.norm(before["key"])
     data = before.get("data")
     if key == regpol.norm(regpol.WSUS_KEY) and isinstance(data, str):
-        scheme, sep, rest = data.partition("://")
-        after["data"] = f"{scheme}{sep}{r.text(rest)}" if sep else r.text(data)
+        after["data"] = _redact_server(r, data)
+    elif key == regpol.norm(regpol.WSUS_KEY) and isinstance(data, list):
+        after["data"] = [_redact_server(r, server) for server in data]
+    elif key == regpol.norm(regpol.MODULE_NAMES_KEY):
+        after["data"] = ""  # no check reads it, and a snapshot can hold the module's name here
     else:
         after["data"] = data
     if key == regpol.norm(regpol.HARDENED_KEY) and before["name"]:
@@ -396,6 +416,16 @@ def _redact_registry(r: Redactor, before: dict[str, Any], after: dict[str, Any])
         after["name"] = before["name"] if before["name"] == "*" else r.text(before["name"])
     else:
         after["name"] = before["name"]
+
+
+def _redact_note(r: Redactor, note: str, walked: str) -> str:
+    """The location of a value named like a password is free text from a GPO, in words the
+    snapshot gives no other reason to learn: one token, unless it is Winlogon's own."""
+    head, sep, location = note.partition(regpol.SECRET_NOTE)
+    if not sep:
+        return walked
+    kept = location if regpol.is_default_password(location) else r.token(location)
+    return f"{r.text(head)}{sep}{kept}"
 
 
 def _keep_invisible(original: str, redacted: str) -> str:
@@ -430,6 +460,9 @@ def redact(data: dict[str, Any], key: bytes) -> dict[str, Any]:
         for guid, entries in data.get(store, {}).items():
             for before, after in zip(entries, out[store][r._key(guid)], strict=True):
                 _redact_registry(r, before, after)
+    if data.get("notes"):
+        pairs = zip(data["notes"], out["notes"], strict=True)
+        out["notes"] = [_redact_note(r, note, walked) for note, walked in pairs]
     # an address block names the network; 0.0.0.0/24 would make every subnet the same one
     for before, after in zip(data.get("subnets", []), out.get("subnets", []), strict=True):
         after["name"] = r.token(before["name"])
