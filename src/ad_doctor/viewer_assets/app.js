@@ -1070,6 +1070,7 @@
     const P = VM.paths;
     if (!P) {
       return h("div", null, pageHead("Control paths", "Control paths to tier 0"), banners(),
+        declaredPanel(),
         h("div", { class: "empty" }, "No principal outside tier 0 has a control path to it in this report."));
     }
     const wanted = parseInt(r.arg, 10);
@@ -1134,7 +1135,8 @@
         title: p.object },
       h("span", { class: "s" }, start.name),
       h("span", { class: "hops" }, plural(p.steps.length, "hop")),
-      h("span", { class: "e" }, (KIND_LABEL[start.kind] || start.kind) + " → " + last.name));
+      h("span", { class: "e" }, (KIND_LABEL[start.kind] || start.kind) + " → " + last.name +
+        (p.declared ? " (declared tier 0)" : "")));
       btn.addEventListener("click", () => {
         history.replaceState(null, "", pathHash(i));
         state.path = i;
@@ -1158,12 +1160,34 @@
     return h("div", { class: "stack" },
       pageHead("Control paths", "Control paths to tier 0", P.detail, [copyMermaid]),
       banners(),
+      declaredPanel(),
       P.broad ? h("div", { class: "banner high" }, h("div", null, h("strong", null, "Broad groups have a path. "),
         "Every user is effectively tier 0: fix those first.")) : null,
       stats,
       filters,
       h("div", { class: "paths-layout" }, list, chainBox),
       chokepointTable());
+  }
+
+  // the assets a user declared: which set each one is in and whether it could be judged
+  function declaredPanel() {
+    const D = VM.declared_tier0;
+    if (!D) return null;
+    const line = (a) => {
+      const seen = plural(a.principals || 0, "principal");
+      if (a.set === "built-in") return ["already built-in tier 0"];
+      if (a.status !== "not_evaluated") return [seen + " with a path"];
+      return [h("span", { class: "pill high" }, "Not evaluated"),
+        " " + a.reason + "; " + seen + " with a path that needs no DACL of its own"];
+    };
+    return h("div", { class: "panel" },
+      h("h2", null, "Declared tier 0 (extended targets)"),
+      h("p", { class: "small muted" }, "Added for this report; built-in tier 0 is unchanged. " +
+        D.exposed_with_declared + " of " + D.users_with_declared +
+        " enabled users outside both sets have a path to either."),
+      h("ul", { class: "declared-assets" }, D.assets.map((a) => h("li", null,
+        h("strong", null, a.name), " (" + (KIND_LABEL[a.kind] || a.kind) + ", from " + a.source + "): ",
+        line(a)))));
   }
 
   function stat(n, label, before) {
@@ -1184,7 +1208,7 @@
     box.replaceChildren(
       h("div", { class: "chain-head" },
         h("div", null, h("div", { class: "eyebrow" }, "Path " + (state.path + 1) + " of " + P.list.length +
-          " · " + plural(p.steps.length, "hop")),
+          " · " + plural(p.steps.length, "hop") + (p.declared ? " · to declared tier 0" : "")),
         h("h2", null, start.name + " → " + end.name)),
         h("div", { class: "no-print" }, copyButton(p.object, "Copy path", "path"),
           copyButton(p.fingerprint, "Copy fingerprint", "fingerprint"))),
@@ -1259,11 +1283,11 @@
         root.appendChild(svg("g", null, svg("title", null, how), line, head, labels));
       }
       const n = nodeAt(id);
-      const kind = (n.tier0 ? "TIER 0 · " : "") + (KIND_LABEL[n.kind] || n.kind).toUpperCase();
+      const kind = (n.tier0 ? "TIER 0 · " : n.declared ? "DECLARED · " : "") + (KIND_LABEL[n.kind] || n.kind).toUpperCase();
       const g = svg("g", {
-        class: "node" + (n.tier0 ? " tier0" : "") + (i === 0 ? " start" : "") + (id === state.node ? " sel" : ""),
+        class: "node" + (n.tier0 || n.declared ? " tier0" : "") + (i === 0 ? " start" : "") + (id === state.node ? " sel" : ""),
         tabindex: "0", role: "button", "aria-pressed": String(id === state.node),
-        "aria-label": n.name + ", " + (KIND_LABEL[n.kind] || n.kind) + (n.tier0 ? ", tier 0" : ""),
+        "aria-label": n.name + ", " + (KIND_LABEL[n.kind] || n.kind) + (n.tier0 ? ", tier 0" : n.declared ? ", declared tier 0" : ""),
       },
       svg("title", null, n.name),
       svg("rect", { class: "nbox", x: x, y: y, width: NW, height: NH, rx: 6 }),
@@ -1289,7 +1313,8 @@
       h("dt", null, "Name"), h("dd", { class: "mono" }, n.name),
       h("dt", null, "Kind"), h("dd", null, KIND_LABEL[n.kind] || n.kind),
       n.sid ? [h("dt", null, "SID"), h("dd", { class: "mono" }, n.sid)] : null,
-      h("dt", null, "Tier 0"), h("dd", null, n.tier0 ? h("span", { class: "pill high" }, "Yes") : "No"),
+      h("dt", null, "Tier 0"), h("dd", null, n.tier0 ? h("span", { class: "pill high" }, "Yes")
+        : n.declared ? h("span", { class: "pill high" }, "Declared") : "No"),
       h("dt", null, "On paths"), h("dd", null, on + " of " + P.list.length + (starts ? " (starts " + starts + ")" : "")),
       h("dt", null, "Also in"), h("dd", null, links.length ? h("span", { class: "links" }, links) :
         h("span", { class: "muted" }, "no other finding names it")));
@@ -1527,7 +1552,8 @@
     }
     if (W.assumptions.length) {
       sections.push(sectionTitle("Assumed tier 0 (not changes)"));
-      sections.push(h("ul", null, W.assumptions.map((x) => h("li", null, x.name + " (" + x.source + ")"))));
+      sections.push(h("ul", null, W.assumptions.map((x) => h("li", null, x.name + " (" + x.source +
+        (x.status ? ", not evaluated" : "") + ")"))));
     }
     const notes = W.notes.concat(W.caveats);
     if (notes.length) {

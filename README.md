@@ -625,6 +625,20 @@ than break sync.
 See [docs/whatif.md](docs/whatif.md) for the forms, the plan file, the model and its
 limits.
 
+### Declaring your own tier 0
+
+```bash
+ad-doctor collect dc01.corp.example -u 'CORP\auditor' -o snap.json --tier0-file tier0.toml
+ad-doctor analyze snap.json --tier0-file tier0.toml    # tier0 = ["JUMP01$", "svc_backup"]
+```
+
+`--tier0-file` (or `--tier0 NAME`) on `analyze`, `scan`, `paths` and `view` adds assets as
+extended targets. Built-in tier 0 and every other check stay as they were, and paths to a
+declared asset end with `[declared tier 0]`. Collection needs the same file, because the
+owner and DACL of an ordinary user or computer are read only when it is declared: without them
+the asset is reported as **not evaluated**, never as clean. See
+[docs/declared-tier0.md](docs/declared-tier0.md).
+
 ## Performance
 
 `scripts/bench.py` builds a synthetic enterprise domain (an OU tree of 8 regions, 80

@@ -8,7 +8,8 @@ The first writes `xss.html` (directory names that are XSS payloads, everywhere a
 appear), `full.html` (every screen populated: baseline, history, acceptances, invariants,
 fix lines, the full graph), `sealed.html` (the same, encrypted with PASSPHRASE),
 `paths.html` (large-domain mode), `clean.html` (no findings, from analyze -f html),
-`bench.html` (a 1,500-user bench.py domain, for long lists) and
+`bench.html` (a 1,500-user bench.py domain, for long lists), `declared.html` (declared
+tier-0 assets, one of them not evaluated) and
 `old-report.json` (the baseline as a JSON report, for the drag-and-drop diff). The second
 writes the compact graph and Python's blast radius of a set of accounts for each snapshot
 (the XSS fixture, the full fixture, a 3,000-user bench.py domain, and any given), which
@@ -177,7 +178,7 @@ def build(out: Path) -> dict[str, Path]:
     out.mkdir(parents=True, exist_ok=True)
     pages = {
         name: out / f"{name}.html"
-        for name in ("xss", "full", "sealed", "paths", "clean", "bench", "whatif")
+        for name in ("xss", "full", "sealed", "paths", "clean", "bench", "whatif", "declared")
     }
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
@@ -243,6 +244,13 @@ def build(out: Path) -> dict[str, Path]:
             json.dumps(with_sids(snapshot(user("alice", NORMAL), computer("WS1"))).to_json())
         )
         assert main(["analyze", str(clean), "-f", "html", "-o", str(pages["clean"])]) == 0
+        from .test_declared_tier0 import declared_snapshot
+
+        extended = work / "declared.json"
+        extended.write_text(json.dumps(declared_snapshot().to_json()))
+        (work / "tier0.toml").write_text('tier0 = ["JUMP01$", "svc_other"]\n')
+        args = ["view", str(extended), "--tier0-file", str(work / "tier0.toml"), "--graph", "none"]
+        assert main([*args, "--no-encrypt", "-o", str(pages["declared"])]) == 0
         # a 1,500-user bench.py domain: AD-PATH-001 has enough objects for the long list
         bench = work / "bench.json"
         bench.write_text(json.dumps(bench_snapshot(1500).to_json()))

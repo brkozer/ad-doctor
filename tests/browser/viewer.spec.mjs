@@ -413,6 +413,18 @@ test("a clean domain reads as good news, and says why there is no graph", async 
   expect(seen.errors).toEqual([]);
 });
 
+test("declared tier 0: paths and assets say which set they belong to", async ({ page }) => {
+  await page.goto(url("declared") + "#paths");
+  const panel = page.locator(".panel", { hasText: "Declared tier 0 (extended targets)" });
+  await expect(panel).toContainText("JUMP01$");
+  await expect(panel).toContainText("Not evaluated");
+  await expect(panel).toContainText("svc_other");
+  const item = page.locator(".pitem", { hasText: "(declared tier 0)" });
+  await expect(item).toHaveCount(1);
+  await item.click();
+  await expect(page.locator(".chain-head .eyebrow")).toContainText("to declared tier 0");
+});
+
 test("large-domain mode lists every precomputed principal and explains a miss", async ({ page }) => {
   await page.goto(url("paths") + "#blast");
   const chips = await page.locator(".chips .chip").count();

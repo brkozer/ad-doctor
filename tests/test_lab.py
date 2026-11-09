@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import os
 from datetime import timedelta
+from typing import Any
 
 import pytest
 
@@ -169,12 +170,11 @@ EXPECTED = {
 }
 
 
-@pytest.fixture(scope="module")
-def snap() -> Snapshot:
+def lab_target(**kw: Any) -> Target:
     host = os.environ.get("AD_DOCTOR_LAB_HOST")
     if not host:
         pytest.skip("AD_DOCTOR_LAB_HOST not set")
-    target = Target(
+    return Target(
         host=host,
         port=int(os.environ.get("AD_DOCTOR_LAB_PORT", "636")),
         user=os.environ["AD_DOCTOR_LAB_USER"],
@@ -184,8 +184,13 @@ def snap() -> Snapshot:
         plain_port=int(os.environ.get("AD_DOCTOR_LAB_PLAIN_PORT", "389")),
         http_port=int(os.environ.get("AD_DOCTOR_LAB_HTTP_PORT", "80")),
         https_port=int(os.environ.get("AD_DOCTOR_LAB_HTTPS_PORT", "0")),
+        **kw,
     )
-    snap = collect(target)
+
+
+@pytest.fixture(scope="module")
+def snap() -> Snapshot:
+    snap = collect(lab_target())
     assert snap.domain == "adlab.test"
     # an ordinary user cannot see fine-grained password policies or dMSAs; nothing else may fail
     ok = ("fine-grained", "dMSA", "by choice", "userPrincipalName")
@@ -196,6 +201,16 @@ def snap() -> Snapshot:
 @pytest.fixture(scope="module")
 def findings(snap: Snapshot) -> dict[str, set[str]]:
     return {f.check_id: set(f.objects) for f in run_all(snap)}
+
+
+def test_declared_account_is_not_evaluated_until_its_dacl_is_collected(snap: Snapshot) -> None:
+    from ad_doctor import declared
+
+    assert declared.declare(snap, [("t", ["WS01$"])]).assets[0].status == declared.NOT_EVALUATED
+    with_dacl = collect(lab_target(declared_tier0=["WS01$"]))
+    d = declared.declare(with_dacl, [("t", ["WS01$"])])
+    assert d.assets[0].status == declared.EVALUATED and d.notes == []
+    assert d.analysis.declared is not None and d.analysis.declared.principals[d.assets[0].node] > 0
 
 
 def test_gpo_reach_through_ou_and_site_links(snap: Snapshot) -> None:

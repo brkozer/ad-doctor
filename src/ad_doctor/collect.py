@@ -189,6 +189,8 @@ class Target:
     all_dcs: bool = True
     # read each CA's configuration over the winreg pipe (part of the probes)
     ca_registry: bool = True
+    # names declared as tier 0: an account among them gets its owner and DACL read too
+    declared_tier0: list[str] = dataclasses.field(default_factory=list)
 
 
 def _ces_urls(values: list[str]) -> list[str]:
@@ -620,10 +622,12 @@ class Collector:
         sync_hosts = {a.sync_host.lower() for a in accounts if a.sync_host}
         ca_hosts = {h.upper() for h in self.ca_hosts}
         exchange = exchange_members(objects)
+        declared = self._declared_dns(accounts)
         sensitive = [
             a
             for a in accounts
             if a.dn.lower() in priv_dns
+            or a.dn.lower() in declared
             or a.is_dc
             or a.sam.lower() == "krbtgt"
             or a.rid == 500
@@ -652,6 +656,19 @@ class Collector:
             if keys:
                 self._read_keys(a, entries)
         return objects
+
+    def _declared_dns(self, accounts: list[Account]) -> set[str]:
+        """DNs of the accounts the user declared as tier 0: their owner and DACL are read
+        too, or analysis cannot tell who controls them. Names as the snapshot resolves
+        them (declared.py); a group, OU or GPO has its DACL read anyway."""
+        names = {n.strip().lower() for n in (self.target.declared_tier0 if self.target else ())}
+        if not names:
+            return set()
+        return {
+            a.dn.lower()
+            for a in accounts
+            if names & {a.sam.lower(), a.sam.lower().removesuffix("$"), a.dn.lower(), a.sid.lower()}
+        }
 
     def _read_keys(self, a: Account, entries: list[dict[str, Any]]) -> None:
         """Key credentials of one tier-0 account, from its BASE read."""

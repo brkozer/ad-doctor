@@ -45,6 +45,8 @@ class Report:
     recorded: dict[str, coverage.CheckStatus] | None = None
     # False for a JSON report: only its notes are left of the snapshot behind it
     from_snapshot: bool = True
+    # declared.Declaration.summary() when tier-0 assets were declared; None otherwise
+    declared: dict[str, Any] | None = None
 
     def statuses(self) -> dict[str, coverage.CheckStatus]:
         """Every check of this run: judged, not applicable, or not evaluated and why."""
@@ -196,6 +198,7 @@ def render_text(r: Report, color: bool = False) -> str:
         scope = ", ".join(a.objects) if a.objects else "all objects"
         accepted = f"accepted: {a.check_id} ({scope}) until {a.expires}: {a.reason}"
         lines.append(c(DIM, one_line(accepted)))
+    lines += [one_line(line) for line in declared_lines(r.declared)]
     for note in snap.notes:
         lines.append(c(DIM, f"note: {one_line(note)}"))
     lines += [c(DIM, line) for line in _status_lines(statuses)]
@@ -242,6 +245,7 @@ def report_dict(r: Report) -> dict[str, Any]:
         ],
         "accepted": [a.__dict__ for a in r.accepted],
         "notes": r.snap.notes,
+        **({"declared_tier0": r.declared} if r.declared is not None else {}),
         **({"checks": sorted(r.ran)} if r.ran is not None else {}),
         "check_status": [s.to_json() for _, s in sorted(statuses.items())],
         "coverage": coverage.summary(statuses, r.snap.notes),
@@ -256,9 +260,10 @@ def _extra(f: Finding) -> dict[str, Any]:
         out["keys"] = keys
     if f.data:
         data = dict(f.data)
-        if isinstance(data.get("paths"), list):
-            kept = set(f.objects)
-            data["paths"] = [p for p in data["paths"] if p.get("object") in kept]
+        kept = set(f.objects)
+        for key in ("paths", "declared_paths"):
+            if isinstance(data.get(key), list):
+                data[key] = [p for p in data[key] if p.get("object") in kept]
         out["data"] = data
     return out
 
@@ -351,10 +356,42 @@ def render_markdown(r: Report) -> str:
         for a in r.accepted:
             scope = ", ".join(a.objects) or "all objects"
             out.append(_prose(f"- {a.check_id} ({scope}), until {a.expires}: {a.reason}"))
+    if r.declared is not None:
+        out += [
+            "",
+            "## Declared tier 0",
+            "",
+            *[f"- {_prose(x)}" for x in declared_lines(r.declared)],
+        ]
     out += _markdown_status(statuses)
     if snap.notes:
         out += ["", "## Notes", "", *[f"- {_prose(n)}" for n in snap.notes]]
     return "\n".join(out) + "\n"
+
+
+def declared_lines(declared: dict[str, Any] | None) -> list[str]:
+    """The declared tier-0 assets, one line each, then the totals."""
+    if declared is None:
+        return []
+    lines = ["declared tier 0 (extended targets; built-in tier 0 is unchanged):"]
+    for a in declared["assets"]:
+        where = f"  {a['name']} ({a['kind']}, from {a['source']}): "
+        if a["set"] == "built-in":
+            lines.append(where + "already built-in tier 0")
+        elif a["status"] == "not_evaluated":
+            seen = a.get("principals", 0)
+            lines.append(
+                f"{where}not evaluated: {a['reason']}; {seen} principals have a path that needs "
+                "no DACL of its own"
+            )
+        else:
+            lines.append(f"{where}{a.get('principals', 0)} principals have a path")
+    lines.append(
+        f"  {declared['paths']} principals hold a path to a declared asset; "
+        f"{declared['exposed_with_declared']} of {declared['users_with_declared']} enabled "
+        "users outside both sets have a path to either"
+    )
+    return lines
 
 
 def _status_why(s: coverage.CheckStatus) -> str:

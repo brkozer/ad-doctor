@@ -117,6 +117,7 @@ def viewmodel(r: Report, snap: Snapshot | None, opts: Options) -> dict[str, Any]
         "invariants": _invariants(r.findings, opts.spec),
         "baseline": _baseline(r, opts),
         "notes": list(r.snap.notes),
+        "declared_tier0": r.declared,
         "check_status": rep["check_status"],
         "coverage": rep["coverage"],
         "trend": trend.build(opts.history, trend.point(rep, "this run"))
@@ -208,7 +209,7 @@ _WHATIF_ROWS: dict[str, dict[str, str]] = {
         "note": "str?",
     },
     "accounts": {"account": "str", "before": "obj", "after": "obj"},
-    "assumptions": {"name": "str", "source": "str"},
+    "assumptions": {"name": "str", "source": "str", "status": "str?"},
 }  # fmt: skip
 _WHATIF_RECOMMENDATION = {
     "goal": "str", "near": "str", "cost": "int", "changes": "int", "budget": "int?",
@@ -375,6 +376,7 @@ def _paths(findings: list[Finding]) -> dict[str, Any] | None:
         return None
     kept = set(f.objects)
     records = [p for p in f.data["paths"] if p.get("object") in kept]
+    extended = [p for p in f.data.get("declared_paths", []) if p.get("object") in kept]
     nodes: list[dict[str, Any]] = []
     index: dict[str, int] = {}
 
@@ -385,12 +387,15 @@ def _paths(findings: list[Finding]) -> dict[str, Any] | None:
             if rec["id"].startswith("sid:"):
                 item["sid"] = rec["id"].removeprefix("sid:")
             nodes.append(item)
+        if rec.get("declared"):
+            nodes[index[rec["id"]]]["declared"] = True
         return index[rec["id"]]
 
     rows = []
-    for p in records:
+    for i, p in enumerate([*records, *extended]):
         rows.append(
             {
+                **({"declared": True} if i >= len(records) else {}),
                 "object": p["object"],
                 "key": f.key(p["object"]),
                 "fingerprint": fingerprint(f.check_id, f.key(p["object"])),
@@ -412,7 +417,8 @@ def _paths(findings: list[Finding]) -> dict[str, Any] | None:
         if mentions[i]:
             item["findings"] = mentions[i]
     exposed, users = f.data.get("exposed"), f.data.get("users")
-    mermaid = mermaid_paths([p["object"] for p in records], limit=len(records))
+    shown = [p["object"] for p in [*records, *extended]]
+    mermaid = mermaid_paths(shown, limit=len(shown))
     return {
         "detail": f.detail,
         "exposed": exposed,

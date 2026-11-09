@@ -9,6 +9,13 @@ logic or severity between versions, but an ID is never reused for something else
 
 ### Added
 
+- **Declared tier 0.** `--tier0-file` (and `--tier0 NAME`) on `analyze`, `scan`, `paths` and
+  `view` adds your own tier-0 assets as extended targets, in a set of their own: built-in paths,
+  numbers and every other check stay as they were, paths that end at a declared asset carry
+  `[declared tier 0]` and the report lists each asset (`declared_tier0` in the JSON). `collect`
+  and `scan` read the owner and DACL of declared accounts; without that the asset is reported as
+  **not evaluated**, with a note naming AD-PATH-001, and paths that need no DACL of its own are
+  a lower bound. `whatif` and `plan` take the file too and use the same lookup and the same test.
 - **Per-check status.** Every run now says, per check, whether it was judged, not applicable
   or not evaluated, with the reason (data unreadable, older snapshot, switched off). It is in
   the JSON report (`check_status`, `coverage`; `schema` is now 3), and in the text, Markdown,

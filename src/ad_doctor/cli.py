@@ -35,6 +35,7 @@ from .model import DomainPolicy, Finding, Severity, Snapshot
 from .report import (
     Accepted,
     Report,
+    declared_lines,
     finding_keys,
     legacy_keys,
     mermaid_paths,
@@ -60,6 +61,7 @@ def _target(args: argparse.Namespace) -> Target:
         password = getpass.getpass(f"Password for {args.user}: ")
     port = args.port or (636 if args.ldaps else 389)
     return Target(
+        declared_tier0=[n for _, names in _tier0_groups(args) for n in names],
         host=args.host,
         port=port,
         user=args.user,
@@ -76,6 +78,36 @@ def _target(args: argparse.Namespace) -> Target:
         all_dcs=not args.single_dc,
         ca_registry=not args.no_ca_registry,
     )
+
+
+def _tier0_groups(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
+    """The names declared as tier 0, per where they came from; empty without either flag."""
+    named, path = getattr(args, "tier0", None), getattr(args, "tier0_file", None)
+    if not named and not path:
+        return []
+    from . import declared
+
+    from_file = declared.load_file(path) if path else []
+    groups = [("--tier0", list(named or [])), (path.name if path else "", from_file)]
+    return [(source, names) for source, names in groups if names]
+
+
+def _run_checks(
+    snap: Snapshot,
+    only: list[str] | None,
+    groups: list[tuple[str, list[str]]],
+    lenient: bool = False,
+) -> tuple[list[Finding], dict[str, Any] | None]:
+    """The findings, and with a declaration what the report says about it. AD-PATH-001
+    sees the declaration through the graph it is lent."""
+    if not groups:
+        return run_all(snap, only), None
+    from . import declared
+
+    decl = declared.declare(snap, groups, lenient)
+    snap.notes.extend(decl.notes)
+    with paths.lend(snap, decl.graph, decl.analysis):
+        return run_all(snap, only), decl.summary()
 
 
 def _write_private(path: Path, text: str | Iterable[str]) -> None:
@@ -134,7 +166,10 @@ def _report_findings(data: dict[str, Any]) -> list[Finding]:
 
 
 def _findings_from(
-    path: Path, only: list[str] | None = None, spec: dict[str, Any] | None = None
+    path: Path,
+    only: list[str] | None = None,
+    spec: dict[str, Any] | None = None,
+    groups: list[tuple[str, list[str]]] | None = None,
 ) -> tuple[str, list[Finding], set[str]]:
     """Findings from either a saved snapshot (analyzed like the current run) or a
     JSON report, and the checks that could not be evaluated there."""
@@ -152,7 +187,8 @@ def _findings_from(
             )
         return data["domain"], findings, coverage.unevaluated(recorded)
     snap = Snapshot.from_json(data)
-    findings = run_all(snap, only)
+    # a name the earlier snapshot does not hold is no reason to refuse the comparison
+    findings, _ = _run_checks(snap, only, groups or [], lenient=True)
     if spec is not None:
         findings += invariants.evaluate(snap, spec)
     wanted = {i.upper() for i in only} if only else None
@@ -236,38 +272,23 @@ def _path_json(g: paths.Graph, p: paths.Path) -> dict[str, Any]:
 
 
 def cmd_paths(args: argparse.Namespace) -> int:
-    from .resolve import edge_id
-
     snap = Snapshot.from_json(_load_json(args.snapshot))
     json_out = args.format == "json"
-    a = paths.analyze(snap, paths.build(snap, provenance=json_out and not args.chokepoints))
+    groups = _tier0_groups(args)
+    summary: dict[str, Any] | None = None
+    if groups:
+        from . import declared
+
+        decl = declared.declare(snap, groups)
+        a, summary = decl.analysis, decl.summary()
+        notes = decl.notes
+    else:
+        a = paths.analyze(snap, paths.build(snap, provenance=json_out and not args.chokepoints))
+        notes = []
     g = a.graph
+    extended = a.declared.paths if a.declared else []
     if args.chokepoints:
-        points = paths.chokepoints(a.paths, args.minimum)
-        if args.format == "json":
-            rows = [
-                {
-                    "count": c.count,
-                    "kind": "edge" if c.is_edge else "node",
-                    **({"from": g.name(c.source), "how": c.how} if c.source is not None else {}),
-                    "node": g.name(c.target),
-                    **({"id": edge_id(c.source, c.target, c.how)} if c.source is not None else {}),
-                }
-                for c in points
-            ]
-            print(json.dumps({"paths": len(a.paths), "chokepoints": rows}, indent=2))
-            return 0
-        print(f"{snap.domain}: {len(a.paths)} paths to tier 0; shared by {args.minimum} or more:")
-        for c in points:
-            where = (
-                f"edge  {g.name(c.source)} -[{c.how}]-> {g.name(c.target)}"
-                if c.source is not None
-                else f"node  {g.name(c.target)}"
-            )
-            print(f"  {c.count:>4}/{len(a.paths)}  {where}")
-        if not points:
-            print("  none: every path takes its own route")
-        return 0
+        return _print_chokepoints(args, snap, a, extended, summary)
     if args.format == "json":
         print(
             json.dumps(
@@ -276,12 +297,23 @@ def cmd_paths(args: argparse.Namespace) -> int:
                     "exposed_users": a.exposed,
                     "enabled_users": a.users,
                     "paths": [_path_json(g, p) for p in a.paths],
+                    **(
+                        {
+                            "declared_tier0": summary,
+                            "declared_paths": [_path_json(g, p) for p in extended],
+                        }
+                        if summary is not None
+                        else {}
+                    ),
                 },
                 indent=2,
             )
         )
     elif args.format == "mermaid":
-        print("\n".join(mermaid_paths([p.render(g) for p in a.paths], limit=len(a.paths))))
+        shown = [p.render(g) for p in [*a.paths, *extended]]
+        print("\n".join(mermaid_paths(shown, limit=len(shown))))
+        for note in notes:  # stdout stays one diagram
+            print(f"note: {note}", file=sys.stderr)
     else:
         print(
             f"{snap.domain}: {len(a.paths)} principals reach tier 0; {a.exposed} of {a.users} "
@@ -289,6 +321,65 @@ def cmd_paths(args: argparse.Namespace) -> int:
         )
         for p in a.paths:
             print(f"  {len(p.steps)} hop{'s' if len(p.steps) != 1 else ' '}  {p.render(g)}")
+        for line in declared_lines(summary):
+            print(line)
+        for p in extended:
+            print(f"  {len(p.steps)} hop{'s' if len(p.steps) != 1 else ' '}  {p.render(g)}")
+    return 0
+
+
+def _print_chokepoints(
+    args: argparse.Namespace,
+    snap: Snapshot,
+    a: paths.Analysis,
+    extended: list[paths.Path],
+    summary: dict[str, Any] | None,
+) -> int:
+    from .resolve import edge_id
+
+    g = a.graph
+    points = paths.chokepoints(a.paths, args.minimum)
+    declared_points = paths.chokepoints(extended, args.minimum)
+    if args.format == "json":
+
+        def rows(found: list[paths.Chokepoint]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "count": c.count,
+                    "kind": "edge" if c.is_edge else "node",
+                    **({"from": g.name(c.source), "how": c.how} if c.source is not None else {}),
+                    "node": g.name(c.target),
+                    **({"id": edge_id(c.source, c.target, c.how)} if c.source is not None else {}),
+                }
+                for c in found
+            ]
+
+        out: dict[str, Any] = {"paths": len(a.paths), "chokepoints": rows(points)}
+        if summary is not None:
+            out["declared_tier0"] = summary
+            out["declared_paths"] = len(extended)
+            out["declared_chokepoints"] = rows(declared_points)
+        print(json.dumps(out, indent=2))
+        return 0
+
+    def show(found: list[paths.Chokepoint], total: int) -> None:
+        for c in found:
+            where = (
+                f"edge  {g.name(c.source)} -[{c.how}]-> {g.name(c.target)}"
+                if c.source is not None
+                else f"node  {g.name(c.target)}"
+            )
+            print(f"  {c.count:>4}/{total}  {where}")
+        if not found:
+            print("  none: every path takes its own route")
+
+    print(f"{snap.domain}: {len(a.paths)} paths to tier 0; shared by {args.minimum} or more:")
+    show(points, len(a.paths))
+    if summary is not None:
+        for line in declared_lines(summary):
+            print(line)
+        print(f"{len(extended)} paths to declared tier 0; shared by {args.minimum} or more:")
+        show(declared_points, len(extended))
     return 0
 
 
@@ -424,6 +515,7 @@ def _analyze(
     findings: list[Finding],
     from_report: bool = False,
     report_data: dict[str, Any] | None = None,
+    declared: dict[str, Any] | None = None,
 ) -> tuple[Report, viewer.Options]:
     """Invariants, acceptances and the baseline on top of the findings: the part of a run
     that scan, analyze and view share. Returns the report and what the viewer needs."""
@@ -434,8 +526,9 @@ def _analyze(
             raise ValueError("--invariants needs a snapshot, not a JSON report")
         findings += invariants.evaluate(snap, spec)
         findings.sort(key=lambda f: (-f.severity, f.check_id))
-    report = Report(snap, findings, from_snapshot=not from_report)
+    report = Report(snap, findings, from_snapshot=not from_report, declared=declared)
     if from_report and report_data is not None:
+        report.declared = report_data.get("declared_tier0")
         report.recorded = coverage.from_report(report_data)
         checks = report_data.get("checks")
         report.ran = list(checks) if isinstance(checks, list) else None
@@ -463,7 +556,7 @@ def _analyze(
         snap.notes.extend(notes)
         opts.entries, opts.ran = entries, ran
     if args.baseline:
-        _, old, _ = _findings_from(args.baseline, only, spec)
+        _, old, _ = _findings_from(args.baseline, only, spec, _tier0_groups(args))
         report.new = finding_keys(report.findings) - finding_keys(old)
         stamp = _load_json(args.baseline).get("collected_at")
         opts.baseline = viewer.Baseline(old, stamp, args.baseline.name)
@@ -479,6 +572,8 @@ def _command(args: argparse.Namespace) -> str:
     for flag in ("baseline", "accept", "invariants", "whatif"):
         if getattr(args, flag, None):
             parts += [f"--{flag}", getattr(args, flag)]
+    if getattr(args, "tier0_file", None):
+        parts += ["--tier0-file", args.tier0_file]
     if args.cmd == "view":
         parts += ["--fixes"] if args.fixes else []
         parts += ["--history", Path(args.history)] if args.history else []
@@ -562,6 +657,8 @@ def cmd_view(args: argparse.Namespace) -> int:
             findings = _report_findings(data)
             if args.fixes:
                 raise ValueError("--fixes needs a snapshot, not a JSON report")
+            if _tier0_groups(args):
+                raise ValueError("--tier0 and --tier0-file need a snapshot, not a JSON report")
             if args.graph not in ("auto", "none") or args.blast_radius_for:
                 raise ValueError("--graph and --blast-radius-for need a snapshot, not a report")
             report, opts = _analyze(args, snap, findings, from_report=True, report_data=data)
@@ -570,7 +667,8 @@ def cmd_view(args: argparse.Namespace) -> int:
         else:
             source = Snapshot.from_json(data)
             del data  # the parsed file is as big as the snapshot
-            report, opts = _analyze(args, source, run_all(source))
+            found, decl = _run_checks(source, None, _tier0_groups(args))
+            report, opts = _analyze(args, source, found, declared=decl)
             opts.graph = viewer_graph.choose(args.graph, source)
             if args.blast_radius_for and opts.graph != "paths":
                 raise ValueError("--blast-radius-for goes with --graph paths (full has them all)")
@@ -643,6 +741,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    def tier0_args(p: argparse.ArgumentParser, what: str) -> None:
+        p.add_argument("--tier0", action="append", metavar="NAME", help=f"{what} (repeatable)")
+        p.add_argument(
+            "--tier0-file",
+            type=Path,
+            metavar="TOML",
+            help='the same for every name of a file: tier0 = ["JUMP01$", ...]',
+        )
 
     def conn_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("host", help="domain controller host name or address")
@@ -720,17 +827,22 @@ def main(argv: list[str] | None = None) -> int:
             help="declared state to check (policy as code)",
         )
 
+    extended = "add this asset to the declared tier-0 targets, kept apart from built-in tier 0"
+
     p_scan = sub.add_parser("scan", help="collect and analyze in one go")
     conn_args(p_scan)
     out_args(p_scan)
+    tier0_args(p_scan, extended + "; its owner and DACL are read too")
 
     p_collect = sub.add_parser("collect", help="save a snapshot for later analysis")
     conn_args(p_collect)
     p_collect.add_argument("-o", "--output", type=Path, required=True)
+    tier0_args(p_collect, "also read the owner and DACL of this account, for a later --tier0")
 
     p_analyze = sub.add_parser("analyze", help="analyze a saved snapshot")
     p_analyze.add_argument("snapshot", type=Path)
     out_args(p_analyze)
+    tier0_args(p_analyze, extended)
 
     p_diff = sub.add_parser("diff", help="compare two snapshots or JSON reports")
     p_diff.add_argument("old", type=Path)
@@ -757,15 +869,11 @@ def main(argv: list[str] | None = None) -> int:
         "--minimum", type=int, default=2, metavar="N", help="with --chokepoints: shared by N+"
     )
     p_paths.add_argument("-f", "--format", choices=["text", "json", "mermaid"], default="text")
+    tier0_args(p_paths, extended)
 
     def whatif_common(p: argparse.ArgumentParser) -> None:
         p.add_argument("snapshot", type=Path)
-        p.add_argument(
-            "--tier0",
-            action="append",
-            metavar="NAME",
-            help="treat this node as tier 0 (an assumption, not a change; repeatable)",
-        )
+        tier0_args(p, "treat this node as tier 0 (an assumption, not a change)")
         p.add_argument("--accept", type=Path, metavar="TOML", help="accepted-risk file")
         p.add_argument(
             "--invariants", type=Path, metavar="TOML", help="declared state (policy as code)"
@@ -923,6 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
         help="a `plan -f json` or `whatif -f json` result of this snapshot, for the What-if screen",
     )
     p_view.add_argument("--open", action="store_true", help="open it in the default browser")
+    tier0_args(p_view, extended)
 
     p_redact = sub.add_parser("redact", help="pseudonymize a snapshot for sharing")
     p_redact.add_argument("snapshot", type=Path)
@@ -993,7 +1102,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"wrote {args.output} ({len(snap.accounts)} accounts)")
             return 0
 
-        report, opts = _analyze(args, snap, run_all(snap, args.only))
+        found, decl = _run_checks(snap, args.only, _tier0_groups(args))
+        report, opts = _analyze(args, snap, found, declared=decl)
     except ERRORS as exc:
         print(f"ad-doctor: {exc}", file=sys.stderr)
         return 1

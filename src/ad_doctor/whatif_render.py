@@ -119,7 +119,9 @@ def _assumed(doc: dict[str, Any]) -> list[str]:
     rows = doc.get("assumptions", [])
     if not rows:
         return []
-    shown = ", ".join(f"{r['name']} ({r['source']})" for r in rows)
+    shown = ", ".join(
+        f"{r['name']} ({r['source']}{', not evaluated' if r.get('status') else ''})" for r in rows
+    )
     return [f"Assumed tier 0 (not changes; numbers count them as tier 0): {shown}", ""]
 
 

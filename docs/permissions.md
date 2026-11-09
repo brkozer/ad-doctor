@@ -14,7 +14,8 @@ the directory.
 - `msDS-KeyCredentialLink` of tier-0 accounts, CA servers and Entra Connect sync accounts
   and servers; the keys themselves are not kept
 - `sPNMappings` on `CN=Directory Service`, to tell which SPNs `HOST/` answers for
-- the owners and DACLs of the security-critical objects
+- the owners and DACLs of the security-critical objects, and of the accounts given with
+  `--tier0-file` ([declared tier 0](declared-tier0.md)), one BASE read each
 - `server` and `nTDSDSA` objects under `CN=Sites`, and `crossRef` objects under `CN=Partitions`
 - `site`, `server`, `subnet` and `siteLink` objects under `CN=Sites`; `msDFSR-Flags` of `CN=DFSR-GlobalSettings,CN=System` and the FRS and DFS Replication SYSVOL subscriptions under each DC; objects whose name holds `CNF:` and accounts named `$DUPLICATE-*`
 - `userPrincipalName`, `msDS-KrbTgtLink` and the dMSA links on accounts (`msDS-ManagedAccountPrecededByLinkBL`, `msDS-SupersededManagedAccountLink`)
