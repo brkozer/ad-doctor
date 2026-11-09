@@ -7,6 +7,39 @@ logic or severity between versions, but an ID is never reused for something else
 
 ## [Unreleased]
 
+### Added
+
+- **Tier-0 logon restrictions, silos and change history.** **AD-PRIV-013** reports the
+  computers, per OU, where Group Policy does not deny tier-0 accounts local logon, RDP,
+  batch or service logon, using each computer's own processing order. **AD-PRIV-014** reports
+  tier-0 accounts outside an enforced authentication policy silo whose user policy limits
+  where they sign in, or that no silo exists. **AD-PRIV-015**, **AD-ACL-010** and
+  **AD-ACC-017** read replication metadata for members added to tier-0 groups, a change to
+  AdminSDHolder's ACL and `sIDHistory` writes in the 30 days before the snapshot, leaving out
+  the domain's first 24 hours. Older snapshots load and report these as not evaluated, and
+  so does a run where the data could not be read.
+- **Declared tier 0.** `--tier0-file` (and `--tier0 NAME`) on `analyze`, `scan`, `paths` and
+  `view` adds your own tier-0 assets as extended targets, in a set of their own: built-in paths,
+  `exposed`, `users` and every other check stay as they were, paths that end at a declared asset
+  carry `[declared tier 0]` and the report lists each asset (`declared_tier0` in the JSON). A
+  path to one is an AD-PATH-001 object, so on a domain with no built-in path a declaration can
+  raise that HIGH finding and the score. `diff` and `--baseline` keep a path to an asset only one
+  run declared apart. A SID the snapshot does not hold is refused like a name. `collect`
+  and `scan` read the owner and DACL of declared accounts; without that the asset is reported as
+  **not evaluated**, with a note naming AD-PATH-001, and paths that need no DACL of its own are
+  a lower bound. `whatif` and `plan` take the file too and use the same lookup and the same test.
+- **Per-check status.** Every run now says, per check, whether it was judged, not applicable
+  or not evaluated, with the reason (data unreadable, older snapshot, switched off). It is in
+  the JSON report (`check_status`, `coverage`; `schema` is now 3), and in the text, Markdown,
+  SARIF and JUnit output and the viewer's overview. The status is computed from the collection notes, so
+  snapshots from earlier versions get one too. A check that was not evaluated never counts as
+  passed: JUnit marks it skipped, its earlier findings stay out of "resolved" in `diff`,
+  `--baseline` and the viewer, an acceptance of it is not reported as stale, and the risk score is
+  then labelled a minimum. A check the older run did not evaluate is kept out of "new" the same
+  way. `paths`, `whatif`, `plan` and the viewer say so when AD-PATH-001 could not judge everything,
+  and `whatif --fail-if-exposed` fails on such a graph. Findings are unchanged. `--no-sysvol`, `--no-probes` and
+  `--http-port 0` now leave a note saying what they skipped.
+
 ## [0.2.4] - 2026-11-09
 
 ### Added

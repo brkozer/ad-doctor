@@ -1,0 +1,49 @@
+id = "AD-ACC-017"
+aliases = ["recent-sid-history"]
+summary = "sIDHistory was written on an account in the 30 days before the snapshot, by replication metadata."
+severities = ["low", "medium"]
+severity_logic = """
+**Medium** when an account in the list holds a SID of this same domain, which a migration between
+domains does not produce. **Low** otherwise: a running migration writes this attribute every day,
+and that is a reason to review, not an alarm.
+"""
+mitre = ["T1134.005"]
+data_sources = ["ldap"]
+attributes = [
+    "sIDHistory of every account",
+    "msDS-ReplAttributeMetaData of each account that has sIDHistory: ftimeLastOriginatingChange of sIDHistory",
+    "whenCreated of the domain head",
+]
+related = ["AD-ACC-007"]
+since = "0.2.5"
+
+risk = """
+A SID in `sIDHistory` gives its holder that SID's rights at every logon. Injecting one is a way to
+get domain control back after a clean-up. [AD-ACC-007](AD-ACC-007.md) says which accounts carry a
+SID history; this one says which got it recently.
+"""
+
+detection = """
+One BASE read for each account that has `sIDHistory`, and the last originating change of that
+attribute in `msDS-ReplAttributeMetaData`. It fires within **30 days before the snapshot was
+collected**, the window used by AD-PRIV-015, and not in the first **24 hours of the domain**.
+
+Reads are capped at **500 accounts** so that a migrated domain stays cheap; beyond that a note names
+AD-ACC-017 and the check is partly judged. An account whose row cannot be read is named in a note.
+"""
+
+false_positives = """
+- **A migration in progress.** The list is expected to fill while accounts are moved.
+- **Removal of one of several values** also updates the attribute's timestamp.
+"""
+
+remediation = """
+Match each change to a migration. If there is none, clear `sIDHistory` and investigate the account.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACC-017"
+
+[[references]]
+title = "ADTimeline: timeline of Active Directory changes from replication metadata"
+url = "https://github.com/ANSSI-FR/ADTimeline"
+kind = "tool"

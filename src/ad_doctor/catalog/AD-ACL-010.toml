@@ -1,0 +1,57 @@
+id = "AD-ACL-010"
+aliases = ["recent-adminsdholder-change"]
+summary = "AdminSDHolder's security descriptor changed in the 30 days before the snapshot, by replication metadata."
+severities = ["medium"]
+severity_logic = """
+Always **medium**: the ACL of this object is rarely touched and it is a known persistence point.
+The metadata says when, not what changed; [AD-ACL-002](AD-ACL-002.md) says who holds rights.
+"""
+mitre = ["T1098", "T1222.001"]
+data_sources = ["ldap"]
+attributes = [
+    "msDS-ReplAttributeMetaData of CN=AdminSDHolder,CN=System: ftimeLastOriginatingChange of nTSecurityDescriptor",
+    "whenCreated of the domain head",
+]
+related = ["AD-ACL-002", "AD-ACL-005", "AD-INF-004"]
+since = "0.2.5"
+
+risk = """
+SDProp copies the ACL of AdminSDHolder onto every protected account and group about once an hour.
+A right added here spreads to every administrator, and a later clean-up of those accounts is undone
+by the next SDProp run. Writing this ACL takes administrative access, so an unexplained change is
+worth looking at.
+"""
+
+detection = """
+One BASE read of `CN=AdminSDHolder,CN=System` for `msDS-ReplAttributeMetaData`, and the last
+originating change of `nTSecurityDescriptor`. It fires when that is within **30 days before the
+snapshot was collected**, the window used by AD-PRIV-015, and not in the first **24 hours of the
+domain** (when installation and forest preparation write this object).
+
+If the row cannot be read, the check is not evaluated and a note says so.
+"""
+
+false_positives = """
+- **Planned changes**, such as a product's setup or a deliberate delegation. Accept by fingerprint
+  once reviewed.
+- **Tooling that rewrites the descriptor** without changing the meaning, for example an
+  ownership change.
+"""
+
+remediation = """
+Match the change to a change record (event 5136 on the DC). Compare the ACL against a known good
+copy or the default, and remove what should not be there; the next SDProp run spreads the
+correction.
+"""
+
+verify = "ad-doctor scan dc01.corp.example --ldaps -u 'CORP\\auditor' --only AD-ACL-010"
+
+[[references]]
+title = "Appendix C: Protected accounts and groups in Active Directory"
+url = "https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/appendix-c--protected-accounts-and-groups-in-active-directory"
+kind = "vendor"
+
+[[references]]
+title = "ADTimeline: timeline of Active Directory changes from replication metadata"
+url = "https://github.com/ANSSI-FR/ADTimeline"
+kind = "tool"

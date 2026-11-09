@@ -14,7 +14,8 @@ the directory.
 - `msDS-KeyCredentialLink` of tier-0 accounts, CA servers and Entra Connect sync accounts
   and servers; the keys themselves are not kept
 - `sPNMappings` on `CN=Directory Service`, to tell which SPNs `HOST/` answers for
-- the owners and DACLs of the security-critical objects
+- the owners and DACLs of the security-critical objects, and of the accounts given with
+  `--tier0-file` ([declared tier 0](declared-tier0.md)), one BASE read each
 - `server` and `nTDSDSA` objects under `CN=Sites`, and `crossRef` objects under `CN=Partitions`
 - `site`, `server`, `subnet` and `siteLink` objects under `CN=Sites`; `msDFSR-Flags` of `CN=DFSR-GlobalSettings,CN=System` and the FRS and DFS Replication SYSVOL subscriptions under each DC; objects whose name holds `CNF:` and accounts named `$DUPLICATE-*`
 - `userPrincipalName`, `msDS-KrbTgtLink` and the dMSA links on accounts (`msDS-ManagedAccountPrecededByLinkBL`, `msDS-SupersededManagedAccountLink`)
@@ -25,6 +26,11 @@ the directory.
 - `dnsNode` objects of forward zones (`name`, `dnsRecord`, `dNSTombstoned`), with one BASE read of the owner of each marshaled, wildcard or well-known name, at most 200 of each kind per scan
 - one BASE read of each `member` value of a tier-0 group that no search returned, at most 500
   per scan
+- `msDS-ReplValueMetaData` and `msDS-ReplAttributeMetaData` of each tier-0 group (at most 200), of
+  `CN=AdminSDHolder,CN=System`, and of each account with `sIDHistory` (at most 500)
+- `msDS-AuthNPolicySilo` and `msDS-AuthNPolicy` objects under `CN=AuthN Policy Configuration`
+  (Authenticated Users may read them by the schema's default), and the DACL of `CN=AuthN Silos`
+  when none comes back
 
 Security descriptors are requested with the SD-flags control for owner and DACL, which
 ordinary users may read, and parsed by a small built-in parser (`sd.py`).

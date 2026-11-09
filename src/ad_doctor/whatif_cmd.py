@@ -18,7 +18,18 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from . import __version__, accept, changes, cut, invariants, paths, planfile, whatif
+from . import (
+    __version__,
+    accept,
+    changes,
+    coverage,
+    cut,
+    declared,
+    invariants,
+    paths,
+    planfile,
+    whatif,
+)
 from .checks import run_all
 from .model import Finding, Severity, Snapshot
 from .paths import Graph
@@ -111,14 +122,16 @@ def load(args: argparse.Namespace) -> Context:
     return ctx
 
 
+def tier0_names(args: argparse.Namespace) -> tuple[list[str], list[str]]:
+    """The names of --tier0 and of --tier0-file."""
+    from_file = declared.load_file(args.tier0_file) if args.tier0_file else []
+    return list(args.tier0 or []), from_file
+
+
 def tier0_nodes(ctx: Context, names: Iterable[str]) -> list[str]:
-    out = []
-    for name in names:
-        node = ctx.resolver.node(name)
-        if node is None:
-            raise SpecError(f"--tier0 / [assume] tier0: no {name!r} in this snapshot")
-        out.append(node)
-    return list(dict.fromkeys(out))
+    extra = declared.nodes(ctx.resolver, names)
+    ctx.notes.extend(declared.gap_notes(ctx.snap, ctx.g, extra))
+    return extra
 
 
 def assumptions(ctx: Context, groups: list[tuple[str, list[str]]]) -> list[dict[str, str]]:
@@ -130,6 +143,8 @@ def assumptions(ctx: Context, groups: list[tuple[str, list[str]]]) -> list[dict[
             node = ctx.resolver.node(name)
             if node is not None and node not in rows:
                 rows[node] = {"node": node, "name": ctx.g.name(node), "source": source}
+    for node in declared.unevaluated(ctx.snap, ctx.g, rows):
+        rows[node]["status"] = declared.NOT_EVALUATED
     return list(rows.values())
 
 
@@ -544,7 +559,8 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         resolved.append(r)
     statuses: list[Status] = []
     goal, sources_from, allow = "exposure", [], []
-    tier0_names = list(args.tier0 or [])
+    named, from_file = tier0_names(args)
+    names = [*named, *from_file]
     plan_tier0: list[str] = []
     if plan is not None:
         if plan.domain_sid and plan.domain_sid != ctx.snap.domain_sid:
@@ -554,12 +570,12 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             )
         else:
             statuses = lifecycle(ctx, plan)
-            tier0_names += plan.tier0
+            names += plan.tier0
             plan_tier0 = list(plan.tier0)
         goal, sources_from, allow = plan.goal, plan.sources, plan.allow
     if goal == "from" and not sources_from:
         goal = "exposure"
-    extra = tier0_nodes(ctx, tier0_names)
+    extra = tier0_nodes(ctx, names)
     removed: set[int] = {p for r in resolved for p in r.prims}
     removed |= {s.p for s in statuses if s.p is not None}
     accounts = list(args.account or [])
@@ -648,7 +664,8 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     doc["findings"] = fb
     doc["accounts"] = res.accounts
     doc["assumptions"] = assumptions(
-        ctx, [("--tier0", list(args.tier0 or [])), ("plan file", plan_tier0)]
+        ctx,
+        [("--tier0", named), (_file_label(args), from_file), ("plan file", plan_tier0)],
     )
     doc["plan_status"] = [
         {
@@ -667,6 +684,12 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         problems_rot += [f"{s.entry.id or s.entry.expected_id}: {x}" for x in s.problems]
     if plan is not None and args.check:
         problems_gate += expect_problems(plan.expect, res, closes_all)
+    gap = coverage.path_gaps(ctx.snap.notes, bool(res.before.holders))
+    if gap and (args.fail_if_exposed is not None or (plan is not None and args.check)):
+        problems_gate.append(
+            "the control graph is incomplete, so a limit on who is exposed cannot be met: "
+            + gap["notes"][0]
+        )
     if args.fail_if_exposed is not None and res.after.exposed > args.fail_if_exposed:
         problems_gate.append(
             f"{res.after.exposed} users exposed after the changes; --fail-if-exposed allows "
@@ -686,6 +709,9 @@ def run_whatif(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         )
     if args.paths_only:
         notes.append("--paths-only: findings were not rechecked")
+    notes += coverage.path_gap_lines(gap)
+    if gap:
+        doc["path_check"] = gap
     if plan_tier0 and args.check:
         notes.append(
             f"the plan file treats {len(plan_tier0)} nodes as tier 0 ([assume] tier0): the "
@@ -809,8 +835,8 @@ def run_plan(args: argparse.Namespace) -> tuple[dict[str, Any], int, planfile.Pl
                 keeps.setdefault(i, "not in --allow")
     names = list(args.sources or []) or (given.sources if given else [])
     goal = "from" if names else args.goal
-    tier0_names = [*(args.tier0 or []), *(given.tier0 if given else [])]
-    extra = tier0_nodes(ctx, tier0_names)
+    named, from_file = tier0_names(args)
+    extra = tier0_nodes(ctx, [*named, *from_file, *(given.tier0 if given else [])])
     for n in names:
         if ctx.resolver.node(n) is None:
             raise SpecError(f"--from: no {n!r} in this snapshot")
@@ -876,7 +902,12 @@ def run_plan(args: argparse.Namespace) -> tuple[dict[str, Any], int, planfile.Pl
     doc["findings"] = fb
     doc["accounts"] = []
     doc["assumptions"] = assumptions(
-        ctx, [("--tier0", list(args.tier0 or [])), ("plan file", given.tier0 if given else [])]
+        ctx,
+        [
+            ("--tier0", named),
+            (_file_label(args), from_file),
+            ("plan file", given.tier0 if given else []),
+        ],
     )
     doc["steps"] = step_rows
     doc["recommendation"] = {
@@ -903,6 +934,10 @@ def run_plan(args: argparse.Namespace) -> tuple[dict[str, Any], int, planfile.Pl
             "a change can move GPO scope or who can be impersonated, so the paths after it "
             "come from a rebuilt graph"
         )
+    gap = coverage.path_gaps(ctx.snap.notes, bool(res.before.holders))
+    notes += coverage.path_gap_lines(gap)
+    if gap:
+        doc["path_check"] = gap
     doc["notes"] = notes
     doc["caveats"] = caveats(ctx.snap, "ad-doctor whatif NEW.json --plan plan.toml --check")
     out = planfile.PlanFile(
@@ -928,6 +963,10 @@ def run_plan(args: argparse.Namespace) -> tuple[dict[str, Any], int, planfile.Pl
         if not (args.keep or kinds):
             out.expect = {"closes_all": True, **out.expect}
     return doc, 0, out
+
+
+def _file_label(args: argparse.Namespace) -> str:
+    return args.tier0_file.name if args.tier0_file else "--tier0-file"
 
 
 def _tier0_name(ctx: Context, node: str) -> str:

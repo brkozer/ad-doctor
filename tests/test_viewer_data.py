@@ -72,7 +72,7 @@ def test_report_json_is_versioned_and_lists_the_checks_that_ran(tmp_path: Path) 
     out = tmp_path / "r.json"
     assert main(["analyze", str(src), "-f", "json", "-o", str(out)]) == 0
     data = json.loads(out.read_text())
-    assert data["schema"] == 2 and data["checks"] == sorted(c.id for c in REGISTRY)
+    assert data["schema"] == 3 and data["checks"] == sorted(c.id for c in REGISTRY)
     assert main(["analyze", str(src), "-f", "json", "--only", "ad-krb-002", "-o", str(out)]) == 0
     assert json.loads(out.read_text())["checks"] == ["AD-KRB-002"]
 

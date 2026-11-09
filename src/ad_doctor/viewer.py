@@ -27,19 +27,21 @@ import hashlib
 import itertools
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from functools import cache
 from importlib import resources
 from typing import Any
 
-from . import __version__, accept, catalog, explain, paths, seal, trend, viewer_graph
+from . import __version__, accept, catalog, coverage, explain, paths, seal, trend, viewer_graph
 from .fixes import _name as object_name
 from .fixes import snippet
 from .invariants import IDS as INVARIANT_IDS
 from .model import Finding, Severity, Snapshot
 from .report import (
     Report,
+    compare,
+    declared_nodes,
     finding_keys,
     fingerprint,
     grade_of,
@@ -73,6 +75,8 @@ class Baseline:
     findings: list[Finding]
     collected_at: str | None  # ISO time, when the file says
     name: str  # the file name, for the Changes screen
+    unknown: set[str] = field(default_factory=set)  # check IDs the earlier run did not evaluate
+    declared: set[str] | None = None  # nodes it declared; None: what this run declares
 
 
 @dataclass
@@ -119,6 +123,9 @@ def viewmodel(r: Report, snap: Snapshot | None, opts: Options) -> dict[str, Any]
         "invariants": _invariants(r.findings, opts.spec),
         "baseline": _baseline(r, opts),
         "notes": list(r.snap.notes),
+        "declared_tier0": r.declared,
+        "check_status": rep["check_status"],
+        "coverage": rep["coverage"],
         "trend": trend.build(opts.history, trend.point(rep, "this run"))
         if opts.history is not None
         else None,
@@ -236,7 +243,7 @@ _WHATIF_ROWS: dict[str, dict[str, str]] = {
         "note": "str?",
     },
     "accounts": {"account": "str", "before": "obj", "after": "obj"},
-    "assumptions": {"name": "str", "source": "str"},
+    "assumptions": {"name": "str", "source": "str", "status": "str?"},
 }  # fmt: skip
 _WHATIF_RECOMMENDATION = {
     "goal": "str", "near": "str", "cost": "int", "changes": "int", "budget": "int?",
@@ -403,6 +410,7 @@ def _paths(findings: list[Finding]) -> dict[str, Any] | None:
         return None
     kept = set(f.objects)
     records = [p for p in f.data["paths"] if p.get("object") in kept]
+    extended = [p for p in f.data.get("declared_paths", []) if p.get("object") in kept]
     nodes: list[dict[str, Any]] = []
     index: dict[str, int] = {}
 
@@ -413,12 +421,15 @@ def _paths(findings: list[Finding]) -> dict[str, Any] | None:
             if rec["id"].startswith("sid:"):
                 item["sid"] = rec["id"].removeprefix("sid:")
             nodes.append(item)
+        if rec.get("declared"):
+            nodes[index[rec["id"]]]["declared"] = True
         return index[rec["id"]]
 
     rows = []
-    for p in records:
+    for i, p in enumerate([*records, *extended]):
         rows.append(
             {
+                **({"declared": True} if i >= len(records) else {}),
                 "object": p["object"],
                 "key": f.key(p["object"]),
                 "fingerprint": fingerprint(f.check_id, f.key(p["object"])),
@@ -440,7 +451,8 @@ def _paths(findings: list[Finding]) -> dict[str, Any] | None:
         if mentions[i]:
             item["findings"] = mentions[i]
     exposed, users = f.data.get("exposed"), f.data.get("users")
-    mermaid = mermaid_paths([p["object"] for p in records], limit=len(records))
+    shown = [p["object"] for p in [*records, *extended]]
+    mermaid = mermaid_paths(shown, limit=len(shown))
     return {
         "detail": f.detail,
         "exposed": exposed,
@@ -575,6 +587,8 @@ def _baseline(r: Report, opts: Options) -> dict[str, Any] | None:
     if opts.entries is not None:  # judge the old run by the same acceptances
         entries = copy.deepcopy(opts.entries)
         old = accept.apply(old, entries, r.snap.collected_at.date(), None)[0]
+    unknown = coverage.unevaluated(r.statuses())
+    changes = compare(old, r.findings, b.unknown, unknown, b.declared, declared_nodes(r.declared))
     before = {(f.check_id, f.key(o)): (f, o) for f in old for o in f.objects}
     after = {(f.check_id, f.key(o)): (f, o) for f in r.findings for o in f.objects}
 
@@ -599,8 +613,13 @@ def _baseline(r: Report, opts: Options) -> dict[str, Any] | None:
         "collected_at": b.collected_at,
         "score": score,
         "grade": grade_of(score),
-        "new": [row(*after[k]) for k in sorted(after.keys() - before.keys())],
-        "resolved": [row(*before[k]) for k in sorted(before.keys() - after.keys())],
+        "new": [row(*after[k]) for k in changes.added],
+        # a finding of a check this run could not evaluate is not known to be gone
+        "resolved": [row(*before[k]) for k in changes.resolved],
+        "not_evaluated": [row(*before[k]) for k in changes.not_evaluated_now],
+        # nor is one the earlier run could not evaluate known to be new
+        "not_evaluated_before": [row(*after[k]) for k in changes.not_evaluated_before],
+        "declaration_changed": [row(*(after.get(k) or before[k])) for k in changes.declaration],
         "changed": changed,
         "unchanged": len(finding_keys(r.findings) & finding_keys(old)) - len(changed),
         "exposed": old_paths.data.get("exposed") if old_paths else None,

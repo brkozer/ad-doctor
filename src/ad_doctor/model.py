@@ -410,6 +410,53 @@ class Dmsa:
 
 
 @dataclass
+class AuthPolicy:
+    """An authentication policy (msDS-AuthNPolicy), as far as a silo's effect depends on it."""
+
+    name: str
+    dn: str
+    # msDS-AuthNPolicyEnforced: False means audit only
+    enforced: bool = False
+    # msDS-UserAllowedToAuthenticateFrom is set and is not an unconditional allow for everyone:
+    # the policy limits where its users sign in (what its condition says is not evaluated)
+    limits_user_from: bool = False
+
+
+@dataclass
+class AuthSilo:
+    """An authentication policy silo (msDS-AuthNPolicySilo)."""
+
+    name: str
+    dn: str
+    # msDS-AuthNPolicySiloEnforced: False means audit only
+    enforced: bool = False
+    # msDS-AuthNPolicySiloMembers: accounts the silo permits
+    members: list[str] = field(default_factory=list)
+    # msDS-AssignedAuthNPolicySiloBL: accounts that name this silo. The KDC wants both
+    assigned: list[str] = field(default_factory=list)
+    # msDS-UserAuthNPolicy: the DN of the policy applied to users in the silo
+    user_policy: str = ""
+
+
+@dataclass
+class MemberChange:
+    """A value of `member` in a tier-0 group, with when it last became a member."""
+
+    group: str
+    group_dn: str
+    member_dn: str
+    added: datetime
+
+
+@dataclass
+class SidHistoryChange:
+    """When an account's sIDHistory was last written, from replication metadata."""
+
+    dn: str
+    changed: datetime
+
+
+@dataclass
 class Site:
     dn: str
     # server objects under the site: domain controllers, or leftovers of ones that left
@@ -712,6 +759,22 @@ class Snapshot:
     dns_spn_hosts: list[str] = field(default_factory=list)
     # names delegated to other DNS servers (NS records) that some SPN host lies under
     dns_delegations: list[str] = field(default_factory=list)
+    # False in older snapshots and when SYSVOL was not read: deny logon rights not evaluated
+    logon_rights_collected: bool = False
+    auth_silos: list[AuthSilo] = field(default_factory=list)
+    auth_policies: list[AuthPolicy] = field(default_factory=list)
+    # False in older snapshots and when the silo objects could not be read
+    silos_checked: bool = False
+    # when the domain head was created: changes in its first day are the install
+    domain_created: datetime | None = None
+    # current members of tier-0 groups with when they were added
+    member_changes: list[MemberChange] = field(default_factory=list)
+    member_changes_checked: bool = False
+    # last originating change of AdminSDHolder's nTSecurityDescriptor
+    admin_sd_holder_changed: datetime | None = None
+    admin_sd_holder_checked: bool = False
+    sid_history_changes: list[SidHistoryChange] = field(default_factory=list)
+    sid_history_checked: bool = False
     # parts of the collection that could not run (no AD CS, SYSVOL unreachable, ...)
     notes: list[str] = field(default_factory=list)
     # False in older snapshots: Ace.inherited was not kept, so an inherited copy looks
@@ -906,6 +969,23 @@ class Snapshot:
             dns_nodes_checked=data.get("dns_nodes_checked", False),
             dns_spn_hosts=data.get("dns_spn_hosts", []),
             dns_delegations=data.get("dns_delegations", []),
+            logon_rights_collected=data.get("logon_rights_collected", False),
+            auth_silos=[AuthSilo(**x) for x in data.get("auth_silos", [])],
+            auth_policies=[AuthPolicy(**x) for x in data.get("auth_policies", [])],
+            silos_checked=data.get("silos_checked", False),
+            domain_created=_dt(data.get("domain_created")),
+            member_changes=[
+                MemberChange(**{**x, "added": _required_dt(x["added"])})
+                for x in data.get("member_changes", [])
+            ],
+            member_changes_checked=data.get("member_changes_checked", False),
+            admin_sd_holder_changed=_dt(data.get("admin_sd_holder_changed")),
+            admin_sd_holder_checked=data.get("admin_sd_holder_checked", False),
+            sid_history_changes=[
+                SidHistoryChange(**{**x, "changed": _required_dt(x["changed"])})
+                for x in data.get("sid_history_changes", [])
+            ],
+            sid_history_checked=data.get("sid_history_checked", False),
             dns_admins=data.get("dns_admins", []),
             pre2k_members=data.get("pre2k_members", []),
             ds_heuristics=data.get("ds_heuristics", ""),
@@ -985,6 +1065,8 @@ EXCHANGE_GROUPS = {
     "exchange trusted subsystem",
     "organization management",
 }
+# domain functional level from which authentication policy silos work (Windows Server 2012 R2)
+SILO_LEVEL = 6
 TIER0_SIDS = {"S-1-5-9", "S-1-5-18", "S-1-5-32-544"}
 TIER0_RIDS = {"498", "500", "512", "516", "518", "519", "521"}
 FOREST_ROOT_RIDS = {"498", "500", "512", "518", "519"}
@@ -1030,6 +1112,11 @@ def _older_snapshot_notes(data: dict[str, Any]) -> list[str]:
                 "(audit.csv and Registry.xml)",
             ),
             ("tier0_members_checked", "AD-PRIV-012 (unreadable tier-0 members)"),
+            ("logon_rights_collected", "AD-PRIV-013 (deny logon rights per OU)"),
+            ("silos_checked", "AD-PRIV-014 (authentication policy silos)"),
+            ("member_changes_checked", "AD-PRIV-015 (recent additions to tier-0 groups)"),
+            ("admin_sd_holder_checked", "AD-ACL-010 (recent change to AdminSDHolder's ACL)"),
+            ("sid_history_checked", "AD-ACC-017 (recent sIDHistory changes)"),
             ("trust_details_checked", "AD-INF-016 and the AES part of AD-INF-015 (trust details)"),
             ("spn_mappings", "the part of AD-DEL-005 about hosts that exist (SPN aliases)"),
             ("site_topology_checked", "AD-INF-020 (sites and subnets)"),
@@ -1115,6 +1202,10 @@ def _encode(value: Any) -> Any:
 
 def _dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
+
+
+def _required_dt(value: str) -> datetime:
+    return datetime.fromisoformat(value)
 
 
 class Severity(IntEnum):

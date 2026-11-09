@@ -119,7 +119,9 @@ def _assumed(doc: dict[str, Any]) -> list[str]:
     rows = doc.get("assumptions", [])
     if not rows:
         return []
-    shown = ", ".join(f"{r['name']} ({r['source']})" for r in rows)
+    shown = ", ".join(
+        f"{r['name']} ({r['source']}{', not evaluated' if r.get('status') else ''})" for r in rows
+    )
     return [f"Assumed tier 0 (not changes; numbers count them as tier 0): {shown}", ""]
 
 
@@ -157,7 +159,11 @@ def render_text(doc: dict[str, Any]) -> str:
         elif rec["budget"] is not None and doc["before"]["routes"]:
             out.append("The budget allows no change that helps.")
         else:
-            out.append("Nothing to change: no closable source reaches tier 0.")
+            out.append(
+                "Nothing to change in the control graph at hand, which is incomplete (see notes)."
+                if doc.get("path_check")
+                else "Nothing to change: no closable source reaches tier 0."
+            )
         out += ["", _verdict(rec)]
         if rec["alternatives"]:
             other = "the sources" if rec["near"] == "tier0" else "tier 0"

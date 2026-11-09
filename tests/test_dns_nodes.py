@@ -14,11 +14,11 @@ from xml.etree import ElementTree
 import pytest
 from ldap3.core.exceptions import LDAPInsufficientAccessRightsResult
 
-from ad_doctor import dnsprop, redact, sd
+from ad_doctor import coverage, dnsprop, redact, sd
 from ad_doctor.checks import dns_lookup_hosts, run_all
 from ad_doctor.collect import MAX_KEPT_DNS_NODES, Collector
 from ad_doctor.model import DnsNode, DnsZone, Severity, Snapshot
-from ad_doctor.report import Report, not_judged, render_junit, render_sarif
+from ad_doctor.report import Report, render_junit, render_sarif
 from ad_doctor.sd import Ace
 from tests.test_acl_adcs import ace_bytes, descriptor, sid_bytes
 from tests.test_checks import NOW, computer, ids, only, snapshot, user
@@ -549,7 +549,7 @@ def test_older_snapshot_skips_every_dns_check_in_junit() -> None:
 def test_collector_notes_skip_every_check_they_name(note: str, named: set[str]) -> None:
     snap = snapshot(notes=[note])
     assert skipped_in_junit(snap) == named
-    assert set(not_judged(Report(snap, []))) == named
+    assert set(coverage.note_gaps(snap.notes)) == named
     item = json.loads(render_sarif(Report(snap, [])))["runs"][0]["invocations"][0][
         "toolConfigurationNotifications"
     ][0]
@@ -573,7 +573,7 @@ def test_notes_from_a_real_walk_skip_every_check() -> None:
     ],
 )
 def test_ranges_in_notes_are_bounded_and_well_formed(note: str, expected: set[str]) -> None:
-    assert set(not_judged(Report(snapshot(notes=[note]), []))) == expected
+    assert set(coverage.note_gaps([note])) == expected
 
 
 def test_quiet_when_records_were_not_read() -> None:

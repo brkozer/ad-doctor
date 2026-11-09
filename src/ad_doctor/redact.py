@@ -21,7 +21,7 @@ import uuid
 from typing import Any
 from urllib.parse import urlsplit
 
-from . import model, regpol
+from . import gpo_scope, model, regpol
 
 KEEP = {
     "administrator", "guest", "krbtgt", "defaultaccount", "wdagutilityaccount",
@@ -115,7 +115,8 @@ FIXED_KEYS = {
                 model.ScriptSecret, model.GpoLocalGroup, model.GpLink, model.RegistryEntry,
                 model.GpoAutologon,
                 model.UnreadableMember, model.KeyCredential, model.Site, model.Subnet,
-                model.ConflictObject, model.Pso, model.Dmsa, model.DnsZone, model.DnsNode)
+                model.ConflictObject, model.Pso, model.Dmsa, model.DnsZone, model.DnsNode,
+                model.AuthSilo, model.AuthPolicy, model.MemberChange, model.SidHistoryChange)
     for f in dataclasses.fields(cls)
 } | {"domain", "AdminSDHolder", "sid", "mask", "object_type", "inherited_object_type"}  # fmt: skip
 # values from a fixed list, which the checks compare: never data, whatever the names around
@@ -239,6 +240,17 @@ class Redactor:
         for node in data.get("dns_nodes", []):
             words.add(node["zone"])
             words.update(label for label in node["name"].split(".") if label != "*")
+        for silo in data.get("auth_silos", []):
+            words.update([silo["name"], *_dn_values(silo["dn"])])
+            for dn in [*silo["members"], *silo["assigned"], silo["user_policy"]]:
+                words.update(_dn_values(dn))
+        for policy in data.get("auth_policies", []):
+            words.update([policy["name"], *_dn_values(policy["dn"])])
+        for change in data.get("member_changes", []):
+            words.update([change["group"], *_dn_values(change["group_dn"])])
+            words.update(_dn_values(change["member_dn"]))
+        for change in data.get("sid_history_changes", []):
+            words.update(_dn_values(change["dn"]))
         for o in data.get("objects", []):
             words.add(o["name"])
             words.update(_dn_values(o["dn"]))
@@ -254,6 +266,11 @@ class Redactor:
         for s in data.get("gpo_settings", {}).values():
             for server in s.get("ntlm_exceptions", []):
                 words.update([server, *server.split(".")])
+            for right in gpo_scope.DENY_LOGON_RIGHTS:
+                for holder in s.get("privileges", {}).get(right, []):
+                    # a name that did not resolve stays as written, and a note repeats it
+                    if not holder.upper().startswith("S-1-") and not model.well_known_sid(holder):
+                        words.update([holder, *re.split(r"[\\@]", holder)])
         for store in POLICY_STORES:
             for entries in data.get(store, {}).values():
                 for e in entries:

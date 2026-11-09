@@ -8,7 +8,7 @@
 Read-only Active Directory security audit that fits in a pipeline.
 
 ad-doctor binds as an ordinary domain user, takes one snapshot of the domain over LDAP
-(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 125
+(plus SYSVOL and a few cheap probes of every DC over SMB, LDAP and HTTP) and runs 130
 checks for what attackers look for first: roastable accounts, risky delegation,
 exploitable certificate templates and CA settings (ESC1–9, 11, 13–17), DCSync and other takeover rights,
 shadow credentials, BadSuccessor, PrivExchange, exposed Entra Connect sync accounts,
@@ -121,6 +121,7 @@ against a live DC.
 | | AD-ACC-014 | Stale enabled computer accounts | low |
 | | AD-ACC-015 | gMSA passwords with a long rotation interval | low |
 | | AD-ACC-016 | Identity collisions to review: UPN, SPN and host name | low |
+| | AD-ACC-017 | sIDHistory written in the last 30 days (replication metadata) | low/medium |
 | Privileged access | AD-PRIV-001 | Tier-0 groups with more than 5 members | low |
 | | AD-PRIV-002 | Privileged accounts that can be delegated | medium |
 | | AD-PRIV-003 | Schema Admins or Enterprise Admins not empty | low |
@@ -133,6 +134,9 @@ against a live DC.
 | | AD-PRIV-010 | Protected Users not used for administrators | info |
 | | AD-PRIV-011 | Entra Connect sync account can DCSync and its server is not protected as tier 0 | medium |
 | | AD-PRIV-012 | Tier-0 group members the scanning account cannot read | high |
+| | AD-PRIV-013 | Tier-0 accounts not denied logon on lower-tier computers, per OU with Group Policy precedence | info/low/medium |
+| | AD-PRIV-014 | Tier-0 accounts outside an enforced authentication policy silo | low |
+| | AD-PRIV-015 | Members added to tier-0 groups in the last 30 days (replication metadata) | low |
 | Policy | AD-POL-001 | Weak default password policy | medium |
 | | AD-POL-002 | `ms-DS-MachineAccountQuota` above 0 | medium |
 | | AD-POL-003 | Weak fine-grained password policies | low/medium |
@@ -195,6 +199,7 @@ against a live DC.
 | | AD-ACL-007 | Exchange groups with WriteDacl over the domain (PrivExchange); medium when only inherited | medium/high |
 | | AD-ACL-008 | Entra Connect sync account or server controllable outside tier 0 | high |
 | | AD-ACL-009 | Control over dMSAs that replace another account | low/medium |
+| | AD-ACL-010 | AdminSDHolder's ACL changed in the last 30 days (replication metadata) | medium |
 | Group Policy | AD-GPO-001 | GPOs linked to the domain or DC OU editable outside tier 0 | high |
 | | AD-GPO-002 | Non-tier-0 principals can link GPOs to the domain or DCs | high |
 | | AD-GPO-003 | NTLMv1/LM, LM hashes, reversible encryption or dangerous privileges in those GPOs | medium/high |
@@ -296,7 +301,11 @@ ad-doctor export-graph 2026-11.json -o graph.json --paths-only
 | `--signing-probe-port PORT` | plain LDAP port for the signing probe; `0` skips it |
 
 Parts that cannot run (no AD CS, SYSVOL unreachable, Kerberos without an NTLM account for
-the signing probes) become notes in the report instead of failing the scan. Domain
+the signing probes) become notes in the report instead of failing the scan, and every
+format shows each check as **judged**, **not applicable** (the snapshot proves the feature
+is absent) or **not evaluated**, with the reason (data unreadable, older snapshot, switched
+off). A check that was not evaluated never counts as passed: JUnit marks it skipped, a
+finding it had before stays out of "resolved" and the risk score is then a minimum. Domain
 controllers that require LDAP signing (the default on Windows Server 2025) reject plain
 LDAP binds, so use `--ldaps`.
 
@@ -455,6 +464,25 @@ ports. A CES URL is reached on the port it names; only a URL with no port follow
   no account holds. A zone whose records cannot be listed is named in a note, not passed.
 - AD-PRIV-012 compares `member` values with search results. A group whose `member`
   attribute is denied looks empty, and groups of other domains are not read.
+- AD-PRIV-013 plays each computer's security templates with Group Policy precedence; a
+  right is not merged across GPOs, the one applied last wins. A deny set in the computer's
+  own local policy is not visible. An admin workstation you declare yourself is not known to
+  the check: accept that OU by ID and fingerprint. On those computers a deny for Administrators
+  names the computer's own group: it counts for Domain Admins only, assuming the default local
+  membership. A member of a tier-0 group the scan cannot read leaves the check not evaluated,
+  unless the deny names a group that holds it.
+- AD-PRIV-014: the schema gives Authenticated Users read and list on silos and policies, and
+  the lab returns the containers to `adreader`. It is reported as not evaluated when the
+  container's DACL no longer lets ordinary users list it. The built-in Administrator is left
+  out, and an authentication policy assigned to an account without a silo does not count. The
+  user policy's sign-in limit counts unless it is an unconditional allow for Everyone or
+  Authenticated Users; what a condition says is not evaluated. A member of a tier-0 group the
+  scan cannot read leaves the check not evaluated.
+- AD-PRIV-015, AD-ACL-010 and AD-ACC-017 are indicators from replication metadata, with a
+  stated window: 30 days before the snapshot, not counting the domain's first 24 hours.
+  The metadata says when, not who or what. The extra cost is one BASE read per tier-0 group,
+  one for AdminSDHolder, up to four searches for silos and policies, and one per account with
+  SID history, up to 500; none of it grows with the number of ordinary users.
 - An ordinary user cannot read fine-grained password policies; the report says so
   instead of assuming the default policy applies to admins, and AD-POL-003 stays silent.
   With an account that can read them, a tie on precedence is not broken (Windows uses the
@@ -479,7 +507,9 @@ ports. A CES URL is reached on the port it names; only a URL with no port follow
   below level 2016 (AD-INF-003: a 2025 DC needs that level), a DC or CA the probes cannot
   read (AD-INF-013, AD-ADCS-016), large tier-0 groups (AD-PRIV-001, not seeded),
   krbtgt, Seamless SSO and admin password age, the password and DC parts of AD-KRB-005,
-  SID history, trust SID filtering, the age of a trust (AD-INF-016 needs 40 days to pass;
+  SID history (AD-ACC-017 needs a real one), an AdminSDHolder change after the domain's first
+  day (AD-ACL-010: the lab's ACL was changed on the first day), silos that exist (AD-PRIV-014:
+  the lab has none) and a deny logon GPO (AD-PRIV-013: none in the lab), trust SID filtering, the age of a trust (AD-INF-016 needs 40 days to pass;
   the lab test moves the snapshot's date instead), RODCs, SMB signing
   off on a DC, the spooler and the high grade of AD-CHAIN-002 and -003 on Server Core 2025
   (which ships without it), the Entra Kerberos object and
@@ -497,7 +527,7 @@ flowchart LR
     P --> S
     S -- "collect -o / redact" --> F[(snapshot.json)]
     F --> A
-    S --> A[checks.py + paths.py<br/>125 pure functions]
+    S --> A[checks.py + paths.py<br/>130 pure functions]
     A --> I[invariants.py<br/>accept.py]
     I --> R[report.py<br/>text, JSON, Markdown,<br/>SARIF, JUnit]
     I --> W[viewer.py<br/>offline HTML viewer]
@@ -639,6 +669,20 @@ than break sync.
 
 See [docs/whatif.md](docs/whatif.md) for the forms, the plan file, the model and its
 limits.
+
+### Declaring your own tier 0
+
+```bash
+ad-doctor collect dc01.corp.example -u 'CORP\auditor' -o snap.json --tier0-file tier0.toml
+ad-doctor analyze snap.json --tier0-file tier0.toml    # tier0 = ["JUMP01$", "svc_backup"]
+```
+
+`--tier0-file` (or `--tier0 NAME`) on `analyze`, `scan`, `paths` and `view` adds assets as
+extended targets. Built-in tier 0 and every other check stay as they were, and paths to a
+declared asset end with `[declared tier 0]`. Collection needs the same file, because the
+owner and DACL of an ordinary user or computer are read only when it is declared: without them
+the asset is reported as **not evaluated**, never as clean. See
+[docs/declared-tier0.md](docs/declared-tier0.md).
 
 ## Performance
 

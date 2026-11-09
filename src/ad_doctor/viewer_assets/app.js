@@ -608,9 +608,9 @@
     } else {
       exposure = h("div", { class: "panel exposure" },
         h("div", { class: "eyebrow" }, "Tier-0 exposure"),
-        h("div", { class: "lead" }, h("div", { class: "hero-num" }, "0"),
+        h("div", { class: "lead" }, h("div", { class: "hero-num" }, !p && pathsNotEvaluated() ? "–" : "0"),
           h("p", null, p ? "Control paths are listed, but this report does not carry the user count."
-            : "No principal outside tier 0 has a control path to it in this snapshot.")),
+            : noPathsText("snapshot"))),
         p ? h("div", { class: "link-row" }, h("a", { href: "#paths" }, "Open control paths →")) : null);
     }
 
@@ -629,11 +629,13 @@
     const cats = h("div", { class: "panel" }, sectionTitle("Risk by category",
       h("span", { class: "small muted" }, "0 to 100 per category")),
     h("div", { class: "cats" }, VM.categories.map(([name, score]) => {
+      const unknown = VM.coverage ? VM.coverage.by_category[name] || 0 : 0;
       const bar = h("span", { class: fillClass(score) });
       bar.style.width = (score ? Math.max(score, 2) : 0) + "%";
-      return h("a", { class: "cat" + (score ? "" : " zero"), href: hrefFor("findings", { cat: name }) },
+      return h("a", { class: "cat" + (score || unknown ? "" : " zero"), href: hrefFor("findings", { cat: name }),
+        title: unknown ? plural(unknown, "check") + " not evaluated" : null },
         h("span", { class: "name" }, name), h("span", { class: "track" }, bar),
-        h("span", { class: "v" }, String(score)));
+        h("span", { class: "v" + (unknown ? " warn-text" : "") }, score + (unknown ? "+" : "")));
     })));
 
     const acts = h("div", { class: "panel" }, sectionTitle("Top actions",
@@ -659,12 +661,68 @@
 
     out.push(h("div", null, sectionTitle("Lifecycle"), lifecycleTiles()));
 
+    out.push(coveragePanel());
+
     if (VM.notes.length) {
       out.push(h("div", { class: "panel" }, sectionTitle("Notes",
         h("span", { class: "small muted" }, "what this run could not check, and acceptance warnings")),
       h("ul", { class: "notes" }, VM.notes.map((n) => h("li", null, n)))));
     }
     return h("div", { class: "stack" }, out);
+  }
+
+  function minimumScore() {
+    return Boolean(VM.coverage && VM.coverage.score_is_minimum);
+  }
+
+  function notEvaluatedCount() {
+    return VM.coverage ? VM.coverage.not_evaluated : 0;
+  }
+
+  // AD-PATH-001's status: "no path" is only an answer when the check gave one
+  function pathCheck() {
+    return (VM.check_status || []).find((c) => c.id === "AD-PATH-001") || null;
+  }
+
+  function pathsNotEvaluated() {
+    const c = pathCheck();
+    return Boolean(c && c.status === "not_evaluated");
+  }
+
+  function noPathsText(where) {
+    if (!pathsNotEvaluated()) return "No principal outside tier 0 has a control path to it in this " + where + ".";
+    return "Control paths were not evaluated, so a path that is not shown can exist: " + (pathCheck().notes || []).join("; ");
+  }
+
+  function pathGapBanner() {
+    const c = pathCheck();
+    if (!c || !c.partial) return null;
+    return h("div", { class: "banner medium" }, h("div", null, h("strong", null, "Judged in part. "),
+      "More paths can exist than are listed: " + (c.notes || []).join("; ")));
+  }
+
+  const REASON = { unreadable: "Data unreadable", older_snapshot: "Older snapshot", switched_off: "Switched off" };
+
+  function coveragePanel() {
+    const cov = VM.coverage;
+    if (!cov) return null;
+    const rows = VM.check_status.filter((c) => c.status === "not_evaluated");
+    const na = VM.check_status.filter((c) => c.status === "not_applicable");
+    const table = (list, why) => h("div", { class: "table-wrap" }, h("table", null,
+      h("thead", null, h("tr", null, ["Check", "Title", "Why"].map((x) => h("th", null, x)))),
+      h("tbody", null, list.map((c) => h("tr", null,
+        h("td", { class: "nowrap mono" }, c.id), h("td", null, c.title), h("td", null, why(c)))))));
+    return h("div", { class: "panel" }, sectionTitle("Check coverage",
+      h("span", { class: "small muted" }, cov.judged + " judged · " + cov.not_applicable + " not applicable · " +
+        cov.not_evaluated + " not evaluated")),
+    rows.length ? table(rows, (c) => [REASON[c.reason] || c.reason, h("div", { class: "small muted" }, (c.notes || []).join("; "))]) :
+      h("div", { class: "empty" + (minimumScore() ? "" : " good") }, minimumScore()
+        ? "A failed search was not tied to a check, so what it left out is unknown."
+        : "Every check that applies was judged."),
+    cov.partial ? h("p", { class: "small muted" }, plural(cov.partial, "check") + " found something but could not judge everything it covers; see the notes.") : null,
+    (cov.unattributed_notes || []).length ? h("p", { class: "small warn-text" }, plural(cov.unattributed_notes.length, "failed search") + " could not be tied to a check; the score is a minimum.") : null,
+    na.length ? h("details", { class: "row-top" }, h("summary", null, "Not applicable (" + na.length + ")"),
+      table(na, (c) => (c.notes || []).join("; "))) : null);
   }
 
   function exposureMeter(pct) {
@@ -700,10 +758,14 @@
       h("div", { class: "score-top" },
         h("div", null, h("div", { class: "eyebrow" }, "Risk score"),
           h("div", { class: "hero-num" }, String(VM.score), h("span", { class: "unit" }, "/100"))),
-        h("div", { class: "grade " + VM.grade, "aria-label": "Grade " + VM.grade }, VM.grade)),
+        h("div", { class: "grade" + (minimumScore() ? "" : " " + VM.grade),
+          "aria-label": "Grade " + VM.grade + (minimumScore() ? ", a minimum" : "") }, VM.grade)),
       h("div", { class: "scale" }, track, labels),
       b ? h("div", { class: "delta" }, "Baseline " + fmtDate(b.collected_at) + ": ",
         h("b", null, b.score + " (" + b.grade + ")"), " → ", h("b", null, VM.score + " (" + VM.grade + ")")) : null,
+      minimumScore() ? h("p", { class: "small warn-text" }, notEvaluatedCount()
+        ? "A minimum: " + plural(notEvaluatedCount(), "check") + " not evaluated, and those add nothing to it."
+        : "A minimum: a failed search could not be tied to a check.") : null,
       h("p", { class: "formula" }, "Lower is better. Each high finding adds 15, medium 6, low 2, " +
         "capped at 100; exposure tells more once the score saturates."));
   }
@@ -767,7 +829,12 @@
   function viewFindings(r) {
     if (!VM.findings.length) {
       return h("div", null, pageHead("Findings", "Findings"),
-        h("div", { class: "empty good" }, h("strong", null, "No findings: every check that ran passed. "),
+        h("div", { class: "empty" + (minimumScore() ? "" : " good") },
+          h("strong", null, notEvaluatedCount()
+            ? "No findings in the checks judged: " + plural(notEvaluatedCount(), "check") + " not evaluated. "
+            : minimumScore()
+              ? "No findings in the checks judged: a failed search was not tied to a check. "
+              : "No findings: every check that ran passed. "),
           "What this run could not check is listed under ", h("a", { href: "#about" }, "About this file"),
           VM.notes.length ? [" and in the ", h("a", { href: "#overview" }, "notes on the overview")] : null, "."));
     }
@@ -1035,7 +1102,8 @@
     const P = VM.paths;
     if (!P) {
       return h("div", null, pageHead("Control paths", "Control paths to tier 0"), banners(),
-        h("div", { class: "empty" }, "No principal outside tier 0 has a control path to it in this report."));
+        declaredPanel(),
+        h("div", { class: "empty" }, noPathsText("report")));
     }
     const wanted = parseInt(r.arg, 10);
     if (!isNaN(wanted) && wanted >= 0 && wanted < P.list.length) {
@@ -1099,7 +1167,8 @@
         title: p.object },
       h("span", { class: "s" }, start.name),
       h("span", { class: "hops" }, plural(p.steps.length, "hop")),
-      h("span", { class: "e" }, (KIND_LABEL[start.kind] || start.kind) + " → " + last.name));
+      h("span", { class: "e" }, (KIND_LABEL[start.kind] || start.kind) + " → " + last.name +
+        (p.declared ? " (declared tier 0)" : "")));
       btn.addEventListener("click", () => {
         history.replaceState(null, "", pathHash(i));
         state.path = i;
@@ -1123,12 +1192,35 @@
     return h("div", { class: "stack" },
       pageHead("Control paths", "Control paths to tier 0", P.detail, [copyMermaid]),
       banners(),
+      pathGapBanner(),
+      declaredPanel(),
       P.broad ? h("div", { class: "banner high" }, h("div", null, h("strong", null, "Broad groups have a path. "),
         "Every user is effectively tier 0: fix those first.")) : null,
       stats,
       filters,
       h("div", { class: "paths-layout" }, list, chainBox),
       chokepointTable());
+  }
+
+  // the assets a user declared: which set each one is in and whether it could be judged
+  function declaredPanel() {
+    const D = VM.declared_tier0;
+    if (!D) return null;
+    const line = (a) => {
+      const seen = plural(a.principals || 0, "principal");
+      if (a.set === "built-in") return ["already built-in tier 0"];
+      if (a.status !== "not_evaluated") return [seen + " with a path"];
+      return [h("span", { class: "pill high" }, "Not evaluated"),
+        " " + a.reason + "; " + seen + " with a path that needs no DACL of its own"];
+    };
+    return h("div", { class: "panel" },
+      h("h2", null, "Declared tier 0 (extended targets)"),
+      h("p", { class: "small muted" }, "Added for this report; built-in tier 0 is unchanged. " +
+        D.exposed_with_declared + " of " + D.users_with_declared +
+        " enabled users outside both sets have a path to either."),
+      h("ul", { class: "declared-assets" }, D.assets.map((a) => h("li", null,
+        h("strong", null, a.name), " (" + (KIND_LABEL[a.kind] || a.kind) + ", from " + a.source + "): ",
+        line(a)))));
   }
 
   function stat(n, label, before) {
@@ -1153,7 +1245,7 @@
     box.replaceChildren(
       h("div", { class: "chain-head" },
         h("div", null, h("div", { class: "eyebrow" }, "Path " + (state.path + 1) + " of " + P.list.length +
-          " · " + plural(p.steps.length, "hop")),
+          " · " + plural(p.steps.length, "hop") + (p.declared ? " · to declared tier 0" : "")),
         h("h2", null, start.name + " → " + end.name)),
         h("div", { class: "no-print" }, copyButton(p.object, "Copy path", "path"),
           copyButton(p.fingerprint, "Copy fingerprint", "fingerprint"))),
@@ -1229,11 +1321,11 @@
         root.appendChild(svg("g", null, svg("title", null, how), line, head, labels));
       }
       const n = nodeAt(id);
-      const kind = (n.tier0 ? "TIER 0 · " : "") + (KIND_LABEL[n.kind] || n.kind).toUpperCase();
+      const kind = (n.tier0 ? "TIER 0 · " : n.declared ? "DECLARED · " : "") + (KIND_LABEL[n.kind] || n.kind).toUpperCase();
       const g = svg("g", {
-        class: "node" + (n.tier0 ? " tier0" : "") + (i === 0 ? " start" : "") + (id === state.node ? " sel" : ""),
+        class: "node" + (n.tier0 || n.declared ? " tier0" : "") + (i === 0 ? " start" : "") + (id === state.node ? " sel" : ""),
         tabindex: "0", role: "button", "aria-pressed": String(id === state.node),
-        "aria-label": n.name + ", " + (KIND_LABEL[n.kind] || n.kind) + (n.tier0 ? ", tier 0" : ""),
+        "aria-label": n.name + ", " + (KIND_LABEL[n.kind] || n.kind) + (n.tier0 ? ", tier 0" : n.declared ? ", declared tier 0" : ""),
       },
       svg("title", null, n.name),
       svg("rect", { class: "nbox", x: x, y: y, width: NW, height: NH, rx: 6 }),
@@ -1259,7 +1351,8 @@
       h("dt", null, "Name"), h("dd", { class: "mono" }, n.name),
       h("dt", null, "Kind"), h("dd", null, KIND_LABEL[n.kind] || n.kind),
       n.sid ? [h("dt", null, "SID"), h("dd", { class: "mono" }, n.sid)] : null,
-      h("dt", null, "Tier 0"), h("dd", null, n.tier0 ? h("span", { class: "pill high" }, "Yes") : "No"),
+      h("dt", null, "Tier 0"), h("dd", null, n.tier0 ? h("span", { class: "pill high" }, "Yes")
+        : n.declared ? h("span", { class: "pill high" }, "Declared") : "No"),
       h("dt", null, "On paths"), h("dd", null, on + " of " + P.list.length + (starts ? " (starts " + starts + ")" : "")),
       h("dt", null, "Also in"), h("dd", null, links.length ? h("span", { class: "links" }, links) :
         h("span", { class: "muted" }, "no other finding names it")));
@@ -1370,6 +1463,9 @@
       stat(c.new.length ? "+" + c.new.length : "0", "new findings on objects"),
       stat(c.resolved.length ? "−" + c.resolved.length : "0", "resolved"));
     const tabs = [["new", "New", c.new], ["resolved", "Resolved", c.resolved], ["changed", "Changed", c.changed]];
+    if ((c.not_evaluated || []).length) tabs.push(["not_evaluated", "Not evaluated now", c.not_evaluated]);
+    if ((c.not_evaluated_before || []).length) tabs.push(["not_evaluated_before", "Not evaluated before", c.not_evaluated_before]);
+    if ((c.declaration_changed || []).length) tabs.push(["declaration_changed", "Declaration changed", c.declaration_changed]);
     const body = h("div", null);
     const bar = h("div", { class: "tabs", role: "tablist" });
     const show = (key) => {
@@ -1520,7 +1616,8 @@
     }
     if (W.assumptions.length) {
       sections.push(sectionTitle("Assumed tier 0 (not changes)"));
-      sections.push(h("ul", null, W.assumptions.map((x) => h("li", null, x.name + " (" + x.source + ")"))));
+      sections.push(h("ul", null, W.assumptions.map((x) => h("li", null, x.name + " (" + x.source +
+        (x.status ? ", not evaluated" : "") + ")"))));
     }
     const notes = W.notes.concat(W.caveats);
     if (notes.length) {
@@ -1859,7 +1956,7 @@
   function changeTable(kind, rows) {
     if (!rows.length) {
       const text = { new: "Nothing new since the baseline.", resolved: "Nothing was resolved.",
-        changed: "No finding changed shape or severity." }[kind];
+        changed: "No finding changed shape or severity." }[kind] || "Nothing here.";
       return h("div", { class: "empty" }, text);
     }
     const head = kind === "changed"
@@ -1869,7 +1966,7 @@
       h("thead", null, h("tr", null, head.map((x) => h("th", null, x)))),
       h("tbody", null, rows.map((r) => h("tr", null,
         h("td", null, sevTag(r.severity)),
-        h("td", { class: "nowrap" }, kind === "resolved" ? h("span", { class: "mono" }, r.id) :
+        h("td", { class: "nowrap" }, kind === "resolved" || kind === "not_evaluated" || kind === "declaration_changed" ? h("span", { class: "mono" }, r.id) :
           h("a", { class: "mono", href: hrefFor("findings", { open: r.id }) }, r.id)),
         h("td", null, h("span", { class: "mono" }, r.object)),
         kind === "changed"
@@ -2032,6 +2129,9 @@
     return h("div", { class: "stack" },
       pageHead("Executive summary", VM.meta.domain, metaLine(), [back]),
       banners(),
+      notEvaluatedCount() ? h("div", { class: "banner medium" }, h("div", null,
+        h("strong", null, "Partial assessment. "),
+        plural(notEvaluatedCount(), "check") + " could not be evaluated, so the score below is a minimum.")) : null,
       h("div", { class: "grid" },
         h("div", { class: "span-7" }, h("div", { class: "panel" },
           h("div", { class: "eyebrow" }, "Tier-0 exposure"),
@@ -2256,7 +2356,8 @@
         const e = exposurePct(p);
         return h("tr", null,
           h("td", { class: "nowrap" }, fmtDate(p.at)), h("td", null, h("span", { class: "mono" }, p.name)),
-          h("td", { class: "nowrap" }, p.version + (p.checks ? " · " + p.checks + " checks" : "")),
+          h("td", { class: "nowrap" }, p.version + (p.checks ? " · " + p.checks + " checks" : "") +
+            (p.not_evaluated ? " · " + p.not_evaluated + " not evaluated" : "")),
           h("td", { class: "num" }, p.score + " (" + p.grade + ")"),
           SEVERITIES.map((s) => h("td", { class: "num" }, String(p.counts[s]))),
           h("td", { class: "num" }, e === null ? "–" : fmtPct(e) + (p.users ? " (" + p.exposed + "/" + p.users + ")" : "")));
@@ -2656,7 +2757,10 @@
     }
     try {
       const rep = CORE.parseReport(await file.text());
-      state.adhoc = { name: file.name, report: rep, diff: CORE.diffReports(rep, currentFindings()) };
+      const unknown = new Set((VM.check_status || []).filter((x) => x.status === "not_evaluated").map((x) => x.id));
+      const assets = (VM.declared_tier0 && VM.declared_tier0.assets) || [];
+      const declared = assets.filter((a) => a.set === "declared").map((a) => a.name);
+      state.adhoc = { name: file.name, report: rep, diff: CORE.diffReports(rep, currentFindings(), unknown, declared) };
       state.tab = "new";
       announce("Compared with " + file.name);
       route();

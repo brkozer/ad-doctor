@@ -110,6 +110,7 @@ which is how the three ESC templates that Domain Users enrolls in and the CA fla
 | `--allow KIND` | propose only changes of these kinds (repeatable) |
 | `--accept FILE` | accepted AD-PATH-001 holders are not sources; other accepted findings keep the changes behind them |
 | `--invariants FILE` | `[dcsync] allowed` and the declared members of `[groups]` are kept |
+| `--tier0-file FILE` | the names of a file (`tier0 = [...]`), the same format `analyze` and `paths` take: see [Declared tier 0](declared-tier0.md) |
 | `--plan FILE` | take the `[[keep]]` entries and `[assume] tier0` of a plan file |
 | `--paths-only` | skip the findings recheck |
 
@@ -194,7 +195,7 @@ An expired `[[keep]]` is a candidate again, with a note.
 |---|---|
 | 0 | ok |
 | 1 | error: usage, an ambiguous name, an absent change under `--strict` or `--check`, a model mismatch |
-| 2 | a gate failed: `[expect]` under `--check`, `--fail-if-exposed N` (more than N users exposed after the changes), `--fail-on SEVERITY` (a finding at that level would appear) |
+| 2 | a gate failed: `[expect]` under `--check`, `--fail-if-exposed N` (more than N users exposed after the changes, or a control graph with edges missing: a limit cannot be met on it), `--fail-on SEVERITY` (a finding at that level would appear) |
 | 3 | plan rot under `--check`: a stale or ineffective change, an edited `id`, or a snapshot of another domain |
 
 ## Fix lines

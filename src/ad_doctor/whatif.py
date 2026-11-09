@@ -161,7 +161,7 @@ def masked(
     tier0 = g.tier0
     if extra_t0 or any(prov.prims[p][0] in CA_KINDS for p in gone):
         tier0 = _tier0(g, snap, prov, gone, closed) | extra_t0
-    return Graph(edges, g.names, tier0, logon, g.edge_props, g.kinds, prov)
+    return Graph(edges, g.names, tier0, logon, g.edge_props, g.kinds, prov, extra_t0 - g.tier0)
 
 
 def _reorder(
@@ -358,6 +358,7 @@ def run(
             rebuilt.logon_edges,
             rebuilt.edge_props,
             rebuilt.kinds,
+            declared=set(extra) - g.tier0,
         )
         after = state(snap, rebuilt)
     closed, rerouted, still = classify(before, after)

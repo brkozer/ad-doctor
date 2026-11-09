@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import sys
 from collections import Counter, deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Collection, Container, Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from . import gpo_scope, sd
@@ -65,10 +65,11 @@ SID_HISTORY = "SID history"
 ENROLL_ESC13 = "enroll (ESC13)"
 ENROLL_ESC6 = "enroll (ESC6+ESC16)"
 # a snapshot does not hold a member server's local groups
-LOCAL_ADMIN_CAVEAT = "assumes Domain Admins is in the local Administrators"
+LOCAL_ADMIN_CAVEAT = gpo_scope.LOCAL_ADMIN_CAVEAT
 # msDS-Behavior-Version of Windows Server 2012 R2, from which DCs apply Protected Users
 PROTECTED_USERS_LEVEL = 6
 EVERY_LOGON = ("S-1-1-0", "S-1-5-11")  # Everyone, Authenticated Users
+DECLARED_MARK = " [declared tier 0]"  # ends a path whose target a user declared
 
 
 @dataclass
@@ -84,6 +85,9 @@ class Graph:
     kinds: dict[str, str] = field(default_factory=dict)
     # what-if: the removable fact behind each edge (build(snap, provenance=True))
     prov: Provenance | None = None
+    # nodes a user declared as tier 0 (declared.py): extended targets, kept apart from the
+    # built-in set above (what-if also adds them to `tier0`, for the cut)
+    declared: set[str] = field(default_factory=set)
 
     def name(self, node: str) -> str:
         """The node's directory name; a well-known SID the snapshot holds no object for
@@ -154,16 +158,15 @@ class Path:
         for node, how in self.steps:
             out += f" -[{edge_text(g, src, node, how)}]-> {g.name(node)}"
             src = node
-        return out
+        return out + DECLARED_MARK if self.steps and src in g.declared else out
 
     def record(self, g: Graph) -> dict[str, Any]:
         """The path as JSON: the start principal and each step, with names, kinds and
         whether the node is tier 0."""
-        return {
-            "object": self.render(g),
-            "start": g.record(self.start),
-            "steps": [{"how": how, **g.record(node)} for node, how in self.steps],
-        }
+        steps = [{"how": how, **g.record(node)} for node, how in self.steps]
+        if steps and self.steps[-1][0] in g.declared:
+            steps[-1]["declared"] = True  # the end only: a declared start or stop changes nothing
+        return {"object": self.render(g), "start": g.record(self.start), "steps": steps}
 
     @classmethod
     def from_record(cls, data: dict[str, Any]) -> Path:
@@ -739,13 +742,26 @@ def _dacl_writers(o: DirObject | None, skip: set[str]) -> dict[str, str]:
 
 def paths_to_tier0(g: Graph) -> dict[str, Path]:
     """Shortest path from every non-tier-0 node that can reach tier 0."""
+    nxt = _next_hops(_reverse(g), g.tier0, g.tier0)
+    return {start: _walk(start, nxt) for start in nxt}
+
+
+def _reverse(g: Graph) -> dict[str, list[Edge]]:
     reverse: dict[str, list[Edge]] = {}
     for src, outs in g.edges.items():
         for dst, how in outs:
             reverse.setdefault(dst, []).append((src, how))
+    return reverse
+
+
+def _next_hops(
+    reverse: dict[str, list[Edge]], seeds: Iterable[str], stop: Iterable[str]
+) -> dict[str, Edge]:
+    """Breadth-first from `seeds` over the reversed edges, not entering `stop`: for every
+    node reached, its next step towards the nearest seed."""
     nxt: dict[str, Edge] = {}
-    seen = set(g.tier0)
-    queue = deque(sorted(g.tier0))
+    seen = set(stop)
+    queue = deque(sorted(seeds))
     while queue:
         node = queue.popleft()
         for src, how in reverse.get(node, []):
@@ -754,7 +770,7 @@ def paths_to_tier0(g: Graph) -> dict[str, Path]:
             seen.add(src)
             nxt[src] = (node, how)
             queue.append(src)
-    return {start: _walk(start, nxt) for start in nxt}
+    return nxt
 
 
 def _walk(start: str, nxt: dict[str, Edge]) -> Path:
@@ -822,7 +838,7 @@ def _identity(snap: Snapshot, account: Account) -> list[str]:
     return nodes
 
 
-def exposure(snap: Snapshot, g: Graph, found: dict[str, Path]) -> tuple[int, int]:
+def exposure(snap: Snapshot, g: Graph, found: Container[str]) -> tuple[int, int]:
     """(enabled non-tier-0 users with a path to tier 0, enabled non-tier-0 users).
 
     `found` holds every node with a path, so a user is exposed when its own node is in it
@@ -839,9 +855,12 @@ def exposure(snap: Snapshot, g: Graph, found: dict[str, Path]) -> tuple[int, int
     return exposed, len(users)
 
 
-def direct_holders(g: Graph, found: dict[str, Path]) -> dict[str, Path]:
+def direct_holders(
+    g: Graph, found: dict[str, Path], targets: Collection[str] | None = None
+) -> dict[str, Path]:
     """Principals that hold a right themselves (not only through a group), each with the
-    shortest path that starts with one of their own rights."""
+    shortest path that starts with one of their own rights, to `targets` (default: tier 0)."""
+    targets = g.tier0 if targets is None else targets
     out = {}
     for node in found:
         if not node.startswith("sid:"):
@@ -850,7 +869,7 @@ def direct_holders(g: Graph, found: dict[str, Path]) -> dict[str, Path]:
         for dst, how in g.edges.get(node, []):
             if how == "member of":
                 continue
-            if dst in g.tier0:
+            if dst in targets:
                 candidate = Path(node, [(dst, how)])
             elif dst in found:
                 candidate = Path(node, [(dst, how), *found[dst].steps])
@@ -875,6 +894,18 @@ BROAD_FIRST = (
 
 
 @dataclass
+class DeclaredReach:
+    """Who reaches the declared targets (Graph.declared), apart from built-in tier 0."""
+
+    # principals outside both sets that hold a right themselves, shortest path to the nearest
+    # declared target, in report order
+    paths: list[Path]
+    principals: dict[str, int]  # declared node -> principals with a path to it
+    exposed: int  # enabled users with a path to built-in or declared tier 0
+    users: int  # enabled users outside both sets
+
+
+@dataclass
 class Analysis:
     """What AD-PATH-001, `ad-doctor paths` and the viewer report."""
 
@@ -884,6 +915,7 @@ class Analysis:
     paths: list[Path]
     exposed: int  # enabled non-tier-0 users with a path
     users: int  # enabled non-tier-0 users
+    declared: DeclaredReach | None = None  # with a declaration; the fields above ignore it
 
     @property
     def broad(self) -> list[Path]:
@@ -894,16 +926,17 @@ class Analysis:
         return (100 * self.exposed // self.users) if self.users else 0
 
 
-# (snapshot, graph built from it): what-if lends its graph to the checks it runs on the
-# snapshot as collected, so AD-PATH-001 does not build the same graph again
-_LENT: tuple[Snapshot, Graph] | None = None
+# (snapshot, graph built from it, its analysis if done): what-if lends its graph to the
+# checks it runs on the snapshot as collected, so AD-PATH-001 does not build the same
+# graph again; a declaration lends its graph the same way, which is how AD-PATH-001 sees it
+_LENT: tuple[Snapshot, Graph, Analysis | None] | None = None
 
 
 @contextmanager
-def lend(snap: Snapshot, g: Graph) -> Iterator[None]:
+def lend(snap: Snapshot, g: Graph, analysis: Analysis | None = None) -> Iterator[None]:
     """While active, analyze(snap) uses `g`, which must be built from `snap` as it is."""
     global _LENT
-    _LENT = (snap, g)
+    _LENT = (snap, g, analysis)
     try:
         yield
     finally:
@@ -913,6 +946,8 @@ def lend(snap: Snapshot, g: Graph) -> Iterator[None]:
 def analyze(snap: Snapshot, g: Graph | None = None) -> Analysis:
     """`g`: a graph already built from this snapshot (with provenance, say)."""
     if g is None and _LENT is not None and _LENT[0] is snap:
+        if _LENT[2] is not None:
+            return _LENT[2]
         g = _LENT[1]
     g = build(snap) if g is None else g
     found = paths_to_tier0(g)
@@ -920,11 +955,38 @@ def analyze(snap: Snapshot, g: Graph | None = None) -> Analysis:
     # are counted in the exposure figure instead of being listed one by one
     starts = direct_holders(g, found)
     exposed, total = exposure(snap, g, found)
-    ordered = sorted(
+    return Analysis(
+        g,
+        _report_order(g, starts),
+        exposed,
+        total,
+        _declared_reach(snap, g) if g.declared else None,
+    )
+
+
+def _report_order(g: Graph, starts: dict[str, Path]) -> list[Path]:
+    return sorted(
         starts.values(),
         key=lambda p: (g.name(p.start) not in BROAD_FIRST, len(p.steps), g.name(p.start).lower()),
     )
-    return Analysis(g, ordered, exposed, total)
+
+
+def _declared_reach(snap: Snapshot, g: Graph) -> DeclaredReach:
+    """The paths to the declared targets, none through built-in tier 0: whoever passes
+    through that is already in the built-in list. The exposure counts both sets, as what-if
+    does when it treats the same nodes as tier 0."""
+    targets = g.declared - g.tier0
+    stop = g.tier0 | targets
+    reverse = _reverse(g)
+    nxt = _next_hops(reverse, targets, stop)
+    starts = direct_holders(g, {s: _walk(s, nxt) for s in nxt}, targets)
+    principals = {
+        t: sum(n.startswith("sid:") for n in _next_hops(reverse, [t], g.tier0 | {t}))
+        for t in sorted(targets)
+    }
+    both = replace(g, tier0=stop, declared=set())
+    exposed, users = exposure(snap, both, _next_hops(reverse, stop, stop))
+    return DeclaredReach(_report_order(g, starts), principals, exposed, users)
 
 
 @dataclass(frozen=True)
@@ -965,7 +1027,8 @@ def chokepoints(paths: Iterable[Path], minimum: int = 2) -> list[Chokepoint]:
 @check("AD-PATH-001", "Control paths from non-tier-0 principals to tier 0")
 def tier0_paths(snap: Snapshot) -> Finding | None:
     a = analyze(snap)
-    if not a.paths:
+    d = a.declared
+    if not a.paths and not (d and d.paths):
         return None
     g = a.graph
     detail = (
@@ -975,6 +1038,12 @@ def tier0_paths(snap: Snapshot) -> Finding | None:
     )
     if a.broad:
         detail += " Broad groups have a path, so every user is effectively tier 0."
+    if d is not None:
+        detail += (
+            f" Declared tier 0 (not built-in): {len(d.paths)} principals can reach an asset "
+            f"you declared, marked{DECLARED_MARK} on the path; {d.exposed} of {d.users} enabled "
+            "users outside both sets have a path to either."
+        )
     f = _finding(
         "AD-PATH-001",
         Severity.HIGH,
@@ -982,7 +1051,7 @@ def tier0_paths(snap: Snapshot) -> Finding | None:
         "Break each path at its first step, starting with the ones shared by most paths "
         "(`ad-doctor paths --chokepoints` ranks them; `ad-doctor blast-radius` shows one "
         "account).",
-        [p.render(g) for p in a.paths],
+        [p.render(g) for p in (a.paths + d.paths if d else a.paths)],
     )
     # a path's identity is the principal it starts from: when the path gets longer or takes
     # another route it keeps its fingerprint and is not new in a diff
@@ -992,4 +1061,8 @@ def tier0_paths(snap: Snapshot) -> Finding | None:
         "users": a.users,
         "paths": [p.record(g) for p in a.paths],
     }
+    if d is not None:
+        # a start can hold a path to each set: the two are different findings
+        f.keys |= {p.render(g): f"declared:{g.ident(p.start)}" for p in d.paths}
+        f.data["declared_paths"] = [p.record(g) for p in d.paths]
     return f

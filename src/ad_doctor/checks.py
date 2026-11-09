@@ -10,14 +10,17 @@ import hashlib
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from . import auditpol, catalog, dnsprop, gpo_scope, regpol, sd
 from .gpo_scope import LOCAL_GROUPS, Grant
 from .model import (
     EXCHANGE_GROUPS,
+    SILO_LEVEL,
     UAC,
     Account,
+    AuthPolicy,
+    AuthSilo,
     CaConfig,
     CertTemplate,
     Dmsa,
@@ -4202,6 +4205,25 @@ def esc10(snap: Snapshot) -> Finding | None:
     )
 
 
+def ca_unjudged(c: CaConfig) -> list[tuple[str, str]]:
+    """(setting, ESC) a readable CA did not answer for."""
+    return [
+        (name, esc)
+        for name, esc, missing in (
+            ("InterfaceFlags", "ESC11", c.interface_flags is None),
+            # a real CA descriptor always has an owner: neither means it was not read
+            ("security descriptor", "ESC7", c.owner is None and not c.aces),
+            ("EditFlags", "ESC6", c.edit_flags is None and not c.third_party_policy),
+            (
+                "DisableExtensionList",
+                "ESC16",
+                c.disabled_extensions is None and not c.third_party_policy,
+            ),
+        )
+        if missing
+    ]
+
+
 @check("AD-ADCS-016", "CA configuration could not be read")
 def unread_ca_config(snap: Snapshot) -> Finding | None:
     hits = []
@@ -4214,21 +4236,7 @@ def unread_ca_config(snap: Snapshot) -> Finding | None:
                 f"{c.host}: policy module {c.policy_module} is not Microsoft's; "
                 "ESC6 and ESC16 not judged"
             )
-        absent = [
-            (name, esc)
-            for name, esc, missing in (
-                ("InterfaceFlags", "ESC11", c.interface_flags is None),
-                # a real CA descriptor always has an owner: neither means it was not read
-                ("security descriptor", "ESC7", c.owner is None and not c.aces),
-                ("EditFlags", "ESC6", c.edit_flags is None and not c.third_party_policy),
-                (
-                    "DisableExtensionList",
-                    "ESC16",
-                    c.disabled_extensions is None and not c.third_party_policy,
-                ),
-            )
-            if missing
-        ]
+        absent = ca_unjudged(c)
         if absent:
             hits.append(
                 f"{c.host}: {', '.join(n for n, _ in absent)} absent or empty; "
@@ -4557,6 +4565,304 @@ def gpo_remote_logon(snap: Snapshot) -> Finding | None:
         "on DCs)." + _filtered_note(hits),
         "Remove the entry, or limit it to the tier the servers belong to.",
         _grant_objects(snap, hits),
+    )
+
+
+# --- tier-0 logon restrictions, silos and change history ----------------------------------
+
+_TIER0_LOGON_GROUPS = ("Domain Admins", "Enterprise Admins", "Schema Admins", "Administrators")
+# their SIDs, or the part after the domain's
+_TIER0_LOGON_SIDS = {
+    "Domain Admins": "-512",
+    "Enterprise Admins": "-519",
+    "Schema Admins": "-518",
+    "Administrators": "S-1-5-32-544",
+}
+_DENY_LABELS = {
+    "SeDenyInteractiveLogonRight": "local logon",
+    "SeDenyRemoteInteractiveLogonRight": "RDP",
+    "SeDenyBatchLogonRight": "batch",
+    "SeDenyServiceLogonRight": "service",
+}
+# the two logon types people use by hand: leaving either open makes the row medium
+_CREDENTIAL_RIGHTS = {"local logon", "RDP"}
+RECENT_CHANGE_DAYS = 30
+INSTALL_DAYS = 1  # changes this close to the domain's creation are the install
+
+
+def _tier0_users(snap: Snapshot) -> list[Account]:
+    """Enabled user accounts of the groups that administer the domain."""
+    members = {dn.lower() for g in _TIER0_LOGON_GROUPS for dn in snap.privileged.get(g, [])}
+    return [a for a in snap.accounts if a.enabled and not a.is_computer and a.dn.lower() in members]
+
+
+def _logon_judged(snap: Snapshot, view: gpo_scope.RegistryView) -> list[Account]:
+    """The computers AD-PRIV-013 judges: none is a DC, so S-1-5-32-* is their own groups."""
+    roles = tier0_hosts(snap)
+    return [a for a in view.targets() if not a.is_registered_dc and a.dn.lower() not in roles]
+
+
+def hidden_tier0(snap: Snapshot, resolver: gpo_scope.Resolver | None = None) -> dict[str, set[str]]:
+    """Members of the groups of `_tier0_users`, nesting included, that the scan could not read:
+    DN -> the SIDs of the groups they are known to be in."""
+    if not snap.unreadable_members:
+        return {}
+    r = resolver or gpo_scope.Resolver(snap)
+    seeds = {
+        name: sid if sid.startswith("S-1-") else f"{snap.domain_sid}{sid}"
+        for name, sid in _TIER0_LOGON_SIDS.items()
+    }
+    groups = {o.name.lower(): o for o in snap.objects if o.kind == "group"}
+    out: dict[str, set[str]] = {}
+    for m in snap.unreadable_members:
+        group = groups.get(m.group.lower())
+        held = r.nested_in(group.dn, group.sid) if group else {seeds.get(m.group, "")} - {""}
+        if held & set(seeds.values()):
+            out[m.dn] = held
+    return out
+
+
+def tier0_deny_unknown(snap: Snapshot) -> bool:
+    """Whether a hidden tier-0 member is outside what AD-PRIV-013 proves. A deny that names a
+    group holding it covers it, unseen; a deny by account or by another group says nothing."""
+    view = gpo_scope.logon_rights_view(snap) if snap.unreadable_members else None
+    hidden = hidden_tier0(snap, view.r) if view is not None else {}
+    if view is None or not hidden:
+        return False
+    tokens = {
+        dn: gpo_scope.member_computer_token(held | gpo_scope.ANYONE_SIDS, snap.domain_sid)
+        for dn, held in hidden.items()
+    }
+    return any(
+        gpo_scope.denied_accounts(view.user_right(a, right), tokens)[0] is not True
+        for a in _logon_judged(snap, view)
+        for right in gpo_scope.DENY_LOGON_RIGHTS
+    )
+
+
+def _deny_row(
+    view: gpo_scope.RegistryView, a: Account, tokens: dict[str, set[str]]
+) -> _PolicyRow | None:
+    not_denied: list[str] = []
+    undecided: list[str] = []
+    left: set[str] = set()
+    for right in gpo_scope.DENY_LOGON_RIGHTS:
+        effective = view.user_right(a, right)
+        state, missed = gpo_scope.denied_accounts(effective, tokens)
+        if state is None:
+            undecided.append(f"{_DENY_LABELS[right]} ({_undecided(effective)})")
+        elif state is False:
+            not_denied.append(_DENY_LABELS[right])
+            left.update(missed)
+    if not not_denied and not undecided:
+        return None
+    severity = Severity.INFO
+    parts = []
+    if not_denied:
+        severity = Severity.MEDIUM if _CREDENTIAL_RIGHTS & set(not_denied) else Severity.LOW
+        text = f"not denied to every tier-0 account: {', '.join(not_denied)}"
+        if len(left) < len(tokens):
+            names = sorted(left)
+            more = f" +{len(names) - MAX_NAMES} more" if len(names) > MAX_NAMES else ""
+            text += f" (left out: {', '.join(names[:MAX_NAMES])}{more})"
+        parts.append(text)
+    if undecided:
+        parts.append(f"not decided: {', '.join(undecided)}")
+    return _PolicyRow(a, severity, "; ".join(parts))
+
+
+@check("AD-PRIV-013", "Tier-0 accounts not denied logon on lower-tier computers")
+def tier0_logon_not_denied(snap: Snapshot) -> Finding | None:
+    view = gpo_scope.logon_rights_view(snap)
+    if view is None:
+        return None
+    users = _tier0_users(snap)
+    if not users:
+        return None
+    # the computers judged are members, whose Administrators is their own local group
+    tokens = {
+        a.sam: gpo_scope.member_computer_token(view.r.token(a), snap.domain_sid) for a in users
+    }
+    rows = [row for a in _logon_judged(snap, view) if (row := _deny_row(view, a, tokens))]
+    return _policy_finding(
+        snap,
+        "AD-PRIV-013",
+        "Group Policy does not stop tier-0 accounts from signing in on these computers. A sign-in "
+        "there leaves credentials that anyone with admin rights on the computer can take, so "
+        "control of one workstation becomes control of the domain. Domain controllers and the "
+        "computers ad-doctor knows to be tier 0 are left out; a computer's own local policy "
+        "cannot be seen from here, and a privileged access workstation you declare yourself is "
+        "not known to this check. A deny entry for Administrators names the computer's own "
+        f"group, so it counts for members of Domain Admins only ({gpo_scope.LOCAL_ADMIN_CAVEAT}).",
+        "In a GPO linked to the lower-tier OUs, add the tier-0 groups to 'Deny log on locally', "
+        "'Deny log on through Remote Desktop Services', 'Deny log on as a batch job' and 'Deny "
+        "log on as a service'. Exclude the OUs of tier-0 servers and admin workstations.",
+        rows,
+    )
+
+
+def _silo_gap(
+    a: Account,
+    silos: list[tuple[AuthSilo, set[str], set[str]]],
+    policies: dict[str, AuthPolicy],
+) -> str:
+    """Why a tier-0 account is not restricted by a silo; "" when it is."""
+    dn = a.dn.lower()
+    named = [s for s, members, assigned in silos if dn in members or dn in assigned]
+    if not named:
+        return "in no silo"
+    both = [s for s, members, assigned in silos if dn in members and dn in assigned]
+    if not both:
+        return (
+            f"silo {named[0].name} has it on one side only: it needs to be a permitted member "
+            "and assigned to the silo"
+        )
+    audited: list[str] = []
+    for s in both:
+        if not s.enforced:
+            audited.append(f"silo {s.name} is in audit mode")
+            continue
+        policy = policies.get(s.user_policy.lower())
+        if policy is None:
+            audited.append(f"silo {s.name} has no user policy this account could read")
+        elif not policy.enforced:
+            audited.append(f"user policy {policy.name} is in audit mode")
+        elif not policy.limits_user_from:
+            audited.append(f"user policy {policy.name} does not limit where users sign in")
+        else:
+            return ""
+    return "; ".join(audited)
+
+
+@check("AD-PRIV-014", "Tier-0 accounts outside an enforced authentication policy silo")
+def tier0_silos(snap: Snapshot) -> Finding | None:
+    if not snap.silos_checked or 0 < snap.policy.functional_level < SILO_LEVEL:
+        return None
+    # the built-in Administrator stays out on purpose: it is the way back in when a silo breaks
+    users = [a for a in _tier0_users(snap) if a.rid != 500]
+    if not users:
+        return None
+    remediation = (
+        "Create an authentication policy that limits where users may sign in, put it in a silo "
+        "with both enforced, then permit and assign each tier-0 account. Keep a break-glass "
+        "account outside."
+    )
+    if not snap.auth_silos:
+        return _finding(
+            "AD-PRIV-014",
+            Severity.LOW,
+            "No authentication policy silo exists, so nothing but Group Policy and habit limits "
+            "where tier-0 accounts can sign in. A silo is enforced by the KDC, on the "
+            "authentication itself.",
+            remediation,
+            _names(users),
+        )
+    policies = {p.dn.lower(): p for p in snap.auth_policies}
+    silos = [
+        (s, {m.lower() for m in s.members}, {m.lower() for m in s.assigned})
+        for s in snap.auth_silos
+    ]
+    objects = [f"{a.sam}: {gap}" for a in users if (gap := _silo_gap(a, silos, policies))]
+    if not objects:
+        return None
+    return _finding(
+        "AD-PRIV-014",
+        Severity.LOW,
+        "These tier-0 accounts are not held by an enforced authentication policy silo with a "
+        "policy that limits where they sign in. Only the silo and its user policy being enforced "
+        "together keep them off lower-tier computers.",
+        remediation,
+        sorted(objects),
+    )
+
+
+def _recent_change(snap: Snapshot, when: datetime | None) -> bool:
+    """Within the last RECENT_CHANGE_DAYS and not part of the domain's first day."""
+    if when is None or when < snap.collected_at - timedelta(days=RECENT_CHANGE_DAYS):
+        return False
+    created = snap.domain_created
+    return created is None or when >= created + timedelta(days=INSTALL_DAYS)
+
+
+def _name_of_dn(snap: Snapshot, dn: str, names: dict[str, str]) -> str:
+    return names.get(dn.lower()) or gpo_scope.RDN_SEPARATOR.split(dn)[0].split("=", 1)[-1]
+
+
+@check("AD-PRIV-015", "Recent additions to tier-0 groups")
+def recent_tier0_members(snap: Snapshot) -> Finding | None:
+    if not snap.member_changes_checked:
+        return None
+    hits = [c for c in snap.member_changes if _recent_change(snap, c.added)]
+    if not hits:
+        return None
+    names = {o.dn.lower(): o.name for o in snap.objects}
+    names.update({a.dn.lower(): a.sam for a in snap.accounts})
+    return _finding(
+        "AD-PRIV-015",
+        Severity.LOW,
+        f"These members were added to tier-0 groups in the {RECENT_CHANGE_DAYS} days before this "
+        "snapshot, by replication metadata. An attacker holding the keys does the same, so each "
+        "should match a change someone can account for. Changes in the domain's first day are "
+        "left out.",
+        "Check each addition against your change record. If it has none, remove the member and "
+        "investigate who made the change (event 4728, 4732 or 4756 on the DC).",
+        sorted(
+            f"{c.group}: {_name_of_dn(snap, c.member_dn, names)} added {c.added:%Y-%m-%d}"
+            for c in hits
+        ),
+    )
+
+
+@check("AD-ACL-010", "AdminSDHolder's ACL changed recently")
+def recent_admin_sd_holder_change(snap: Snapshot) -> Finding | None:
+    when = snap.admin_sd_holder_changed
+    if not snap.admin_sd_holder_checked or when is None or not _recent_change(snap, when):
+        return None
+    return _finding(
+        "AD-ACL-010",
+        Severity.MEDIUM,
+        f"AdminSDHolder's security descriptor changed in the {RECENT_CHANGE_DAYS} days before "
+        "this snapshot, by replication metadata. SDProp copies this ACL over every protected "
+        "account and group, so a change here is rare and is a known persistence technique. The "
+        "metadata says when, not who or what: see AD-ACL-002 for who holds rights now.",
+        "Match the change to a change record (event 5136 on the DC). Compare the ACL with a known "
+        "good copy and remove what should not be there.",
+        [f"AdminSDHolder: nTSecurityDescriptor changed {when:%Y-%m-%d}"],
+    )
+
+
+@check("AD-ACC-017", "Recent sIDHistory changes")
+def recent_sid_history(snap: Snapshot) -> Finding | None:
+    if not snap.sid_history_checked:
+        return None
+    accounts = snap.by_dn()
+    hits = [
+        (accounts[c.dn.lower()], c)
+        for c in snap.sid_history_changes
+        if c.dn.lower() in accounts and _recent_change(snap, c.changed)
+    ]
+    if not hits:
+        return None
+    same_domain = [
+        a for a, _ in hits if any(s.startswith(snap.domain_sid + "-") for s in a.sid_history)
+    ]
+    detail = (
+        f"sIDHistory was written on these accounts in the {RECENT_CHANGE_DAYS} days before this "
+        "snapshot, by replication metadata. Outside a running domain migration it should not "
+        "change at all."
+    )
+    if same_domain:
+        detail += (
+            " Accounts holding a SID of this same domain, which a migration does not produce: "
+            f"{', '.join(_names(same_domain))}."
+        )
+    return _finding(
+        "AD-ACC-017",
+        Severity.MEDIUM if same_domain else Severity.LOW,
+        detail,
+        "Match each change to a migration. If there is none, clear sIDHistory and investigate "
+        "the account.",
+        sorted(f"{a.sam}: sIDHistory changed {c.changed:%Y-%m-%d}" for a, c in hits),
     )
 
 

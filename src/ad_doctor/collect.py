@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import html
 import re
 import struct
 from collections import Counter
@@ -24,9 +25,12 @@ from ldap3.protocol.microsoft import security_descriptor_control
 from . import dnsprop, gpo_scope, keycred, probes, sd, sysvol
 from .checks import dns_lookup_hosts, foreign_zone_trustee, san_note
 from .model import (
+    SILO_LEVEL,
     TIER0_RIDS,
     UAC,
     Account,
+    AuthPolicy,
+    AuthSilo,
     CaConfig,
     CertTemplate,
     ConflictObject,
@@ -41,9 +45,11 @@ from .model import (
     Gpo,
     GpoLocalGroup,
     GpoSettings,
+    MemberChange,
     Probes,
     Pso,
     Rodc,
+    SidHistoryChange,
     Site,
     Snapshot,
     Subnet,
@@ -70,6 +76,11 @@ PROTECTED_USERS_RID = 525
 RODC_GROUP_RID = 521
 REPL_METADATA = "msDS-ReplAttributeMetaData"
 VALUE_METADATA = "msDS-ReplValueMetaData"
+# BASE reads for the change history: tier-0 groups are few, accounts with SID history may not be
+MAX_GROUP_METADATA_READS = 200
+MAX_SID_HISTORY_READS = 500
+AUTHN_CONFIGURATION = "CN=AuthN Policy Configuration,CN=Services,"
+OPEN_TO_READERS = {"S-1-1-0", "S-1-5-11"}
 # direct reads of member values that no search returned; each one is a BASE search
 MAX_MEMBER_READS = 500
 NOT_RETURNED = "not returned: hidden, or this account has no right to see it"
@@ -219,6 +230,8 @@ class Target:
     all_dcs: bool = True
     # read each CA's configuration over the winreg pipe (part of the probes)
     ca_registry: bool = True
+    # names declared as tier 0: an account among them gets its owner and DACL read too
+    declared_tier0: list[str] = dataclasses.field(default_factory=list)
 
 
 def _ces_urls(values: list[str]) -> list[str]:
@@ -260,6 +273,12 @@ def _generalized_time(value: str) -> datetime | None:
         return datetime.strptime(value[:14], "%Y%m%d%H%M%S").replace(tzinfo=UTC)
     except ValueError:
         return None
+
+
+def _limits_sign_in(sddl: str) -> bool:
+    """Set, and not an allow for everyone. Only this fact is kept: the descriptor holds SIDs
+    and a claim expression a snapshot meant for sharing has no use for."""
+    return bool(sddl) and not sd.sddl_opens_to_anyone(sddl)
 
 
 class Collector:
@@ -380,6 +399,7 @@ class Collector:
                 "gPLink",
                 "gPOptions",
                 "msDS-ReplAttributeMetaData",
+                "whenCreated",
             ],
             scope=ldap3.BASE,
         )
@@ -506,6 +526,13 @@ class Collector:
                 "no userPrincipalName came back (none set, or this account cannot read them): "
                 "the UPN part of AD-ACC-016 not judged"
             )
+        rights_read = sysvol_result.scanned
+        if rights_read:
+            gpo_settings = self._resolve_deny_rights(gpo_settings, domain_dn, config_dn, domain)
+        silos, auth_policies, silos_checked = self._auth_silos(config_dn, policy.functional_level)
+        member_changes, member_changes_checked = self._member_changes(objects, domain_sid)
+        holder_changed, holder_checked = self._admin_sd_holder_change(domain_dn)
+        sid_changes, sid_checked = self._sid_history_changes(accounts)
         snap = Snapshot(
             domain=domain,
             domain_dn=domain_dn,
@@ -583,6 +610,17 @@ class Collector:
             dns_nodes_checked=dns_nodes_checked,
             dns_spn_hosts=sorted(dns_scan.hosts),
             dns_delegations=sorted(dns_scan.delegations),
+            logon_rights_collected=rights_read,
+            auth_silos=silos,
+            auth_policies=auth_policies,
+            silos_checked=silos_checked,
+            domain_created=_generalized_time(_first(h, "whenCreated")),
+            member_changes=member_changes,
+            member_changes_checked=member_changes_checked,
+            admin_sd_holder_changed=holder_changed,
+            admin_sd_holder_checked=holder_checked,
+            sid_history_changes=sid_changes,
+            sid_history_checked=sid_checked,
             notes=self.notes,
             ace_inheritance_checked=True,
         )
@@ -672,10 +710,12 @@ class Collector:
         sync_hosts = {a.sync_host.lower() for a in accounts if a.sync_host}
         ca_hosts = {h.upper() for h in self.ca_hosts}
         exchange = exchange_members(objects)
+        declared = self._declared_dns(accounts)
         sensitive = [
             a
             for a in accounts
             if a.dn.lower() in priv_dns
+            or a.dn.lower() in declared
             or a.is_dc
             or a.sam.lower() == "krbtgt"
             or a.rid == 500
@@ -704,6 +744,19 @@ class Collector:
             if keys:
                 self._read_keys(a, entries)
         return objects
+
+    def _declared_dns(self, accounts: list[Account]) -> set[str]:
+        """DNs of the accounts the user declared as tier 0: their owner and DACL are read
+        too, or analysis cannot tell who controls them. Names as the snapshot resolves
+        them (declared.py); a group, OU or GPO has its DACL read anyway."""
+        names = {n.strip().lower() for n in (self.target.declared_tier0 if self.target else ())}
+        if not names:
+            return set()
+        return {
+            a.dn.lower()
+            for a in accounts
+            if names & {a.sam.lower(), a.sam.lower().removesuffix("$"), a.dn.lower(), a.sid.lower()}
+        }
 
     def _read_keys(self, a: Account, entries: list[dict[str, Any]]) -> None:
         """Key credentials of one tier-0 account, from its BASE read."""
@@ -1454,6 +1507,222 @@ class Collector:
             )
         return out, resolved_settings
 
+    def _resolve_deny_rights(
+        self, settings: dict[str, GpoSettings], domain_dn: str, config_dn: str, domain: str
+    ) -> dict[str, GpoSettings]:
+        """SIDs for the names in the deny logon rights. A name that does not resolve stays as
+        written, so the check treats that right as undecided rather than as not denying."""
+
+        def named(holder: str) -> bool:
+            return not holder.upper().startswith("S-1-") and not well_known_sid(holder)
+
+        rights = gpo_scope.DENY_LOGON_RIGHTS
+        if not any(
+            named(h) for s in settings.values() for r in rights for h in s.privileges.get(r, [])
+        ):
+            return settings
+        crossref = self.optional(
+            f"CN=Partitions,{config_dn}",
+            f"(&(objectClass=crossRef)(nCName={ldap3.utils.conv.escape_filter_chars(domain_dn)}))",
+            ["nETBIOSName"],
+        )
+        netbios = (_first(crossref[0], "nETBIOSName") if crossref else "") or domain.split(".")[0]
+        cache: dict[str, str] = {}
+
+        def sid_of(name: str) -> str:
+            if name not in cache:
+                cache[name] = self._principal_sid(name, domain_dn, domain, netbios)
+            return cache[name]
+
+        out = {}
+        for guid, s in settings.items():
+            changed = {
+                r: [(sid_of(h) or h) if named(h) else h for h in s.privileges[r]]
+                for r in rights
+                if r in s.privileges
+            }
+            out[guid] = (
+                dataclasses.replace(s, privileges={**s.privileges, **changed}) if changed else s
+            )
+        unresolved = sorted(name for name, sid in cache.items() if not sid)
+        if unresolved:
+            self.notes.append(
+                "deny logon rights name principals that could not be resolved, so AD-PRIV-013 "
+                f"cannot judge those rights: {', '.join(unresolved[:5])}"
+                + (f" (+{len(unresolved) - 5} more)" if len(unresolved) > 5 else "")
+            )
+        return out
+
+    # --- silos and change history ----------------------------------------------------
+
+    def _auth_silos(
+        self, config_dn: str, level: int
+    ) -> tuple[list[AuthSilo], list[AuthPolicy], bool]:
+        """Authentication policy silos and policies. The schema gives Authenticated Users read
+        and list on both, so an ordinary user sees them unless someone changed that; an empty
+        result only proves there are none if the container's DACL still says so."""
+        root = AUTHN_CONFIGURATION + config_dn
+        silos_dn = f"CN=AuthN Silos,{root}"
+        unjudged: tuple[list[AuthSilo], list[AuthPolicy], bool] = ([], [], False)
+        box = self.attempt(silos_dn, "(objectClass=*)", ["distinguishedName"], scope=ldap3.BASE)
+        if box is None:
+            self.notes.append("authentication policy silos not readable: AD-PRIV-014 not judged")
+            return unjudged
+        if not box:
+            if 0 < level < SILO_LEVEL:  # the container comes with the 2012 R2 schema
+                return [], [], True
+            self.notes.append(
+                "CN=AuthN Silos is not visible to this account: AD-PRIV-014 not judged"
+            )
+            return unjudged
+        entries = self.attempt(
+            silos_dn,
+            "(objectClass=msDS-AuthNPolicySilo)",
+            [
+                "name",
+                "msDS-AuthNPolicySiloEnforced",
+                "msDS-AuthNPolicySiloMembers",
+                "msDS-AssignedAuthNPolicySiloBL",
+                "msDS-UserAuthNPolicy",
+            ],
+        )
+        policies = self.attempt(
+            f"CN=AuthN Policies,{root}",
+            "(objectClass=msDS-AuthNPolicy)",
+            ["name", "msDS-AuthNPolicyEnforced", "msDS-UserAllowedToAuthenticateFrom"],
+        )
+        if entries is None or policies is None:
+            self.notes.append("authentication policy silos not readable: AD-PRIV-014 not judged")
+            return unjudged
+        if not entries and not any(
+            a.sid in OPEN_TO_READERS and a.mask & sd.LIST_CHILDREN for a in self._dacl(silos_dn)
+        ):
+            self.notes.append(
+                "no authentication policy silo visible and CN=AuthN Silos does not let ordinary "
+                "users list it: AD-PRIV-014 not judged"
+            )
+            return unjudged
+        silos = [
+            AuthSilo(
+                name=_first(e, "name") or e["distinguishedname"][0],
+                dn=e["distinguishedname"][0],
+                enforced=_optional_bool(e, "msDS-AuthNPolicySiloEnforced") is True,
+                members=_str(e.get("msds-authnpolicysilomembers", [])),
+                assigned=_str(e.get("msds-assignedauthnpolicysilobl", [])),
+                user_policy=_first(e, "msDS-UserAuthNPolicy"),
+            )
+            for e in entries
+        ]
+        out = [
+            AuthPolicy(
+                name=_first(e, "name") or e["distinguishedname"][0],
+                dn=e["distinguishedname"][0],
+                enforced=_optional_bool(e, "msDS-AuthNPolicyEnforced") is True,
+                limits_user_from=_limits_sign_in(_first(e, "msDS-UserAllowedToAuthenticateFrom")),
+            )
+            for e in policies
+        ]
+        return silos, out, True
+
+    def _member_changes(
+        self, objects: list[DirObject], domain_sid: str
+    ) -> tuple[list[MemberChange], bool]:
+        """When each current member of a tier-0 group (nesting included) was added.
+
+        One BASE read per group, because the metadata of a linked attribute is a constructed
+        attribute and the list stays short: tier-0 groups have few members. A member with no
+        row was added before linked value replication, so it is older than any window.
+        """
+        groups = {o.dn.lower(): o for o in objects if o.kind == "group"}
+        seeds = {f"{domain_sid}-{rid}" for rid in PRIVILEGED_RIDS.values()}
+        seeds |= {f"{domain_sid}-{rid}" for rid in TIER0_RIDS} | set(PRIVILEGED_BUILTIN.values())
+        todo = [g for g in groups.values() if g.sid in seeds]
+        if not {g.sid for g in todo} >= {f"{domain_sid}-512", "S-1-5-32-544"}:
+            self.notes.append(
+                "Domain Admins or Administrators not readable: AD-PRIV-015 not judged"
+            )
+            return [], False
+        seen = {g.dn.lower() for g in todo}
+        tier0_groups = []
+        while todo:
+            group = todo.pop()
+            tier0_groups.append(group)
+            for member in group.members:
+                key = member.lower()
+                if key in groups and key not in seen:
+                    seen.add(key)
+                    todo.append(groups[key])
+        tier0_groups.sort(key=lambda g: g.dn.lower())
+        if len(tier0_groups) > MAX_GROUP_METADATA_READS:
+            self.notes.append(
+                f"{len(tier0_groups)} tier-0 groups: AD-PRIV-015 read the member metadata of the "
+                f"first {MAX_GROUP_METADATA_READS} only"
+            )
+        unread: list[str] = []
+        partial: list[str] = []
+        changes: list[MemberChange] = []
+        for g in tier0_groups[:MAX_GROUP_METADATA_READS]:
+            entries = self._base(g.dn, [REPL_METADATA, VALUE_METADATA])
+            e = entries[0] if entries else {}
+            if not e.get(REPL_METADATA.lower()):
+                unread.append(g.name)
+                continue
+            if (g.dn.lower(), VALUE_METADATA.lower()) in self.ranged:
+                partial.append(g.name)
+            for member_dn, added in _member_additions(
+                "".join(_str(e.get(VALUE_METADATA.lower(), [])))
+            ):
+                changes.append(MemberChange(g.name, g.dn, member_dn, added))
+        for text, names in (
+            ("replication metadata of tier-0 groups not readable", unread),
+            ("more member metadata than one LDAP page in", partial),
+        ):
+            if names:
+                self.notes.append(
+                    f"{text}: {', '.join(sorted(names)[:5])}: AD-PRIV-015 did not judge them"
+                )
+        return changes, True
+
+    def _admin_sd_holder_change(self, domain_dn: str) -> tuple[datetime | None, bool]:
+        """Last originating change of AdminSDHolder's security descriptor."""
+        entries = self._base(f"CN=AdminSDHolder,CN=System,{domain_dn}", [REPL_METADATA])
+        metadata = "".join(_str(entries[0].get(REPL_METADATA.lower(), []))) if entries else ""
+        when = _meta_time(metadata, "nTSecurityDescriptor")
+        if when is None:
+            self.notes.append(
+                "replication metadata of AdminSDHolder's nTSecurityDescriptor not readable: "
+                "AD-ACL-010 not judged"
+            )
+        return when, when is not None
+
+    def _sid_history_changes(self, accounts: list[Account]) -> tuple[list[SidHistoryChange], bool]:
+        """When sIDHistory was last written, one BASE read per account that has it: none in
+        most domains, and capped because a migrated domain can hold thousands."""
+        holders = sorted((a for a in accounts if a.sid_history), key=lambda a: a.dn.lower())
+        if len(holders) > MAX_SID_HISTORY_READS:
+            self.notes.append(
+                f"{len(holders)} accounts have SID history: AD-ACC-017 read the metadata of the "
+                f"first {MAX_SID_HISTORY_READS} only"
+            )
+        out = []
+        unread = []
+        for a in holders[:MAX_SID_HISTORY_READS]:
+            entries = self._base(a.dn, [REPL_METADATA])
+            metadata = "".join(_str(entries[0].get(REPL_METADATA.lower(), []))) if entries else ""
+            when = _meta_time(metadata, "sIDHistory")
+            if when is None:
+                unread.append(a.sam)
+            else:
+                out.append(SidHistoryChange(a.dn, when))
+        if unread:
+            shown = ", ".join(sorted(unread)[:5])
+            more = f" (+{len(unread) - 5} more)" if len(unread) > 5 else ""
+            self.notes.append(
+                f"replication metadata of sIDHistory not readable for {shown}{more}: AD-ACC-017 "
+                "did not judge them"
+            )
+        return out, True
+
     def _principal_sid(self, name: str, domain_dn: str, domain: str, netbios: str) -> str:
         """SID of a principal named in a local group setting; "" if unknown or foreign."""
         name = name.strip()
@@ -1809,7 +2078,13 @@ class Collector:
 
     def _sysvol(self, domain: str, gpo_guids: list[str]) -> sysvol.SysvolResult:
         t = self.target
-        if t is None or not t.sysvol:
+        if t is None:
+            return sysvol.SysvolResult()
+        if not t.sysvol:
+            self.notes.append(
+                "SYSVOL not checked by choice: AD-GPP-001, AD-GPP-002, AD-GPO-003, AD-GPO-005, "
+                "AD-GPO-006 and AD-GPO-007 did not judge it"
+            )
             return sysvol.SysvolResult()
         if not t.user and not t.kerberos:
             self.notes.append("SYSVOL not checked: needs credentials")
@@ -1914,6 +2189,15 @@ class Collector:
             self.notes.append(
                 "HTTPS enrollment endpoints not probed by choice: AD-ADCS-019 did not judge them"
             )
+        if not t.probes:
+            self.notes.append(
+                "SMB, Print Spooler and channel binding probes not run by choice: AD-INF-008, "
+                "AD-INF-009, AD-INF-010 and AD-INF-013 did not judge them"
+            )
+        if self.ca_dns_hosts and not (t.probes and t.http_port):
+            self.notes.append(
+                "web enrollment not probed by choice: AD-ADCS-010 and AD-CHAIN-003 did not judge it"
+            )
         if not t.probes and not t.plain_port:
             return result
         for name, scanned in self._dc_targets(dc_dns_host, accounts):
@@ -1977,9 +2261,12 @@ class Collector:
     def _ca_configs(self, dc_dns_host: str) -> list[CaConfig]:
         """Each enterprise CA's configuration, read from its registry over the winreg pipe."""
         t = self.target
-        if t is None or not t.probes or not self.ca_dns_hosts:
+        if t is None or not self.ca_dns_hosts:
             return []
         skipped = "CA configuration (ESC6, ESC7, ESC11, ESC16, audit filter) not read"
+        if not t.probes:
+            self.notes.append(f"{skipped}: --no-probes")
+            return []
         if not t.ca_registry:
             self.notes.append(f"{skipped}: --no-ca-registry")
             return []
@@ -2208,6 +2495,7 @@ def _sync_host(sam: str, description: str) -> str | None:
 
 META_BLOCK = re.compile(r"<DS_REPL_ATTR_META_DATA>(.*?)</DS_REPL_ATTR_META_DATA>", re.S)
 LAST_CHANGE = re.compile(r"<ftimeLastOriginatingChange>([^<]+)</ftimeLastOriginatingChange>")
+VALUE_TARGET = re.compile(r"<pszObjectDn>([^<]*)</pszObjectDn>")
 
 
 def _meta_time(metadata_xml: str, attribute: str) -> datetime | None:
@@ -2221,6 +2509,32 @@ def _meta_time(metadata_xml: str, attribute: str) -> datetime | None:
                 except ValueError:
                     return None  # the caller's "not readable" case
     return None
+
+
+def _member_additions(metadata_xml: str) -> list[tuple[str, datetime]]:
+    """(member DN, when it last became a member) of every live `member` value.
+
+    The last originating change is used rather than ftimeCreated: a value removed and added
+    again keeps its row, and for a live value the last change is the addition.
+    """
+    out = []
+    for block in keycred.VALUE_BLOCK.findall(metadata_xml):
+        name = keycred.VALUE_ATTRIBUTE.search(block)
+        target = VALUE_TARGET.search(block)
+        deleted = keycred.VALUE_DELETED.search(block)
+        changed = LAST_CHANGE.search(block)
+        if name is None or name.group(1) != "member" or target is None or changed is None:
+            continue
+        if deleted is None or not deleted.group(1).startswith("1601"):
+            continue
+        if changed.group(1).startswith("1601"):
+            continue
+        try:
+            when = datetime.fromisoformat(changed.group(1).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        out.append((html.unescape(target.group(1)), when))
+    return out
 
 
 def _last_backup(metadata_xml: str) -> datetime | None:

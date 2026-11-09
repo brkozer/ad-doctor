@@ -73,11 +73,20 @@ SIDES = (("computer", GPO_COMPUTER_DISABLED), ("user", GPO_USER_DISABLED))
 EVERYONE = "S-1-1-0"
 AUTHENTICATED_USERS = "S-1-5-11"
 THIS_ORGANIZATION = "S-1-5-15"
+ANYONE_SIDS = frozenset({EVERYONE, AUTHENTICATED_USERS, THIS_ORGANIZATION})
+LOCAL_ADMIN_CAVEAT = "assumes Domain Admins is in the local Administrators"
 ENTERPRISE_DCS = "S-1-5-9"
 INTERACTIVE = "S-1-5-4"
 ADMINISTRATORS = "S-1-5-32-544"
 RDP_USERS = "S-1-5-32-555"
 REMOTE_LOGON_RIGHT = "SeRemoteInteractiveLogonRight"
+DENY_LOGON_RIGHTS = (
+    "SeDenyInteractiveLogonRight",
+    "SeDenyRemoteInteractiveLogonRight",
+    "SeDenyBatchLogonRight",
+    "SeDenyServiceLogonRight",
+)
+USER_RIGHTS_KEY = "GptTmpl\\Privilege Rights"  # not a registry path: names the store in a layer
 # a comma that ends an RDN: not escaped, i.e. after an even number of backslashes
 RDN_SEPARATOR = re.compile(r"(?<!\\)(?:\\\\)*,")
 ILT_CAVEAT = "item-level targeting not evaluated"
@@ -304,7 +313,7 @@ class _Resolver:
         if known is not None:
             return known
         dom = self.snap.domain_sid
-        sids = {a.sid, EVERYONE, AUTHENTICATED_USERS, THIS_ORGANIZATION}
+        sids = {a.sid, *ANYONE_SIDS}
         sids.add(f"{dom}-{a.primary_group or (515 if a.is_computer else 513)}")
         if a.is_dc:
             sids |= {ENTERPRISE_DCS, f"{dom}-{521 if a.is_rodc else 516}"}
@@ -314,6 +323,12 @@ class _Resolver:
         todo += [
             self.sid_dn.get(s, f"cn={s.lower()},cn=foreignsecurityprincipals,{head}") for s in sids
         ]
+        self._add_holders(todo, sids)
+        self._tokens[a.dn.lower()] = sids
+        return sids
+
+    def _add_holders(self, todo: list[str], sids: set[str]) -> None:
+        """Add the SID of every group that holds one of these DNs, through nesting."""
         seen = set(todo)
         while todo:
             for group in self.member_of.get(todo.pop(), []):
@@ -323,7 +338,11 @@ class _Resolver:
                     if group.sid:
                         sids.add(group.sid)
                     todo.append(key)
-        self._tokens[a.dn.lower()] = sids
+
+    def nested_in(self, dn: str, sid: str) -> set[str]:
+        """The SID of a group and of every group that holds it."""
+        sids = {sid} - {""}
+        self._add_holders([dn.lower()], sids)
         return sids
 
     def applied(self, a: Account, source: str) -> list[tuple[Gpo, tuple[str, ...]]]:
@@ -614,6 +633,7 @@ class RegistryView:
         self.r = _Resolver(snap)
         self._layers: dict[tuple[str, str], tuple[_Layer, ...]] = {}
         self._memo: dict[tuple[object, ...], Effective] = {}
+        self._rights: dict[str, list[RegistryEntry]] | None = None
 
     def targets(self) -> list[Account]:
         """Computers that process Windows Group Policy. A computer object with no operating
@@ -707,6 +727,21 @@ class RegistryView:
                     found.setdefault(category, False)
         return found
 
+    def user_right(self, a: Account, right: str) -> Effective:
+        """What the GPOs' security templates leave in one user right. Windows does not merge a
+        right across GPOs: the one applied last that defines it decides the whole list."""
+        if self._rights is None:
+            self._rights = {
+                guid: [
+                    RegistryEntry(USER_RIGHTS_KEY, name, "set", data=holders)
+                    for name, holders in s.privileges.items()
+                    if name in DENY_LOGON_RIGHTS
+                ]
+                for guid, s in self.snap.gpo_settings.items()
+            }
+        layers = self._source_layers(a, "restricted", self._rights, "GptTmpl.inf")
+        return self._played("rights", layers, USER_RIGHTS_KEY, right)
+
     def _played(self, kind: str, layers: tuple[_Layer, ...], key: str, name: str) -> Effective:
         memo = (kind, key, name, *[(x.gpo.guid, x.caveats) for x in layers])
         found = self._memo.get(memo)
@@ -724,6 +759,57 @@ class RegistryView:
                 if e.action in ("set", "soft") and regpol.norm(e.key) == wanted:
                     out.setdefault(e.name.casefold(), e.name)
         return list(out.values())
+
+
+def logon_rights_view(snap: Snapshot) -> RegistryView | None:
+    """None when the deny logon rights were not collected: the check then does not judge."""
+    return RegistryView(snap) if snap.logon_rights_collected else None
+
+
+Resolver = _Resolver
+
+
+def member_computer_token(token: set[str], domain_sid: str) -> set[str]:
+    """A domain token as a member computer sees it. There S-1-5-32-* names the computer's own
+    groups, so what the domain's Builtin groups hold says nothing about them. Joining the
+    domain puts Domain Admins in the local Administrators and Domain Users in the local Users
+    (Microsoft's default groups); Enterprise Admins and the members of the domain's
+    Administrators are not added. That default is all that can be seen from here, the same
+    assumption as LOCAL_ADMIN_CAVEAT."""
+    out = {sid for sid in token if not sid.startswith("S-1-5-32-")}
+    if f"{domain_sid}-512" in token:
+        out.add("S-1-5-32-544")
+    if f"{domain_sid}-513" in token:
+        out.add("S-1-5-32-545")
+    return out
+
+
+def denied_accounts(
+    effective: Effective, tokens: dict[str, set[str]]
+) -> tuple[bool | None, list[str]]:
+    """Whether what a right can end up holding denies every account in `tokens` (name -> SIDs in
+    its token), and who is left out. None: it depends on something that cannot be decided, or
+    on a name that could not be resolved to a SID."""
+    states: set[bool | None] = set()
+    left: set[str] = set()
+    for o in effective.outcomes:
+        if o.unknown:
+            states.add(None)
+        elif not o.present or not isinstance(o.data, list):
+            states.add(False)
+            left |= tokens.keys()
+        else:
+            holders = {_holder(h) for h in o.data}
+            missed = {name for name, token in tokens.items() if not holders & token}
+            if missed and any(not h.startswith("S-1-") for h in holders):
+                states.add(None)
+            else:
+                states.add(not missed)
+                left |= missed
+    if len(states) == 1:
+        state = states.pop()
+        return state, sorted(left) if state is False else []
+    return None, []
 
 
 def registry_view(snap: Snapshot) -> RegistryView | None:
