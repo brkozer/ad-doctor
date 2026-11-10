@@ -12,6 +12,7 @@ nav = [
   { "Home" = "index.md" },
   { "Getting started" = [
     { "Quick start" = "quickstart.md" },
+    { "Command line" = "cli.md" },
     { "Permissions needed" = "permissions.md" },
     { "Network probes" = "probes.md" },
   ] },
@@ -26,6 +27,10 @@ nav = [
     { "BloodHound export" = "bloodhound.md" },
   ] },
   { "Checks" = "checks/index.md" },
+  { "Reference" = [
+    { "How it works" = "how-it-works.md" },
+    { "Limits" = "limits.md" },
+  ] },
   { "Changelog" = "changelog.md" },
 ]
 

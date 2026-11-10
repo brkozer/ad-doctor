@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -14,7 +13,7 @@ from ldap3.core.exceptions import LDAPBusyResult
 from smbprotocol.exceptions import SMBOSError
 from smbprotocol.header import NtStatus
 
-from ad_doctor import catalog, collect, fixes, gpo_scope, probes, redact, sd, sysvol, winreg
+from ad_doctor import collect, fixes, gpo_scope, probes, redact, sd, sysvol, winreg
 from ad_doctor.checks import run_all
 from ad_doctor.collect import mark_rogue_dcs
 from ad_doctor.model import DirObject, GpoSettings, Probes, Severity, Snapshot
@@ -441,18 +440,6 @@ def test_no_ca_registry_note_names_the_audit_filter() -> None:
 
 
 # --- docs ---------------------------------------------------------------------------------
-
-
-def test_readme_severities_match_the_catalog() -> None:
-    cat = catalog.load()
-    rows = re.findall(
-        r"^\|[^|]*\| (AD-[A-Z]+-\d+) \|.*\| ([a-z/]+) \|$",
-        (ROOT / "README.md").read_text(encoding="utf8"),
-        re.M,
-    )
-    assert len(rows) == len(cat) - sum(1 for k in cat if k.startswith("AD-INV-"))
-    wrong = [cid for cid, grades in rows if set(grades.split("/")) != set(cat[cid].severities)]
-    assert wrong == []
 
 
 def test_old_password_margin_still_applies_to_a_read_time() -> None:

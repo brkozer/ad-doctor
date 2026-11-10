@@ -85,8 +85,9 @@ is proven, "heuristic" on every ordering or budget claim, and never "fixed", "re
    default configuration must stay clean (`test_clean_domain_has_no_findings`). If the lab
    can reproduce it, seed it in `lab/seed.ps1` and assert it in `tests/test_lab.py`.
 6. **Document it.** Add `src/ad_doctor/catalog/<ID>.toml` (copy an existing entry for the
-   schema; the loader in `catalog/__init__.py` validates it). Add a row to the check table
-   in the README, and a `-WhatIf` fix in `fixes.py` if the fix is a safe command.
+   schema; the loader in `catalog/__init__.py` validates it; the docs check catalog is built
+   from it), add what it cannot see to `docs/limits.md`, and a `-WhatIf` fix in `fixes.py`
+   if the fix is a safe command.
    `tests/test_catalog.py` fails when a check has no entry, and the severity gate in
    `tests/conftest.py` fails the run when a test makes a check emit a severity its entry's
    `severities` does not list, so write a test for every grade. `uv run python
