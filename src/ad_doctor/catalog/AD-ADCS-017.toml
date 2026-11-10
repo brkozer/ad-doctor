@@ -51,7 +51,7 @@ Certipy and Locksmith flag the same combination. Two differences:
   one only looks at broad groups.
 
 A schema v1 template can fire together with [AD-ADCS-008](AD-ADCS-008.md): they describe
-different problems. The object looks like `LabESC15 (enroll: Domain Users)`.
+different problems. The object looks like `WebServerV1 (enroll: Domain Users)`.
 """
 
 false_positives = """
@@ -68,7 +68,7 @@ remediation = """
 2. **Require CA certificate manager approval** where the requester must supply the subject:
 
     ```powershell
-    $t = "CN=LabESC15,CN=Certificate Templates,CN=Public Key Services,CN=Services,$((Get-ADRootDSE).configurationNamingContext)"
+    $t = "CN=WebServerV1,CN=Certificate Templates,CN=Public Key Services,CN=Services,$((Get-ADRootDSE).configurationNamingContext)"
     Set-ADObject $t -Replace @{ 'msPKI-Enrollment-Flag' = 2 } -WhatIf
     ```
 

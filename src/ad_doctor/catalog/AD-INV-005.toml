@@ -30,7 +30,7 @@ published = ["User", "Machine", "DomainController", "WebServer"]
 A template counts as published when its name appears in `certificateTemplates` of any
 enrollment service under `CN=Enrollment Services,CN=Public Key Services,CN=Services` in
 the configuration partition. Names are compared, ignoring case, with `published`; each
-extra template is one object, for example `LabESC1`.
+extra template is one object, for example `VPNUser`.
 """
 
 false_positives = """
@@ -50,7 +50,7 @@ remediation = """
    can be issued from the template:
 
     ```powershell
-    Remove-CATemplate -Name LabESC1 -WhatIf
+    Remove-CATemplate -Name VPNUser -WhatIf
     ```
 
 3. **For templates that stay, review their enrollment rights and flags** with the ESC

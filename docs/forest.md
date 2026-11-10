@@ -4,19 +4,19 @@ A normal scan reads one domain. `--forest` reads every domain of the forest, one
 time, starting from one domain controller:
 
 ```bash
-ad-doctor scan dc01.corp.example --ldaps -u 'CORP\auditor' --forest -o forest-2026-11/
-ad-doctor rollup --forest forest-2026-11/
+ad-doctor scan dc01.corp.example --ldaps -u 'CORP\auditor' --forest -o forest/
+ad-doctor rollup --forest forest/
 ```
 
 `collect --forest -o DIR` does the collection only. Analyze each snapshot to a
 `<domain>.report.json` next to it, then roll up:
 
 ```bash
-ad-doctor collect dc01.corp.example --ldaps -u 'CORP\auditor' --forest -o forest-2026-11/
-for f in forest-2026-11/*.snapshot.json; do
+ad-doctor collect dc01.corp.example --ldaps -u 'CORP\auditor' --forest -o forest/
+for f in forest/*.snapshot.json; do
   ad-doctor analyze "$f" -f json -o "${f%.snapshot.json}.report.json"
 done
-ad-doctor rollup --forest forest-2026-11/
+ad-doctor rollup --forest forest/
 ```
 
 Without `--forest`, every command behaves and prints exactly as before.

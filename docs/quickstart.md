@@ -32,10 +32,10 @@ ad-doctor checks                   # list every check
 ## Collect once, analyze and compare offline
 
 ```bash
-ad-doctor collect dc01.corp.example --ldaps -u 'CORP\auditor' -o 2026-11.json
-ad-doctor analyze 2026-11.json -f markdown -o report.md --invariants invariants.toml
-ad-doctor diff 2026-10.json 2026-11.json
-ad-doctor blast-radius 2026-11.json helpdesk_jane
+ad-doctor collect dc01.corp.example --ldaps -u 'CORP\auditor' -o snapshot.json
+ad-doctor analyze snapshot.json -f markdown -o report.md --invariants invariants.toml
+ad-doctor diff previous.json snapshot.json
+ad-doctor blast-radius snapshot.json jdoe
 ```
 
 ## Kerberos instead of a password

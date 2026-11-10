@@ -6,7 +6,7 @@ every scan instead of living in a wiki.
 
 ```bash
 ad-doctor scan dc01.corp.example --ldaps -u 'CORP\auditor' --invariants invariants.toml
-ad-doctor analyze 2026-11.json --invariants invariants.toml
+ad-doctor analyze snapshot.json --invariants invariants.toml
 ```
 
 Every section is optional. See

@@ -45,7 +45,7 @@ each principal that holds `GenericAll`, `GenericWrite`, `WriteDacl`, `WriteOwner
 - on a CA object, that CA server's own computer account.
 
 Each object names the PKI object and the principals, for example
-`NTAuthCertificates (helpdesk)` or `CA adlab-CA (svc_pki)`.
+`NTAuthCertificates (helpdesk)` or `CA CORP-CA (svc_pki)`.
 """
 
 false_positives = """

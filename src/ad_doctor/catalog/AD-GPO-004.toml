@@ -42,7 +42,7 @@ right on it: GenericAll or full control, GenericWrite, WriteDacl, WriteOwner, or
 WriteProperty on all attributes (which GPMC's *Edit settings* grants). CREATOR OWNER is
 ignored.
 
-Each object names the GPO and the editors, for example `LabUserPolicy (helpdesk)`. The
+Each object names the GPO and the editors, for example `Workstation Baseline (helpdesk)`. The
 NTFS permissions on the GPO's SYSVOL folder are not read.
 """
 
@@ -58,10 +58,10 @@ remediation = """
 1. **List who can edit the GPO and where it is linked** (read-only):
 
     ```powershell
-    Get-GPPermission -Name 'LabUserPolicy' -All |
+    Get-GPPermission -Name 'Workstation Baseline' -All |
         Where-Object Permission -in 'GpoEdit', 'GpoEditDeleteModifySecurity' |
         Format-Table Trustee, TrusteeType, Permission -AutoSize
-    [xml](Get-GPOReport -Name 'LabUserPolicy' -ReportType Xml) |
+    [xml](Get-GPOReport -Name 'Workstation Baseline' -ReportType Xml) |
         ForEach-Object { $_.GPO.LinksTo } | Format-Table SOMPath, Enabled
     ```
 
@@ -69,7 +69,7 @@ remediation = """
    read access where needed:
 
     ```powershell
-    Set-GPPermission -Name 'LabUserPolicy' -TargetName 'helpdesk' -TargetType Group -PermissionLevel GpoRead -Replace -WhatIf
+    Set-GPPermission -Name 'Workstation Baseline' -TargetName 'helpdesk' -TargetType Group -PermissionLevel GpoRead -Replace -WhatIf
     ```
 
 3. **Delete unlinked GPOs that nobody owns** after a backup (`Backup-GPO`), instead of

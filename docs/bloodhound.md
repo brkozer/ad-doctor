@@ -5,8 +5,8 @@
 can be explored next to SharpHound data instead of in a second tool.
 
 ```bash
-ad-doctor export-graph 2026-11.json -o graph.json
-ad-doctor export-graph 2026-11.json -o graph.json --paths-only
+ad-doctor export-graph snapshot.json -o graph.json
+ad-doctor export-graph snapshot.json -o graph.json --paths-only
 ```
 
 Load `graph.json` through BloodHound CE's File Ingest, which accepts OpenGraph JSON.

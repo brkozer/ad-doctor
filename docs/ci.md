@@ -63,7 +63,7 @@ scheduled scan can therefore stay green until something changes.
 
 ```bash
 ad-doctor scan "$DC" --ldaps -u "$AD_USER" --baseline last.json --fail-on high
-ad-doctor diff 2026-10.json 2026-11.json       # or compare two saved runs directly
+ad-doctor diff previous.json snapshot.json       # or compare two saved runs directly
 ```
 
 ## Accepted risks

@@ -38,7 +38,7 @@ reports every principal outside tier 0 that can write `gPLink`: WriteProperty on
 Tier 0 here includes the operator groups (Account, Server, Print and Backup Operators) as
 well as Administrators, Domain Admins, Enterprise Admins, Schema Admins, the DC groups, the
 built-in Administrator and SYSTEM. Each object names the container and the principal, for
-example `Domain Controllers OU: gpo_linker` or `domain: helpdesk`. A principal with full
+example `Domain Controllers OU: it_ops` or `domain: helpdesk`. A principal with full
 control of the domain object also appears in [AD-ACL-003](AD-ACL-003.md). The owner of the
 container is not evaluated here.
 """
@@ -67,7 +67,7 @@ remediation = """
    first; `/R` removes every ACE for the trustee on that container):
 
     ```powershell
-    # dsacls "OU=Domain Controllers,DC=corp,DC=example" /R "CORP\\gpo_linker"
+    # dsacls "OU=Domain Controllers,DC=corp,DC=example" /R "CORP\\it_ops"
     ```
 
 3. **Review the current links** on both containers for GPOs you do not recognise:

@@ -34,7 +34,7 @@ From the LDAP snapshot: every **enabled** account with the
 names the account and the SPNs it may delegate to, from `msDS-AllowedToDelegateTo`:
 
 ```text
-svc_iis -> cifs/fs01.adlab.test
+svc_iis -> cifs/fs01.corp.example
 ```
 
 When the flag is set but the list is empty, the target shows as `?`.

@@ -67,11 +67,11 @@ one became.
 | finding fingerprint | `fp:3fa1c2d4e5f60718` (a finding of the table below; a setting such as AD-KRB-003 is refused) |
 | step of a path | `fp:<AD-PATH-001 fingerprint>#2`, `path:"Domain Users"#1` |
 | edge | `edge:helpdesk->"Domain Admins":"full control"`, or the `edge:<12 hex>` ID of a `paths --chokepoints -f json` row |
-| ACE | `ace:"OU=Team,DC=lab,DC=test":helpdesk`, `inherited-ace:...`, `adminsdholder:helpdesk` |
-| owner | `owner:"CN=Owned,OU=Lab,DC=lab,DC=test"` |
-| membership | `member:"Domain Admins":grp171` |
+| ACE | `ace:"OU=Staff,DC=corp,DC=example":helpdesk`, `inherited-ace:...`, `adminsdholder:helpdesk` |
+| owner | `owner:"CN=Old Share,OU=Servers,DC=corp,DC=example"` |
+| membership | `member:"Domain Admins":old_admin` |
 | Group Policy | `gplink:"<GPO>":"<container DN>"`, `gpo-entry:"<GPO>":Administrators:"Domain Users"` |
-| AD CS | `template:LabESC1:enroll:"Domain Users"`, `template:LabESC1:enrollee-supplies-subject`, `pki:NTAuthCertificates:helpdesk`, `ca:<CA>:helpdesk:ManageCertificates`, `oid-link:<OID>`, `ca-flag:<CA>:san-from-request` (or `no-sid-extension`) |
+| AD CS | `template:VPNUser:enroll:"Domain Users"`, `template:VPNUser:enrollee-supplies-subject`, `pki:NTAuthCertificates:helpdesk`, `ca:<CA>:helpdesk:ManageCertificates`, `oid-link:<OID>`, `ca-flag:<CA>:san-from-request` (or `no-sid-extension`) |
 | gMSA, delegation | `gmsa:<gMSA>:<reader>`, `delegation:<account>:unconstrained` (or `protocol-transition`, `rbcd`, `constrained:<SPN>`), `rbcd:<computer>:<principal>` |
 | SID history | `sid-history:<account>:<SID>`, `sid-history:<account>` (every SID the account holds) |
 | files GPOs run | `script-ace:"<SYSVOL path>":<trustee>`, `script-host:"<GPO>":"<path as the GPO writes it>"` |
@@ -138,7 +138,7 @@ and what to assume.
 schema = 1
 
 [plan]
-domain = "adlab.test"
+domain = "corp.example"
 domain_sid = "S-1-5-21-..."
 made_against = 2026-11-07T22:51:51Z
 made_by = "ad-doctor 0.2.6 plan"
@@ -157,7 +157,7 @@ due = 2026-11-30
 
 [[keep]]
 kind = "ace"
-object = "dc=adlab,dc=test"
+object = "dc=corp,dc=example"
 trustee = "S-1-5-21-...-1137"
 reason = "Entra Connect needs DCSync"
 expires = 2027-06-30                           # required, as in the accept file

@@ -48,7 +48,7 @@ it reads the owner and the effective ACEs and reports:
 
 Key Admins and Enterprise Key Admins writing `msDS-KeyCredentialLink` is the default and is
 not reported. Objects look like `adm_bob: helpdesk (write/WriteDacl/WriteOwner)`,
-`DC01$: kc_writer (write msDS-KeyCredentialLink)` or `adm_bob: owned by helpdesk`.
+`DC01$: svc_provision (write msDS-KeyCredentialLink)` or `adm_bob: owned by helpdesk`.
 """
 
 false_positives = """

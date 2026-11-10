@@ -50,7 +50,7 @@ set, then reports a template when **all** of these hold:
 | Usable for authentication | EKU includes Client Authentication, Smart Card Logon, PKINIT Client Authentication or Any Purpose, or is empty |
 
 Each object names the template and the broad groups that can enroll, for example
-`LabESC13 (enroll: Domain Users)`. Find the linked group with the read-only command in
+`IssuancePolicyUser (enroll: Domain Users)`. Find the linked group with the read-only command in
 the remediation.
 """
 

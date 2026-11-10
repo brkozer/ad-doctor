@@ -53,7 +53,7 @@ template when **all** of these hold:
 
 The template's own EKU is not considered, because the attack replaces it. Each object
 names the template and the broad groups that can enroll, for example
-`LabESC15 (enroll: Domain Users)`.
+`WebServerV1 (enroll: Domain Users)`.
 """
 
 false_positives = """
@@ -77,7 +77,7 @@ remediation = """
    stop publishing the original:
 
     ```powershell
-    Remove-CATemplate -Name LabESC15 -WhatIf
+    Remove-CATemplate -Name WebServerV1 -WhatIf
     ```
 
 4. **Look for abuse**: in *Issued Certificates* for this template, look for certificates

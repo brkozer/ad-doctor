@@ -7,8 +7,8 @@ radius); the page renders, filters and navigates it, and walks the control graph
 is embedded. It needs no server and works from a USB stick or an air-gapped laptop.
 
 ```bash
-ad-doctor view 2026-11.json --baseline 2026-10.json --history reports/ \
-  --accept accept.toml --invariants invariants.toml --fixes -o 2026-11.html --open
+ad-doctor view snapshot.json --baseline previous.json --history reports/ \
+  --accept accept.toml --invariants invariants.toml --fixes -o report.html --open
 ```
 
 <p align="center"><img src="viewer-paths.png" alt="Control paths screen: edge filters, the path list, one path drawn as a chain from LabServerAdmins through ENTRA01$ and the sync account to the domain, and the node inspector" width="85%"></p>
@@ -169,8 +169,8 @@ limit (`paths` mode) that data is not embedded and the screen shows the plan onl
 The same path data is available without the page:
 
 ```bash
-ad-doctor paths 2026-11.json                       # every path, broad groups first
-ad-doctor paths 2026-11.json --chokepoints         # steps shared by 2 or more paths
-ad-doctor paths 2026-11.json -f mermaid > paths.md
-ad-doctor blast-radius 2026-11.json svc_backup     # one account, like the Blast radius screen
+ad-doctor paths snapshot.json                       # every path, broad groups first
+ad-doctor paths snapshot.json --chokepoints         # steps shared by 2 or more paths
+ad-doctor paths snapshot.json -f mermaid > paths.md
+ad-doctor blast-radius snapshot.json svc_backup     # one account, like the Blast radius screen
 ```

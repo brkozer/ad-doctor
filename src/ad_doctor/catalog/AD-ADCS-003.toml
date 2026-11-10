@@ -48,7 +48,7 @@ template when **all** of these hold:
 
 The EKU list is `msPKI-Certificate-Application-Policy` when set, otherwise
 `pKIExtendedKeyUsage`. Each object names the template and the broad groups that can
-enroll, for example `LabESC3 (enroll: Domain Users)`. Templates with the Any Purpose EKU
+enroll, for example `EnrollmentAgent (enroll: Domain Users)`. Templates with the Any Purpose EKU
 also work as agent templates and are reported by [AD-ADCS-002](AD-ADCS-002.md).
 """
 
@@ -72,7 +72,7 @@ remediation = """
 
     ```powershell
     $cfg = (Get-ADRootDSE).configurationNamingContext
-    $dn  = "CN=LabESC3,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
+    $dn  = "CN=EnrollmentAgent,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
     $t   = Get-ADObject $dn -Properties 'msPKI-Enrollment-Flag'
     Set-ADObject $dn -Replace @{'msPKI-Enrollment-Flag' = ($t.'msPKI-Enrollment-Flag' -bor 2)} -WhatIf
     ```
@@ -84,7 +84,7 @@ remediation = """
 4. **Stop publishing** the agent template if smart card enrollment is not in use:
 
     ```powershell
-    Remove-CATemplate -Name LabESC3 -WhatIf
+    Remove-CATemplate -Name EnrollmentAgent -WhatIf
     ```
 
 Then review *Issued Certificates* for requests signed by an agent certificate from this

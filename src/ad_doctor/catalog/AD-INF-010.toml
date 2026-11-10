@@ -36,7 +36,7 @@ reported. Any other failure is inconclusive and not reported.
 The setting *When supported* (`LdapEnforceChannelBinding` = 1) still accepts clients that
 send no token, so only *Always* (2) passes. The probe needs `--ldaps` and a
 `DOMAIN\\user` account with a password (NTLM), and is skipped with `--no-probes`. Each
-object is a DC host name, for example `DC01.adlab.test`.
+object is a DC host name, for example `DC01.corp.example`.
 """
 
 false_positives = """

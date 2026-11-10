@@ -29,7 +29,7 @@ ad-doctor reads `msDS-EnabledFeature` on `CN=Partitions` in the configuration pa
 and reports the domain when no value starts with `CN=Recycle Bin Feature,`. If that
 object cannot be read the result is unknown and nothing is reported.
 
-The finding has one object, the domain name, for example `adlab.test`.
+The finding has one object, the domain name, for example `corp.example`.
 """
 
 false_positives = """

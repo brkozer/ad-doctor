@@ -45,7 +45,7 @@ objects) over LDAP and reports a template when **all** of these hold:
 | Usable for authentication | EKU (`pKIExtendedKeyUsage` / application policies) includes Client Authentication, Smart Card Logon, PKINIT Client Authentication or Any Purpose, or is empty |
 
 Each reported object names the template and the broad groups that can enroll, for
-example `LabESC1 (enroll: Domain Users)`.
+example `VPNUser (enroll: Domain Users)`.
 """
 
 false_positives = """
@@ -73,7 +73,7 @@ Apply **at least one** of these, in order of preference:
 
     ```powershell
     $cfg = (Get-ADRootDSE).configurationNamingContext
-    $dn  = "CN=LabESC1,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
+    $dn  = "CN=VPNUser,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
     $t   = Get-ADObject $dn -Properties 'msPKI-Enrollment-Flag'
     Set-ADObject $dn -Replace @{'msPKI-Enrollment-Flag' = ($t.'msPKI-Enrollment-Flag' -bor 2)} -WhatIf
     ```
@@ -81,7 +81,7 @@ Apply **at least one** of these, in order of preference:
 4. **Stop publishing** a template nobody needs (run on the CA):
 
     ```powershell
-    Remove-CATemplate -Name LabESC1 -WhatIf
+    Remove-CATemplate -Name VPNUser -WhatIf
     ```
 
 Then **look for abuse**: in the CA console, *Issued Certificates*, compare the requester

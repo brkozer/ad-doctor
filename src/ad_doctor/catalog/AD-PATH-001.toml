@@ -84,7 +84,7 @@ Each object is one principal that holds a right itself, with its shortest path, 
 groups first, for example:
 
 ```text
-Domain Users -[enroll (ESC1-3)]-> template LabESC1
+Domain Users -[enroll (ESC1-3)]-> template VPNUser
 LabServerAdmins -[admin to via GPO LabLocalAdmins]-> ENTRA01$ -[hosts sync account]-> MSOL_0a1b2c3d4e5f -[DCSync]-> corp.example
 ```
 
@@ -102,10 +102,10 @@ the GPO.
 A GPO that reaches only a read-only DC gets no `linked to domain` edge, because an RODC cannot
 write the domain; an RODC itself counts as tier 0, so the path to it stays. A GPO reaches
 computers and users, not groups or the OU itself, and it does reach objects with inheritance
-disabled. The steps between the GPO and the account are scope nodes such as `users under Lab`:
+disabled. The steps between the GPO and the account are scope nodes such as `users under Branch`:
 
 ```text
-gpo_editor -[full control]-> LabOuReach -[GPO applies to]-> users under Lab -[GPO reaches]-> svc_sql
+branch_admins -[full control]-> Branch Policy -[GPO applies to]-> users under Branch -[GPO reaches]-> svc_sql
 ```
 
 A delegation edge means the source can impersonate an admin to the computer, and admin on

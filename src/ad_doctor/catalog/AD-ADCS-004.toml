@@ -34,7 +34,7 @@ Compatible Access, Domain Users, Domain Guests or Domain Computers hold any of:
 Write access to a single attribute or property set is not counted. Templates are reported
 whether or not a CA publishes them, because an unpublished template can be published
 later. Each object names the template and the groups, for example
-`LabESC4 (Authenticated Users)`.
+`LegacyWorkstation (Authenticated Users)`.
 """
 
 false_positives = """
@@ -52,7 +52,7 @@ remediation = """
 
     ```powershell
     $cfg  = (Get-ADRootDSE).configurationNamingContext
-    $path = "AD:CN=LabESC4,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
+    $path = "AD:CN=LegacyWorkstation,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
     $acl  = Get-Acl $path
     $acl.Owner
     $acl.Access | Where-Object ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteDacl|WriteOwner|WriteProperty'

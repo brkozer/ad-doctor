@@ -43,8 +43,8 @@ From the LDAP snapshot, for every **enabled** account:
 
 | Reported when | Example object |
 |---|---|
-| an SPN in `msDS-AllowedToDelegateTo` has service `ldap`, `cifs`, `host`, `http`, `gc`, `rpcss`, `wsman` or `dns`, and its host is a DC (matched on the DC's `sAMAccountName` without `$` or its `dNSHostName`, ignoring case and port) | `svc_dc -> ldap/DC01.adlab.test` |
-| an SPN in `msDS-AllowedToDelegateTo` has service `krbtgt` | `svc_x -> krbtgt/ADLAB.TEST` |
+| an SPN in `msDS-AllowedToDelegateTo` has service `ldap`, `cifs`, `host`, `http`, `gc`, `rpcss`, `wsman` or `dns`, and its host is a DC (matched on the DC's `sAMAccountName` without `$` or its `dNSHostName`, ignoring case and port) | `svc_dc -> ldap/DC01.corp.example` |
+| an SPN in `msDS-AllowedToDelegateTo` has service `krbtgt` | `svc_x -> krbtgt/CORP.EXAMPLE` |
 | the account is a DC or RODC and its `msDS-AllowedToActOnBehalfOfOtherIdentity` is set | `DC01$ (resource-based delegation configured on it)` |
 
 Delegation is reported whether or not protocol transition is enabled.
@@ -81,7 +81,7 @@ remediation = """
 
     ```powershell
     Set-ADUser svc_dc -WhatIf `
-        -Remove @{'msDS-AllowedToDelegateTo' = 'ldap/DC01.adlab.test'}
+        -Remove @{'msDS-AllowedToDelegateTo' = 'ldap/DC01.corp.example'}
     ```
 
 3. **Clear RBCD on DCs**:

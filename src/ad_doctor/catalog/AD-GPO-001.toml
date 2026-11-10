@@ -41,7 +41,7 @@ GPMC grant these rights.
 Default tier 0 is Administrators, Domain Admins, Enterprise Admins, Schema Admins, Domain
 Controllers, Enterprise Domain Controllers, the read-only DC groups, the built-in
 Administrator and SYSTEM. Each object names the GPO, where it is linked and who can edit
-it, for example `LabDCPolicy -> Domain Controllers OU (helpdesk)`.
+it, for example `DC Hardening -> Domain Controllers OU (helpdesk)`.
 
 Only the directory side (the GPC) is checked; the NTFS permissions on the GPO's SYSVOL
 folder are not read. Links on sites, security filtering and WMI filters are not taken into
@@ -61,7 +61,7 @@ remediation = """
 1. **List who can edit the GPO** (read-only):
 
     ```powershell
-    Get-GPPermission -Name 'LabDCPolicy' -All |
+    Get-GPPermission -Name 'DC Hardening' -All |
         Where-Object Permission -in 'GpoEdit', 'GpoEditDeleteModifySecurity' |
         Format-Table Trustee, TrusteeType, Permission -AutoSize
     ```
@@ -70,11 +70,11 @@ remediation = """
    they need to see the settings:
 
     ```powershell
-    Set-GPPermission -Name 'LabDCPolicy' -TargetName 'helpdesk' -TargetType Group -PermissionLevel GpoRead -Replace -WhatIf
+    Set-GPPermission -Name 'DC Hardening' -TargetName 'helpdesk' -TargetType Group -PermissionLevel GpoRead -Replace -WhatIf
     ```
 
 3. **Check the GPO for changes you did not make** (scheduled tasks, scripts, user rights):
-   `Get-GPOReport -Name 'LabDCPolicy' -ReportType Html -Path .\\LabDCPolicy.html`.
+   `Get-GPOReport -Name 'DC Hardening' -ReportType Html -Path .\\DC Hardening.html`.
 
 4. **Keep DC and domain-wide GPOs separate** from GPOs that other teams manage, and give
    edit rights on them to tier-0 administrators only.

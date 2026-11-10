@@ -35,7 +35,7 @@ is inconclusive and is written to the scan notes, not reported.
 The probe needs a `DOMAIN\\user` account with a password (NTLM); it is skipped with a
 note when scanning with Kerberos. By default every enabled DC in the domain is probed by
 its `dNSHostName`; `--single-dc` limits it to the DC being scanned. Each object is a DC
-host name, for example `DC01.adlab.test`, and the detail says how many of the probed DCs
+host name, for example `DC01.corp.example`, and the detail says how many of the probed DCs
 failed.
 """
 

@@ -5,9 +5,9 @@ analyzing offline keeps the heavy LDAP work separate from the fast, network-free
 lets you compare runs over time.
 
 ```bash
-ad-doctor collect dc01.corp.example --ldaps -u 'CORP\auditor' -o 2026-11.json
-ad-doctor analyze 2026-11.json -f html -o report.html
-ad-doctor diff 2026-10.json 2026-11.json
+ad-doctor collect dc01.corp.example --ldaps -u 'CORP\auditor' -o snapshot.json
+ad-doctor analyze snapshot.json -f html -o report.html
+ad-doctor diff previous.json snapshot.json
 ```
 
 `analyze` takes the same reporting options as `scan` (`-f`, `-o`, `--accept`,
@@ -31,7 +31,7 @@ Before a snapshot leaves your hands &mdash; attached to a bug report, sent to a 
 &mdash; redact it:
 
 ```bash
-AD_DOCTOR_REDACT_KEY='any secret' ad-doctor redact 2026-11.json -o shareable.json
+AD_DOCTOR_REDACT_KEY='any secret' ad-doctor redact snapshot.json -o shareable.json
 ```
 
 Redaction replaces names, DNs, host names, addresses and the domain SID with stable

@@ -56,7 +56,7 @@ template when **all** of these hold:
 | Usable for authentication | EKU includes Client Authentication, Smart Card Logon, PKINIT Client Authentication or Any Purpose, or is empty |
 
 Each object names the template and the broad groups that can enroll, for example
-`LabESC9 (enroll: Domain Users)`. The same effect configured CA-wide is reported by
+`SmartcardLogon (enroll: Domain Users)`. The same effect configured CA-wide is reported by
 [AD-ADCS-015](AD-ADCS-015.md).
 """
 
@@ -75,7 +75,7 @@ remediation = """
 
     ```powershell
     $cfg = (Get-ADRootDSE).configurationNamingContext
-    $dn  = "CN=LabESC9,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
+    $dn  = "CN=SmartcardLogon,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
     $t   = Get-ADObject $dn -Properties 'msPKI-Enrollment-Flag'
     Set-ADObject $dn -Replace @{'msPKI-Enrollment-Flag' = ($t.'msPKI-Enrollment-Flag' -band -bnot 0x80000)} -WhatIf
     ```

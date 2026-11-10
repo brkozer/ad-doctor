@@ -20,20 +20,20 @@ ad-doctor scan dc01.corp.example --ldaps -u 'CORP\auditor' -f html -o report.htm
 ad-doctor scan dc01.corp.example --ldaps -k
 
 # collect once, analyze and compare offline
-ad-doctor collect dc01.corp.example --ldaps -u 'CORP\auditor' -o 2026-11.json
-ad-doctor analyze 2026-11.json -f markdown -o report.md --invariants invariants.toml
-ad-doctor diff 2026-10.json 2026-11.json
-ad-doctor blast-radius 2026-11.json helpdesk_jane
-ad-doctor paths 2026-11.json --chokepoints        # where one change breaks the most paths
-ad-doctor view 2026-11.json --baseline 2026-10.json --accept accept.toml --fixes --open
-AD_DOCTOR_REDACT_KEY=... ad-doctor redact 2026-11.json -o shareable.json
+ad-doctor collect dc01.corp.example --ldaps -u 'CORP\auditor' -o snapshot.json
+ad-doctor analyze snapshot.json -f markdown -o report.md --invariants invariants.toml
+ad-doctor diff previous.json snapshot.json
+ad-doctor blast-radius snapshot.json jdoe
+ad-doctor paths snapshot.json --chokepoints        # where one change breaks the most paths
+ad-doctor view snapshot.json --baseline previous.json --accept accept.toml --fixes --open
+AD_DOCTOR_REDACT_KEY=... ad-doctor redact snapshot.json -o shareable.json
 
 # the control graph for BloodHound CE (File Ingest accepts OpenGraph JSON)
-ad-doctor export-graph 2026-11.json -o graph.json --paths-only
+ad-doctor export-graph snapshot.json -o graph.json --paths-only
 
 # every domain of the forest, one snapshot and report each, then the forest-level view
-ad-doctor scan dc01.corp.example --ldaps -u 'CORP\auditor' --forest -o forest-2026-11/
-ad-doctor rollup --forest forest-2026-11/
+ad-doctor scan dc01.corp.example --ldaps -u 'CORP\auditor' --forest -o forest/
+ad-doctor rollup --forest forest/
 ```
 
 | Option | |

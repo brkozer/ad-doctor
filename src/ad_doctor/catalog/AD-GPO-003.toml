@@ -45,9 +45,9 @@ security client-side extension is listed in `gPCMachineExtensionNames`. It then 
 - any of the privileges above granted in `[Privilege Rights]` to a principal other than
   the tier-0 groups, the operator groups, SYSTEM, LOCAL SERVICE and NETWORK SERVICE.
 
-Objects look like `LabDCPolicy: LmCompatibilityLevel 1 (LM/NTLMv1 allowed)`,
-`LabDCPolicy: LM hashes stored (NoLMHash 0)`, `LabDCPolicy: reversible password
-encryption enabled` or `LabDCPolicy: SeDebugPrivilege granted to Authenticated Users`.
+Objects look like `DC Hardening: LmCompatibilityLevel 1 (LM/NTLMv1 allowed)`,
+`DC Hardening: LM hashes stored (NoLMHash 0)`, `DC Hardening: reversible password
+encryption enabled` or `DC Hardening: SeDebugPrivilege granted to Authenticated Users`.
 
 The check judges each GPO on its own: it does not compute precedence, so a weak value
 overridden by a higher-precedence GPO is still reported, and settings made outside Group
@@ -70,7 +70,7 @@ remediation = """
 1. **See the effective settings in the GPO** (read-only):
 
     ```powershell
-    Get-GPOReport -Name 'LabDCPolicy' -ReportType Html -Path .\\LabDCPolicy.html
+    Get-GPOReport -Name 'DC Hardening' -ReportType Html -Path .\\DC Hardening.html
     ```
 
 2. **Fix the values** in GPMC under *Computer Configuration > Policies > Windows Settings >

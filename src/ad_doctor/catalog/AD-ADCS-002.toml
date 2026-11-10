@@ -53,7 +53,7 @@ template when **all** of these hold:
 
 The EKU list is `msPKI-Certificate-Application-Policy` when it is set (schema v2 and
 later), otherwise `pKIExtendedKeyUsage`. Each object names the template and the broad
-groups that can enroll, for example `LabESC2 (enroll: Domain Users)`.
+groups that can enroll, for example `AnyPurpose (enroll: Domain Users)`.
 """
 
 false_positives = """
@@ -81,7 +81,7 @@ Apply **at least one** of these, in order of preference:
 
     ```powershell
     $cfg = (Get-ADRootDSE).configurationNamingContext
-    $dn  = "CN=LabESC2,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
+    $dn  = "CN=AnyPurpose,CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
     $t   = Get-ADObject $dn -Properties 'msPKI-Enrollment-Flag'
     Set-ADObject $dn -Replace @{'msPKI-Enrollment-Flag' = ($t.'msPKI-Enrollment-Flag' -bor 2)} -WhatIf
     ```
@@ -89,7 +89,7 @@ Apply **at least one** of these, in order of preference:
 4. **Stop publishing** a template nobody needs (run on the CA):
 
     ```powershell
-    Remove-CATemplate -Name LabESC2 -WhatIf
+    Remove-CATemplate -Name AnyPurpose -WhatIf
     ```
 
 Then review the CA's *Issued Certificates* for this template and revoke certificates

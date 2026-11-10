@@ -48,7 +48,7 @@ ManageCertificates grade it also checks the LDAP snapshot for a published templa
 valid for authentication and lets the enrollee supply the subject.
 
 Each object names the CA, the principal and the right, for example
-`adlab-CA: helpdesk (ManageCertificates)`. ESC7 principals are added to the control graph
+`CORP-CA: helpdesk (ManageCertificates)`. ESC7 principals are added to the control graph
 and the BloodHound export (`ADD_ManageCA`, `ADD_ManageCertificates`), so attack paths run
 through them.
 """

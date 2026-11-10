@@ -86,7 +86,7 @@ remediation = """
 2. **List who can create objects in the reported OUs.**
 
     ```powershell
-    (Get-Acl 'AD:OU=Lab,DC=corp,DC=example').Access |
+    (Get-Acl 'AD:OU=Staff,DC=corp,DC=example').Access |
         Where-Object { $_.ActiveDirectoryRights -match 'CreateChild|GenericAll|WriteDacl|WriteOwner' } |
         Select-Object IdentityReference, ActiveDirectoryRights, ObjectType, InheritanceType
     ```
@@ -96,14 +96,14 @@ remediation = """
    remove the principal's ACEs:
 
     ```
-    dsacls "OU=Lab,DC=corp,DC=example"
-    dsacls "OU=Lab,DC=corp,DC=example" /R "CORP\\ou_admin"
+    dsacls "OU=Staff,DC=corp,DC=example"
+    dsacls "OU=Staff,DC=corp,DC=example" /R "CORP\\ou_admin"
     ```
 
 4. **Give non-tier-0 owners' objects back to Domain Admins**:
 
     ```powershell
-    $p = 'AD:OU=Lab,DC=corp,DC=example'; $acl = Get-Acl $p
+    $p = 'AD:OU=Staff,DC=corp,DC=example'; $acl = Get-Acl $p
     $acl.SetOwner([System.Security.Principal.NTAccount]'CORP\\Domain Admins')
     Set-Acl $p $acl -WhatIf
     ```
