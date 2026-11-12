@@ -37,7 +37,7 @@ ad-doctor = "ad_doctor.cli:main"
 [dependency-groups]
 dev = ["pytest>=8.3", "ruff>=0.8", "mypy>=1.13", "rich>=13.9"]
 # pinned exactly: zensical is pre-1.0; Dependabot (uv ecosystem) proposes bumps
-docs = ["zensical==0.0.74"]
+docs = ["zensical==0.1.0"]
 
 [build-system]
 requires = ["hatchling"]
